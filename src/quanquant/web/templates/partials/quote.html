@@ -1,0 +1,14 @@
+{% if snap %}
+<div class="quote {{ 'up' if snap.change >= 0 else 'down' }}">
+  <span class="sym">{{ snap.symbol }}</span>
+  <span class="price">{{ snap.price | num }}</span>
+  <span class="chg">{{ '▲' if snap.change >= 0 else '▼' }} {{ snap.change | signed }} ({{ snap.change_pct | pct }}%)</span>
+  <span class="meta">量 {{ snap.volume | comma }}　高 {{ snap.high_price | num }}　低 {{ snap.low_price | num }}</span>
+  <span class="sess sess-{{ session }}">{{ session_label }}</span>
+  <span class="time">{{ snap.fetched_at | cst_time }} CST</span>
+</div>
+{% elif error %}
+<div class="quote err"><span>⚠ 報價錯誤：{{ error }}</span></div>
+{% else %}
+<div class="quote"><span>等待報價…</span></div>
+{% endif %}

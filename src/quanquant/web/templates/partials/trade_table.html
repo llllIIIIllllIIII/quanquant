@@ -1,0 +1,34 @@
+{% if not rows %}
+<tr class="empty"><td colspan="14">尚無交易紀錄，點「+ 新增交易」開始記錄。</td></tr>
+{% endif %}
+{% for r in rows %}
+<tr id="trade-{{ r.t.id }}">
+  <td>{{ r.t.symbol }}</td>
+  <td><span class="dir {{ 'long' if r.t.direction == 'long' else 'short' }}">{{ '多' if r.t.direction == 'long' else '空' }}</span></td>
+  <td class="nowrap">{{ r.t.entry_time | dt }}</td>
+  <td class="numcell">{{ r.t.entry_price | num }}</td>
+  <td class="nowrap">{% if r.t.exit_time %}{{ r.t.exit_time | dt }}{% else %}<span class="badge open">未平倉</span>{% endif %}</td>
+  <td class="numcell">{{ r.t.exit_price | num }}</td>
+  <td class="numcell">{{ r.t.stop_loss_price | num }}</td>
+  <td>{{ r.t.take_profit_strategy or '—' }}</td>
+  <td class="numcell">{{ r.t.size }}</td>
+  <td class="numcell">{{ r.t.fee | num }}</td>
+  <td class="numcell">
+    {% if r.t.exit_time %}
+      <span class="pnl {{ 'up' if r.t.pnl >= 0 else 'down' }}">{{ r.t.pnl | signed }}</span>{% if r.t.pnl_is_manual %} <small class="muted">手動</small>{% endif %}
+    {% elif r.unrealized is not none %}
+      <span class="pnl {{ 'up' if r.unrealized >= 0 else 'down' }}">{{ r.unrealized | signed }}</span> <small class="muted">未實現</small>
+    {% else %}—{% endif %}
+  </td>
+  <td>{% for tag in r.tags %}<span class="tag">{{ tag }}</span>{% endfor %}</td>
+  <td class="note">{{ r.t.note or '' }}</td>
+  <td class="nowrap">
+    <a href="#" role="button" class="outline mini"
+       hx-get="/trades/{{ r.t.id }}/edit" hx-target="#modal-body" hx-swap="innerHTML"
+       @click="open = true">編輯</a>
+    <a href="#" role="button" class="outline mini contrast"
+       hx-delete="/trades/{{ r.t.id }}" hx-swap="none"
+       hx-confirm="確定刪除這筆交易？">刪除</a>
+  </td>
+</tr>
+{% endfor %}

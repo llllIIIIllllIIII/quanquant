@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<div x-data="{ open: false }" @closemodal.window="open = false">
+
+  <div class="journal-head">
+    <h3>交易日記</h3>
+    <button hx-get="/trades/new" hx-target="#modal-body" hx-swap="innerHTML" @click="open = true">
+      + 新增交易
+    </button>
+  </div>
+
+  <form class="filterbar" hx-get="/trades" hx-target="#trade-tbody" hx-swap="innerHTML"
+        hx-trigger="change, submit, refreshtable from:body" @submit.prevent>
+    <select name="symbol" aria-label="商品">
+      <option value="">全部商品</option>
+      {% for s in symbols %}<option value="{{ s }}" {% if f.symbol == s %}selected{% endif %}>{{ s }}</option>{% endfor %}
+    </select>
+    <select name="tag" aria-label="標籤">
+      <option value="">全部標籤</option>
+      {% for t in all_tags %}<option value="{{ t }}" {% if f.tag == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+    </select>
+    <select name="status" aria-label="狀態">
+      <option value="all" {% if f.status == 'all' %}selected{% endif %}>全部狀態</option>
+      <option value="open" {% if f.status == 'open' %}selected{% endif %}>未平倉</option>
+      <option value="closed" {% if f.status == 'closed' %}selected{% endif %}>已平倉</option>
+    </select>
+    <input type="date" name="date_from" value="{{ f.date_from }}" aria-label="開始日期">
+    <input type="date" name="date_to" value="{{ f.date_to }}" aria-label="結束日期">
+  </form>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>商品</th><th>方向</th><th>開倉時間</th><th>開倉價</th><th>平倉時間</th><th>平倉價</th>
+          <th>停損</th><th>停利策略</th><th>口數</th><th>手續費</th><th>損益</th><th>標籤</th><th>備註</th><th>操作</th>
+        </tr>
+      </thead>
+      <tbody id="trade-tbody">
+        {% include "partials/trade_table.html" %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- modal -->
+  <dialog :open="open">
+    <article class="modal-card">
+      <header>
+        <button aria-label="Close" rel="prev" @click="open = false"></button>
+        <strong>交易紀錄</strong>
+      </header>
+      <div id="modal-body"></div>
+    </article>
+  </dialog>
+
+</div>
+{% endblock %}

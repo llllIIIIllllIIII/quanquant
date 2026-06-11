@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+
+{% macro metric_cards(m) %}
+<div class="cards">
+  <article><small>總損益</small><div class="big {{ 'up' if m.total_pnl >= 0 else 'down' }}">{{ m.total_pnl | signed }}</div></article>
+  <article><small>交易次數</small><div class="big">{{ m.count }}</div></article>
+  <article><small>勝率</small><div class="big">{{ (m.win_rate * 100) | round(1) }}%</div><small class="muted">{{ m.wins }} 勝 / {{ m.losses }} 負</small></article>
+  <article><small>平均獲利</small><div class="big up">{{ m.avg_win | num }}</div></article>
+  <article><small>平均虧損</small><div class="big down">{{ m.avg_loss | num }}</div></article>
+  <article><small>最大單筆獲利</small><div class="big up">{{ m.max_win | num }}</div></article>
+  <article><small>最大單筆虧損</small><div class="big down">{{ m.max_loss | num }}</div></article>
+  <article><small>最大回撤</small><div class="big down">{{ m.max_drawdown | num }}</div></article>
+  <article><small>獲利因子</small><div class="big">{% if m.profit_factor is not none %}{{ m.profit_factor | round(2) }}{% else %}—{% endif %}</div></article>
+</div>
+{% endmacro %}
+
+{% macro breakdown(title, groups) %}
+{% if groups %}
+<h4>{{ title }}</h4>
+<div class="table-wrap">
+  <table>
+    <thead><tr><th>{{ title }}</th><th>次數</th><th>總損益</th><th>勝率</th><th>平均獲利</th><th>平均虧損</th><th>最大回撤</th></tr></thead>
+    <tbody>
+      {% for key, m in groups.items() %}
+      <tr>
+        <td>{{ key }}</td>
+        <td class="numcell">{{ m.count }}</td>
+        <td class="numcell {{ 'up' if m.total_pnl >= 0 else 'down' }}">{{ m.total_pnl | signed }}</td>
+        <td class="numcell">{{ (m.win_rate * 100) | round(1) }}%</td>
+        <td class="numcell">{{ m.avg_win | num }}</td>
+        <td class="numcell">{{ m.avg_loss | num }}</td>
+        <td class="numcell">{{ m.max_drawdown | num }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endif %}
+{% endmacro %}
+
+{% block content %}
+{% set qs = 'symbol=' ~ (f.symbol | urlencode) ~ '&tag=' ~ (f.tag | urlencode) ~ '&date_from=' ~ f.date_from ~ '&date_to=' ~ f.date_to %}
+
+<div class="journal-head">
+  <h3>績效統計</h3>
+  <div class="export-actions">
+    <a role="button" class="outline" href="/stats/export.csv?{{ qs }}">匯出 CSV</a>
+    <a role="button" class="outline" href="/stats/export.xlsx?{{ qs }}">匯出 Excel</a>
+  </div>
+</div>
+
+<form class="filterbar" method="get" action="/stats">
+  <select name="symbol" aria-label="商品">
+    <option value="">全部商品</option>
+    {% for s in symbols %}<option value="{{ s }}" {% if f.symbol == s %}selected{% endif %}>{{ s }}</option>{% endfor %}
+  </select>
+  <select name="tag" aria-label="標籤">
+    <option value="">全部標籤</option>
+    {% for t in all_tags %}<option value="{{ t }}" {% if f.tag == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
+  </select>
+  <input type="date" name="date_from" value="{{ f.date_from }}" aria-label="開始日期">
+  <input type="date" name="date_to" value="{{ f.date_to }}" aria-label="結束日期">
+  <button type="submit">套用</button>
+</form>
+
+<small class="muted">統計僅計入已平倉交易。</small>
+{{ metric_cards(stats.overall) }}
+{{ breakdown('依標籤', stats.by_tag) }}
+{{ breakdown('依商品', stats.by_symbol) }}
+{% endblock %}

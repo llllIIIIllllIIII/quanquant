@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# SQLite database (runtime)
+*.db
+*.db-wal
+*.db-shm
+
+# Environment
+.env
+.env.local
+
+# Deployment artifacts (local-only)
+*.dump
+backups/
+docker-compose.override.yml
+
+# Local tooling
+.claude/
+
+# OS
+.DS_Store

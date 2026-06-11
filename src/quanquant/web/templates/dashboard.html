@@ -1,0 +1,93 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="quote-panel" hx-ext="sse" sse-connect="/quote/stream">
+  <div id="quote" sse-swap="message" hx-swap="innerHTML"
+       hx-get="/quote" hx-trigger="load">
+    <div class="quote">等待報價…</div>
+  </div>
+</section>
+
+<section x-data="chartPanel()">
+  <div class="chart-head">
+    <h3>{{ symbol }} 走勢圖 <small class="muted">· 本系統即時資料</small></h3>
+    <div class="chart-head-actions">
+      <button class="outline mini" @click="openSettings()">指標設定</button>
+      <a role="button" class="outline mini" href="{{ tv_url }}" target="_blank" rel="noopener">
+        TradingView ↗
+      </a>
+    </div>
+  </div>
+
+  <div class="tf-bar" role="group">
+    <template x-for="t in tfs" :key="t.code">
+      <button class="tf-btn" :class="{active: tf === t.code}"
+              @click="setTf(t.code)" x-text="t.label"></button>
+    </template>
+  </div>
+
+  <div class="draw-bar" role="group">
+    <span class="muted draw-label">繪圖</span>
+    <button class="draw-btn" @click="draw('segment')">趨勢線</button>
+    <button class="draw-btn" @click="draw('rayLine')">射線</button>
+    <button class="draw-btn" @click="draw('horizontalStraightLine')">水平線</button>
+    <button class="draw-btn" @click="draw('verticalStraightLine')">垂直線</button>
+    <button class="draw-btn" @click="draw('priceChannelLine')">平行通道</button>
+    <button class="draw-btn" @click="draw('priceLine')">價格線</button>
+    <button class="draw-btn" @click="draw('fibonacciLine')">Fibonacci</button>
+    <button class="draw-btn danger" @click="clearDrawings()">清除全部</button>
+  </div>
+
+  <div id="kchart">
+    <div id="chart-empty" class="muted">資料累積中…（盤中每 5 秒記錄，累積約 1 分鐘出現第一根 K 棒）</div>
+  </div>
+  <small class="muted">
+    K 線為本系統自 TAIFEX 擷取之即時台指期資料；日 K 以上由 FinMind 歷史回補。
+    分鐘 K 僅涵蓋系統開始記錄之後的期間。
+  </small>
+
+  <!-- 指標設定 dialog -->
+  <dialog :open="settingsOpen">
+    <article class="modal-card">
+      <header>
+        <button aria-label="Close" rel="prev" @click="settingsOpen = false"></button>
+        <strong>指標設定</strong>
+      </header>
+
+      <template x-for="ind in indicatorDefs" :key="ind.key">
+        <fieldset class="ind-block">
+          <label>
+            <input type="checkbox" x-model="form[ind.key].enabled">
+            <strong x-text="ind.title"></strong> <small class="muted" x-text="ind.hint"></small>
+          </label>
+          <template x-for="(p, i) in form[ind.key].params" :key="i">
+            <div class="param-row">
+              <input type="number" min="1" step="1" x-model.number="p.period" placeholder="週期">
+              <input type="color" x-model="p.color">
+              <button type="button" class="outline mini danger"
+                      @click="form[ind.key].params.splice(i, 1)">−</button>
+            </div>
+          </template>
+          <button type="button" class="outline mini"
+                  @click="form[ind.key].params.push({period: 10, color: '#f0b90b'})">＋ 加一條</button>
+        </fieldset>
+      </template>
+
+      <fieldset class="ind-block">
+        <label>
+          <input type="checkbox" x-model="form.vol.enabled">
+          <strong>成交量 VOL</strong>
+        </label>
+      </fieldset>
+
+      <footer class="form-actions">
+        <button type="button" class="secondary" @click="settingsOpen = false">取消</button>
+        <button type="button" @click="saveSettings()">儲存</button>
+      </footer>
+    </article>
+  </dialog>
+</section>
+
+<script src="https://unpkg.com/klinecharts@9.8.12/dist/umd/klinecharts.min.js"></script>
+<script>window.QQ_SYMBOL = "{{ symbol }}";</script>
+<script src="/static/chart.js"></script>
+{% endblock %}

@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-Hant" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>QuanQuant</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+  <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
+  <script defer src="https://unpkg.com/alpinejs@3.14.8/dist/cdn.min.js"></script>
+</head>
+<body>
+  <nav class="container-fluid topnav">
+    <ul>
+      <li><strong>QuanQuant</strong></li>
+    </ul>
+    <ul>
+      <li><a href="/" {% if active == 'dashboard' %}class="active"{% endif %}>儀表板</a></li>
+      <li><a href="/journal" {% if active == 'journal' %}class="active"{% endif %}>交易日記</a></li>
+      <li><a href="/stats" {% if active == 'stats' %}class="active"{% endif %}>績效統計</a></li>
+    </ul>
+  </nav>
+  <main class="container">
+    {% block content %}{% endblock %}
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

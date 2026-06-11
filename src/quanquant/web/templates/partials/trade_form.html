@@ -1,0 +1,69 @@
+<form {% if v.action == 'post' %}hx-post="{{ v.url }}"{% else %}hx-put="{{ v.url }}"{% endif %}
+      hx-swap="none" hx-disabled-elt="find button[type='submit']">
+  <div class="form-error-slot"></div>
+  <div class="grid">
+    <label>商品名稱
+      <input name="symbol" value="{{ v.symbol }}" placeholder="TXF" required>
+    </label>
+    <label>方向
+      <select name="direction" required>
+        <option value="long" {% if v.direction == 'long' %}selected{% endif %}>多單</option>
+        <option value="short" {% if v.direction == 'short' %}selected{% endif %}>空單</option>
+      </select>
+    </label>
+  </div>
+  <div class="grid">
+    <label>開倉時間
+      <input type="datetime-local" name="entry_time" value="{{ v.entry_time }}" required>
+    </label>
+    <label>開倉價格
+      <input type="number" step="any" name="entry_price" value="{{ v.entry_price }}" required>
+    </label>
+  </div>
+  <div class="grid">
+    <label>平倉時間 <small class="muted">(留空 = 未平倉)</small>
+      <input type="datetime-local" name="exit_time" value="{{ v.exit_time }}">
+    </label>
+    <label>平倉價格
+      <input type="number" step="any" name="exit_price" value="{{ v.exit_price }}">
+    </label>
+  </div>
+  <div class="grid">
+    <label>停損價格
+      <input type="number" step="any" name="stop_loss_price" value="{{ v.stop_loss_price }}">
+    </label>
+    <label>停利策略
+      <input name="take_profit_strategy" value="{{ v.take_profit_strategy }}" placeholder="例：移動停利 20 點">
+    </label>
+  </div>
+  <div class="grid">
+    <label>部位大小 (口)
+      <input type="number" step="1" name="size" value="{{ v.size }}" required>
+    </label>
+    <label>每點價值
+      <input type="number" step="any" name="point_value" value="{{ v.point_value }}" required>
+      <small class="muted">大台 200 / 小台 50</small>
+    </label>
+    <label>手續費
+      <input type="number" step="any" name="fee" value="{{ v.fee }}">
+    </label>
+  </div>
+  <div class="grid">
+    <label>損益 <small class="muted">(留空 = 自動計算)</small>
+      <input type="number" step="any" name="pnl" value="{{ v.pnl }}">
+    </label>
+    <label>標籤 <small class="muted">逗號分隔，例：突破,均線</small>
+      <input name="tags" value="{{ v.tags }}" list="tag-options">
+      <datalist id="tag-options">
+        {% for t in all_tags %}<option value="{{ t }}">{% endfor %}
+      </datalist>
+    </label>
+  </div>
+  <label>備註
+    <textarea name="note" rows="2">{{ v.note }}</textarea>
+  </label>
+  <footer class="form-actions">
+    <button type="button" class="secondary" @click="open = false">取消</button>
+    <button type="submit">儲存</button>
+  </footer>
+</form>

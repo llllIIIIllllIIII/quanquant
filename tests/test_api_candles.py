@@ -1,0 +1,150 @@
+import json
+from datetime import datetime
+from decimal import Decimal
+
+import pytest
+from sqlmodel import Session
+
+from quanquant.candles.repo import upsert_candles
+from quanquant.db.models import Candle
+from quanquant.market_hours import CST
+
+
+def ms(y, m, d, hh, mm) -> int:
+    return int(datetime(y, m, d, hh, mm, tzinfo=CST).timestamp() * 1000)
+
+
+def mk_1m(ts, price, vol=10, session="day", trading_date=None):
+    p = Decimal(price)
+    return Candle(
+        symbol="TXF", timeframe="1m", ts=ts, open=p, high=p + 5, low=p - 5, close=p + 1,
+        volume=vol, source="live", session=session, trading_date=trading_date,
+    )
+
+
+def mk_1d(date_str, price, vol=1000):
+    y, m, d = (int(x) for x in date_str.split("-"))
+    p = Decimal(price)
+    return Candle(
+        symbol="TXF", timeframe="1d", ts=ms(y, m, d, 8, 45), open=p, high=p + 50,
+        low=p - 50, close=p + 10, volume=vol, source="finmind", session="day",
+        trading_date=date_str,
+    )
+
+
+@pytest.fixture
+def seeded(engine):
+    """30 day-session 1m bars (09:00–09:29 on 2026-06-10) + 5 stored 日K."""
+    with Session(engine) as s:
+        rows = [
+            mk_1m(ms(2026, 6, 10, 9, i), "18000", vol=10, trading_date="2026-06-10")
+            for i in range(30)
+        ]
+        rows += [
+            mk_1d(d, "17900")
+            for d in ("2026-06-03", "2026-06-04", "2026-06-05", "2026-06-08", "2026-06-09")
+        ]
+        upsert_candles(s, rows)
+    return engine
+
+
+def test_page_shape_and_order(client, seeded):
+    r = client.get("/api/candles", params={"symbol": "TXF", "tf": "1m", "limit": 10})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["symbol"] == "TXF" and data["tf"] == "1m"
+    bars = data["bars"]
+    assert len(bars) == 10
+    assert bars == sorted(bars, key=lambda b: b["timestamp"])  # ascending
+    assert bars[-1]["timestamp"] == ms(2026, 6, 10, 9, 29)
+    assert data["hasMore"] is True  # 20 older 1m bars exist
+
+
+def test_before_pagination_and_has_more_exact(client, seeded):
+    r1 = client.get("/api/candles", params={"tf": "1m", "limit": 20})
+    oldest = r1.json()["bars"][0]["timestamp"]
+    r2 = client.get("/api/candles", params={"tf": "1m", "limit": 20, "before": oldest})
+    bars2 = r2.json()["bars"]
+    assert len(bars2) == 10  # only 10 remain
+    assert bars2[-1]["timestamp"] < oldest
+    assert r2.json()["hasMore"] is False
+
+
+def test_derived_5m_aggregation(client, seeded):
+    r = client.get("/api/candles", params={"tf": "5m", "limit": 100})
+    bars = r.json()["bars"]
+    assert len(bars) == 6  # 30 minutes -> 6 buckets
+    assert bars[0]["timestamp"] == ms(2026, 6, 10, 9, 0)
+    assert bars[0]["volume"] == 50  # 5 x vol 10
+
+
+def test_daily_includes_synthetic_today(client, seeded):
+    r = client.get("/api/candles", params={"tf": "1d", "limit": 100})
+    bars = r.json()["bars"]
+    # 5 stored days + 1 synthetic from 2026-06-10's day-session 1m data
+    assert len(bars) == 6
+    assert bars[-1]["timestamp"] == ms(2026, 6, 10, 8, 45)
+    assert bars[-1]["volume"] == 300  # 30 x vol 10
+
+
+def test_weekly_aggregates_from_daily(client, seeded):
+    r = client.get("/api/candles", params={"tf": "1w", "limit": 100})
+    bars = r.json()["bars"]
+    # 06-03..05 (W23) and 06-08..10 incl. synthetic (W24)
+    assert len(bars) == 2
+
+
+def test_latest_since_filtering(client, seeded):
+    since = ms(2026, 6, 10, 9, 25)
+    r = client.get("/api/candles/latest", params={"tf": "5m", "since": since})
+    bars = r.json()["bars"]
+    assert len(bars) == 1
+    assert bars[0]["timestamp"] == since
+    assert bars[0]["volume"] == 50
+
+
+def test_unknown_tf_422(client):
+    assert client.get("/api/candles", params={"tf": "7m"}).status_code == 422
+    assert (
+        client.get("/api/candles/latest", params={"tf": "7m", "since": 0}).status_code == 422
+    )
+
+
+# --- chart state ---
+
+
+def test_chart_state_roundtrip(client):
+    empty = client.get("/api/chart/state").json()
+    assert empty == {"indicators": None, "drawings": None}
+
+    ind = {"ma": {"enabled": True, "params": [{"period": 5, "color": "#f0b90b"}]}}
+    assert client.put("/api/chart/state/indicators", json=ind).status_code == 204
+    drawings = [{"name": "segment", "points": [{"timestamp": 1, "value": 2}]}]
+    assert client.put("/api/chart/state/drawings", json=drawings).status_code == 204
+
+    state = client.get("/api/chart/state").json()
+    assert state["indicators"] == ind
+    assert state["drawings"] == drawings
+
+    ind2 = {"ma": {"enabled": False, "params": []}}
+    assert client.put("/api/chart/state/indicators", json=ind2).status_code == 204
+    assert client.get("/api/chart/state").json()["indicators"] == ind2  # upserted
+
+
+def test_chart_state_unknown_kind_404(client):
+    assert client.put("/api/chart/state/nope", json={}).status_code == 404
+
+
+def test_chart_state_oversize_413(client):
+    huge = json.dumps({"x": "a" * (260 * 1024)})
+    r = client.put(
+        "/api/chart/state/drawings", content=huge,
+        headers={"content-type": "application/json"},
+    )
+    assert r.status_code == 413
+
+
+def test_healthz(client):
+    r = client.get("/healthz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
