@@ -36,7 +36,6 @@ quanquant-backfill = "quanquant.backfill_cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/quanquant"]
-force-include = { "src/quanquant/web/templates" = "quanquant/web/templates", "src/quanquant/web/static" = "quanquant/web/static" }
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
