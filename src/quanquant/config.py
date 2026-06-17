@@ -15,6 +15,8 @@ class Settings(BaseSettings):
     source: str = "taifex"  # data source name; see sources/registry.py
     finmind_token: str = ""  # for FinMind history backfill (and FinMindSource)
     quote_retention_days: int = 7  # raw quotes pruned after N days (0 = keep forever)
+    telegram_bot_token: str = ""  # alerts → Telegram (browser-only when unset)
+    telegram_chat_id: str = ""
 
     # Web / dashboard
     db_url: str = "sqlite:///./quanquant.db"

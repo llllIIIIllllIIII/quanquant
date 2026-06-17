@@ -80,42 +80,56 @@ def _fast_rows(result, *, with_trading_date: bool) -> list[FastCandle]:
 
 
 def select_1m_desc(
-    session: Session, symbol: str, *, before_ms: int | None, limit: int
+    session: Session, symbol: str, *, before_ms: int | None, limit: int,
+    session_filter: str | None = None,
 ) -> list[FastCandle]:
-    """ASCENDING page of the newest 1m candles strictly before `before_ms`."""
+    """ASCENDING page of the newest 1m candles strictly before `before_ms`.
+
+    session_filter "day"/"night" restricts to that session; None = both.
+    """
     sql = (
         "SELECT ts, open, high, low, close, volume FROM candles "
         "WHERE symbol = :symbol AND timeframe = '1m' "
         + ("AND ts < :before " if before_ms is not None else "")
+        + ("AND session = :sess " if session_filter else "")
         + "ORDER BY ts DESC LIMIT :limit"
     )
     params: dict = {"symbol": symbol, "limit": limit}
     if before_ms is not None:
         params["before"] = before_ms
+    if session_filter:
+        params["sess"] = session_filter
     rows = session.connection().execute(text(sql), params).fetchall()
     rows.reverse()
     return _fast_rows(rows, with_trading_date=False)
 
 
-def select_1m_range(session: Session, symbol: str, *, start_ms: int) -> list[FastCandle]:
+def select_1m_range(
+    session: Session, symbol: str, *, start_ms: int, session_filter: str | None = None
+) -> list[FastCandle]:
     """Ascending 1m candles with ts >= start_ms (for /latest re-aggregation)."""
     sql = (
         "SELECT ts, open, high, low, close, volume FROM candles "
-        "WHERE symbol = :symbol AND timeframe = '1m' AND ts >= :start ORDER BY ts"
+        "WHERE symbol = :symbol AND timeframe = '1m' AND ts >= :start "
+        + ("AND session = :sess " if session_filter else "")
+        + "ORDER BY ts"
     )
-    rows = session.connection().execute(
-        text(sql), {"symbol": symbol, "start": start_ms}
-    ).fetchall()
+    params: dict = {"symbol": symbol, "start": start_ms}
+    if session_filter:
+        params["sess"] = session_filter
+    rows = session.connection().execute(text(sql), params).fetchall()
     return _fast_rows(rows, with_trading_date=False)
 
 
-def exists_1m_before(session: Session, symbol: str, ts_ms: int) -> bool:
-    stmt = (
-        select(Candle.ts)
-        .where(Candle.symbol == symbol, Candle.timeframe == "1m", Candle.ts < ts_ms)
-        .limit(1)
+def exists_1m_before(
+    session: Session, symbol: str, ts_ms: int, session_filter: str | None = None
+) -> bool:
+    stmt = select(Candle.ts).where(
+        Candle.symbol == symbol, Candle.timeframe == "1m", Candle.ts < ts_ms
     )
-    return session.exec(stmt).first() is not None
+    if session_filter:
+        stmt = stmt.where(Candle.session == session_filter)
+    return session.exec(stmt.limit(1)).first() is not None
 
 
 def select_1d_all(session: Session, symbol: str) -> list[FastCandle]:

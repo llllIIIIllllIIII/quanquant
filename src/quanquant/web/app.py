@@ -11,14 +11,16 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session
 
+from quanquant.alerts.engine import run_alert_engine
 from quanquant.candles.builder import CandleBuilder
 from quanquant.candles.repo import prune_quotes, upsert_candles
 from quanquant.config import get_settings
 from quanquant.db.engine import get_engine, init_db
 from quanquant.db.models import Quote
+from quanquant.notify import build_notify
 from quanquant.poller import QuotePoller
 from quanquant.sources.registry import make_source
-from quanquant.web.routers import candles, dashboard, stats, trades
+from quanquant.web.routers import alerts, candles, dashboard, stats, trades
 from quanquant.web.templating import STATIC_DIR
 
 
@@ -81,10 +83,13 @@ async def lifespan(app: FastAPI):
     source = make_source(settings.source)
     poller = QuotePoller(source, settings.symbol, settings.poll_interval_seconds)
     app.state.poller = poller
+    notify = build_notify(settings)
+    app.state.notify = notify
     tasks = [
         asyncio.create_task(poller.run()),
         asyncio.create_task(_persist_market_data(poller, settings.symbol)),
         asyncio.create_task(_prune_quotes_loop()),
+        asyncio.create_task(run_alert_engine(poller, notify, settings.symbol)),
     ]
     try:
         yield
@@ -106,6 +111,7 @@ def create_app() -> FastAPI:
     app.include_router(trades.router)
     app.include_router(stats.router)
     app.include_router(candles.router)
+    app.include_router(alerts.router)
     return app
 
 

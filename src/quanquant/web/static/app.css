@@ -37,13 +37,35 @@
 .chart-head h3 { margin: 0; }
 .chart-head-actions { display: flex; gap: 0.5rem; align-items: center; }
 .chart-head-actions .mini { margin: 0; width: auto; }
+.session-sel {
+  margin: 0; width: auto; padding: 0.2rem 1.6rem 0.2rem 0.6rem;
+  font-size: 0.8rem; height: auto;
+}
+
+/* chart area: vertical drawing rail (left) + chart (right), TradingView-style */
+.chart-row { display: flex; align-items: stretch; gap: 0; margin-top: 0.4rem; }
+.draw-rail {
+  display: flex; flex-direction: column; gap: 0.25rem;
+  flex: 0 0 40px; width: 40px; padding: 0.3rem 0.2rem;
+  border: 1px solid var(--pico-muted-border-color); border-right: none;
+  border-radius: 0.5rem 0 0 0.5rem; background: var(--pico-card-background-color);
+}
+.rail-btn {
+  margin: 0; width: 100%; aspect-ratio: 1; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 1rem; line-height: 1; background: transparent;
+  border: 1px solid transparent; color: var(--pico-color); border-radius: 0.35rem;
+}
+.rail-btn:hover { border-color: var(--pico-muted-border-color); background: rgba(255,255,255,0.04); }
+.rail-btn.danger { color: var(--down); }
 
 #kchart {
   position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
   height: 680px;
-  width: 100%;
   border: 1px solid var(--pico-muted-border-color);
-  border-radius: 0.5rem;
+  border-radius: 0 0.5rem 0.5rem 0;
   overflow: hidden;
 }
 #chart-empty {
@@ -59,15 +81,15 @@
   z-index: 2;
 }
 
-/* timeframe & drawing toolbars */
-.tf-bar, .draw-bar {
+/* timeframe bar */
+.tf-bar {
   display: flex;
   flex-wrap: wrap;
   gap: 0.25rem;
   align-items: center;
   margin: 0.6rem 0;
 }
-.tf-btn, .draw-btn {
+.tf-btn {
   margin: 0;
   width: auto;
   padding: 0.2rem 0.6rem;
@@ -83,8 +105,30 @@
   color: var(--pico-primary-inverse);
   font-weight: 700;
 }
-.draw-btn.danger { color: var(--down); border-color: var(--down); }
-.draw-label { font-size: 0.8rem; margin-right: 0.25rem; }
+
+/* alerts dialog + toasts */
+.alerts-card { max-width: 660px; }
+.alerts-card h6 { margin: 1rem 0 0.3rem; }
+.alert-list, .alert-events { max-height: 13rem; overflow-y: auto; }
+.alert-row, .alert-event {
+  display: flex; justify-content: space-between; align-items: center; gap: 0.5rem;
+  padding: 0.35rem 0; border-bottom: 1px solid var(--pico-muted-border-color); font-size: 0.85rem;
+}
+.alert-row.disabled { opacity: 0.5; }
+.alert-actions { display: flex; gap: 0.3rem; flex-shrink: 0; }
+.alert-actions .mini { margin: 0; width: auto; padding: 0.15rem 0.5rem; font-size: 0.75rem; }
+.alert-actions .danger { color: var(--down); border-color: var(--down); }
+.alert-event { flex-direction: column; align-items: flex-start; gap: 0.1rem; }
+
+.toast-stack {
+  position: fixed; right: 1rem; bottom: 1rem; z-index: 1000;
+  display: flex; flex-direction: column; gap: 0.5rem;
+}
+.alert-toast {
+  background: var(--pico-card-background-color); border: 1px solid var(--up);
+  color: var(--pico-color); padding: 0.6rem 0.9rem; border-radius: 0.5rem;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4); max-width: 22rem; font-size: 0.85rem;
+}
 
 /* indicator settings dialog */
 .ind-block { margin-bottom: 1rem; padding: 0.6rem 0.8rem;

@@ -64,21 +64,30 @@ def _cache_put(key: tuple, page: CandlePage, ttl: float) -> None:
     _page_cache[key] = (time.monotonic() + ttl, page)
 
 
+def _session_filter(tf: str, session_mode: str) -> str | None:
+    """Intraday day/night filter; daily+ ignores session (always combined)."""
+    if session_mode in ("day", "night") and TIMEFRAMES[tf].kind == "intraday":
+        return session_mode
+    return None
+
+
 def get_candles(
-    session: Session, symbol: str, tf: str, *, before: int | None = None, limit: int = 500
+    session: Session, symbol: str, tf: str, *, before: int | None = None, limit: int = 500,
+    session_mode: str = "all",
 ) -> CandlePage:
     spec = TIMEFRAMES[tf]  # KeyError → router turns into 422
+    sf = _session_filter(tf, session_mode)
 
-    key = (symbol, tf, before, limit)
+    key = (symbol, tf, before, limit, sf or "all")
     cached = _cache_get(key)
     if cached is not None:
         return cached
 
     if spec.kind == "intraday":
         if tf == "1m":
-            page = _page_1m(session, symbol, before, limit)
+            page = _page_1m(session, symbol, before, limit, sf)
         else:
-            page = _page_derived_intraday(session, symbol, tf, before, limit)
+            page = _page_derived_intraday(session, symbol, tf, before, limit, sf)
     else:
         page = _page_daily(session, symbol, tf, before, limit)
 
@@ -86,11 +95,14 @@ def get_candles(
     return page
 
 
-def get_latest(session: Session, symbol: str, tf: str, *, since: int) -> list[Bar]:
+def get_latest(
+    session: Session, symbol: str, tf: str, *, since: int, session_mode: str = "all"
+) -> list[Bar]:
     """Bars with timestamp >= since, freshly re-aggregated (usually 1–2 bars)."""
     spec = TIMEFRAMES[tf]
     if spec.kind == "intraday":
-        rows = repo.select_1m_range(session, symbol, start_ms=since)
+        sf = _session_filter(tf, session_mode)
+        rows = repo.select_1m_range(session, symbol, start_ms=since, session_filter=sf)
         if tf == "1m":
             return to_bars(rows)
         return [b for b in aggregate_intraday(rows, tf) if b["timestamp"] >= since]
@@ -102,23 +114,25 @@ def get_latest(session: Session, symbol: str, tf: str, *, since: int) -> list[Ba
 # --- pages ---
 
 
-def _page_1m(session: Session, symbol: str, before: int | None, limit: int) -> CandlePage:
-    rows = repo.select_1m_desc(session, symbol, before_ms=before, limit=limit)  # ascending
+def _page_1m(
+    session: Session, symbol: str, before: int | None, limit: int, sf: str | None
+) -> CandlePage:
+    rows = repo.select_1m_desc(session, symbol, before_ms=before, limit=limit, session_filter=sf)
     if not rows:
         return CandlePage(bars=[], has_more=False)
     return CandlePage(
         bars=to_bars(rows),
-        has_more=repo.exists_1m_before(session, symbol, rows[0].ts),
+        has_more=repo.exists_1m_before(session, symbol, rows[0].ts, sf),
     )
 
 
 def _page_derived_intraday(
-    session: Session, symbol: str, tf: str, before: int | None, limit: int
+    session: Session, symbol: str, tf: str, before: int | None, limit: int, sf: str | None
 ) -> CandlePage:
     minutes = TIMEFRAMES[tf].minutes
     assert minutes is not None
     fetch = min(limit * minutes + minutes, _MAX_1M_FETCH)
-    rows = repo.select_1m_desc(session, symbol, before_ms=before, limit=fetch)  # ascending
+    rows = repo.select_1m_desc(session, symbol, before_ms=before, limit=fetch, session_filter=sf)
     if not rows:
         return CandlePage(bars=[], has_more=False)
 
@@ -130,7 +144,7 @@ def _page_derived_intraday(
     if not bars:
         return CandlePage(bars=[], has_more=False)
 
-    has_more = repo.exists_1m_before(session, symbol, bars[0]["timestamp"])
+    has_more = repo.exists_1m_before(session, symbol, bars[0]["timestamp"], sf)
     return CandlePage(bars=bars, has_more=has_more)
 
 

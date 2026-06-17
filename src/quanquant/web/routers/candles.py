@@ -1,6 +1,7 @@
 """Candle data + chart UI state API (consumed by the KLineCharts frontend)."""
 import json
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
@@ -37,8 +38,11 @@ def candles_page(
     tf: str = Query("1m"),
     before: int | None = Query(None, description="exclusive upper bound, epoch ms"),
     limit: int = Query(500, ge=1, le=1000),
+    session_mode: Literal["all", "day", "night"] = Query("all", alias="session"),
 ):
-    page = get_candles(session, symbol, _validate_tf(tf), before=before, limit=limit)
+    page = get_candles(
+        session, symbol, _validate_tf(tf), before=before, limit=limit, session_mode=session_mode
+    )
     return JSONResponse(
         {"symbol": symbol, "tf": tf, "bars": page.bars, "hasMore": page.has_more}
     )
@@ -50,8 +54,9 @@ def candles_latest(
     symbol: str = Query("TXF"),
     tf: str = Query("1m"),
     since: int = Query(..., description="return bars with timestamp >= since (epoch ms)"),
+    session_mode: Literal["all", "day", "night"] = Query("all", alias="session"),
 ):
-    bars = get_latest(session, symbol, _validate_tf(tf), since=since)
+    bars = get_latest(session, symbol, _validate_tf(tf), since=since, session_mode=session_mode)
     return JSONResponse({"bars": bars})
 
 

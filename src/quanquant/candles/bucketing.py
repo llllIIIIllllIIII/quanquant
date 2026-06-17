@@ -80,6 +80,24 @@ def bucket_start_ms(ts_ms: int, tf: str) -> int | None:
     return _ms(start)
 
 
+def bucket_close_ms(ts_ms: int, tf: str) -> int:
+    """Epoch ms when the intraday bucket starting at ts_ms finalizes.
+
+    = start of the next bucket, clamped to the session close (13:45 / 05:00).
+    Used by the alert engine to know when a timeframe's final session bar has
+    closed by wall-clock (when no newer bar will appear).
+    """
+    spec = TIMEFRAMES[tf]
+    if spec.kind != "intraday":
+        raise ValueError(f"bucket_close_ms only handles intraday timeframes, got {tf!r}")
+    bounds = session_bounds_cst(_cst(ts_ms))
+    if bounds is None:
+        return ts_ms
+    _open_dt, close_dt, _sess = bounds
+    assert spec.minutes is not None
+    return min(ts_ms + spec.minutes * 60_000, _ms(close_dt))
+
+
 def day_session_date(ts_ms: int) -> str | None:
     """CST trading date ("YYYY-MM-DD") if ts is in the DAY session, else None."""
     ts_cst = _cst(ts_ms)

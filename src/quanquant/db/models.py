@@ -104,3 +104,47 @@ class ChartState(SQLModel, table=True):
     kind: str                                             # "indicators" | "drawings"
     payload: str                                          # JSON TEXT
     updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class Alert(SQLModel, table=True):
+    """A close-based price/indicator alert. Single condition: left OP right,
+    evaluated at the bar close of `timeframe`."""
+
+    __tablename__ = "alerts"
+
+    id: int | None = Field(default=None, primary_key=True)
+    symbol: str = Field(index=True)                       # "TXF"
+    timeframe: str                                        # e.g. "5m"
+
+    left_kind: str                                        # "price" | "indicator"
+    left_name: str | None = None                          # "ma"|"wr"|"bias"
+    left_period: int | None = None
+
+    op: str                                               # "gte"|"lte"|"cross_up"|"cross_down"
+
+    right_kind: str                                       # "const" | "indicator"
+    right_value: Decimal | None = Field(default=None, sa_column=Column(DecimalText))
+    right_name: str | None = None
+    right_period: int | None = None
+
+    enabled: bool = True
+    fire_once: bool = False                               # disable after first fire
+    armed: bool = True                                    # gte/lte dedup state
+    last_triggered_at: datetime | None = None
+    last_triggered_bar_ts: int | None = Field(default=None, sa_column=Column(BigInteger))
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class AlertEvent(SQLModel, table=True):
+    """One alert firing — the trigger log (visible even if no browser was open)."""
+
+    __tablename__ = "alert_events"
+
+    id: int | None = Field(default=None, primary_key=True)
+    alert_id: int = Field(index=True)
+    fired_at: datetime = Field(default_factory=_utcnow)
+    bar_ts: int = Field(sa_column=Column(BigInteger))     # closed bar that triggered
+    message: str
+    left_value: Decimal | None = Field(default=None, sa_column=Column(DecimalText))
+    right_value: Decimal | None = Field(default=None, sa_column=Column(DecimalText))

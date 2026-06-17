@@ -11,7 +11,14 @@
   <div class="chart-head">
     <h3>{{ symbol }} 走勢圖 <small class="muted">· 本系統即時資料</small></h3>
     <div class="chart-head-actions">
+      <select class="session-sel" x-model="session" @change="setSession(session)"
+              aria-label="價格時段">
+        <template x-for="s in sessions" :key="s.code">
+          <option :value="s.code" x-text="s.label"></option>
+        </template>
+      </select>
       <button class="outline mini" @click="openSettings()">指標設定</button>
+      <button class="outline mini" @click="openAlerts()">警示</button>
       <a role="button" class="outline mini" href="{{ tv_url }}" target="_blank" rel="noopener">
         TradingView ↗
       </a>
@@ -25,20 +32,20 @@
     </template>
   </div>
 
-  <div class="draw-bar" role="group">
-    <span class="muted draw-label">繪圖</span>
-    <button class="draw-btn" @click="draw('segment')">趨勢線</button>
-    <button class="draw-btn" @click="draw('rayLine')">射線</button>
-    <button class="draw-btn" @click="draw('horizontalStraightLine')">水平線</button>
-    <button class="draw-btn" @click="draw('verticalStraightLine')">垂直線</button>
-    <button class="draw-btn" @click="draw('priceChannelLine')">平行通道</button>
-    <button class="draw-btn" @click="draw('priceLine')">價格線</button>
-    <button class="draw-btn" @click="draw('fibonacciLine')">Fibonacci</button>
-    <button class="draw-btn danger" @click="clearDrawings()">清除全部</button>
-  </div>
-
-  <div id="kchart">
-    <div id="chart-empty" class="muted">資料累積中…（盤中每 5 秒記錄，累積約 1 分鐘出現第一根 K 棒）</div>
+  <div class="chart-row">
+    <div class="draw-rail" role="toolbar" aria-label="繪圖工具">
+      <button class="rail-btn" @click="draw('segment')" title="趨勢線" aria-label="趨勢線">╱</button>
+      <button class="rail-btn" @click="draw('rayLine')" title="射線" aria-label="射線">↗</button>
+      <button class="rail-btn" @click="draw('horizontalStraightLine')" title="水平線" aria-label="水平線">━</button>
+      <button class="rail-btn" @click="draw('verticalStraightLine')" title="垂直線" aria-label="垂直線">┃</button>
+      <button class="rail-btn" @click="draw('priceChannelLine')" title="平行通道" aria-label="平行通道">∥</button>
+      <button class="rail-btn" @click="draw('priceLine')" title="價格線" aria-label="價格線">⊢</button>
+      <button class="rail-btn" @click="draw('fibonacciLine')" title="Fibonacci" aria-label="Fibonacci">≣</button>
+      <button class="rail-btn danger" @click="clearDrawings()" title="清除全部" aria-label="清除全部">✕</button>
+    </div>
+    <div id="kchart">
+      <div id="chart-empty" class="muted">資料累積中…（盤中每 5 秒記錄，累積約 1 分鐘出現第一根 K 棒）</div>
+    </div>
   </div>
   <small class="muted">
     K 線為本系統自 TAIFEX 擷取之即時台指期資料；日 K 以上由 FinMind 歷史回補。
@@ -85,6 +92,89 @@
       </footer>
     </article>
   </dialog>
+
+  <!-- 警示 dialog -->
+  <dialog :open="alertsOpen">
+    <article class="modal-card alerts-card">
+      <header>
+        <button aria-label="Close" rel="prev" @click="alertsOpen = false"></button>
+        <strong>價格 / 指標 警示</strong>
+        <small class="muted">以該週期 K 棒收盤結算值為準</small>
+      </header>
+
+      <form @submit.prevent="submitAlert()">
+        <div class="grid">
+          <label>時間週期
+            <select x-model="alertForm.timeframe">
+              <template x-for="t in tfs" :key="t.code"><option :value="t.code" x-text="t.label"></option></template>
+            </select>
+          </label>
+          <label>目標
+            <select x-model="alertForm.leftTarget">
+              <template x-for="o in indTargets" :key="o.code"><option :value="o.code" x-text="o.label"></option></template>
+            </select>
+          </label>
+          <label x-show="alertForm.leftTarget !== 'price'">週期
+            <input type="number" min="1" step="1" x-model.number="alertForm.leftPeriod">
+          </label>
+        </div>
+        <div class="grid">
+          <label>條件
+            <select x-model="alertForm.op">
+              <template x-for="o in ops" :key="o.code"><option :value="o.code" x-text="o.label"></option></template>
+            </select>
+          </label>
+          <label>對象
+            <select x-model="alertForm.rightTarget">
+              <template x-for="o in rightTargets" :key="o.code"><option :value="o.code" x-text="o.label"></option></template>
+            </select>
+          </label>
+          <label x-show="alertForm.rightTarget === 'const'">數值
+            <input type="number" step="any" x-model.number="alertForm.rightValue">
+          </label>
+          <label x-show="alertForm.rightTarget !== 'const'">週期
+            <input type="number" min="1" step="1" x-model.number="alertForm.rightPeriod">
+          </label>
+        </div>
+        <label><input type="checkbox" x-model="alertForm.fireOnce"> 觸發一次後自動停用</label>
+        <footer class="form-actions">
+          <button type="submit">＋ 新增警示</button>
+        </footer>
+      </form>
+
+      <h6>已建立的警示</h6>
+      <div class="alert-list">
+        <template x-for="a in alerts" :key="a.id">
+          <div class="alert-row" :class="{disabled: !a.enabled}">
+            <span x-text="alertLabel(a)"></span>
+            <span class="alert-actions">
+              <button class="outline mini" @click="toggleAlert(a)" x-text="a.enabled ? '停用' : '啟用'"></button>
+              <button class="outline mini danger" @click="deleteAlert(a.id)">刪除</button>
+            </span>
+          </div>
+        </template>
+        <p class="muted" x-show="!alerts.length">尚無警示</p>
+      </div>
+
+      <h6>近期觸發</h6>
+      <div class="alert-events">
+        <template x-for="e in alertEvents" :key="e.id">
+          <div class="alert-event">
+            <small class="muted" x-text="(e.firedAt||'').slice(0,19).replace('T',' ')"></small>
+            <span x-text="e.message"></span>
+          </div>
+        </template>
+        <p class="muted" x-show="!alertEvents.length">尚無觸發紀錄</p>
+      </div>
+    </article>
+  </dialog>
+
+  <!-- 警示即時通知 -->
+  <div class="toast-stack">
+    <template x-for="t in toasts" :key="t.id">
+      <div class="alert-toast">🔔 <span x-text="t.body"></span></div>
+    </template>
+  </div>
 </section>
 
 <script src="https://unpkg.com/klinecharts@9.8.12/dist/umd/klinecharts.min.js"></script>

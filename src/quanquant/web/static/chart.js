@@ -24,6 +24,14 @@
     { code: "1w", label: "週" }, { code: "1M", label: "月" },
   ];
 
+  const IND_NAMES = { ma: "MA", wr: "WR", bias: "BIAS" };
+  const OP_LABELS = { gte: "≥", lte: "≤", cross_up: "向上突破", cross_down: "向下突破" };
+  function alertLabel(a) {
+    const L = a.left_kind === "price" ? "收盤" : `${IND_NAMES[a.left_name]}(${a.left_period})`;
+    const R = a.right_kind === "const" ? a.right_value : `${IND_NAMES[a.right_name]}(${a.right_period})`;
+    return `${a.timeframe}｜${L} ${OP_LABELS[a.op]} ${R}`;
+  }
+
   const DEFAULT_SETTINGS = {
     ma: { enabled: true, params: [
       { period: 5, color: "#f0b90b" }, { period: 10, color: "#ff9800" },
@@ -65,13 +73,14 @@
   const QQChart = {
     chart: null,
     tf: "1m",
+    session: "all", // "all" | "day" | "night" — intraday price filter
     lastBarTs: 0,
     hasMore: true,
     loadingMore: false,
     polling: false,
     paneIds: { wr: null, bias: null, vol: null, ma: false },
     overlays: new Map(), // id -> {name, points}
-    tfCache: new Map(),  // tf -> {bars: Bar[], hasMore} — instant timeframe switching
+    tfCache: new Map(),  // (session|tf) -> {bars, hasMore} — instant switching
     settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
 
     async init() {
@@ -87,6 +96,7 @@
       if (this.chart.setTimezone) this.chart.setTimezone("Asia/Taipei");
       if (this.chart.setPriceVolumePrecision) this.chart.setPriceVolumePrecision(0, 0);
 
+      this.session = localStorage.getItem("qq_session") || "all";
       this.chart.loadMore((ts) => this.loadMore(ts));
 
       let state = { indicators: null, drawings: null };
@@ -100,6 +110,9 @@
       await this.applyIndicators();
       this.restoreDrawings(Array.isArray(state.drawings) ? state.drawings : []);
       this._watchdog();
+
+      // pick up the final container width after the flex layout (left rail) settles
+      requestAnimationFrame(() => this.chart.resize());
 
       setInterval(() => this.pollLatest(), 5000);
       window.addEventListener("resize", () => {
@@ -123,21 +136,24 @@
 
     // ---- data ----
 
+    _cacheKey(tf) { return this.session + "|" + (tf || this.tf); },
+
     async fetchPage(before) {
       const params = new URLSearchParams({ symbol: SYMBOL, tf: this.tf, limit: PAGE_LIMIT });
       if (before) params.set("before", String(before));
+      if (this.session !== "all") params.set("session", this.session);
       const resp = await fetch(`/api/candles?${params}`);
       return resp.json();
     },
 
     _cacheBars(bars, hasMore) {
-      this.tfCache.set(this.tf, { bars, hasMore });
+      this.tfCache.set(this._cacheKey(), { bars, hasMore });
     },
 
     _applyBar(bar) {
       // keep chart + tfCache consistent for one updated/appended bar
       this.chart.updateData(bar);
-      const cached = this.tfCache.get(this.tf);
+      const cached = this.tfCache.get(this._cacheKey());
       if (cached && cached.bars.length) {
         const last = cached.bars[cached.bars.length - 1];
         if (last.timestamp === bar.timestamp) cached.bars[cached.bars.length - 1] = bar;
@@ -152,16 +168,15 @@
       if (this.chart.scrollToRealTime) this.chart.scrollToRealTime();
     },
 
-    // NOTE on `tf` guards: every async data path captures the timeframe it was
+    // NOTE on guards: every async data path captures the (tf, session) it was
     // started for and discards its result if the user switched meanwhile.
-    // Without this, a stale /latest response can append e.g. a daily bar into a
-    // 1m series — the resulting layout math wedges KLineCharts' render loop
-    // permanently (blank chart, no exception).
+    // Without this, a stale response can append e.g. a daily bar into a 1m series
+    // — the resulting layout math wedges KLineCharts' render loop (blank chart).
 
     async loadInitial() {
-      const tf = this.tf;
+      const tf = this.tf, sess = this.session;
       const data = await this.fetchPage(null);
-      if (this.tf !== tf) return; // user switched timeframe mid-flight
+      if (this.tf !== tf || this.session !== sess) return; // switched mid-flight
       this.hasMore = !!data.hasMore;
       const bars = data.bars || [];
       const empty = document.getElementById("chart-empty");
@@ -176,14 +191,14 @@
     async loadMore(ts) {
       if (!this.hasMore || this.loadingMore || !ts) return;
       this.loadingMore = true;
-      const tf = this.tf;
+      const tf = this.tf, sess = this.session;
       try {
         const data = await this.fetchPage(ts);
-        if (this.tf !== tf) return; // stale response for a previous timeframe
+        if (this.tf !== tf || this.session !== sess) return; // stale response
         this.hasMore = !!data.hasMore;
         const bars = data.bars || [];
         this.chart.applyMoreData(bars, this.hasMore);
-        const cached = this.tfCache.get(this.tf);
+        const cached = this.tfCache.get(this._cacheKey());
         if (cached) {
           cached.bars = bars.concat(cached.bars);
           cached.hasMore = this.hasMore;
@@ -197,7 +212,7 @@
     async pollLatest() {
       if (this.polling || document.hidden) return; // pause in background tabs
       this.polling = true;
-      const tf = this.tf;
+      const tf = this.tf, sess = this.session;
       try {
         if (!this.lastBarTs) {
           await this.loadInitial(); // nothing yet (e.g. server just started)
@@ -206,20 +221,18 @@
         const params = new URLSearchParams({
           symbol: SYMBOL, tf, since: String(this.lastBarTs),
         });
+        if (sess !== "all") params.set("session", sess);
         const resp = await fetch(`/api/candles/latest?${params}`);
         const data = await resp.json();
-        if (this.tf !== tf) return; // stale response for a previous timeframe
+        if (this.tf !== tf || this.session !== sess) return; // stale response
         for (const bar of data.bars || []) this._applyBar(bar);
       } catch (e) { /* next poll retries */ } finally {
         this.polling = false;
       }
     },
 
-    async setTf(tf) {
-      if (tf === this.tf) return;
-      this.tf = tf;
-
-      const cached = this.tfCache.get(tf);
+    _switchFromCacheOrLoad() {
+      const cached = this.tfCache.get(this._cacheKey());
       if (cached && cached.bars.length) {
         // instant switch from client cache, then refresh just the tail
         this.hasMore = cached.hasMore;
@@ -228,12 +241,24 @@
         this._snapToLatest();
         this._watchdog();
         this.pollLatest();
-        return;
+        return true;
       }
-
       this.lastBarTs = 0;
       this.hasMore = true;
-      await this.loadInitial();
+      return false;
+    },
+
+    async setTf(tf) {
+      if (tf === this.tf) return;
+      this.tf = tf;
+      if (!this._switchFromCacheOrLoad()) await this.loadInitial();
+    },
+
+    async setSession(mode) {
+      if (mode === this.session) return;
+      this.session = mode;
+      localStorage.setItem("qq_session", mode);
+      if (!this._switchFromCacheOrLoad()) await this.loadInitial();
     },
 
     // ---- indicators ----
@@ -424,6 +449,12 @@
   window.chartPanel = () => ({
     tfs: TFS,
     tf: "1m",
+    session: "all",
+    sessions: [
+      { code: "all", label: "全部" },
+      { code: "day", label: "只日盤" },
+      { code: "night", label: "只夜盤" },
+    ],
     settingsOpen: false,
     form: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     indicatorDefs: [
@@ -432,11 +463,121 @@
       { key: "bias", title: "乖離率 BIAS", hint: "副圖" },
     ],
 
-    init() { QQChart.init(); },
+    // ---- alerts ----
+    alertsOpen: false,
+    alerts: [],
+    alertEvents: [],
+    toasts: [],
+    _toastId: 0,
+    indTargets: [
+      { code: "price", label: "收盤價" }, { code: "ma", label: "MA 均線" },
+      { code: "wr", label: "WR 威廉" }, { code: "bias", label: "BIAS 乖離" },
+    ],
+    rightTargets: [
+      { code: "const", label: "固定值" }, { code: "ma", label: "MA 均線" },
+      { code: "wr", label: "WR 威廉" }, { code: "bias", label: "BIAS 乖離" },
+    ],
+    ops: [
+      { code: "cross_up", label: "向上突破" }, { code: "cross_down", label: "向下突破" },
+      { code: "gte", label: "≥ 大於等於" }, { code: "lte", label: "≤ 小於等於" },
+    ],
+    alertForm: {
+      timeframe: "1m", leftTarget: "price", leftPeriod: 20, op: "cross_up",
+      rightTarget: "const", rightValue: 18000, rightPeriod: 60, fireOnce: false,
+    },
+
+    alertLabel(a) { return alertLabel(a); },
+
+    init() {
+      this.session = localStorage.getItem("qq_session") || "all";
+      QQChart.init();
+      this._initAlerts();
+    },
+
+    _initAlerts() {
+      this.loadAlerts();
+      this.loadEvents();
+      try {
+        const es = new EventSource("/alerts/stream");
+        es.onmessage = (e) => {
+          try { this._onAlert(JSON.parse(e.data)); } catch (err) { /* ignore */ }
+        };
+      } catch (e) { /* SSE unsupported */ }
+    },
+
+    _onAlert(data) {
+      const id = ++this._toastId;
+      this.toasts.push({ id, body: data.body });
+      setTimeout(() => { this.toasts = this.toasts.filter((t) => t.id !== id); }, 9000);
+      this.loadEvents();
+    },
+
+    async openAlerts() {
+      this.alertForm.timeframe = this.tf;
+      await this.loadAlerts();
+      await this.loadEvents();
+      this.alertsOpen = true;
+    },
+
+    async loadAlerts() {
+      try { this.alerts = await (await fetch(`/api/alerts?symbol=${SYMBOL}`)).json(); }
+      catch (e) { /* offline */ }
+    },
+
+    async loadEvents() {
+      try { this.alertEvents = await (await fetch("/api/alerts/events?limit=20")).json(); }
+      catch (e) { /* offline */ }
+    },
+
+    async submitAlert() {
+      const f = this.alertForm;
+      const leftInd = f.leftTarget !== "price";
+      const rightConst = f.rightTarget === "const";
+      const payload = {
+        symbol: SYMBOL, timeframe: f.timeframe,
+        left_kind: leftInd ? "indicator" : "price",
+        left_name: leftInd ? f.leftTarget : null,
+        left_period: leftInd ? Math.round(f.leftPeriod) : null,
+        op: f.op,
+        right_kind: rightConst ? "const" : "indicator",
+        right_value: rightConst ? Number(f.rightValue) : null,
+        right_name: rightConst ? null : f.rightTarget,
+        right_period: rightConst ? null : Math.round(f.rightPeriod),
+        fire_once: f.fireOnce,
+      };
+      try {
+        const r = await fetch("/api/alerts", {
+          method: "POST", headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (r.ok) await this.loadAlerts();
+        else window.alert("警示建立失敗，請檢查欄位設定。");
+      } catch (e) { /* offline */ }
+    },
+
+    async toggleAlert(a) {
+      try {
+        const r = await fetch(`/api/alerts/${a.id}`, {
+          method: "PATCH", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ enabled: !a.enabled }),
+        });
+        if (r.ok) await this.loadAlerts();
+      } catch (e) { /* offline */ }
+    },
+
+    async deleteAlert(id) {
+      try { await fetch(`/api/alerts/${id}`, { method: "DELETE" }); await this.loadAlerts(); }
+      catch (e) { /* offline */ }
+    },
 
     async setTf(tf) {
       this.tf = tf;
       await QQChart.setTf(tf);
+    },
+
+    async setSession(mode) {
+      this.session = mode;
+      await QQChart.setSession(mode);
     },
 
     draw(name) { QQChart.draw(name); },
