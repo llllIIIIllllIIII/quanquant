@@ -23,6 +23,10 @@ docker-compose.override.yml
 # Local tooling
 .claude/
 
+# Shioaji client runtime log
+shioaji.log
+*.log
+
 # OS
 .DS_Store
 dist/

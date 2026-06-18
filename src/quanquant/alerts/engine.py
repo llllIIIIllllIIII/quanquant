@@ -6,6 +6,7 @@ settled value (never intra-bar). Always reads the standard series (intraday =
 all sessions, daily = day) regardless of the chart's session dropdown.
 """
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -13,6 +14,7 @@ from decimal import Decimal
 from sqlmodel import Session, select
 
 from quanquant.candles.bucketing import bucket_close_ms
+from quanquant.config import get_settings
 from quanquant.candles.service import get_candles
 from quanquant.candles.timeframes import TIMEFRAMES
 from quanquant.db.engine import get_engine
@@ -172,9 +174,18 @@ async def run_alert_engine(poller, notify, symbol: str) -> None:
     """Lifespan task: evaluate alerts at each bar close, fire notifications."""
     queue = poller.subscribe()
     last_evaluated: dict[tuple[str, str], int] = {}
+    min_interval = get_settings().alert_eval_min_interval
+    last_eval = 0.0
     try:
         while True:
             await queue.get()
+            # Alerts evaluate on closed bars only, so sub-second tick streaming needs
+            # no faster cadence than this — skip ticks within the throttle window to
+            # avoid a DB session + worker thread per tick.
+            now = time.monotonic()
+            if now - last_eval < min_interval:
+                continue
+            last_eval = now
             try:
                 # sync DB/eval off the event loop; fan out notifications on it
                 fired = await asyncio.to_thread(_evaluate_sync, symbol, last_evaluated)

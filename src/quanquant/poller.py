@@ -5,6 +5,7 @@ each result to every subscriber's queue. Both the CLI and the web server attach
 as subscribers, so one upstream poll serves all consumers (and all browser tabs).
 """
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -36,11 +37,31 @@ class QuotePoller:
         self._interval = interval
         self._subscribers: set[asyncio.Queue[QuoteEvent]] = set()
         self._last: FuturesSnapshot | None = None
+        self._last_snapshot_at: float | None = None  # time.monotonic() of last snapshot
 
     @property
     def last(self) -> FuturesSnapshot | None:
         """The most recent successful snapshot, for late-joining subscribers."""
         return self._last
+
+    def publish(self, event: QuoteEvent) -> None:
+        """Record + fan out one event. The single entry point for every producer
+        (this poller's own loop, the MIS fallback, and the Shioaji streamer)."""
+        if event.snapshot is not None:
+            self._last = event.snapshot
+            self._last_snapshot_at = time.monotonic()
+        self._broadcast(event)
+
+    def seconds_since_snapshot(self) -> float:
+        """Seconds since the last successful snapshot (inf if none yet)."""
+        if self._last_snapshot_at is None:
+            return float("inf")
+        return time.monotonic() - self._last_snapshot_at
+
+    def is_stale(self, threshold: float) -> bool:
+        """True when no fresh snapshot has arrived within `threshold` seconds —
+        used by the fallback poll to decide when to take over from the stream."""
+        return self.seconds_since_snapshot() >= threshold
 
     def subscribe(self) -> asyncio.Queue[QuoteEvent]:
         queue: asyncio.Queue[QuoteEvent] = asyncio.Queue(maxsize=_QUEUE_MAXSIZE)
@@ -59,12 +80,11 @@ class QuotePoller:
         while True:
             try:
                 snap = await self._source.fetch_snapshot(self._symbol)
-                self._last = snap
-                self._broadcast(QuoteEvent(snapshot=snap, error=None, at=snap.fetched_at))
+                self.publish(QuoteEvent(snapshot=snap, error=None, at=snap.fetched_at))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # keep the loop alive on any fetch failure
-                self._broadcast(
+                self.publish(
                     QuoteEvent(snapshot=None, error=str(exc), at=datetime.now(timezone.utc))
                 )
             await asyncio.sleep(self._interval)

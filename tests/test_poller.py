@@ -63,3 +63,44 @@ async def test_fetch_error_does_not_kill_loop():
         assert second.snapshot is not None  # loop kept polling after the error
     finally:
         task.cancel()
+
+
+# --- hub API used by the Shioaji streamer + MIS fallback ---
+
+
+def test_is_stale_true_before_any_snapshot():
+    poller = QuotePoller(FakeSource(["1"]), "TXF", 0.01)
+    assert poller.seconds_since_snapshot() == float("inf")
+    assert poller.is_stale(0.0) is True
+
+
+def test_publish_records_last_and_clears_staleness():
+    from quanquant.poller import QuoteEvent
+
+    poller = QuotePoller(FakeSource(["1"]), "TXF", 0.01)
+    snap = _snap("18500")
+    poller.publish(QuoteEvent(snapshot=snap, error=None, at=snap.fetched_at))
+    assert poller.last is snap
+    assert poller.seconds_since_snapshot() < 1.0
+    assert poller.is_stale(5.0) is False
+
+
+def test_publish_error_event_leaves_last_and_staleness_untouched():
+    from quanquant.poller import QuoteEvent
+
+    poller = QuotePoller(FakeSource(["1"]), "TXF", 0.01)
+    poller.publish(QuoteEvent(snapshot=None, error="boom", at=_snap("1").fetched_at))
+    assert poller.last is None
+    assert poller.is_stale(0.0) is True  # no snapshot ever → still stale
+
+
+@pytest.mark.asyncio
+async def test_publish_fans_out_to_subscribers():
+    from quanquant.poller import QuoteEvent
+
+    poller = QuotePoller(FakeSource(["1"]), "TXF", 0.01)
+    q = poller.subscribe()
+    snap = _snap("18000")
+    poller.publish(QuoteEvent(snapshot=snap, error=None, at=snap.fetched_at))
+    event = await asyncio.wait_for(q.get(), 1)
+    assert event.snapshot.price == Decimal("18000")

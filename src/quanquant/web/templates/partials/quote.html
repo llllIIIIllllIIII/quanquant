@@ -6,7 +6,7 @@
   <span class="chg">{{ '▲' if snap.change >= 0 else '▼' }} {{ snap.change | signed }} ({{ snap.change_pct | pct }}%)</span>
   <span class="meta">量 {{ snap.volume | comma }}　高 {{ snap.high_price | num }}　低 {{ snap.low_price | num }}</span>
   <span class="sess sess-{{ session }}">{{ session_label }}</span>
-  <span class="time">{{ snap.fetched_at | cst_time }} CST</span>
+  <span class="time">{{ (as_of or snap.fetched_at) | cst_time }} CST</span>
 </div>
 {% elif error %}
 <div class="quote err"><span>⚠ 報價錯誤：{{ error }}</span></div>

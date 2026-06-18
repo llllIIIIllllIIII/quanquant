@@ -16,6 +16,7 @@ dependencies = [
     "pydantic>=2.7.0",
     "pydantic-settings>=2.3.0",
     "python-multipart>=0.0.32",
+    "shioaji>=1.5.3",  # 永豐 streaming live source (abi3 wheels: mac arm64 + linux x86_64)
     "sqlmodel>=0.0.38",
     "sse-starlette>=3.4.4",
     "uvicorn[standard]>=0.49.0",
