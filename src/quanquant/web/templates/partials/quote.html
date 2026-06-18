@@ -1,5 +1,6 @@
 {% if snap %}
-<div class="quote {{ 'up' if snap.change >= 0 else 'down' }}">
+<div class="quote {{ 'up' if snap.change >= 0 else 'down' }}"
+     data-qq-price="{{ snap.price }}" data-qq-session="{{ session }}">
   <span class="sym">{{ snap.symbol }}</span>
   <span class="price">{{ snap.price | num }}</span>
   <span class="chg">{{ '▲' if snap.change >= 0 else '▼' }} {{ snap.change | signed }} ({{ snap.change_pct | pct }}%)</span>

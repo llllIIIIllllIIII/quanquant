@@ -115,6 +115,7 @@
       requestAnimationFrame(() => this.chart.resize());
 
       setInterval(() => this.pollLatest(), 5000);
+      this._bindQuoteSync();
       window.addEventListener("resize", () => {
         this.chart.resize();
         this._watchdog(); // rapid resizes can wedge the render loop too
@@ -229,6 +230,50 @@
       } catch (e) { /* next poll retries */ } finally {
         this.polling = false;
       }
+    },
+
+    // Keep the chart's last-price marker in lockstep with the big quote display.
+    // Both are the same value (CLastPrice of the live snapshot), but the quote is
+    // server-pushed over SSE on every 5s poll while the chart's own pollLatest()
+    // runs on an independent 5s timer — so the chart can visibly trail the quote
+    // by up to a poll cycle. The quote partial swaps into #quote (htmx SSE) and
+    // carries the raw price in data-qq-price; on each swap we nudge the in-progress
+    // bar's close immediately, with zero server round-trip. pollLatest() still
+    // reconciles volume / new buckets on its timer.
+    _bindQuoteSync() {
+      const el = document.getElementById("quote");
+      if (!el) return;
+      const sync = () => {
+        const node = el.querySelector("[data-qq-price]");
+        if (!node) return;
+        this.onQuote(parseFloat(node.dataset.qqPrice), node.dataset.qqSession);
+      };
+      // htmx fires afterSwap on the target after each SSE message is swapped in.
+      document.body.addEventListener("htmx:afterSwap", (e) => {
+        if (e.target && e.target.id === "quote") sync();
+      });
+      sync(); // pick up the first quote already rendered via hx-get on load
+    },
+
+    onQuote(price, quoteSession) {
+      if (!Number.isFinite(price)) return;
+      // A day/night-filtered chart intentionally shows that session's last bar; a
+      // live quote from the other session must not overwrite it. Only sync when
+      // the chart shows the combined series (matches the quote's contract).
+      if (this.session !== "all") return;
+      if (!this.chart) return;
+      const list = this.chart.getDataList();
+      if (!list || !list.length) return;
+      const last = list[list.length - 1];
+      if (price === last.close) return;
+      this._applyBar({
+        timestamp: last.timestamp,
+        open: last.open,
+        high: Math.max(last.high, price),
+        low: Math.min(last.low, price),
+        close: price,
+        volume: last.volume,
+      });
     },
 
     _switchFromCacheOrLoad() {
