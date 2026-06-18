@@ -16,6 +16,7 @@ from sqlmodel import Session
 from quanquant.candles import repo
 from quanquant.candles.aggregate import Bar, aggregate_daily, aggregate_intraday, to_bars
 from quanquant.candles.bucketing import day_open_ms
+from quanquant.candles.market_calendar import is_trading_session
 from quanquant.candles.repo import FastCandle
 from quanquant.candles.timeframes import TIMEFRAMES
 
@@ -64,6 +65,13 @@ def _cache_put(key: tuple, page: CandlePage, ttl: float) -> None:
     _page_cache[key] = (time.monotonic() + ttl, page)
 
 
+def _trading_only(rows: list[FastCandle]) -> list[FastCandle]:
+    """Drop 1m rows on non-trading days/times (phantom bars). Mirrors the
+    aggregation calendar gate so the canonical 1m view is robust against weekend/
+    holiday bars left in the DB before `clean-nontrading` removes them."""
+    return [r for r in rows if is_trading_session(r.ts) is not None]
+
+
 def _session_filter(tf: str, session_mode: str) -> str | None:
     """Intraday day/night filter; daily+ ignores session (always combined)."""
     if session_mode in ("day", "night") and TIMEFRAMES[tf].kind == "intraday":
@@ -104,7 +112,7 @@ def get_latest(
         sf = _session_filter(tf, session_mode)
         rows = repo.select_1m_range(session, symbol, start_ms=since, session_filter=sf)
         if tf == "1m":
-            return to_bars(rows)
+            return to_bars(_trading_only(rows))
         return [b for b in aggregate_intraday(rows, tf) if b["timestamp"] >= since]
     series = _full_1d_series(session, symbol)
     bars = to_bars(series) if tf == "1d" else aggregate_daily(series, tf)
@@ -117,7 +125,9 @@ def get_latest(
 def _page_1m(
     session: Session, symbol: str, before: int | None, limit: int, sf: str | None
 ) -> CandlePage:
-    rows = repo.select_1m_desc(session, symbol, before_ms=before, limit=limit, session_filter=sf)
+    rows = _trading_only(
+        repo.select_1m_desc(session, symbol, before_ms=before, limit=limit, session_filter=sf)
+    )
     if not rows:
         return CandlePage(bars=[], has_more=False)
     return CandlePage(

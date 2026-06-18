@@ -57,6 +57,43 @@ def test_bucket_timestamp_is_canonical_even_if_first_minute_missing():
     assert bars[0]["timestamp"] == ms(2026, 6, 10, 8, 45)
 
 
+def test_aggregate_drops_phantom_weekend_daytime_bars():
+    # bucket_start_ms only knows time-of-day, so it accepts a Saturday 10:00 tick;
+    # the calendar gate must drop it while keeping the real Fri/Mon buckets.
+    rows = [
+        c1m(ms(2026, 6, 12, 9, 0), "100", "101", "99", "100", 10),   # Fri day — keep
+        c1m(ms(2026, 6, 13, 10, 0), "999", "999", "999", "999", 0),  # Sat phantom — drop
+        c1m(ms(2026, 6, 15, 9, 0), "200", "201", "199", "200", 20),  # Mon day — keep
+    ]
+    bars = aggregate_intraday(rows, "60m")
+    assert [b["timestamp"] for b in bars] == [
+        ms(2026, 6, 12, 8, 45), ms(2026, 6, 15, 8, 45)
+    ]
+    assert all(b["close"] != 999.0 for b in bars)
+
+
+def test_aggregate_keeps_friday_night_into_saturday_morning():
+    # Friday night session runs 15:00 Fri → 05:00 Sat; the Sat-morning portion is
+    # legitimate and anchors to Friday, so it must NOT be dropped.
+    rows = [
+        c1m(ms(2026, 6, 12, 23, 0), "100", "101", "99", "100", 5),  # Fri night
+        c1m(ms(2026, 6, 13, 2, 0), "100", "103", "100", "102", 7),  # Sat 02:00 = Fri night
+    ]
+    bars = aggregate_intraday(rows, "60m")
+    assert len(bars) == 2
+    assert bars[1]["timestamp"] == ms(2026, 6, 13, 2, 0)
+
+
+def test_aggregate_drops_holiday_bars():
+    # 2026-06-19 is a TAIFEX holiday (端午節) embedded in market_calendar._HOLIDAYS.
+    rows = [
+        c1m(ms(2026, 6, 18, 9, 0), "100", "101", "99", "100", 10),   # Thu — keep
+        c1m(ms(2026, 6, 19, 9, 0), "999", "999", "999", "999", 0),   # Fri holiday — drop
+    ]
+    bars = aggregate_intraday(rows, "30m")
+    assert [b["timestamp"] for b in bars] == [ms(2026, 6, 18, 8, 45)]
+
+
 def test_aggregate_3d_positional_groups():
     days = ["2026-06-01", "2026-06-02", "2026-06-03", "2026-06-04",
             "2026-06-05", "2026-06-08", "2026-06-09"]

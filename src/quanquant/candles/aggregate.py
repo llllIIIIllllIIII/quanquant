@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from datetime import date
 
 from quanquant.candles.bucketing import bucket_start_ms
+from quanquant.candles.market_calendar import is_trading_session
 from quanquant.candles.timeframes import TIMEFRAMES
 
 Bar = dict
@@ -40,9 +41,16 @@ def aggregate_intraday(rows: Sequence, tf: str) -> list[Bar]:
     cur: Bar | None = None
     for r in rows:
         key = bucket_start_ms(r.ts, tf)
-        if key is None:  # outside trading sessions — skip defensively
+        if key is None:  # outside trading sessions (time-of-day) — skip defensively
             continue
         if key != cur_key:
+            # Calendar gate: bucket_start_ms knows only time-of-day, so it accepts
+            # weekend/holiday timestamps. Drop buckets that aren't a real trading
+            # session — defends the chart against phantom bars sitting in the DB
+            # (e.g. built by a pre-fix poller over a weekend) that would otherwise
+            # render as a flat empty block. Checked once per bucket (cheap).
+            if is_trading_session(r.ts) is None:
+                continue
             if cur is not None:
                 out.append(cur)
             cur_key = key
