@@ -80,6 +80,9 @@
     polling: false,
     paneIds: { wr: null, bias: null, vol: null, ma: false },
     overlays: new Map(), // id -> {name, points}
+    _drawingId: null,    // overlay currently being drawn (ESC cancels it)
+    _hoverId: null,      // overlay under the cursor (Delete target)
+    _selectedId: null,   // overlay last clicked/selected (sticky Delete target)
     tfCache: new Map(),  // (session|tf) -> {bars, hasMore} — instant switching
     settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
 
@@ -116,6 +119,7 @@
 
       setInterval(() => this.pollLatest(), 5000);
       this._bindQuoteSync();
+      this._bindDrawingKeys();
       window.addEventListener("resize", () => {
         this.chart.resize();
         this._watchdog(); // rapid resizes can wedge the render loop too
@@ -431,10 +435,16 @@
 
     overlayEvents() {
       return {
-        onDrawEnd: (e) => { this.trackOverlay(e.overlay); return false; },
+        onDrawEnd: (e) => { this._drawingId = null; this.trackOverlay(e.overlay); return false; },
         onPressedMoveEnd: (e) => { this.trackOverlay(e.overlay); return false; },
+        // track the cursor/click target so keyboard Delete knows what to remove
+        onMouseEnter: (e) => { this._hoverId = e.overlay.id; return false; },
+        onMouseLeave: (e) => { if (this._hoverId === e.overlay.id) this._hoverId = null; return false; },
+        onClick: (e) => { this._selectedId = e.overlay.id; return false; },
         onRemoved: (e) => {
           this.overlays.delete(e.overlay.id);
+          if (this._hoverId === e.overlay.id) this._hoverId = null;
+          if (this._selectedId === e.overlay.id) this._selectedId = null;
           this.scheduleSave();
           return false;
         },
@@ -451,7 +461,38 @@
     },
 
     draw(name) {
-      this.chart.createOverlay({ name, groupId: GROUP_ID, ...this.overlayEvents() });
+      // remember the id while it's being drawn so ESC can cancel it mid-draw
+      this._drawingId = this.chart.createOverlay({ name, groupId: GROUP_ID, ...this.overlayEvents() });
+    },
+
+    // TradingView-style keyboard UX: ESC cancels a half-drawn overlay (or clears
+    // the selection); Delete/Backspace removes the hovered/selected overlay.
+    // Skipped while typing in a field or while a settings/alerts dialog is open.
+    _bindDrawingKeys() {
+      document.addEventListener("keydown", (e) => {
+        const t = e.target;
+        if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" ||
+                  t.tagName === "TEXTAREA" || t.isContentEditable)) return;
+        if (document.querySelector("dialog[open]")) return;
+
+        if (e.key === "Escape") {
+          if (this._drawingId) {
+            this.chart.removeOverlay(this._drawingId); // cancel mid-draw
+            this._drawingId = null;
+            e.preventDefault();
+          } else {
+            this._selectedId = null; // just clear the sticky selection
+          }
+        } else if (e.key === "Delete" || e.key === "Backspace") {
+          const id = this._selectedId || this._hoverId;
+          if (id) {
+            this.chart.removeOverlay(id); // onRemoved clears tracking + persists
+            this._selectedId = null;
+            this._hoverId = null;
+            e.preventDefault();
+          }
+        }
+      });
     },
 
     restoreDrawings(list) {
@@ -469,6 +510,8 @@
     clearDrawings() {
       this.chart.removeOverlay({ groupId: GROUP_ID });
       this.overlays.clear();
+      this._hoverId = null;
+      this._selectedId = null;
       this.scheduleSave();
     },
 

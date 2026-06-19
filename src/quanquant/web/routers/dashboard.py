@@ -36,15 +36,12 @@ def _quote_context(
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     settings = get_settings()
-    tv_url = f"https://www.tradingview.com/symbols/{settings.tv_symbol.replace(':', '-')}/"
     return templates.TemplateResponse(
         request,
         "dashboard.html",
         {
             "active": "dashboard",
             "symbol": settings.symbol,
-            "tv_symbol": settings.tv_symbol,
-            "tv_url": tv_url,
         },
     )
 
