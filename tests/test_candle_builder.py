@@ -6,13 +6,13 @@ from quanquant.market_hours import CST
 from quanquant.models import FuturesSnapshot
 
 
-def snap(hh, mm, ss, price, cum_vol, y=2026, mo=6, d=10):
+def snap(hh, mm, ss, price, cum_vol, y=2026, mo=6, d=10, contract="TXFF6"):
     cst = datetime(y, mo, d, hh, mm, ss, tzinfo=CST)
     return FuturesSnapshot(
         symbol="TXF", price=Decimal(price), change=Decimal(0), change_pct=0.0,
         volume=cum_vol, open_price=Decimal(price), high_price=Decimal(price),
         low_price=Decimal(price), fetched_at=cst.astimezone(timezone.utc),
-        data_date="2026-06-10", contract_month="TXFF6",
+        data_date="2026-06-10", contract_month=contract,
     )
 
 
@@ -69,3 +69,20 @@ def test_closed_session_emits_nothing_and_resets_baseline():
     assert b.on_snapshot(snap(14, 30, 0, "18000", 50000)) == []  # closed
     rows = b.on_snapshot(snap(15, 0, 5, "18005", 120))
     assert rows[-1].volume == 0  # baseline was reset during the closed window
+
+
+def test_source_switch_does_not_diff_across_cumulative_baselines():
+    """A MIS-fallback tick mixed into a Shioaji stream must not diff its separate
+    cumulative counter against Shioaji's — that produced a phantom ~40k 1m bar."""
+    b = CandleBuilder("TXF")
+    # Shioaji stream ticks (contract "TXFG6"), small night-session cumulative.
+    b.on_snapshot(snap(4, 50, 0, "18000", 300, contract="TXFG6"))
+    b.on_snapshot(snap(4, 50, 30, "18005", 320, contract="TXFG6"))
+    # MIS fallback fires once during a stream gap; its CTotalVolume (~40k) is a
+    # SEPARATE counter tagged with the MIS symbol — must NOT diff against Shioaji.
+    rows = b.on_snapshot(snap(4, 51, 0, "18010", 40878, contract="TXFG6-M"))
+    assert rows[-1].ts == ms(4, 51)
+    assert rows[-1].volume == 0  # identity changed → re-baseline, no 40k phantom
+    # Stream resumes: first tick re-baselines (0), then diffs within the same source.
+    assert b.on_snapshot(snap(4, 51, 30, "18012", 360, contract="TXFG6"))[-1].volume == 0
+    assert b.on_snapshot(snap(4, 51, 50, "18015", 380, contract="TXFG6"))[-1].volume == 20

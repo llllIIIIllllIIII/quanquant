@@ -25,6 +25,7 @@ class CandleBuilder:
     def __init__(self, symbol: str) -> None:
         self._symbol = symbol
         self._prev_cum_vol: int | None = None
+        self._prev_vol_contract: str | None = None  # identity that set _prev_cum_vol
         self._cur: Candle | None = None
 
     def on_snapshot(self, snap: FuturesSnapshot) -> list[Candle]:
@@ -47,7 +48,7 @@ class CandleBuilder:
         bucket = bucket_start_ms(ts_ms, "1m")
         assert bucket is not None  # session is open
 
-        dv = self._volume_delta(snap.volume)
+        dv = self._volume_delta(snap.volume, snap.contract_month)
 
         if self._cur is not None and self._cur.ts == bucket:
             cur = self._cur
@@ -84,11 +85,19 @@ class CandleBuilder:
         today = datetime.fromtimestamp(ts_ms / 1000, tz=CST).strftime("%Y%m%d")
         return digits[:8] < today
 
-    def _volume_delta(self, cum_vol: int) -> int:
+    def _volume_delta(self, cum_vol: int, contract: str) -> int:
         prev = self._prev_cum_vol
+        prev_contract = self._prev_vol_contract
         self._prev_cum_vol = cum_vol
-        if prev is None:
-            return 0  # first tick after start: baseline unknown
+        self._prev_vol_contract = contract
+        if prev is None or contract != prev_contract:
+            # Baseline unknown, OR a different source/contract set it. Cumulative
+            # counters aren't comparable across identities — the Shioaji stream
+            # ("TXFG6") and the MIS fallback ("TXFG6-M"/"-F") keep separate session
+            # totals, and a real contract roll starts a fresh count. Diffing across
+            # them produced a phantom spike (e.g. a 40k 1m bar at a source switch),
+            # so reset the baseline and emit no volume for this boundary tick.
+            return 0
         if cum_vol >= prev:
             return cum_vol - prev
         return cum_vol  # cumulative dropped → new session restarted counting
