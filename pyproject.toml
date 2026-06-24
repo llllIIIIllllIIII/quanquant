@@ -34,6 +34,7 @@ dev = [
 quanquant = "quanquant.cli:main"
 quanquant-web = "quanquant.web.app:run"
 quanquant-backfill = "quanquant.backfill_cli:main"
+quanquant-pulse-verify = "quanquant.pulse.verify:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/quanquant"]

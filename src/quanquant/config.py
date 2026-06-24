@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""  # alerts → Telegram (browser-only when unset)
     telegram_chat_id: str = ""
 
+    # Market Pulse v0.1 — price-velocity audio + Telegram alerts.
+    # Audio/cooldown/toggle live in the browser; the backend only computes the
+    # Velocity Level and pushes Telegram when ENTERING the configured high level.
+    pulse_enabled: bool = True
+    pulse_telegram_level: int = 4        # Telegram only when entering this level (4 = Extreme)
+    pulse_telegram_cooldown: float = 60.0  # seconds between Telegram pushes (edge-triggered)
+
     # Web / dashboard
     db_url: str = "sqlite:///./quanquant.db"
     host: str = "127.0.0.1"

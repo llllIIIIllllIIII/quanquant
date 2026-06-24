@@ -19,8 +19,9 @@ from quanquant.candles.repo import prune_quotes, upsert_candles
 from quanquant.config import get_settings
 from quanquant.db.engine import get_engine, init_db
 from quanquant.db.models import Quote
-from quanquant.notify import build_notify
+from quanquant.notify import TelegramNotifier, build_notify
 from quanquant.poller import QuoteEvent, QuotePoller
+from quanquant.pulse.engine import PulseEngine, run_pulse_engine
 from quanquant.sources.registry import make_source
 from quanquant.web.routers import alerts, candles, dashboard, stats, trades
 from quanquant.web.templating import STATIC_DIR
@@ -128,6 +129,18 @@ async def lifespan(app: FastAPI):
     poller = QuotePoller(source, settings.symbol, settings.poll_interval_seconds)
     app.state.poller = poller
 
+    # Market Pulse: classify tick velocity off the un-coalesced poller stream;
+    # the level is stamped onto the quote SSE, Telegram fires on entering Extreme.
+    pulse = None
+    if settings.pulse_enabled:
+        pulse = PulseEngine(
+            settings.symbol,
+            telegram=TelegramNotifier(settings.telegram_bot_token, settings.telegram_chat_id),
+            telegram_level=settings.pulse_telegram_level,
+            telegram_cooldown=settings.pulse_telegram_cooldown,
+        )
+    app.state.pulse = pulse
+
     tasks = [
         asyncio.create_task(_persist_market_data(
             poller, settings.symbol,
@@ -136,6 +149,8 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(_prune_quotes_loop()),
         asyncio.create_task(run_alert_engine(poller, notify, settings.symbol)),
     ]
+    if pulse is not None:
+        tasks.append(asyncio.create_task(run_pulse_engine(poller, pulse)))
     streamer = None
     if use_shioaji:
         from quanquant.sources.shioaji_stream import ShioajiStreamer

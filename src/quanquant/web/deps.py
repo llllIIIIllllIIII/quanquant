@@ -5,13 +5,19 @@ from fastapi import Request
 
 from quanquant.db.engine import get_session  # re-exported for routers
 from quanquant.poller import QuotePoller
+from quanquant.pulse.engine import PulseEngine
 
-__all__ = ["get_session", "get_poller", "parse_date"]
+__all__ = ["get_session", "get_poller", "get_pulse", "parse_date"]
 
 
 def get_poller(request: Request) -> QuotePoller | None:
     """The shared poller from app state; None if not started (e.g. in tests)."""
     return getattr(request.app.state, "poller", None)
+
+
+def get_pulse(request: Request) -> PulseEngine | None:
+    """The shared Market Pulse engine from app state; None if disabled / in tests."""
+    return getattr(request.app.state, "pulse", None)
 
 
 def parse_date(value: str | None, *, end: bool = False) -> datetime | None:

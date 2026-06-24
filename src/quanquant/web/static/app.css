@@ -65,6 +65,20 @@
 }
 .session-sel:hover { border-color: var(--pico-primary-hover); }
 
+/* Market Pulse heart-beat toggle: tighter for the ♥ glyph; red + pulsing when on */
+.chart-head-actions .pulse-toggle { padding: 0 0.7rem; font-size: 1rem; }
+.chart-head-actions .pulse-toggle.active {
+  color: var(--down);
+  border-color: var(--down);
+  animation: qq-heartbeat 1s ease-in-out infinite;
+}
+@keyframes qq-heartbeat {
+  0%, 100% { transform: scale(1); }
+  15% { transform: scale(1.18); }
+  30% { transform: scale(1); }
+  45% { transform: scale(1.12); }
+}
+
 /* chart area: vertical drawing rail (left) + chart (right), TradingView-style */
 .chart-row { display: flex; align-items: stretch; gap: 0; margin-top: 0.4rem; }
 .draw-rail {

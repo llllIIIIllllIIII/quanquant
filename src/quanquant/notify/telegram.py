@@ -52,13 +52,18 @@ class TelegramNotifier:
         return bool(self._token and self._chat_id)
 
     async def send(self, n: Notification) -> None:
+        await self.send_text(format_alert(n))
+
+    async def send_text(self, text: str) -> None:
+        """Send a plain message. Market Pulse pushes through here directly; alerts
+        go via `send` (format then delegate). No-op when unconfigured; never raises."""
         if not self.configured:
             return  # browser-only when no token/chat_id set
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 await client.post(
                     f"https://api.telegram.org/bot{self._token}/sendMessage",
-                    json={"chat_id": self._chat_id, "text": format_alert(n)},
+                    json={"chat_id": self._chat_id, "text": text},
                 )
         except Exception:
             pass  # a Telegram outage must never block alerts / the poll loop

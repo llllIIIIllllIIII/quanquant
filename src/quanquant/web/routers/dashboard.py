@@ -14,22 +14,31 @@ from quanquant.config import get_settings
 from quanquant.market_hours import get_session
 from quanquant.models import FuturesSnapshot
 from quanquant.poller import QuotePoller
-from quanquant.web.deps import get_poller
+from quanquant.pulse.engine import PulseEngine
+from quanquant.web.deps import get_poller, get_pulse
 from quanquant.web.templating import SESSION_LABEL, render_partial, templates
 
 router = APIRouter()
 
 
 def _quote_context(
-    snap: FuturesSnapshot | None, error: str | None, as_of: datetime | None = None
+    snap: FuturesSnapshot | None,
+    error: str | None,
+    as_of: datetime | None = None,
+    pulse: PulseEngine | None = None,
 ) -> dict:
     session = get_session()
+    pulse_level, pulse_state = (0, "silent")
+    if pulse is not None:
+        pulse_level, pulse_state = pulse.level_at()
     return {
         "snap": snap,
         "error": error,
         "session": session,
         "session_label": SESSION_LABEL.get(session, SESSION_LABEL["closed"]),
         "as_of": as_of,  # "live as of now" clock for the SSE heartbeat; None = use data time
+        "pulse_level": pulse_level,
+        "pulse_state": pulse_state,
     }
 
 
@@ -47,13 +56,23 @@ async def dashboard(request: Request):
 
 
 @router.get("/quote", response_class=HTMLResponse)
-async def quote_now(request: Request, poller: QuotePoller | None = Depends(get_poller)):
+async def quote_now(
+    request: Request,
+    poller: QuotePoller | None = Depends(get_poller),
+    pulse: PulseEngine | None = Depends(get_pulse),
+):
     snap = poller.last if poller else None
-    return HTMLResponse(render_partial("partials/quote.html", **_quote_context(snap, None)))
+    return HTMLResponse(
+        render_partial("partials/quote.html", **_quote_context(snap, None, pulse=pulse))
+    )
 
 
 @router.get("/quote/stream")
-async def quote_stream(request: Request, poller: QuotePoller | None = Depends(get_poller)):
+async def quote_stream(
+    request: Request,
+    poller: QuotePoller | None = Depends(get_poller),
+    pulse: PulseEngine | None = Depends(get_pulse),
+):
     if poller is None:
         return EventSourceResponse(iter(()))
 
@@ -65,7 +84,7 @@ async def quote_stream(request: Request, poller: QuotePoller | None = Depends(ge
             if poller.last is not None:
                 yield {
                     "data": render_partial(
-                        "partials/quote.html", **_quote_context(poller.last, None)
+                        "partials/quote.html", **_quote_context(poller.last, None, pulse=pulse)
                     )
                 }
             last_emit = time.monotonic()
@@ -90,7 +109,7 @@ async def quote_stream(request: Request, poller: QuotePoller | None = Depends(ge
                 last_emit = time.monotonic()
                 yield {
                     "data": render_partial(
-                        "partials/quote.html", **_quote_context(snap, error, as_of)
+                        "partials/quote.html", **_quote_context(snap, error, as_of, pulse=pulse)
                     )
                 }
         finally:
