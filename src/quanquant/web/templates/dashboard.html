@@ -22,7 +22,24 @@
       <button type="button" id="pulse-toggle" class="outline mini pulse-toggle"
               aria-pressed="false" aria-label="市場脈搏音效"
               title="市場脈搏音效：關（點擊開啟）">♥</button>
+      <button type="button" class="outline mini ded-toggle" :class="{active: deductionOn}"
+              @click="toggleDeduction()" :aria-pressed="deductionOn" aria-label="均線扣抵"
+              :title="deductionOn ? '均線扣抵：開（點擊關閉）' : '均線扣抵：關（點擊開啟）'">▽ 扣抵</button>
     </div>
+  </div>
+
+  <div class="ded-legend" x-show="deductionOn" x-cloak>
+    <span class="muted ded-legend-label">即時扣抵</span>
+    <template x-if="deductionLegend.length === 0">
+      <small class="muted">請先在指標設定加入 MA</small>
+    </template>
+    <template x-for="(r, index) in deductionLegend" :key="r.period + '_' + index">
+      <span class="ded-chip" :style="`color:${r.color}`" :title="dedTitle(r)">
+        <span x-text="'MA' + r.period"></span>
+        <span x-text="r.status === 'insufficient-data' ? '—' : Math.round(r.deductionValue).toLocaleString()"></span>
+        <span class="ded-arrow" x-text="dedArrow(r.status)"></span>
+      </span>
+    </template>
   </div>
 
   <div class="tf-bar" role="group">
@@ -179,6 +196,7 @@
 
 <script src="https://unpkg.com/klinecharts@9.8.12/dist/umd/klinecharts.min.js"></script>
 <script>window.QQ_SYMBOL = "{{ symbol }}";</script>
+<script src="/static/ma_deduction.js"></script>
 <script src="/static/chart.js"></script>
 <script src="/static/pulse.js"></script>
 {% endblock %}

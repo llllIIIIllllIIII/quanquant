@@ -85,6 +85,10 @@
     _selectedId: null,   // overlay last clicked/selected (sticky Delete target)
     tfCache: new Map(),  // (session|tf) -> {bars, hasMore} — instant switching
     settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
+    deductionEnabled: false,   // 均線扣抵開關（由 Alpine 依 localStorage 設定）
+    onDeductionUpdate: null,   // (results) => void：把扣抵結果交給狀態列
+    _deductionSig: "",         // 上次已畫三角的幾何簽章；相同則跳過重畫
+    _deductionDrawn: false,    // 目前是否有扣抵三角在圖上（關閉時只清一次）
 
     async init() {
       if (!window.klinecharts) {
@@ -109,6 +113,7 @@
       if (state.indicators) this.settings = this.mergeSettings(state.indicators);
 
       // load data BEFORE indicators: even if an indicator fails, candles render
+      if (window.MADeduction) window.MADeduction.register();
       await this.loadInitial();
       await this.applyIndicators();
       this.restoreDrawings(Array.isArray(state.drawings) ? state.drawings : []);
@@ -191,6 +196,7 @@
       this._cacheBars(bars.slice(), this.hasMore);
       this._snapToLatest();
       this._watchdog();
+      this.refreshDeduction();
     },
 
     async loadMore(ts) {
@@ -231,6 +237,7 @@
         const data = await resp.json();
         if (this.tf !== tf || this.session !== sess) return; // stale response
         for (const bar of data.bars || []) this._applyBar(bar);
+        if ((data.bars || []).length) this.refreshDeduction();
       } catch (e) { /* next poll retries */ } finally {
         this.polling = false;
       }
@@ -278,6 +285,7 @@
         close: price,
         volume: last.volume,
       });
+      this.refreshDeduction();
     },
 
     _switchFromCacheOrLoad() {
@@ -289,6 +297,7 @@
         this.lastBarTs = cached.bars[cached.bars.length - 1].timestamp;
         this._snapToLatest();
         this._watchdog();
+        this.refreshDeduction();
         this.pollLatest();
         return true;
       }
@@ -422,6 +431,7 @@
 
     async saveIndicators() {
       await this.applyIndicators();
+      this.refreshDeduction();
       try {
         await fetch(`/api/chart/state/indicators?symbol=${SYMBOL}`, {
           method: "PUT",
@@ -429,6 +439,42 @@
           body: JSON.stringify(this.settings),
         });
       } catch (e) { /* non-fatal */ }
+    },
+
+    // ---- MA deduction (live mode) ----
+
+    setDeduction(on) {
+      this.deductionEnabled = !!on;
+      this.refreshDeduction();
+    },
+
+    // 以最新 K 棒重算各啟用 MA 的扣抵；狀態列每 tick 更新，三角僅在扣抵 K 棒
+    // 組合改變（新棒）時重畫，避免每 5 秒輪詢重建造成閃爍與 hover 文字斷裂。
+    refreshDeduction() {
+      if (!this.chart || !window.MADeduction) return;
+      const cb = this.onDeductionUpdate;
+      if (!this.deductionEnabled) {
+        if (this._deductionDrawn) {
+          window.MADeduction.clear(this.chart);
+          if (cb) cb([]);
+          this._deductionDrawn = false;
+          this._deductionSig = "";
+        }
+        return;
+      }
+      const bars = this.chart.getDataList() || [];
+      // 只對「已顯示」的 MA 線算扣抵：MA 指標關閉時不顯示三角/狀態列。
+      const params = (this.settings.ma && this.settings.ma.enabled && this.settings.ma.params) || [];
+      const results = window.MADeduction.computeLive(bars, params); // 用模組預設容忍值 0.1
+      if (cb) cb(results); // 狀態列反映即時基準價/狀態
+      const sig = results
+        .map((r) => r.period + ":" + r.deductionTime + ":" + r.deductionValue + ":" + r.color)
+        .join("|");
+      if (sig !== this._deductionSig) {
+        window.MADeduction.draw(this.chart, results); // 三角幾何改變才重畫
+        this._deductionSig = sig;
+        this._deductionDrawn = true;
+      }
     },
 
     // ---- drawings ----
@@ -544,6 +590,8 @@
       { code: "night", label: "只夜盤" },
     ],
     settingsOpen: false,
+    deductionOn: false,
+    deductionLegend: [],
     form: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     indicatorDefs: [
       { key: "ma", title: "均線 MA", hint: "疊於主圖" },
@@ -578,6 +626,9 @@
 
     init() {
       this.session = localStorage.getItem("qq_session") || "all";
+      this.deductionOn = localStorage.getItem("qq_ma_deduction") === "1";
+      QQChart.onDeductionUpdate = (results) => { this.deductionLegend = results; };
+      QQChart.deductionEnabled = this.deductionOn;
       QQChart.init();
       this._initAlerts();
     },
@@ -671,6 +722,23 @@
     draw(name) { QQChart.draw(name); },
     clearDrawings() {
       if (confirm("確定清除所有繪圖？")) QQChart.clearDrawings();
+    },
+
+    toggleDeduction() {
+      this.deductionOn = !this.deductionOn;
+      localStorage.setItem("qq_ma_deduction", this.deductionOn ? "1" : "0");
+      QQChart.setDeduction(this.deductionOn);
+    },
+    dedArrow(status) {
+      return { upward: "↑", downward: "↓", flat: "→" }[status] || "—";
+    },
+    dedTitle(r) {
+      if (r.status === "insufficient-data") return `MA${r.period} 扣抵：資料不足`;
+      const dv = Math.round(r.deductionValue).toLocaleString();
+      const bp = Math.round(r.basePrice).toLocaleString();
+      const pct = r.diffPercent == null ? "—" : r.diffPercent.toFixed(2) + "%";
+      const lbl = { upward: "傾向上彎", downward: "傾向下彎", flat: "傾向走平" }[r.status];
+      return `MA${r.period} 即時扣抵\n扣抵位置：${r.period} 根前\n扣抵價：${dv}\n基準價：${bp}\n差距：${pct}\n狀態：MA${r.period} ${lbl}`;
     },
 
     openSettings() {
