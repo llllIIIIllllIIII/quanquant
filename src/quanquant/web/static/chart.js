@@ -575,6 +575,8 @@
       { code: "night", label: "只夜盤" },
     ],
     settingsOpen: false,
+    deductionOn: false,
+    deductionLegend: [],
     form: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     indicatorDefs: [
       { key: "ma", title: "均線 MA", hint: "疊於主圖" },
@@ -610,6 +612,9 @@
     init() {
       this.session = localStorage.getItem("qq_session") || "all";
       QQChart.init();
+      this.deductionOn = localStorage.getItem("qq_ma_deduction") === "1";
+      QQChart.onDeductionUpdate = (results) => { this.deductionLegend = results; };
+      QQChart.deductionEnabled = this.deductionOn;
       this._initAlerts();
     },
 
@@ -702,6 +707,23 @@
     draw(name) { QQChart.draw(name); },
     clearDrawings() {
       if (confirm("確定清除所有繪圖？")) QQChart.clearDrawings();
+    },
+
+    toggleDeduction() {
+      this.deductionOn = !this.deductionOn;
+      localStorage.setItem("qq_ma_deduction", this.deductionOn ? "1" : "0");
+      QQChart.setDeduction(this.deductionOn);
+    },
+    dedArrow(status) {
+      return { upward: "↑", downward: "↓", flat: "→" }[status] || "—";
+    },
+    dedTitle(r) {
+      if (r.status === "insufficient-data") return `MA${r.period} 扣抵：資料不足`;
+      const dv = Math.round(r.deductionValue).toLocaleString();
+      const bp = Math.round(r.basePrice).toLocaleString();
+      const pct = r.diffPercent == null ? "—" : r.diffPercent.toFixed(2) + "%";
+      const lbl = { upward: "傾向上彎", downward: "傾向下彎", flat: "傾向走平" }[r.status];
+      return `MA${r.period} 即時扣抵\n扣抵位置：${r.period} 根前\n扣抵價：${dv}\n基準價：${bp}\n差距：${pct}\n狀態：MA${r.period} ${lbl}`;
     },
 
     openSettings() {

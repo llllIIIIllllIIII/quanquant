@@ -225,3 +225,17 @@ a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
 .cards .big.up { color: var(--up); }
 .cards .big.down { color: var(--down); }
 .export-actions { display: flex; gap: 0.5rem; }
+
+/* 均線扣抵 */
+[x-cloak] { display: none !important; }
+.ded-toggle.active { color: #f0b90b; border-color: #f0b90b; }
+.ded-legend {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  margin: 4px 0 2px; font-variant-numeric: tabular-nums;
+}
+.ded-legend-label { font-size: 12px; }
+.ded-chip {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 12px; font-weight: 600;
+}
+.ded-chip .ded-arrow { font-weight: 700; }
