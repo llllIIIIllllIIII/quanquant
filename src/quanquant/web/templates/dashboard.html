@@ -33,7 +33,7 @@
     <template x-if="deductionLegend.length === 0">
       <small class="muted">請先在指標設定加入 MA</small>
     </template>
-    <template x-for="r in deductionLegend" :key="r.period">
+    <template x-for="(r, index) in deductionLegend" :key="r.period + '_' + index">
       <span class="ded-chip" :style="`color:${r.color}`" :title="dedTitle(r)">
         <span x-text="'MA' + r.period"></span>
         <span x-text="r.status === 'insufficient-data' ? '—' : Math.round(r.deductionValue).toLocaleString()"></span>
