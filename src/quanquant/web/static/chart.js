@@ -85,6 +85,8 @@
     _selectedId: null,   // overlay last clicked/selected (sticky Delete target)
     tfCache: new Map(),  // (session|tf) -> {bars, hasMore} — instant switching
     settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
+    deductionEnabled: false,   // 均線扣抵開關（由 Alpine 依 localStorage 設定）
+    onDeductionUpdate: null,   // (results) => void：把扣抵結果交給狀態列
 
     async init() {
       if (!window.klinecharts) {
@@ -109,6 +111,7 @@
       if (state.indicators) this.settings = this.mergeSettings(state.indicators);
 
       // load data BEFORE indicators: even if an indicator fails, candles render
+      if (window.MADeduction) window.MADeduction.register();
       await this.loadInitial();
       await this.applyIndicators();
       this.restoreDrawings(Array.isArray(state.drawings) ? state.drawings : []);
@@ -191,6 +194,7 @@
       this._cacheBars(bars.slice(), this.hasMore);
       this._snapToLatest();
       this._watchdog();
+      this.refreshDeduction();
     },
 
     async loadMore(ts) {
@@ -231,6 +235,7 @@
         const data = await resp.json();
         if (this.tf !== tf || this.session !== sess) return; // stale response
         for (const bar of data.bars || []) this._applyBar(bar);
+        if ((data.bars || []).length) this.refreshDeduction();
       } catch (e) { /* next poll retries */ } finally {
         this.polling = false;
       }
@@ -278,6 +283,7 @@
         close: price,
         volume: last.volume,
       });
+      this.refreshDeduction();
     },
 
     _switchFromCacheOrLoad() {
@@ -289,6 +295,7 @@
         this.lastBarTs = cached.bars[cached.bars.length - 1].timestamp;
         this._snapToLatest();
         this._watchdog();
+        this.refreshDeduction();
         this.pollLatest();
         return true;
       }
@@ -422,6 +429,7 @@
 
     async saveIndicators() {
       await this.applyIndicators();
+      this.refreshDeduction();
       try {
         await fetch(`/api/chart/state/indicators?symbol=${SYMBOL}`, {
           method: "PUT",
@@ -429,6 +437,29 @@
           body: JSON.stringify(this.settings),
         });
       } catch (e) { /* non-fatal */ }
+    },
+
+    // ---- MA deduction (live mode) ----
+
+    setDeduction(on) {
+      this.deductionEnabled = !!on;
+      this.refreshDeduction();
+    },
+
+    // 以最新 K 棒重算各啟用 MA 的扣抵，重畫三角並更新狀態列。冪等、計算量低。
+    refreshDeduction() {
+      if (!this.chart || !window.MADeduction) return;
+      const cb = this.onDeductionUpdate;
+      if (!this.deductionEnabled) {
+        window.MADeduction.clear(this.chart);
+        if (cb) cb([]);
+        return;
+      }
+      const bars = this.chart.getDataList() || [];
+      const params = (this.settings.ma && this.settings.ma.params) || [];
+      const results = window.MADeduction.computeLive(bars, params, 0.1);
+      window.MADeduction.draw(this.chart, results);
+      if (cb) cb(results);
     },
 
     // ---- drawings ----
