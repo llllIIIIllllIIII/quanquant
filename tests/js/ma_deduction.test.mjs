@@ -64,3 +64,26 @@ test('deductionTime 取扣抵 K 棒的 timestamp', () => {
 test('空 bars 回傳空陣列', () => {
   assert.deepEqual(computeLive([], [P(2)], 0.1), []);
 });
+
+// Guard tests for register/draw/clear
+const MAD = require('../../src/quanquant/web/static/ma_deduction.js');
+
+test('register/draw/clear 皆為函式', () => {
+  assert.equal(typeof MAD.register, 'function');
+  assert.equal(typeof MAD.draw, 'function');
+  assert.equal(typeof MAD.clear, 'function');
+});
+
+test('register 在無 klinecharts 環境安全 no-op（不丟例外）', () => {
+  assert.doesNotThrow(() => MAD.register());
+});
+
+test('draw/clear 對 falsy chart 安全 no-op', () => {
+  assert.doesNotThrow(() => MAD.draw(null, []));
+  assert.doesNotThrow(() => MAD.clear(undefined));
+});
+
+test('GROUP_ID 與 user-drawings 隔離', () => {
+  assert.equal(MAD.GROUP_ID, 'ma-deduction');
+  assert.notEqual(MAD.GROUP_ID, 'user-drawings');
+});
