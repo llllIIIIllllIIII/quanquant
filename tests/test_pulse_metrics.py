@@ -67,3 +67,30 @@ def test_sustained_burst_is_extreme():
 def test_warmup_caps_level_when_history_too_short():
     buf = [(0.1 * k, 110 + k) for k in range(9)]  # same burst, <1s of history
     assert classify(buf, 0.9)[0] <= 1
+
+
+def test_few_ticks_capped_at_watch():
+    buf = _slow_baseline(26)
+    for k in range(4):  # only 4 ticks (< MIN_TICKS_SOUND) but a big move
+        buf.append((29.1 + 0.2 * k, 110 + 3 * k))
+    level, _, m = classify(buf, 30.0)
+    assert m["tick_count_1s"] == 4
+    assert level <= 1  # anti-false gate caps at Watch despite the move
+
+
+def test_high_ratio_tiny_move_stays_watch():
+    buf = _slow_baseline(26)
+    for k in range(7):  # fast in-place flicker: many ticks, ~no displacement
+        buf.append((29.0 + 0.1 * k, 100 + (k % 2)))
+    level, _, m = classify(buf, 30.0)
+    assert m["tick_count_1s"] >= 5
+    assert level == 1  # R high, but M below both L2 move thresholds → no sound
+
+
+def test_pure_move_triggers_active_even_when_ratio_low():
+    buf = [(i / 3.0, 100 + (i % 2)) for i in range(90)]  # dense ~3 changes/s baseline
+    for k in range(5):  # real move (M ≥ M_L2_PURE) but a low ratio
+        buf.append((29.7 + 0.02 * k, 104 + k))
+    level, _, m = classify(buf, 30.0)
+    assert m["velocity_ratio"] < metrics.R_L2
+    assert level == 2  # pure-move path still sounds Active

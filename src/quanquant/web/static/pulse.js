@@ -10,20 +10,24 @@
 
   var STORE_KEY = "qq_pulse";
 
-  // Per-level beep pattern: beep count, frequency (Hz), gap + duration (s), gain.
+  // Express level by hit DENSITY, not pitch: one dull base tone, more beeps.
+  var FREQ = 520; // low-ish; a low-pass keeps the timbre blunt, not piercing
+  var LOWPASS = 4000; // cut highs (3–5kHz) so it reads as soft taps
   var PATTERNS = {
-    2: { beeps: 1, freq: 880, gap: 0.0, dur: 0.06, gain: 0.12 },
-    3: { beeps: 2, freq: 1100, gap: 0.07, dur: 0.05, gain: 0.16 },
-    4: { beeps: 3, freq: 1320, gap: 0.05, dur: 0.045, gain: 0.2 },
+    2: { beeps: 1, gap: 0.0, dur: 0.05, gain: 0.05 },
+    3: { beeps: 2, gap: 0.09, dur: 0.05, gain: 0.07 },
+    4: { beeps: 3, gap: 0.07, dur: 0.045, gain: 0.1 },
   };
-  var COOLDOWN = { 2: 2000, 3: 1000, 4: 500 }; // per-level cooldown ms (spec §11.3)
-  var MAX_RATE = 5; // global max plays/sec (spec §11.4)
+  var COOLDOWN = { 2: 3000, 3: 2000, 4: 1500 }; // per-level cooldown ms (1.5–3s)
+  var MAX_RATE = 2; // global max plays/sec
   var RATE_WINDOW = 1000;
 
   var ctx = null;
   var enabled = false;
   var lastPlay = { 2: 0, 3: 0, 4: 0 };
   var recent = []; // timestamps of recent plays, for the max-rate cap
+  var seenLevel = 0; // last level read from the SSE
+  var confirmedLevel = 0; // committed level (upgrades need 2 consecutive reads)
   var btn = null;
 
   function now() {
@@ -43,19 +47,23 @@
     if (c && c.state === "suspended") c.resume();
   }
 
-  function beep(freq, startAt, dur, gain) {
+  function beep(startAt, dur, gain) {
     var c = ensureCtx();
     if (!c) return;
     var osc = c.createOscillator();
     var g = c.createGain();
-    osc.type = "square";
-    osc.frequency.value = freq;
-    // tiny attack/decay envelope so each "唧" is clean (no click)
+    var lp = c.createBiquadFilter();
+    osc.type = "triangle"; // blunt, less piercing than a square wave
+    osc.frequency.value = FREQ;
+    lp.type = "lowpass";
+    lp.frequency.value = LOWPASS;
+    // fast attack + fast decay → a soft tap, not a sharp beep
     g.gain.setValueAtTime(0.0001, startAt);
-    g.gain.exponentialRampToValueAtTime(gain, startAt + 0.005);
+    g.gain.exponentialRampToValueAtTime(gain, startAt + 0.004);
     g.gain.exponentialRampToValueAtTime(0.0001, startAt + dur);
     osc.connect(g);
-    g.connect(c.destination);
+    g.connect(lp);
+    lp.connect(c.destination);
     osc.start(startAt);
     osc.stop(startAt + dur + 0.02);
   }
@@ -66,7 +74,7 @@
     if (!c || !p) return;
     var t0 = c.currentTime + 0.01;
     for (var i = 0; i < p.beeps; i++) {
-      beep(p.freq, t0 + i * (p.dur + p.gap), p.dur, p.gain);
+      beep(t0 + i * (p.dur + p.gap), p.dur, p.gain);
     }
   }
 
@@ -97,7 +105,16 @@
 
   function onSwap(e) {
     if (!e || !e.target || e.target.id !== "quote") return;
-    maybePlay(readLevel(e.target));
+    var lvl = readLevel(e.target);
+    // Upgrades need 2 consecutive confirmations (a 1-tick blip never escalates);
+    // downgrades apply immediately so it goes quiet fast.
+    if (lvl > confirmedLevel) {
+      if (lvl === seenLevel) confirmedLevel = lvl;
+    } else {
+      confirmedLevel = lvl;
+    }
+    seenLevel = lvl;
+    maybePlay(confirmedLevel);
   }
 
   function reflect() {

@@ -16,23 +16,24 @@ from collections.abc import Sequence
 
 Buffer = Sequence[tuple[float, float]]
 
-# --- Tunable thresholds (spec defaults; edit here to retune) -----------------
+# --- Tunable thresholds (revised parameter table; edit here to retune) -------
 TICK_SIZE = 1.0          # TXF: 1 tick = 1 index point
 
-# Minimum Activity Gate (§7): below BOTH → forced silent.
-MIN_TICKS = 3            # tick_count_1s
-MIN_MOVE = 2.0           # price_move_3s, in ticks
+# Silence / anti-false gates.
+MIN_TICKS = 3            # T < this → silent (kills single/double-tick noise)
+MIN_TICKS_SOUND = 5      # T < this → capped at Watch (idle market, one trade spiking R)
 
 # Velocity-ratio thresholds per level (R = now-speed vs 30s baseline speed).
 R_L1 = 1.5
-R_L2 = 2.5
-R_L3 = 4.0
+R_L2 = 3.0               # raised from 2.5 to filter common small wobble
+R_L3 = 4.5
 R_L4 = 6.0
 
-# Move confirmation floor per level (in ticks): real displacement must back the
-# ratio, else a ratio spike from in-place flicker would falsely sound.
-M_L2 = 3.0
-M_L3 = 5.0
+# Move thresholds per level (in ticks). L2 needs EITHER (R≥R_L2 and M≥M_L2)
+# OR a pure real move M≥M_L2_PURE — so a high ratio with a tiny move stays quiet.
+M_L2 = 2.0               # move floor when ratio-driven
+M_L2_PURE = 4.0          # pure-move trigger (ratio-independent)
+M_L3 = 6.0
 M_L4 = 8.0
 
 WINDOW_TICK = 1.0        # tick_count window (seconds)
@@ -104,14 +105,15 @@ def _warmed(buf: Buffer, now: float) -> bool:
 def classify(buf: Buffer, now: float) -> tuple[int, str, dict]:
     """Velocity-gated descending classification → (level, state_code, metrics).
 
-        gate (T<MIN_TICKS and M<MIN_MOVE)  → 0 Silent
-        R≥R_L4 and M≥M_L4                  → 4 Extreme
-        R≥R_L3 and M≥M_L3                  → 3 Fast
-        R≥R_L2 and M≥M_L2                  → 2 Active
-        R≥R_L1                             → 1 Watch
-        else                               → 0 Silent
+        T < MIN_TICKS (3)                       → 0 Silent  (single/double-tick noise)
+        T < MIN_TICKS_SOUND (5)                 → ≤1 Watch  (idle market false R spike)
+        R≥R_L4 and M≥M_L4                       → 4 Extreme
+        R≥R_L3 and M≥M_L3                       → 3 Fast
+        (R≥R_L2 and M≥M_L2) or M≥M_L2_PURE      → 2 Active
+        R≥R_L1                                  → 1 Watch
+        else                                    → 0 Silent
 
-    Levels 2+ also require a warmed baseline (else capped at Watch).
+    Levels 2+ require ≥MIN_TICKS_SOUND ticks AND a warmed baseline (else ≤Watch).
     """
     t = tick_count_1s(buf, now)
     m = price_move_3s(buf, now)
@@ -124,15 +126,20 @@ def classify(buf: Buffer, now: float) -> tuple[int, str, dict]:
         "directional_continuity_3s": d,
     }
 
-    if t < MIN_TICKS and m < MIN_MOVE:
+    if t < MIN_TICKS:
         return 0, STATE_NAMES[0], metrics
+
+    # Anti-false-signal gate: too few ticks/s to sound → at most Watch.
+    if t < MIN_TICKS_SOUND:
+        level = 1 if r >= R_L1 else 0
+        return level, STATE_NAMES[level], metrics
 
     warm = _warmed(buf, now)
     if warm and r >= R_L4 and m >= M_L4:
         level = 4
     elif warm and r >= R_L3 and m >= M_L3:
         level = 3
-    elif warm and r >= R_L2 and m >= M_L2:
+    elif warm and ((r >= R_L2 and m >= M_L2) or m >= M_L2_PURE):
         level = 2
     elif r >= R_L1:
         level = 1

@@ -90,6 +90,13 @@ def _slow_drift(eng, clock):
         eng.on_event(_snap(102 + k))
 
 
+def _idle_spike(eng, clock):
+    _baseline(eng, clock, 0)
+    for k in range(4):  # only 4 ticks (< 5) → anti-false gate caps at Watch
+        clock.t = 29 + 0.1 * k
+        eng.on_event(_snap(110 + 3 * k))
+
+
 @dataclass
 class Scenario:
     name: str
@@ -104,8 +111,9 @@ SCENARIOS = [
     Scenario("原地高頻震盪", _flicker, 1, False, 0),
     Scenario("單筆暴衝(雜訊)", _single_spike, 1, False, 0),
     Scenario("慢慢走一段(低頻)", _slow_drift, 1, False, 0),
+    Scenario("靜止盤微量(T<5)", _idle_spike, 1, False, 0),
     Scenario("開始變快 Active", lambda e, c: _episode(e, c, 0, 5), 2, True, 0),
-    Scenario("明顯快速 Fast", lambda e, c: _episode(e, c, 0, 6), 3, True, 0),
+    Scenario("明顯快速 Fast", lambda e, c: _episode(e, c, 0, 7), 3, True, 0),
     Scenario("持續急速 Extreme", lambda e, c: _episode(e, c, 0, 9), 4, True, 1),
     Scenario("急→落→60s內再急", lambda e, c: (_episode(e, c, 0, 9), _episode(e, c, 40, 9)), 4, True, 1),
     Scenario("急→落→60s後再急", lambda e, c: (_episode(e, c, 0, 9), _episode(e, c, 80, 9)), 4, True, 2),
@@ -123,8 +131,8 @@ def _pad(s, width):
 async def _run() -> int:
     print("Market Pulse 觸發驗證（情境模擬器）\n")
     print(
-        f"門檻參考：gate T<{M.MIN_TICKS}且M<{M.MIN_MOVE:.0f}ticks｜"
-        f"L2 R≥{M.R_L2}&M≥{M.M_L2:.0f}｜L3 R≥{M.R_L3}&M≥{M.M_L3:.0f}｜"
+        f"門檻：T<{M.MIN_TICKS}靜音、T<{M.MIN_TICKS_SOUND}最多L1｜"
+        f"L2 (R≥{M.R_L2}&M≥{M.M_L2:.0f})或M≥{M.M_L2_PURE:.0f}｜L3 R≥{M.R_L3}&M≥{M.M_L3:.0f}｜"
         f"L4 R≥{M.R_L4}&M≥{M.M_L4:.0f}｜Telegram=進入L{_TG_LEVEL}+{_TG_COOLDOWN:.0f}s冷卻\n"
     )
     head = (

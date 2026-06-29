@@ -48,7 +48,7 @@ async def test_entering_extreme_pushes_telegram_once():
 async def test_below_threshold_does_not_push():
     clock, tg = Clock(), FakeTelegram()
     eng = PulseEngine("TXF", telegram=tg, telegram_level=4, telegram_cooldown=60, clock=clock)
-    await _feed_burst(eng, clock, 0, n_burst=6)  # tops out at Fast (move < 8 ticks)
+    await _feed_burst(eng, clock, 0, n_burst=7)  # tops out at Fast (move < 8 ticks)
     assert tg.calls == []
     assert eng.level_at()[0] == 3
 
