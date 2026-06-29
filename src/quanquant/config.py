@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     pulse_enabled: bool = True
     pulse_telegram_level: int = 4        # Telegram only when entering this level (4 = Extreme)
     pulse_telegram_cooldown: float = 60.0  # seconds between Telegram pushes (edge-triggered)
+    pulse_telegram_enabled: bool = False  # default OFF; toggle on from the web (persisted in DB)
 
     # Web / dashboard
     db_url: str = "sqlite:///./quanquant.db"

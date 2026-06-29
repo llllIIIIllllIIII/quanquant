@@ -22,8 +22,10 @@ from quanquant.db.models import Quote
 from quanquant.notify import TelegramNotifier, build_notify
 from quanquant.poller import QuoteEvent, QuotePoller
 from quanquant.pulse.engine import PulseEngine, run_pulse_engine
+from quanquant.pulse.prefs import load_telegram_enabled
 from quanquant.sources.registry import make_source
 from quanquant.web.routers import alerts, candles, dashboard, stats, trades
+from quanquant.web.routers import pulse as pulse_routes
 from quanquant.web.templating import STATIC_DIR
 
 log = logging.getLogger(__name__)
@@ -139,6 +141,13 @@ async def lifespan(app: FastAPI):
             telegram_level=settings.pulse_telegram_level,
             telegram_cooldown=settings.pulse_telegram_cooldown,
         )
+    if pulse is not None:
+        # Telegram on/off: persisted web toggle wins; else the config default.
+        with Session(get_engine()) as db:
+            saved = load_telegram_enabled(db, settings.symbol)
+        pulse.telegram_enabled = (
+            settings.pulse_telegram_enabled if saved is None else saved
+        )
     app.state.pulse = pulse
 
     tasks = [
@@ -192,6 +201,7 @@ def create_app() -> FastAPI:
     app.include_router(stats.router)
     app.include_router(candles.router)
     app.include_router(alerts.router)
+    app.include_router(pulse_routes.router)
     return app
 
 

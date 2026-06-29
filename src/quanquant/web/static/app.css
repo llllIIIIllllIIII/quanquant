@@ -79,6 +79,10 @@
   45% { transform: scale(1.12); }
 }
 
+/* Market Pulse Telegram toggle: green when notifications are on */
+.chart-head-actions .pulse-tg-toggle { padding: 0 0.6rem; font-size: 0.95rem; }
+.chart-head-actions .pulse-tg-toggle.active { color: var(--up); border-color: var(--up); }
+
 /* chart area: vertical drawing rail (left) + chart (right), TradingView-style */
 .chart-row { display: flex; align-items: stretch; gap: 0; margin-top: 0.4rem; }
 .draw-rail {

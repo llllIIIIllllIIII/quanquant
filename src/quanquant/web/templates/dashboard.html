@@ -22,6 +22,9 @@
       <button type="button" id="pulse-toggle" class="outline mini pulse-toggle"
               aria-pressed="false" aria-label="市場脈搏音效"
               title="市場脈搏音效：關（點擊開啟）">♥</button>
+      <button type="button" id="pulse-tg-toggle" class="outline mini pulse-tg-toggle"
+              aria-pressed="false" aria-label="Telegram 通知"
+              title="Telegram 通知：載入中…">🔔</button>
       <button type="button" class="outline mini ded-toggle" :class="{active: deductionOn}"
               @click="toggleDeduction()" :aria-pressed="deductionOn" aria-label="均線扣抵"
               :title="deductionOn ? '均線扣抵：開（點擊關閉）' : '均線扣抵：關（點擊開啟）'">▽ 扣抵</button>

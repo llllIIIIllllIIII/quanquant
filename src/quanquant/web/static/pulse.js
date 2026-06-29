@@ -29,6 +29,8 @@
   var seenLevel = 0; // last level read from the SSE
   var confirmedLevel = 0; // committed level (upgrades need 2 consecutive reads)
   var btn = null;
+  var tgBtn = null; // Telegram toggle (server-side state, not localStorage)
+  var tgEnabled = false;
 
   function now() {
     return window.performance && performance.now ? performance.now() : Date.now();
@@ -140,6 +142,42 @@
     setEnabled(!enabled);
   }
 
+  // --- Telegram toggle (server-side: Telegram is pushed by the backend) -----
+  function reflectTg() {
+    if (!tgBtn) return;
+    tgBtn.classList.toggle("active", tgEnabled);
+    tgBtn.setAttribute("aria-pressed", tgEnabled ? "true" : "false");
+    tgBtn.title = "Telegram 通知：" + (tgEnabled ? "開（點擊關閉）" : "關（點擊開啟）");
+  }
+
+  function toggleTg() {
+    var next = !tgEnabled;
+    tgBtn.disabled = true;
+    fetch("/api/pulse/telegram", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: next }),
+    })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) tgEnabled = !!d.telegramEnabled; })
+      .catch(function () {})
+      .finally(function () {
+        tgBtn.disabled = false;
+        reflectTg();
+      });
+  }
+
+  function initTg() {
+    tgBtn = document.getElementById("pulse-tg-toggle");
+    if (!tgBtn) return;
+    tgBtn.addEventListener("click", toggleTg);
+    fetch("/api/pulse/state")
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (d) { if (d) tgEnabled = !!d.telegramEnabled; })
+      .catch(function () {})
+      .finally(reflectTg);
+  }
+
   function init() {
     try {
       enabled = localStorage.getItem(STORE_KEY) === "1";
@@ -150,6 +188,7 @@
     if (btn) btn.addEventListener("click", toggle);
     document.body.addEventListener("htmx:afterSwap", onSwap);
     reflect();
+    initTg();
   }
 
   // Console QA helper: hear a level's pattern without waiting for a real burst.

@@ -63,12 +63,14 @@ class PulseEngine:
         *,
         telegram_level: int = 4,
         telegram_cooldown: float = 60.0,
+        telegram_enabled: bool = True,
         clock=time.monotonic,
     ) -> None:
         self._symbol = symbol
         self._telegram = telegram
         self._tg_level = telegram_level
         self._tg_cooldown = telegram_cooldown
+        self.telegram_enabled = telegram_enabled  # runtime toggle (web /api/pulse/telegram)
         self._clock = clock
         self._buf: deque[tuple[float, float]] = deque()
         self._prev_level = 0
@@ -116,7 +118,7 @@ class PulseEngine:
             b.popleft()
 
     def _maybe_notify(self, level, state, snapshot, price, m, now) -> None:
-        if self._telegram is None:
+        if self._telegram is None or not self.telegram_enabled:
             return
         entered = level >= self._tg_level and self._prev_level < self._tg_level
         if not entered:

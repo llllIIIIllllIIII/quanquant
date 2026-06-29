@@ -64,6 +64,15 @@ async def test_cooldown_blocks_re_entry_then_allows():
     assert len(tg.calls) == 2
 
 
+async def test_telegram_disabled_blocks_send():
+    clock, tg = Clock(), FakeTelegram()
+    eng = PulseEngine("TXF", telegram=tg, telegram_level=4, telegram_cooldown=60,
+                      telegram_enabled=False, clock=clock)
+    await _feed_burst(eng, clock, 0, n_burst=9)  # reaches Extreme...
+    assert eng.level_at()[0] == 4
+    assert tg.calls == []  # ...but the runtime toggle is off, so no push
+
+
 async def test_no_telegram_configured_never_crashes():
     clock = Clock()
     eng = PulseEngine("TXF", telegram=None, clock=clock)
