@@ -73,19 +73,22 @@
       needDefaultYAxisFigure: false,
       createPointFigures: function (params) {
         const coordinates = params.coordinates || [];
+        const bounding = params.bounding || {};
         const overlay = params.overlay || {};
         const c = coordinates[0];
         if (!c) return [];
         const ext = overlay.extendData || {};
         const color = ext.color || "#888888";
-        const w = 5, h = 7, gap = 6;
-        const top = c.y + gap;
+        const w = 5, h = 7, margin = 8;
+        // 釘在主圖底部（x 仍對齊扣抵 K 棒的時間欄），不再貼著扣抵價。
+        const baseY = (bounding.height || 0) - margin; // 三角底邊貼近主圖底部
+        const apexY = baseY - h;                       // 朝上三角的頂點
         const figures = [{
           type: "polygon",
           attrs: { coordinates: [
-            { x: c.x - w, y: top },
-            { x: c.x + w, y: top },
-            { x: c.x, y: top + h },
+            { x: c.x, y: apexY },        // 頂點朝上，指向 K 棒
+            { x: c.x - w, y: baseY },
+            { x: c.x + w, y: baseY },
           ]},
           styles: { style: "fill", color: color },
         }];
@@ -94,7 +97,8 @@
             ? Math.round(ext.deductionValue).toLocaleString() : "";
           figures.push({
             type: "text",
-            attrs: { x: c.x + w + 2, y: top, text: "MA" + ext.period + " 扣抵 " + val, baseline: "top" },
+            // 文字放在三角上方，避免被 x 軸裁切
+            attrs: { x: c.x, y: apexY - 2, text: "MA" + ext.period + " 扣抵 " + val, align: "center", baseline: "bottom" },
             styles: { color: color, size: 11, family: "inherit",
               backgroundColor: "rgba(0,0,0,0.7)",
               paddingLeft: 4, paddingRight: 4, paddingTop: 1, paddingBottom: 1 },
