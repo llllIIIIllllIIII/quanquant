@@ -521,7 +521,13 @@
     },
 
     _pointsOf(overlay) {
-      return (overlay.points || []).map((p) => ({ timestamp: p.timestamp, value: p.value }));
+      // Keep dataIndex alongside timestamp: klinecharts positions x by timestamp
+      // when present, else falls back to dataIndex. Points drawn past the last
+      // bar (the empty "future" zone) have NO timestamp — without dataIndex they
+      // recreate at convertToPixel(undefined) === NaN and the drawing breaks.
+      return (overlay.points || []).map((p) => ({
+        timestamp: p.timestamp, dataIndex: p.dataIndex, value: p.value,
+      }));
     },
 
     _registerNewOverlay(overlay) {
@@ -548,6 +554,14 @@
 
     // Which drawings are visible for the current (scope, timeframe).
     _isCrossTf(name) { return CROSS_TF_NAMES.has(name); },
+    // Every point must have an x anchor (timestamp OR dataIndex); a point with
+    // neither renders at convertToPixel(undefined) === NaN and sprawls across the
+    // whole chart. Skip such records (e.g. drawings saved by the buggy build that
+    // lost their anchor) instead of misrendering them.
+    _anchorable(rec) {
+      return (rec.points || []).length > 0 && rec.points.every(
+        (p) => Number.isFinite(p.timestamp) || Number.isFinite(p.dataIndex));
+    },
     _shouldShow(rec) {
       if (this.drawScope === "all") return true;          // show everything, everywhere
       if (this._isCrossTf(rec.name)) return true;         // horizontal price levels: all TFs
@@ -568,6 +582,7 @@
       this._selectedId = null;
       for (const rec of this.drawings) {
         if (!this._shouldShow(rec)) continue;
+        if (!this._anchorable(rec)) { console.warn("skip unanchorable drawing", rec); continue; }
         const id = this.chart.createOverlay({
           name: rec.name, groupId: GROUP_ID, points: rec.points, ...this.overlayEvents(),
         });
