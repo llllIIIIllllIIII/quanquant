@@ -95,6 +95,10 @@
     // TF only. "all": every drawing on every TF (time+price anchored). Set by
     // the Alpine layer from localStorage before init().
     drawScope: "hybrid",
+    // Master visibility switch for the whole user-drawing layer. false hides
+    // every overlay without touching the master list. Set by the Alpine layer
+    // from localStorage before init().
+    drawingsVisible: true,
     _suppressRemoveTracking: false, // true while re-rendering (ignore onRemoved)
     _drawingId: null,    // overlay currently being drawn (ESC cancels it)
     _hoverId: null,      // overlay under the cursor (Delete target)
@@ -580,6 +584,7 @@
       this._liveIds.clear();
       this._hoverId = null;
       this._selectedId = null;
+      if (!this.drawingsVisible) return; // master switch off: keep the layer wiped
       for (const rec of this.drawings) {
         if (!this._shouldShow(rec)) continue;
         if (!this._anchorable(rec)) { console.warn("skip unanchorable drawing", rec); continue; }
@@ -593,6 +598,14 @@
     setDrawScope(scope) {
       this.drawScope = scope === "all" ? "all" : "hybrid";
       localStorage.setItem("qq_draw_scope", this.drawScope);
+      this._renderDrawings();
+    },
+
+    // Show/hide the entire user-drawing layer. The master list is untouched, so
+    // toggling back on re-renders every drawing for the current TF/scope.
+    setDrawingsVisible(visible) {
+      this.drawingsVisible = !!visible;
+      localStorage.setItem("qq_draw_visible", this.drawingsVisible ? "1" : "0");
       this._renderDrawings();
     },
 
@@ -684,6 +697,7 @@
     deductionOn: false,
     deductionLegend: [],
     drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
+    drawingsVisible: true, // master show/hide switch for the whole drawing layer
     form: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     indicatorDefs: [
       { key: "ma", title: "均線 MA", hint: "疊於主圖" },
@@ -720,9 +734,11 @@
       this.session = localStorage.getItem("qq_session") || "all";
       this.deductionOn = localStorage.getItem("qq_ma_deduction") === "1";
       this.drawScope = localStorage.getItem("qq_draw_scope") || "hybrid";
+      this.drawingsVisible = localStorage.getItem("qq_draw_visible") !== "0";
       QQChart.onDeductionUpdate = (results) => { this.deductionLegend = results; };
       QQChart.deductionEnabled = this.deductionOn;
       QQChart.drawScope = this.drawScope;
+      QQChart.drawingsVisible = this.drawingsVisible;
       QQChart.init();
       this._initAlerts();
     },
@@ -827,6 +843,11 @@
     toggleDrawScope() {
       this.drawScope = this.drawScope === "hybrid" ? "all" : "hybrid";
       QQChart.setDrawScope(this.drawScope);
+    },
+
+    toggleDrawingsVisible() {
+      this.drawingsVisible = !this.drawingsVisible;
+      QQChart.setDrawingsVisible(this.drawingsVisible);
     },
     dedArrow(status) {
       return { upward: "↑", downward: "↓", flat: "→" }[status] || "—";

@@ -99,6 +99,9 @@
 }
 .rail-btn:hover { border-color: var(--pico-muted-border-color); background: rgba(255,255,255,0.04); }
 .rail-btn.danger { color: var(--down); }
+.rail-btn svg { display: block; }
+/* drawings hidden: dim the eye-off toggle so the "off" state reads at a glance */
+.draw-vis-toggle.off { color: var(--pico-muted-color); }
 
 #kchart {
   position: relative;
