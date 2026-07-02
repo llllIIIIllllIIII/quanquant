@@ -28,6 +28,12 @@
       <button type="button" class="outline mini ded-toggle" :class="{active: deductionOn}"
               @click="toggleDeduction()" :aria-pressed="deductionOn" aria-label="均線扣抵"
               :title="deductionOn ? '均線扣抵：開（點擊關閉）' : '均線扣抵：關（點擊開啟）'">▽ 扣抵</button>
+      <button type="button" class="outline mini draw-scope-toggle" @click="toggleDrawScope()"
+              :aria-pressed="drawScope === 'all'" aria-label="畫線跨時框模式"
+              :title="drawScope === 'hybrid'
+                ? '畫線跨時框：智慧混合（水平線/價格線跨所有時框，位置鎖定；趨勢線/射線/通道等只在繪製的時框顯示）。點擊改為全部時框'
+                : '畫線跨時框：全部時框顯示（所有畫線都出現在每個時框，趨勢線在較粗時框可能被壓縮）。點擊改回智慧混合'"
+              x-text="drawScope === 'hybrid' ? '跨框:智慧' : '跨框:全部'"></button>
     </div>
   </div>
 

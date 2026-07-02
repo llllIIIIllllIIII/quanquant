@@ -15,6 +15,13 @@
   const PAGE_LIMIT = 1000;
   const GROUP_ID = "user-drawings";
 
+  // Overlays whose position is defined purely by price (a single horizontal
+  // level). These translate 1:1 across timeframes — a price is grid-independent
+  // — so in "hybrid" scope they render on every timeframe. Everything else is
+  // anchored to bar timestamps/geometry and only makes sense on the timeframe
+  // it was drawn on (two 1m-apart points collapse onto one daily bar, etc.).
+  const CROSS_TF_NAMES = new Set(["horizontalStraightLine", "priceLine"]);
+
   const TFS = [
     { code: "1m", label: "1分" }, { code: "5m", label: "5分" },
     { code: "10m", label: "10分" }, { code: "15m", label: "15分" },
@@ -79,7 +86,16 @@
     loadingMore: false,
     polling: false,
     paneIds: { wr: null, bias: null, vol: null, ma: false },
-    overlays: new Map(), // id -> {name, points}
+    // Master list of ALL drawings (persisted), each: {key, name, points, tf}.
+    // `tf` = timeframe it was drawn on ("1m".."1M"), null for legacy drawings.
+    drawings: [],
+    _liveIds: new Map(),  // klinecharts overlay id -> drawing key (rendered subset)
+    _drawKey: 0,          // monotonic id generator for drawing records
+    // "hybrid": horizontal price lines on all TFs, geometric lines on their own
+    // TF only. "all": every drawing on every TF (time+price anchored). Set by
+    // the Alpine layer from localStorage before init().
+    drawScope: "hybrid",
+    _suppressRemoveTracking: false, // true while re-rendering (ignore onRemoved)
     _drawingId: null,    // overlay currently being drawn (ESC cancels it)
     _hoverId: null,      // overlay under the cursor (Delete target)
     _selectedId: null,   // overlay last clicked/selected (sticky Delete target)
@@ -310,6 +326,7 @@
       if (tf === this.tf) return;
       this.tf = tf;
       if (!this._switchFromCacheOrLoad()) await this.loadInitial();
+      this._renderDrawings(); // re-anchor overlays to the new timeframe grid
     },
 
     async setSession(mode) {
@@ -317,6 +334,7 @@
       this.session = mode;
       localStorage.setItem("qq_session", mode);
       if (!this._switchFromCacheOrLoad()) await this.loadInitial();
+      this._renderDrawings(); // data grid changed → rebuild overlays cleanly
     },
 
     // ---- indicators ----
@@ -481,14 +499,19 @@
 
     overlayEvents() {
       return {
-        onDrawEnd: (e) => { this._drawingId = null; this.trackOverlay(e.overlay); return false; },
-        onPressedMoveEnd: (e) => { this.trackOverlay(e.overlay); return false; },
+        // freshly drawn overlay → create a new record tagged with the current TF
+        onDrawEnd: (e) => { this._drawingId = null; this._registerNewOverlay(e.overlay); return false; },
+        // dragged an existing overlay → update its record's points
+        onPressedMoveEnd: (e) => { this._updateOverlayPoints(e.overlay); return false; },
         // track the cursor/click target so keyboard Delete knows what to remove
         onMouseEnter: (e) => { this._hoverId = e.overlay.id; return false; },
         onMouseLeave: (e) => { if (this._hoverId === e.overlay.id) this._hoverId = null; return false; },
         onClick: (e) => { this._selectedId = e.overlay.id; return false; },
         onRemoved: (e) => {
-          this.overlays.delete(e.overlay.id);
+          if (this._suppressRemoveTracking) return false; // re-render churn, not a user delete
+          const key = this._liveIds.get(e.overlay.id);
+          this._liveIds.delete(e.overlay.id);
+          if (key != null) this.drawings = this.drawings.filter((r) => r.key !== key);
           if (this._hoverId === e.overlay.id) this._hoverId = null;
           if (this._selectedId === e.overlay.id) this._selectedId = null;
           this.scheduleSave();
@@ -497,18 +520,65 @@
       };
     },
 
-    trackOverlay(overlay) {
+    _pointsOf(overlay) {
+      return (overlay.points || []).map((p) => ({ timestamp: p.timestamp, value: p.value }));
+    },
+
+    _registerNewOverlay(overlay) {
       if (!overlay || !overlay.points) return;
-      this.overlays.set(overlay.id, {
-        name: overlay.name,
-        points: overlay.points.map((p) => ({ timestamp: p.timestamp, value: p.value })),
-      });
+      const key = ++this._drawKey;
+      this.drawings.push({ key, name: overlay.name, points: this._pointsOf(overlay), tf: this.tf });
+      this._liveIds.set(overlay.id, key);
+      this.scheduleSave();
+    },
+
+    _updateOverlayPoints(overlay) {
+      const key = this._liveIds.get(overlay.id);
+      if (key == null) return;
+      const rec = this.drawings.find((r) => r.key === key);
+      if (!rec) return;
+      rec.points = this._pointsOf(overlay);
       this.scheduleSave();
     },
 
     draw(name) {
       // remember the id while it's being drawn so ESC can cancel it mid-draw
       this._drawingId = this.chart.createOverlay({ name, groupId: GROUP_ID, ...this.overlayEvents() });
+    },
+
+    // Which drawings are visible for the current (scope, timeframe).
+    _isCrossTf(name) { return CROSS_TF_NAMES.has(name); },
+    _shouldShow(rec) {
+      if (this.drawScope === "all") return true;          // show everything, everywhere
+      if (this._isCrossTf(rec.name)) return true;         // horizontal price levels: all TFs
+      if (rec.tf == null) return true;                    // legacy (untagged): keep visible
+      return rec.tf === this.tf;                           // geometric: native TF only
+    },
+
+    // Rebuild the on-chart overlays from the master list for the current TF/scope.
+    // Wipes the live layer first; the group-remove fires onRemoved per overlay,
+    // so guard it to avoid mutating the master list.
+    _renderDrawings() {
+      if (!this.chart) return;
+      this._suppressRemoveTracking = true;
+      this.chart.removeOverlay({ groupId: GROUP_ID });
+      this._suppressRemoveTracking = false;
+      this._liveIds.clear();
+      this._hoverId = null;
+      this._selectedId = null;
+      for (const rec of this.drawings) {
+        if (!this._shouldShow(rec)) continue;
+        const id = this.chart.createOverlay({
+          name: rec.name, groupId: GROUP_ID, points: rec.points, ...this.overlayEvents(),
+        });
+        if (typeof id === "string") this._liveIds.set(id, rec.key);
+      }
+    },
+
+    setDrawScope(scope) {
+      this.drawScope = scope === "all" ? "all" : "hybrid";
+      localStorage.setItem("qq_draw_scope", this.drawScope);
+      this._renderDrawings();
     },
 
     // TradingView-style keyboard UX: ESC cancels a half-drawn overlay (or clears
@@ -542,20 +612,25 @@
     },
 
     restoreDrawings(list) {
+      this.drawings = [];
       for (const d of list) {
         if (!d || !d.name || !Array.isArray(d.points)) continue;
-        const id = this.chart.createOverlay({
-          name: d.name, groupId: GROUP_ID, points: d.points, ...this.overlayEvents(),
+        this.drawings.push({
+          key: ++this._drawKey,
+          name: d.name,
+          points: d.points,
+          tf: typeof d.tf === "string" ? d.tf : null, // legacy records have no tf
         });
-        if (typeof id === "string") {
-          this.overlays.set(id, { name: d.name, points: d.points });
-        }
       }
+      this._renderDrawings();
     },
 
     clearDrawings() {
-      this.chart.removeOverlay({ groupId: GROUP_ID });
-      this.overlays.clear();
+      this._suppressRemoveTracking = true;
+      this.chart.removeOverlay({ groupId: GROUP_ID }); // wipe all TFs, not just visible
+      this._suppressRemoveTracking = false;
+      this.drawings = [];
+      this._liveIds.clear();
       this._hoverId = null;
       this._selectedId = null;
       this.scheduleSave();
@@ -568,11 +643,12 @@
     },
 
     async saveDrawings() {
+      const payload = this.drawings.map((r) => ({ name: r.name, points: r.points, tf: r.tf }));
       try {
         await fetch(`/api/chart/state/drawings?symbol=${SYMBOL}`, {
           method: "PUT",
           headers: { "content-type": "application/json" },
-          body: JSON.stringify([...this.overlays.values()]),
+          body: JSON.stringify(payload),
         });
       } catch (e) { /* non-fatal */ }
     },
@@ -592,6 +668,7 @@
     settingsOpen: false,
     deductionOn: false,
     deductionLegend: [],
+    drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
     form: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     indicatorDefs: [
       { key: "ma", title: "均線 MA", hint: "疊於主圖" },
@@ -627,8 +704,10 @@
     init() {
       this.session = localStorage.getItem("qq_session") || "all";
       this.deductionOn = localStorage.getItem("qq_ma_deduction") === "1";
+      this.drawScope = localStorage.getItem("qq_draw_scope") || "hybrid";
       QQChart.onDeductionUpdate = (results) => { this.deductionLegend = results; };
       QQChart.deductionEnabled = this.deductionOn;
+      QQChart.drawScope = this.drawScope;
       QQChart.init();
       this._initAlerts();
     },
@@ -728,6 +807,11 @@
       this.deductionOn = !this.deductionOn;
       localStorage.setItem("qq_ma_deduction", this.deductionOn ? "1" : "0");
       QQChart.setDeduction(this.deductionOn);
+    },
+
+    toggleDrawScope() {
+      this.drawScope = this.drawScope === "hybrid" ? "all" : "hybrid";
+      QQChart.setDrawScope(this.drawScope);
     },
     dedArrow(status) {
       return { upward: "↑", downward: "↓", flat: "→" }[status] || "—";
