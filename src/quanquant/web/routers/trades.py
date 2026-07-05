@@ -6,11 +6,12 @@ from fastapi.responses import HTMLResponse
 from pydantic import ValidationError
 from sqlmodel import Session
 
+from quanquant.db.models import User
 from quanquant.journal import repository as repo
 from quanquant.journal.pnl import unrealized_pnl
 from quanquant.journal.schemas import TradeCreate, TradeUpdate, split_tags
 from quanquant.poller import QuotePoller
-from quanquant.web.deps import get_poller, get_session, parse_date
+from quanquant.web.deps import get_current_user, get_poller, get_session, parse_date
 from quanquant.web.templating import render_partial, templates
 
 router = APIRouter()
@@ -76,6 +77,7 @@ async def journal_page(
     request: Request,
     session: Session = Depends(get_session),
     poller: QuotePoller | None = Depends(get_poller),
+    user: User = Depends(get_current_user),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
@@ -84,6 +86,7 @@ async def journal_page(
 ):
     trades = repo.list_trades(
         session,
+        user_id=user.id,
         symbol=symbol or None,
         tag=tag or None,
         date_from=parse_date(date_from),
@@ -96,8 +99,8 @@ async def journal_page(
         {
             "active": "journal",
             "rows": _rows(trades, _mark_price(poller)),
-            "symbols": repo.list_symbols(session),
-            "all_tags": repo.list_all_tags(session),
+            "symbols": repo.list_symbols(session, user_id=user.id),
+            "all_tags": repo.list_all_tags(session, user_id=user.id),
             "f": {"symbol": symbol or "", "tag": tag or "", "date_from": date_from or "",
                   "date_to": date_to or "", "status": status},
         },
@@ -108,6 +111,7 @@ async def journal_page(
 async def list_trades_fragment(
     session: Session = Depends(get_session),
     poller: QuotePoller | None = Depends(get_poller),
+    user: User = Depends(get_current_user),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
@@ -116,6 +120,7 @@ async def list_trades_fragment(
 ):
     trades = repo.list_trades(
         session,
+        user_id=user.id,
         symbol=symbol or None,
         tag=tag or None,
         date_from=parse_date(date_from),
@@ -154,43 +159,59 @@ def _form_values(t=None) -> dict:
 
 
 @router.get("/trades/new", response_class=HTMLResponse)
-async def new_trade_form(request: Request, session: Session = Depends(get_session)):
+async def new_trade_form(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
     return templates.TemplateResponse(
         request,
         "partials/trade_form.html",
-        {"v": _form_values(None), "all_tags": repo.list_all_tags(session)},
+        {"v": _form_values(None), "all_tags": repo.list_all_tags(session, user_id=user.id)},
     )
 
 
 @router.get("/trades/{trade_id}/edit", response_class=HTMLResponse)
-async def edit_trade_form(trade_id: int, request: Request, session: Session = Depends(get_session)):
-    trade = repo.get_trade(session, trade_id)
+async def edit_trade_form(
+    trade_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    trade = repo.get_trade(session, trade_id, user_id=user.id)
     if trade is None:
         return HTMLResponse("找不到交易", status_code=404)
     return templates.TemplateResponse(
         request,
         "partials/trade_form.html",
-        {"v": _form_values(trade), "all_tags": repo.list_all_tags(session)},
+        {"v": _form_values(trade), "all_tags": repo.list_all_tags(session, user_id=user.id)},
     )
 
 
 @router.post("/trades", response_class=HTMLResponse)
-async def create_trade_route(request: Request, session: Session = Depends(get_session)):
+async def create_trade_route(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
     try:
         data = TradeCreate(**await _clean_form(request))
     except (ValidationError, ValueError) as exc:
         return _form_error(str(exc))
-    repo.create_trade(session, data)
+    repo.create_trade(session, data, user_id=user.id)
     return _trigger_response(close_modal=True)
 
 
 @router.put("/trades/{trade_id}", response_class=HTMLResponse)
 async def update_trade_route(
-    trade_id: int, request: Request, session: Session = Depends(get_session)
+    trade_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
 ):
     try:
         data = TradeUpdate(**await _clean_form(request))
-        updated = repo.update_trade(session, trade_id, data)
+        updated = repo.update_trade(session, trade_id, data, user_id=user.id)
     except (ValidationError, ValueError) as exc:
         return _form_error(str(exc))
     if updated is None:
@@ -199,6 +220,10 @@ async def update_trade_route(
 
 
 @router.delete("/trades/{trade_id}", response_class=HTMLResponse)
-async def delete_trade_route(trade_id: int, session: Session = Depends(get_session)):
-    repo.delete_trade(session, trade_id)
+async def delete_trade_route(
+    trade_id: int,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    repo.delete_trade(session, trade_id, user_id=user.id)
     return _trigger_response(close_modal=False)

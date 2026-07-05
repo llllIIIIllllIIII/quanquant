@@ -24,8 +24,9 @@ def _recompute_pnl(trade: Trade) -> None:
         )
 
 
-def create_trade(session: Session, data: TradeCreate) -> Trade:
+def create_trade(session: Session, data: TradeCreate, *, user_id: int) -> Trade:
     trade = Trade(
+        user_id=user_id,
         symbol=data.symbol,
         direction=data.direction,
         entry_time=data.entry_time,
@@ -49,8 +50,15 @@ def create_trade(session: Session, data: TradeCreate) -> Trade:
     return trade
 
 
-def update_trade(session: Session, trade_id: int, data: TradeUpdate) -> Trade | None:
+def get_trade(session: Session, trade_id: int, *, user_id: int) -> Trade | None:
     trade = session.get(Trade, trade_id)
+    if trade is None or trade.user_id != user_id:
+        return None  # not found OR someone else's — identical from the caller's view
+    return trade
+
+
+def update_trade(session: Session, trade_id: int, data: TradeUpdate, *, user_id: int) -> Trade | None:
+    trade = get_trade(session, trade_id, user_id=user_id)
     if trade is None:
         return None
 
@@ -75,12 +83,8 @@ def update_trade(session: Session, trade_id: int, data: TradeUpdate) -> Trade | 
     return trade
 
 
-def get_trade(session: Session, trade_id: int) -> Trade | None:
-    return session.get(Trade, trade_id)
-
-
-def delete_trade(session: Session, trade_id: int) -> bool:
-    trade = session.get(Trade, trade_id)
+def delete_trade(session: Session, trade_id: int, *, user_id: int) -> bool:
+    trade = get_trade(session, trade_id, user_id=user_id)
     if trade is None:
         return False
     session.delete(trade)
@@ -91,13 +95,14 @@ def delete_trade(session: Session, trade_id: int) -> bool:
 def list_trades(
     session: Session,
     *,
+    user_id: int,
     symbol: str | None = None,
     tag: str | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     status: str = "all",  # "all" | "open" | "closed"
 ) -> list[Trade]:
-    stmt = select(Trade)
+    stmt = select(Trade).where(Trade.user_id == user_id)
     if symbol:
         stmt = stmt.where(Trade.symbol == symbol)
     if status == "open":
@@ -119,6 +124,7 @@ def list_trades(
 def list_for_stats(
     session: Session,
     *,
+    user_id: int,
     symbol: str | None = None,
     tag: str | None = None,
     date_from: datetime | None = None,
@@ -127,6 +133,7 @@ def list_for_stats(
     """Closed trades matching the filters, sorted by exit_time ascending."""
     trades = list_trades(
         session,
+        user_id=user_id,
         symbol=symbol,
         tag=tag,
         date_from=date_from,
@@ -136,13 +143,13 @@ def list_for_stats(
     return sorted(trades, key=lambda t: (t.exit_time or t.entry_time))
 
 
-def list_symbols(session: Session) -> list[str]:
-    rows = session.exec(select(Trade.symbol).distinct())
+def list_symbols(session: Session, *, user_id: int) -> list[str]:
+    rows = session.exec(select(Trade.symbol).where(Trade.user_id == user_id).distinct())
     return sorted(set(rows))
 
 
-def list_all_tags(session: Session) -> list[str]:
-    rows = session.exec(select(Trade.tags))
+def list_all_tags(session: Session, *, user_id: int) -> list[str]:
+    rows = session.exec(select(Trade.tags).where(Trade.user_id == user_id))
     tags: set[str] = set()
     for raw in rows:
         tags.update(split_tags(raw))

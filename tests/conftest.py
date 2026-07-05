@@ -85,11 +85,12 @@ def make_create(**overrides) -> TradeCreate:
 
 
 @pytest.fixture
-def sample_trades(session):
+def sample_trades(session, user):
     # +20000 win
     repo.create_trade(
         session,
         make_create(exit_time=dt.datetime(2026, 6, 1, 10, 0), exit_price=Decimal("18100"), tags=["突破"]),
+        user_id=user.id,
     )
     # MTX short loss: (18000-18050)*1*50 = -2500
     repo.create_trade(
@@ -98,12 +99,14 @@ def sample_trades(session):
             symbol="MTX", direction="short", point_value=Decimal("50"),
             exit_time=dt.datetime(2026, 6, 2, 10, 0), exit_price=Decimal("18050"), tags=["消息面"],
         ),
+        user_id=user.id,
     )
     # -20000 loss
     repo.create_trade(
         session,
         make_create(exit_time=dt.datetime(2026, 6, 3, 10, 0), exit_price=Decimal("17900"), tags=["突破", "均線"]),
+        user_id=user.id,
     )
     # open position
-    repo.create_trade(session, make_create(entry_time=dt.datetime(2026, 6, 4, 9, 0)))
-    return repo.list_trades(session)
+    repo.create_trade(session, make_create(entry_time=dt.datetime(2026, 6, 4, 9, 0)), user_id=user.id)
+    return repo.list_trades(session, user_id=user.id)
