@@ -1,12 +1,9 @@
 """Login/logout flow. Router protection is asserted in test_route_protection.py (Task 5)."""
 import pytest
-from fastapi.testclient import TestClient
 from sqlmodel import Session
 
 from quanquant.auth import service
 from quanquant.auth.tokens import SESSION_COOKIE
-from quanquant.web.app import create_app
-from quanquant.web.deps import get_poller, get_session
 
 
 @pytest.fixture(autouse=True)
@@ -14,18 +11,6 @@ def _fresh_lockout():
     service.clear_failures()
     yield
     service.clear_failures()
-
-
-@pytest.fixture
-def anon_client(engine):
-    def _session_override():
-        with Session(engine) as s:
-            yield s
-
-    app = create_app()
-    app.dependency_overrides[get_session] = _session_override
-    app.dependency_overrides[get_poller] = lambda: None
-    return TestClient(app)
 
 
 @pytest.fixture

@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from quanquant.auth import service as auth_service
+from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.candles import service as candle_service
 from quanquant.journal import repository as repo
 from quanquant.journal.schemas import TradeCreate
@@ -36,7 +38,16 @@ def session(engine):
 
 
 @pytest.fixture
-def client(engine):
+def user(engine):
+    """Default logged-in account for route tests. Admin so admin-only surfaces
+    (pulse toggle, /admin) work without a second fixture in most tests."""
+    with Session(engine) as s:
+        return auth_service.create_user(
+            s, "tester", "test-pw", display_name="Tester", role="admin"
+        )
+
+
+def _build_app(engine):
     def _session_override():
         with Session(engine) as s:
             yield s
@@ -44,7 +55,20 @@ def client(engine):
     app = create_app()
     app.dependency_overrides[get_session] = _session_override
     app.dependency_overrides[get_poller] = lambda: None
-    return TestClient(app)
+    return app
+
+
+@pytest.fixture
+def client(engine, user):
+    """TestClient already logged in as `user` (signed cookie, no /login round-trip)."""
+    c = TestClient(_build_app(engine))
+    c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
+    return c
+
+
+@pytest.fixture
+def anon_client(engine):
+    return TestClient(_build_app(engine))
 
 
 def make_create(**overrides) -> TradeCreate:

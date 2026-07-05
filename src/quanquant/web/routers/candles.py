@@ -1,6 +1,5 @@
 """Candle data + chart UI state API (consumed by the KLineCharts frontend)."""
 import json
-from datetime import datetime, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -10,8 +9,7 @@ from sqlmodel import Session, select
 from quanquant.candles.service import get_candles, get_latest
 from quanquant.candles.timeframes import TIMEFRAMES
 from quanquant.db.models import ChartState, _utcnow
-from quanquant.poller import QuotePoller
-from quanquant.web.deps import get_poller, get_session
+from quanquant.web.deps import get_session
 
 router = APIRouter()
 
@@ -112,13 +110,3 @@ async def put_chart_state(
     session.commit()
     return Response(status_code=204)
 
-
-# --- health ---
-
-
-@router.get("/healthz")
-async def healthz(poller: QuotePoller | None = Depends(get_poller)):
-    age: float | None = None
-    if poller is not None and poller.last is not None:
-        age = (datetime.now(timezone.utc) - poller.last.fetched_at).total_seconds()
-    return JSONResponse({"status": "ok", "last_quote_age_s": age})
