@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     pulse_telegram_enabled: bool = False  # default OFF; toggle on from the web (persisted in DB)
 
     # Web / dashboard
+    # Account system — signs the session cookie. MUST be set in production
+    # (.env on the VM); unset → a transient per-process key (dev only).
+    session_secret: str = ""
     db_url: str = "sqlite:///./quanquant.db"
     host: str = "127.0.0.1"
     port: int = 8000
