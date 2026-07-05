@@ -97,3 +97,32 @@ def test_chart_state_upsert_per_user(client, client_b):
     client_b.put("/api/chart/state/drawings", json=[{"type": "rect"}])
     assert client.get("/api/chart/state").json()["drawings"] == [{"type": "line"}]
     assert client_b.get("/api/chart/state").json()["drawings"] == [{"type": "rect"}]
+
+
+_ALERT_BODY = {
+    "symbol": "TXF", "timeframe": "5m", "left_kind": "price",
+    "op": "gte", "right_kind": "const", "right_value": "18000",
+}
+
+
+def test_alerts_isolated(client, client_b):
+    client.post("/api/alerts", json=_ALERT_BODY)
+    assert len(client.get("/api/alerts").json()) == 1
+    assert len(client_b.get("/api/alerts").json()) == 0
+
+
+def test_others_alert_404(client, client_b):
+    aid = client.post("/api/alerts", json=_ALERT_BODY).json()["id"]
+    assert client_b.patch(f"/api/alerts/{aid}", json={"enabled": False}).status_code == 404
+    assert client_b.delete(f"/api/alerts/{aid}").status_code == 404
+    assert client.get("/api/alerts").json()[0]["enabled"] is True  # owner unaffected
+
+
+def test_alert_events_scoped(client, client_b, session):
+    from quanquant.db.models import AlertEvent
+
+    aid = client.post("/api/alerts", json=_ALERT_BODY).json()["id"]
+    session.add(AlertEvent(alert_id=aid, bar_ts=0, message="fired"))
+    session.commit()
+    assert len(client.get("/api/alerts/events").json()) == 1
+    assert len(client_b.get("/api/alerts/events").json()) == 0
