@@ -25,6 +25,7 @@ from quanquant.pulse.engine import PulseEngine, run_pulse_engine
 from quanquant.pulse.prefs import load_telegram_enabled
 from quanquant.sources.registry import make_source
 from quanquant.web.routers import alerts, candles, dashboard, stats, trades
+from quanquant.web.routers import auth as auth_routes
 from quanquant.web.routers import pulse as pulse_routes
 from quanquant.web.templating import STATIC_DIR
 
@@ -196,6 +197,7 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="QuanQuant", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    app.include_router(auth_routes.router)  # public: /login, /logout
     app.include_router(dashboard.router)
     app.include_router(trades.router)
     app.include_router(stats.router)
