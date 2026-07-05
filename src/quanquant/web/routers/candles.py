@@ -8,8 +8,8 @@ from sqlmodel import Session, select
 
 from quanquant.candles.service import get_candles, get_latest
 from quanquant.candles.timeframes import TIMEFRAMES
-from quanquant.db.models import ChartState, _utcnow
-from quanquant.web.deps import get_session
+from quanquant.db.models import User, UserChartState, _utcnow
+from quanquant.web.deps import get_current_user, get_session
 
 router = APIRouter()
 
@@ -61,8 +61,12 @@ def candles_latest(
 # --- chart UI state (indicator configs + drawings) ---
 
 
-def _get_state(session: Session, symbol: str, kind: str) -> dict | list | None:
-    stmt = select(ChartState).where(ChartState.symbol == symbol, ChartState.kind == kind)
+def _get_state(session: Session, user_id: int, symbol: str, kind: str) -> dict | list | None:
+    stmt = select(UserChartState).where(
+        UserChartState.user_id == user_id,
+        UserChartState.symbol == symbol,
+        UserChartState.kind == kind,
+    )
     row = session.exec(stmt).first()
     if row is None:
         return None
@@ -73,11 +77,15 @@ def _get_state(session: Session, symbol: str, kind: str) -> dict | list | None:
 
 
 @router.get("/api/chart/state")
-def chart_state(session: Session = Depends(get_session), symbol: str = Query("TXF")):
+def chart_state(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    symbol: str = Query("TXF"),
+):
     return JSONResponse(
         {
-            "indicators": _get_state(session, symbol, "indicators"),
-            "drawings": _get_state(session, symbol, "drawings"),
+            "indicators": _get_state(session, user.id, symbol, "indicators"),
+            "drawings": _get_state(session, user.id, symbol, "drawings"),
         }
     )
 
@@ -87,6 +95,7 @@ async def put_chart_state(
     kind: str,
     request: Request,
     session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
     symbol: str = Query("TXF"),
 ):
     if kind not in _STATE_KINDS:
@@ -99,10 +108,14 @@ async def put_chart_state(
     except json.JSONDecodeError:
         raise HTTPException(status_code=422, detail="payload must be valid JSON") from None
 
-    stmt = select(ChartState).where(ChartState.symbol == symbol, ChartState.kind == kind)
+    stmt = select(UserChartState).where(
+        UserChartState.user_id == user.id,
+        UserChartState.symbol == symbol,
+        UserChartState.kind == kind,
+    )
     row = session.exec(stmt).first()
     if row is None:
-        row = ChartState(symbol=symbol, kind=kind, payload=body.decode("utf-8"))
+        row = UserChartState(user_id=user.id, symbol=symbol, kind=kind, payload=body.decode("utf-8"))
     else:
         row.payload = body.decode("utf-8")
         row.updated_at = _utcnow()

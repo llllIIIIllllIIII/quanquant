@@ -84,3 +84,16 @@ def test_stats_only_own(client, client_b, session, user, user_b):
     # Verify user B (no trades) sees zero trades, user A sees their trade
     assert own["overall"]["count"] == 1
     assert other["overall"]["count"] == 0
+
+
+def test_chart_state_isolated(client, client_b):
+    client.put("/api/chart/state/indicators", json={"ma": [5, 10]})
+    assert client.get("/api/chart/state").json()["indicators"] == {"ma": [5, 10]}
+    assert client_b.get("/api/chart/state").json()["indicators"] is None
+
+
+def test_chart_state_upsert_per_user(client, client_b):
+    client.put("/api/chart/state/drawings", json=[{"type": "line"}])
+    client_b.put("/api/chart/state/drawings", json=[{"type": "rect"}])
+    assert client.get("/api/chart/state").json()["drawings"] == [{"type": "line"}]
+    assert client_b.get("/api/chart/state").json()["drawings"] == [{"type": "rect"}]
