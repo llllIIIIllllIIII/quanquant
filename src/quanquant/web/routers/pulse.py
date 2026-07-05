@@ -9,9 +9,10 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from quanquant.config import get_settings
+from quanquant.db.models import User
 from quanquant.pulse import prefs
 from quanquant.pulse.engine import PulseEngine
-from quanquant.web.deps import get_pulse, get_session
+from quanquant.web.deps import get_pulse, get_session, require_admin
 
 router = APIRouter()
 
@@ -30,6 +31,7 @@ def set_pulse_telegram(
     body: TelegramToggle,
     session: Session = Depends(get_session),
     pulse: PulseEngine | None = Depends(get_pulse),
+    _: User = Depends(require_admin),
 ) -> dict:
     prefs.save_telegram_enabled(session, get_settings().symbol, body.enabled)
     if pulse is not None:

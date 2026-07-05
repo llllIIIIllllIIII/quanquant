@@ -63,7 +63,7 @@ def test_journal_page_shows_only_own(client, client_b, session, user, user_b):
 
 def test_cannot_delete_others_trade_via_route(client_b, session, user):
     t = _trade(session, user.id)
-    client_b.delete(f"/trades/{t.id}")
+    assert client_b.delete(f"/trades/{t.id}").status_code == 404
     assert repo.get_trade(session, t.id, user_id=user.id) is not None
 
 

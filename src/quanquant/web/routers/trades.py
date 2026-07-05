@@ -1,7 +1,7 @@
 """Trade journal: page, table fragment (filtered), and CRUD (HTMX-first)."""
 from decimal import Decimal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from pydantic import ValidationError
 from sqlmodel import Session
@@ -225,5 +225,7 @@ async def delete_trade_route(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    repo.delete_trade(session, trade_id, user_id=user.id)
+    deleted = repo.delete_trade(session, trade_id, user_id=user.id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="trade not found")
     return _trigger_response(close_modal=False)
