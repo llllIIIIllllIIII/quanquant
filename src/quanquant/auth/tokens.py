@@ -44,4 +44,6 @@ def load_session(value: str) -> dict | None:
         return None
     if not isinstance(data, dict) or "uid" not in data or "tv" not in data:
         return None
+    if not isinstance(data["uid"], int) or not isinstance(data["tv"], int):
+        return None
     return data

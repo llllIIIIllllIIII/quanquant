@@ -14,6 +14,10 @@ def test_verify_garbage_hash_is_false():
     assert not verify_password("pw", "not-a-bcrypt-hash")
 
 
+def test_verify_non_ascii_hash_is_false():
+    assert not verify_password("pw", "не-bcrypt-хэш")  # non-ASCII must not raise
+
+
 def test_session_roundtrip():
     token = sign_session(42, 3)
     data = load_session(token)
