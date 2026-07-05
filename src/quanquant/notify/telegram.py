@@ -31,6 +31,10 @@ def format_alert(n: Notification) -> str:
     lines = [
         "🔔 QuanQuant 警示觸發",
         "",
+    ]
+    if n.owner_name:
+        lines.append(f"👤 擁有者：{n.owner_name}")
+    lines += [
         f"📊 商品：{n.symbol}",
         f"🕐 週期：{n.tf_label}",
         f"🎯 條件：{n.condition}",

@@ -18,7 +18,7 @@ from quanquant.config import get_settings
 from quanquant.candles.service import get_candles
 from quanquant.candles.timeframes import TIMEFRAMES
 from quanquant.db.engine import get_engine
-from quanquant.db.models import Alert, AlertEvent, _utcnow
+from quanquant.db.models import Alert, AlertEvent, User, _utcnow
 from quanquant.indicators import value_at
 from quanquant.notify.base import Notification
 
@@ -135,6 +135,13 @@ def _evaluate_sync(symbol: str, last_evaluated: dict[tuple[str, str], int]) -> l
         alerts = list(db.exec(select(Alert).where(Alert.symbol == symbol, Alert.enabled)))
         if not alerts:
             return out
+        owner_ids = {a.user_id for a in alerts if a.user_id is not None}
+        owners: dict[int, str] = {}
+        if owner_ids:
+            owners = {
+                u.id: u.display_name
+                for u in db.exec(select(User).where(User.id.in_(owner_ids)))  # type: ignore[union-attr]
+            }
         now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
 
         for tf in {a.timeframe for a in alerts}:
@@ -161,6 +168,8 @@ def _evaluate_sync(symbol: str, last_evaluated: dict[tuple[str, str], int]) -> l
                         left_value=res.left_value, right_value=res.right_value,
                         right_is_indicator=(alert.right_kind == "indicator"),
                         alert_id=alert.id or 0, bar_ts=closed_ts, body=res.message,
+                        user_id=alert.user_id,
+                        owner_name=owners.get(alert.user_id) if alert.user_id else None,
                     ))
         db.commit()
     return out

@@ -15,6 +15,8 @@ class Notification:
     alert_id: int
     bar_ts: int             # closed bar epoch ms UTC
     body: str               # compact one-line summary (browser toast / DB log)
+    user_id: int | None = None      # alert owner (None = system-wide, broadcast)
+    owner_name: str | None = None   # display name for the shared Telegram chat
 
 
 class Notifier(Protocol):

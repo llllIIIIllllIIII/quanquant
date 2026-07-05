@@ -152,11 +152,11 @@ def list_events(
 
 
 @router.get("/alerts/stream")
-async def alerts_stream(request: Request):
+async def alerts_stream(request: Request, user: User = Depends(get_current_user)):
     notify = getattr(request.app.state, "notify", None)
     if notify is None:
         return EventSourceResponse(iter(()))
-    queue = notify.browser.subscribe()
+    queue = notify.browser.subscribe(user_id=user.id)
 
     async def event_generator():
         try:

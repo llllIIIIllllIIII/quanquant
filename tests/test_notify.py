@@ -48,3 +48,41 @@ async def test_telegram_sends_when_configured():
     body = json.loads(route.calls.last.request.content)
     assert body["chat_id"] == "CHAT"
     assert "TXF" in body["text"]
+
+
+from quanquant.notify.telegram import format_alert  # noqa: E402
+
+
+def _owned_n(user_id=None, owner_name=None) -> Notification:
+    return Notification(
+        symbol="TXF", timeframe="5m", tf_label="5分", condition="收盤 ≥ 18000",
+        left_value=18001.0, right_value=18000.0, right_is_indicator=False,
+        alert_id=1, bar_ts=0, body="TXF 5m 收盤 ≥ 18000（18001.0）",
+        user_id=user_id, owner_name=owner_name,
+    )
+
+
+async def test_browser_routes_to_owner_only():
+    notifier = BrowserNotifier()
+    q_owner = notifier.subscribe(user_id=1)
+    q_other = notifier.subscribe(user_id=2)
+    await notifier.send(_owned_n(user_id=1))
+    assert q_owner.qsize() == 1
+    assert q_other.qsize() == 0
+
+
+async def test_browser_ownerless_notification_broadcasts():
+    notifier = BrowserNotifier()
+    q1 = notifier.subscribe(user_id=1)
+    q2 = notifier.subscribe(user_id=2)
+    await notifier.send(_owned_n(user_id=None))
+    assert q1.qsize() == 1 and q2.qsize() == 1
+
+
+def test_telegram_message_names_owner():
+    text = format_alert(_owned_n(user_id=1, owner_name="Henry"))
+    assert "👤 擁有者：Henry" in text
+
+
+def test_telegram_message_without_owner_unchanged():
+    assert "👤" not in format_alert(_owned_n())
