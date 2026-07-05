@@ -112,8 +112,8 @@ git commit → git push → ./scripts/deploy.sh
 
 ## 9. 機密與權限配置
 
-- VM `~/quanquant/.env`：`POSTGRES_PASSWORD`、`FINMIND_TOKEN`、`DOMAIN`（chmod 600，不進 git）
-- basic-auth 密碼：bcrypt hash 存於 Caddyfile；旋轉：`docker run --rm caddy:2 caddy hash-password` → commit → deploy
+- VM `~/quanquant/.env`：`POSTGRES_PASSWORD`、`FINMIND_TOKEN`、`DOMAIN`、`SESSION_SECRET`（chmod 600，不進 git）
+- 認證：帳戶系統上線後改為 app 層 session 登入，`SESSION_SECRET` 簽章 cookie（`openssl rand -base64 32` 產生，輪替即讓所有人重新登入）；Caddy `basic_auth` 於 cutover 第 5 步移除（見下方「帳戶系統部署」）
 - VM 服務帳戶 scopes：`storage-rw`（備份上傳，bucket 已授 `objectAdmin`）、`logging-write`、`monitoring-write`
 - GitHub deploy key：唯讀，僅供 VM pull
 
