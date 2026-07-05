@@ -58,6 +58,7 @@ def test_journal_page_shows_only_own(client, client_b, session, user, user_b):
     assert "11,111" in client.get("/journal").text
     assert "22,222" not in client.get("/journal").text
     assert "11,111" not in client_b.get("/journal").text
+    assert "22,222" in client_b.get("/journal").text
 
 
 def test_cannot_delete_others_trade_via_route(client_b, session, user):
@@ -80,3 +81,6 @@ def test_stats_only_own(client, client_b, session, user, user_b):
     other = client_b.get("/stats/data").json()
     # 鍵名以 quanquant/stats/metrics.py compute_stats 實際回傳為準（實作前先讀該檔確認）
     assert own != other
+    # Verify user B (no trades) sees zero trades, user A sees their trade
+    assert own["overall"]["count"] == 1
+    assert other["overall"]["count"] == 0
