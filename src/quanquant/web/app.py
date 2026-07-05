@@ -26,6 +26,7 @@ from quanquant.pulse.prefs import load_telegram_enabled
 from quanquant.sources.registry import make_source
 from quanquant.web.deps import get_current_user
 from quanquant.web.routers import alerts, candles, dashboard, health, stats, trades
+from quanquant.web.routers import admin as admin_routes
 from quanquant.web.routers import auth as auth_routes
 from quanquant.web.routers import pulse as pulse_routes
 from quanquant.web.templating import STATIC_DIR
@@ -209,6 +210,7 @@ def create_app() -> FastAPI:
     app.include_router(candles.router, dependencies=protected)
     app.include_router(alerts.router, dependencies=protected)
     app.include_router(pulse_routes.router, dependencies=protected)
+    app.include_router(admin_routes.router)   # self-guarded: require_admin
     return app
 
 

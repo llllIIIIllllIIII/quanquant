@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>使用者管理</h2>
+{% if error %}<p style="color: var(--pico-color-red-500);">{{ error }}</p>{% endif %}
+
+<table>
+  <thead>
+    <tr><th>帳號</th><th>顯示名稱</th><th>角色</th><th>狀態</th><th>建立時間</th><th>操作</th></tr>
+  </thead>
+  <tbody>
+  {% for u in users %}
+    <tr>
+      <td>{{ u.username }}</td>
+      <td>{{ u.display_name }}</td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}/role" style="display:inline">
+          <select name="role" onchange="this.form.submit()">
+            <option value="user" {% if u.role == 'user' %}selected{% endif %}>user</option>
+            <option value="admin" {% if u.role == 'admin' %}selected{% endif %}>admin</option>
+          </select>
+        </form>
+      </td>
+      <td>{{ '啟用' if u.is_active else '停用' }}</td>
+      <td>{{ u.created_at | dt }}</td>
+      <td>
+        <form method="post" action="/admin/users/{{ u.id }}/toggle-active" style="display:inline">
+          <button class="secondary" type="submit">{{ '停用' if u.is_active else '啟用' }}</button>
+        </form>
+        <form method="post" action="/admin/users/{{ u.id }}/reset-password" style="display:inline">
+          <input type="password" name="password" placeholder="新密碼" required style="width:8rem">
+          <button class="secondary" type="submit">重設密碼</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<h3>建立帳號</h3>
+<form method="post" action="/admin/users">
+  <div class="grid">
+    <input type="text" name="username" placeholder="帳號" required>
+    <input type="text" name="display_name" placeholder="顯示名稱">
+    <input type="password" name="password" placeholder="初始密碼" required>
+    <select name="role"><option value="user">user</option><option value="admin">admin</option></select>
+  </div>
+  <button type="submit">建立</button>
+</form>
+{% endblock %}
