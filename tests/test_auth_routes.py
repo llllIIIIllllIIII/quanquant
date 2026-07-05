@@ -47,3 +47,23 @@ def test_logout_clears_cookie(anon_client, henry):
     assert r.status_code == 303
     assert r.headers["location"] == "/login"
     assert anon_client.cookies.get(SESSION_COOKIE) is None
+
+
+def test_change_password_flow(client):
+    # wrong old password → error page
+    r = client.post("/account/password",
+                    data={"old_password": "WRONG", "new_password": "brand-new"})
+    assert "舊密碼錯誤" in r.text
+
+    r = client.post("/account/password",
+                    data={"old_password": "test-pw", "new_password": "brand-new"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    # a fresh cookie was issued for this device — protected pages still work
+    assert client.get("/journal").status_code == 200
+
+
+def test_navbar_shows_user_menu(client):
+    body = client.get("/").text
+    assert "Tester" in body           # display_name
+    assert "/logout" in body

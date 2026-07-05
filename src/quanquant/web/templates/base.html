@@ -19,6 +19,20 @@
       <li><a href="/" {% if active == 'dashboard' %}class="active"{% endif %}>儀表板</a></li>
       <li><a href="/journal" {% if active == 'journal' %}class="active"{% endif %}>交易日記</a></li>
       <li><a href="/stats" {% if active == 'stats' %}class="active"{% endif %}>績效統計</a></li>
+      {% set u = request.state.user if request.state.user is defined else None %}
+      {% if u %}
+      <li>
+        <details class="dropdown">
+          <summary>{{ u.display_name }}</summary>
+          <ul dir="rtl">
+            {% if u.role == 'admin' %}<li><a href="/admin/users">使用者管理</a></li>{% endif %}
+            <li><a href="/account">帳戶設定</a></li>
+            <li><a href="#" onclick="document.getElementById('logout-form').submit(); return false;">登出</a></li>
+          </ul>
+        </details>
+        <form id="logout-form" method="post" action="/logout" hidden></form>
+      </li>
+      {% endif %}
     </ul>
   </nav>
   <main class="container">

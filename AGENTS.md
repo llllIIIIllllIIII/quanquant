@@ -9,6 +9,7 @@ uv sync --extra dev          # 安裝（含測試工具）
 uv run pytest                # 測試（79+，必須全綠才可部署）
 uv run quanquant-web         # 本機開發 → http://127.0.0.1:8000
 uv run quanquant-backfill daily|minute   # 歷史回補（FinMind）
+uv run quanquant-user bootstrap|create|reset-password|list   # 帳戶管理（首次部署先 bootstrap）
 ```
 
 ## 部署（重要：沒有自動 CI/CD）

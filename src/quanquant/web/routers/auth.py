@@ -7,7 +7,7 @@ from sqlmodel import Session
 from quanquant.auth import service
 from quanquant.auth.tokens import MAX_AGE_SECONDS, SESSION_COOKIE, sign_session
 from quanquant.db.models import User
-from quanquant.web.deps import get_session
+from quanquant.web.deps import get_current_user, get_session
 from quanquant.web.templating import templates
 
 router = APIRouter()
@@ -52,4 +52,29 @@ def login(
 def logout():
     response = RedirectResponse("/login", status_code=303)
     response.delete_cookie(SESSION_COOKIE)
+    return response
+
+
+@router.get("/account", response_class=HTMLResponse)
+def account_page(request: Request, user: User = Depends(get_current_user)):
+    return templates.TemplateResponse(
+        request, "account.html", {"active": "account", "error": None}
+    )
+
+
+@router.post("/account/password")
+def change_password(
+    request: Request,
+    old_password: str = Form(...),
+    new_password: str = Form(...),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    if not service.change_password(session, user, old_password, new_password):
+        return templates.TemplateResponse(
+            request, "account.html", {"active": "account", "error": "舊密碼錯誤"}
+        )
+    # token_version was bumped — re-issue THIS device's cookie; other devices log out
+    response = RedirectResponse("/", status_code=303)
+    set_session_cookie(response, request, user)
     return response

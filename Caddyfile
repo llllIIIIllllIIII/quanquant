@@ -1,15 +1,6 @@
 # DOMAIN comes from the environment (compose). Unset → https://localhost (internal CA).
 # Domain swap later = change DOMAIN in .env and `docker compose up -d caddy`.
+# Auth is app-level (session login) since the account system — no basic_auth here.
 {$DOMAIN:localhost} {
-	# /healthz stays unauthenticated so the GCP uptime check needs no credentials.
-	@health path /healthz
-	handle @health {
-		reverse_proxy app:8000
-	}
-	handle {
-		basic_auth {
-			quant $2a$14$Nc/oW//4ZApSqF0ZPyMLJ.HMn62JbI3xQk5UVGpZISeMTGEcJMIbm
-		}
-		reverse_proxy app:8000
-	}
+	reverse_proxy app:8000
 }

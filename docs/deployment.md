@@ -116,3 +116,18 @@ git commit → git push → ./scripts/deploy.sh
 - basic-auth 密碼：bcrypt hash 存於 Caddyfile；旋轉：`docker run --rm caddy:2 caddy hash-password` → commit → deploy
 - VM 服務帳戶 scopes：`storage-rw`（備份上傳，bucket 已授 `objectAdmin`）、`logging-write`、`monitoring-write`
 - GitHub deploy key：唯讀，僅供 VM pull
+
+## 帳戶系統部署（首次啟用）
+
+依序執行：
+
+1. VM 的 `.env` 加 `SESSION_SECRET`（`openssl rand -base64 32` 產生）。
+2. 照固定三步部署 app：`git commit → git push → ./scripts/deploy.sh`。
+3. VM 上建第一個 admin 並認領舊資料：
+   `docker compose exec app quanquant-user bootstrap <帳號>`（互動輸入密碼）。
+4. 瀏覽器登入驗證（此時 Caddy basic_auth 與 app 登入並存，安全無虞）。
+5. 確認可登入後部署移除 basic_auth 的 Caddyfile：`docker compose up -d caddy`。
+
+日常帳號管理：Web `/admin/users`（admin），或 SSH 備援
+`docker compose exec app quanquant-user create|reset-password|list`。
+密碼重設會 bump token_version，所有裝置立即登出。
