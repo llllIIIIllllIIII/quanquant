@@ -39,10 +39,13 @@ def get_engine():
 
 
 def init_db() -> None:
-    """Create all tables. Importing models registers them on SQLModel.metadata."""
+    """Create all tables, then apply lightweight column migrations."""
     from quanquant.db import models  # noqa: F401
+    from quanquant.db.migrate import ensure_columns
 
-    SQLModel.metadata.create_all(get_engine())
+    engine = get_engine()
+    SQLModel.metadata.create_all(engine)
+    ensure_columns(engine)
 
 
 def get_session() -> Iterator[Session]:

@@ -55,6 +55,7 @@ class Trade(SQLModel, table=True):
     note: str | None = None                               # 備註
     tags: str | None = None                               # 標籤 (逗號連接, e.g. "突破,均線")
 
+    user_id: int | None = Field(default=None, index=True)  # 擁有者（帳戶系統後必填）
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -132,6 +133,7 @@ class Alert(SQLModel, table=True):
     armed: bool = True                                    # gte/lte dedup state
     last_triggered_at: datetime | None = None
     last_triggered_bar_ts: int | None = Field(default=None, sa_column=Column(BigInteger))
+    user_id: int | None = Field(default=None, index=True)  # 擁有者（帳戶系統後必填）
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -148,3 +150,36 @@ class AlertEvent(SQLModel, table=True):
     message: str
     left_value: Decimal | None = Field(default=None, sa_column=Column(DecimalText))
     right_value: Decimal | None = Field(default=None, sa_column=Column(DecimalText))
+
+
+class User(SQLModel, table=True):
+    """Account for app-level auth. Deactivation replaces deletion (data ownership)."""
+
+    __tablename__ = "users"
+
+    id: int | None = Field(default=None, primary_key=True)
+    username: str = Field(unique=True, index=True)        # 登入帳號
+    display_name: str                                     # 顯示名稱（navbar、通知）
+    password_hash: str                                    # bcrypt
+    role: str = "user"                                    # "admin" | "user"
+    is_active: bool = True
+    token_version: int = 0                                # bump → 所有舊 cookie 失效
+    telegram_chat_id: str | None = None                   # 第二階段深度連結綁定用
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class UserChartState(SQLModel, table=True):
+    """Per-user chart UI state (indicators/drawings). The old chart_states table
+    stays as the system-level KV store (e.g. kind="pulse") — see the design spec
+    for why we don't ALTER its (symbol, kind) unique constraint."""
+
+    __tablename__ = "user_chart_states"
+    __table_args__ = (UniqueConstraint("user_id", "symbol", "kind"),)
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True)
+    symbol: str = Field(index=True)
+    kind: str                                             # "indicators" | "drawings"
+    payload: str                                          # JSON TEXT
+    updated_at: datetime = Field(default_factory=_utcnow)
