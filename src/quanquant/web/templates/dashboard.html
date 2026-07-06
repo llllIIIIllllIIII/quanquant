@@ -224,7 +224,7 @@
 </section>
 
 <script src="https://unpkg.com/klinecharts@9.8.12/dist/umd/klinecharts.min.js"></script>
-<script>window.QQ_SYMBOL = "{{ symbol }}"; window.QQ_COLOR_SCHEME = "{{ color_scheme }}";</script>
+<script>window.QQ_SYMBOL = "{{ symbol }}"; window.QQ_COLOR_SCHEME = {{ color_scheme | tojson }};</script>
 <script src="/static/ma_deduction.js"></script>
 <script src="/static/chart.js"></script>
 <script src="/static/pulse.js"></script>
