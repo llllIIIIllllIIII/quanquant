@@ -56,7 +56,7 @@ html[data-theme="dark"], html[data-theme="light"] {
 body { font-family: var(--pico-font-family); }
 
 /* data numerals: prices, stats, table number cells */
-.num, .quote .price, .quote .chg, .cards .big, .numcell {
+.num, .quote .price, .cards .big, .numcell {
   font-family: var(--qq-font-mono);
   font-variant-numeric: tabular-nums;
 }

@@ -302,7 +302,6 @@ a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
 
 /* 均線扣抵 */
 [x-cloak] { display: none !important; }
-.ded-toggle.active { color: #f0b90b; border-color: #f0b90b; }
 .ded-legend {
   display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
   margin: 4px 0 2px; font-variant-numeric: tabular-nums;
