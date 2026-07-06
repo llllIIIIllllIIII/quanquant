@@ -753,6 +753,7 @@
     ],
     settingsOpen: false,
     moreOpen: false,
+    fullscreen: false,
     deductionOn: false,
     deductionLegend: [],
     drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
@@ -802,6 +803,9 @@
       QQChart.colorScheme = this.colorScheme;
       QQChart.init();
       this._initAlerts();
+      window.addEventListener("keydown", (e) => {
+        if (e.key === "Escape" && this.fullscreen) this.toggleFullscreen();
+      });
     },
 
     _initAlerts() {
@@ -909,6 +913,13 @@
     toggleDrawingsVisible() {
       this.drawingsVisible = !this.drawingsVisible;
       QQChart.setDrawingsVisible(this.drawingsVisible);
+    },
+
+    toggleFullscreen() {
+      this.fullscreen = !this.fullscreen;
+      document.body.classList.toggle("chart-fullscreen", this.fullscreen);
+      // relayout after the CSS takes effect
+      requestAnimationFrame(() => { if (QQChart.chart) QQChart.chart.resize(); });
     },
 
     toggleColorScheme() {

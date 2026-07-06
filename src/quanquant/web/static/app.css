@@ -191,7 +191,7 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
   position: relative;
   flex: 1 1 auto;
   min-width: 0;
-  height: 680px;
+  height: clamp(420px, calc(100vh - 320px), 760px);
   border: 1px solid var(--pico-muted-border-color);
   border-radius: 0 0.5rem 0.5rem 0;
   overflow: hidden;
@@ -305,3 +305,9 @@ a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
   font-size: 12px; font-weight: 600;
 }
 .ded-chip .ded-arrow { font-weight: 700; }
+
+/* ---- chart fullscreen mode ---- */
+body.chart-fullscreen .topnav,
+body.chart-fullscreen .quote-panel { display: none; }
+body.chart-fullscreen main.container { max-width: none; padding: 0.5rem 0.75rem; }
+body.chart-fullscreen #kchart { height: calc(100vh - 130px); }
