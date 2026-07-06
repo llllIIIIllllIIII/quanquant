@@ -1,28 +1,35 @@
 {% extends "base.html" %}
 {% block content %}
 <h2>帳戶設定</h2>
-{% if error %}<p style="color: var(--pico-color-red-500);">{{ error }}</p>{% endif %}
-<form method="post" action="/account/password" style="max-width: 24rem;">
-  <label>舊密碼
-    <input type="password" name="old_password" autocomplete="current-password" required>
-  </label>
-  <label>新密碼
-    <input type="password" name="new_password" autocomplete="new-password" required>
-  </label>
-  <button type="submit">修改密碼（其他裝置將被登出）</button>
-</form>
-<h3>K 線配色</h3>
-<form method="post" action="/account/color-scheme" style="max-width: 24rem;">
-  <fieldset>
-    <label>
-      <input type="radio" name="scheme" value="green_up" {% if color_scheme == 'green_up' %}checked{% endif %}>
-      綠漲紅跌（歐美慣例）
-    </label>
-    <label>
-      <input type="radio" name="scheme" value="red_up" {% if color_scheme == 'red_up' %}checked{% endif %}>
-      紅漲綠跌（台灣慣例）
-    </label>
-  </fieldset>
-  <button type="submit">儲存配色</button>
-</form>
+<div class="settings-grid">
+  <article class="settings-card">
+    <h3>修改密碼</h3>
+    {% if error %}<p class="field-error">{{ error }}</p>{% endif %}
+    <form method="post" action="/account/password">
+      <label>舊密碼
+        <input type="password" name="old_password" autocomplete="current-password" required>
+      </label>
+      <label>新密碼
+        <input type="password" name="new_password" autocomplete="new-password" required>
+      </label>
+      <button type="submit">修改密碼（其他裝置將被登出）</button>
+    </form>
+  </article>
+  <article class="settings-card">
+    <h3>K 線配色</h3>
+    <form method="post" action="/account/color-scheme">
+      <fieldset>
+        <label>
+          <input type="radio" name="scheme" value="green_up" {% if color_scheme == 'green_up' %}checked{% endif %}>
+          綠漲紅跌（歐美慣例）
+        </label>
+        <label>
+          <input type="radio" name="scheme" value="red_up" {% if color_scheme == 'red_up' %}checked{% endif %}>
+          紅漲綠跌（台灣慣例）
+        </label>
+      </fieldset>
+      <button type="submit">儲存配色</button>
+    </form>
+  </article>
+</div>
 {% endblock %}

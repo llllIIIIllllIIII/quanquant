@@ -16,16 +16,31 @@
     if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
   </script>
 </head>
-<body>
-  <main class="container" style="max-width: 24rem; padding-top: 8vh;">
-    <h1>QuanQuant</h1>
-    {% if error %}<p style="color: var(--pico-color-red-500);">{{ error }}</p>{% endif %}
+<body class="login-body">
+  <main class="login-card">
+    <div class="brand login-brand">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M8 6v12M8 9h-3v6h3M16 4v16M16 7h3v8h-3"/>
+      </svg>
+      <strong>QuanQuant</strong>
+    </div>
     <form method="post" action="/login">
+      {% if error %}<p class="field-error">{{ error }}</p>{% endif %}
       <label>帳號
         <input type="text" name="username" autocomplete="username" required autofocus>
       </label>
       <label>密碼
-        <input type="password" name="password" autocomplete="current-password" required>
+        <div class="pw-wrap">
+          <input type="password" name="password" id="login-pw" autocomplete="current-password" required>
+          <button type="button" class="pw-toggle" aria-label="顯示/隱藏密碼"
+                  onclick="var i=document.getElementById('login-pw'); i.type = i.type==='password'?'text':'password';">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z"/><circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+        </div>
       </label>
       <button type="submit">登入</button>
     </form>

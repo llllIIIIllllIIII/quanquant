@@ -319,3 +319,27 @@ body.chart-fullscreen .topnav,
 body.chart-fullscreen .quote-panel { display: none; }
 body.chart-fullscreen main.container { max-width: none; padding: 0.5rem 0.75rem; }
 body.chart-fullscreen #kchart { height: calc(100vh - 130px); }
+
+/* ---- login & settings ---- */
+.login-body { display: flex; align-items: flex-start; justify-content: center; min-height: 100dvh; padding-top: 14vh; }
+.login-card {
+  width: min(24rem, 92vw); padding: 2rem;
+  background: var(--qq-surface); border: 1px solid var(--qq-border);
+  border-radius: var(--qq-radius-lg); box-shadow: var(--qq-shadow-1);
+}
+.login-brand { justify-content: center; display: flex; font-size: 1.3rem; margin-bottom: 1.25rem; }
+.pw-wrap { position: relative; }
+.pw-wrap input { padding-right: 2.6rem; }
+.pw-toggle {
+  position: absolute; right: 0.35rem; top: 50%; transform: translateY(-50%);
+  margin: 0; width: auto; padding: 0.3rem 0.45rem;
+  background: transparent; border: none; color: var(--qq-text-muted);
+}
+.pw-toggle:hover { color: var(--qq-text); }
+.field-error {
+  background: color-mix(in srgb, var(--down) 12%, transparent); color: var(--down);
+  padding: 0.5rem 0.8rem; border-radius: var(--qq-radius-sm); font-size: 0.85rem;
+}
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 24rem)); gap: 1rem; }
+.settings-card { margin: 0; padding: 1.25rem; border-radius: var(--qq-radius-lg); }
+.settings-card h3 { font-size: 1rem; margin-bottom: 0.75rem; }
