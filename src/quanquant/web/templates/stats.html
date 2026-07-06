@@ -2,15 +2,15 @@
 
 {% macro metric_cards(m) %}
 <div class="cards">
-  <article><small>總損益</small><div class="big {{ 'up' if m.total_pnl >= 0 else 'down' }}">{{ m.total_pnl | signed }}</div></article>
-  <article><small>交易次數</small><div class="big">{{ m.count }}</div></article>
-  <article><small>勝率</small><div class="big">{{ (m.win_rate * 100) | round(1) }}%</div><small class="muted">{{ m.wins }} 勝 / {{ m.losses }} 負</small></article>
-  <article><small>平均獲利</small><div class="big up">{{ m.avg_win | num }}</div></article>
-  <article><small>平均虧損</small><div class="big down">{{ m.avg_loss | num }}</div></article>
-  <article><small>最大單筆獲利</small><div class="big up">{{ m.max_win | num }}</div></article>
-  <article><small>最大單筆虧損</small><div class="big down">{{ m.max_loss | num }}</div></article>
-  <article><small>最大回撤</small><div class="big down">{{ m.max_drawdown | num }}</div></article>
-  <article><small>獲利因子</small><div class="big">{% if m.profit_factor is not none %}{{ m.profit_factor | round(2) }}{% else %}—{% endif %}</div></article>
+  <article class="stat-card focus {{ 'up' if m.total_pnl >= 0 else 'down' }}"><small>總損益</small><div class="big {{ 'up' if m.total_pnl >= 0 else 'down' }}">{{ m.total_pnl | signed }}</div></article>
+  <article class="stat-card"><small>交易次數</small><div class="big">{{ m.count }}</div></article>
+  <article class="stat-card"><small>勝率</small><div class="big">{{ (m.win_rate * 100) | round(1) }}%</div><small class="muted">{{ m.wins }} 勝 / {{ m.losses }} 負</small></article>
+  <article class="stat-card up"><small>平均獲利</small><div class="big up">{{ m.avg_win | num }}</div></article>
+  <article class="stat-card down"><small>平均虧損</small><div class="big down">{{ m.avg_loss | num }}</div></article>
+  <article class="stat-card up"><small>最大單筆獲利</small><div class="big up">{{ m.max_win | num }}</div></article>
+  <article class="stat-card down"><small>最大單筆虧損</small><div class="big down">{{ m.max_loss | num }}</div></article>
+  <article class="stat-card down"><small>最大回撤</small><div class="big down">{{ m.max_drawdown | num }}</div></article>
+  <article class="stat-card"><small>獲利因子</small><div class="big">{% if m.profit_factor is not none %}{{ m.profit_factor | round(2) }}{% else %}—{% endif %}</div></article>
 </div>
 {% endmacro %}
 
@@ -49,7 +49,7 @@
   </div>
 </div>
 
-<form class="filterbar" method="get" action="/stats">
+<form class="filterbar card-bar" method="get" action="/stats">
   <select name="symbol" aria-label="商品">
     <option value="">全部商品</option>
     {% for s in symbols %}<option value="{{ s }}" {% if f.symbol == s %}selected{% endif %}>{{ s }}</option>{% endfor %}

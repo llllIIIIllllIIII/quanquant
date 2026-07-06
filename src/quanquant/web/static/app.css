@@ -244,20 +244,24 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
 }
 .param-row .mini { margin: 0; }
 
-/* ---- Journal ---- */
+/* ---- Journal & Stats ---- */
 .journal-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
 .journal-head h3 { margin: 0; }
-.filterbar {
-  display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center;
-  margin: 1rem 0;
+.filterbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 1rem 0; }
+.filterbar.card-bar {
+  padding: 0.6rem 0.75rem; background: var(--qq-surface);
+  border: 1px solid var(--qq-border); border-radius: var(--qq-radius-lg);
 }
-.filterbar select, .filterbar input { margin: 0; width: auto; min-width: 9rem; }
+.filterbar select, .filterbar input { margin: 0; width: auto; min-width: 9rem; font-size: 0.85rem; }
 
-.table-wrap { overflow-x: auto; }
-table { font-size: 0.9rem; }
+.table-wrap { overflow-x: auto; border: 1px solid var(--qq-border); border-radius: var(--qq-radius-lg); }
+table { font-size: 0.88rem; margin-bottom: 0; }
+thead th { position: sticky; top: 0; background: var(--qq-surface); z-index: 1;
+  font-size: 0.78rem; color: var(--qq-text-muted); }
+tbody tr:hover { background: var(--qq-surface-2); }
 th, td { white-space: normal; }
 td.nowrap, th { white-space: nowrap; }
-.numcell { text-align: right; font-variant-numeric: tabular-nums; }
+.numcell { text-align: right; }
 td.note { max-width: 14rem; }
 
 .dir.long { color: var(--up); font-weight: 700; }
@@ -265,15 +269,28 @@ td.note { max-width: 14rem; }
 .pnl.up { color: var(--up); font-weight: 600; }
 .pnl.down { color: var(--down); font-weight: 600; }
 
-.badge { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 1rem; }
-.badge.open { background: rgba(240,185,11,0.18); color: #f0b90b; }
-.tag {
-  display: inline-block; font-size: 0.72rem; padding: 0.1rem 0.45rem; margin: 0.1rem;
-  border-radius: 0.3rem; background: var(--pico-muted-border-color);
-}
-.empty td { text-align: center; color: var(--pico-muted-color); padding: 2rem; }
-
+.badge { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 999px; }
+.badge.open { background: rgba(240, 185, 11, 0.18); color: #f0b90b; }
+.tag { display: inline-block; font-size: 0.72rem; padding: 0.1rem 0.45rem; margin: 0.1rem;
+  border-radius: var(--qq-radius-sm); background: var(--qq-surface-2);
+  border: 1px solid var(--qq-border); }
+.empty td { text-align: center; color: var(--qq-text-muted); padding: 2rem; }
 a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
+
+/* stat cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; margin: 1rem 0 1.5rem; }
+.cards article { margin: 0; padding: 0.9rem 1rem; border-radius: var(--qq-radius-lg); }
+.stat-card { border-left: 2px solid var(--qq-border-strong); }
+.stat-card.up { border-left-color: var(--up); }
+.stat-card.down { border-left-color: var(--down); }
+.stat-card.focus { grid-column: span 2; }
+.stat-card.focus .big { font-size: 2rem; }
+.cards small { color: var(--qq-text-muted); }
+.cards .big { font-size: 1.5rem; font-weight: 700; }
+.cards .big.up { color: var(--up); }
+.cards .big.down { color: var(--down); }
+.export-actions { display: flex; gap: 0.5rem; }
+.export-actions [role="button"] { font-size: 0.82rem; padding: 0.35rem 0.8rem; }
 
 /* ---- Form ---- */
 .modal-card { max-width: 640px; }
@@ -282,15 +299,6 @@ a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
   background: rgba(234,57,67,0.15); color: var(--down);
   padding: 0.6rem 0.8rem; border-radius: 0.4rem; margin-bottom: 0.6rem; font-size: 0.85rem;
 }
-
-/* ---- Stats cards ---- */
-.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; margin: 1rem 0 1.5rem; }
-.cards article { margin: 0; padding: 0.9rem 1rem; }
-.cards small { color: var(--pico-muted-color); }
-.cards .big { font-size: 1.5rem; font-weight: 700; font-variant-numeric: tabular-nums; }
-.cards .big.up { color: var(--up); }
-.cards .big.down { color: var(--down); }
-.export-actions { display: flex; gap: 0.5rem; }
 
 /* 均線扣抵 */
 [x-cloak] { display: none !important; }

@@ -9,7 +9,7 @@
     </button>
   </div>
 
-  <form class="filterbar" hx-get="/trades" hx-target="#trade-tbody" hx-swap="innerHTML"
+  <form class="filterbar card-bar" hx-get="/trades" hx-target="#trade-tbody" hx-swap="innerHTML"
         hx-trigger="change, submit, refreshtable from:body" @submit.prevent>
     <select name="symbol" aria-label="商品">
       <option value="">全部商品</option>
