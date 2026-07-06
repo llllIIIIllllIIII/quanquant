@@ -125,3 +125,17 @@ def set_color_scheme(db: Session, user: User, scheme: str) -> bool:
     db.add(user)
     db.commit()
     return True
+
+
+VALID_THEMES = {"dark", "light"}
+
+
+def set_theme(db: Session, user: User, theme: str) -> bool:
+    """設定介面主題。theme 非法則回 False 且不寫入。"""
+    if theme not in VALID_THEMES:
+        return False
+    user.theme = theme
+    user.updated_at = _utcnow()
+    db.add(user)
+    db.commit()
+    return True

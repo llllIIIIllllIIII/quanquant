@@ -2,6 +2,7 @@
 import pytest
 
 from quanquant.auth import service
+from quanquant.db.models import User
 
 
 @pytest.fixture(autouse=True)
@@ -94,3 +95,21 @@ def test_set_color_scheme_does_not_bump_token_version(session, henry):
     before = henry.token_version
     service.set_color_scheme(session, henry, "green_up")
     assert henry.token_version == before
+
+
+def test_set_theme_valid_persists(session, henry):
+    assert service.set_theme(session, henry, "light") is True
+    reloaded = session.get(User, henry.id)
+    assert reloaded.theme == "light"
+
+
+def test_set_theme_rejects_invalid(session, henry):
+    assert service.set_theme(session, henry, "neon") is False
+    reloaded = session.get(User, henry.id)
+    assert reloaded.theme is None  # 未寫入
+
+
+def test_set_theme_does_not_bump_token_version(session, henry):
+    before = henry.token_version
+    service.set_theme(session, henry, "dark")
+    assert session.get(User, henry.id).token_version == before
