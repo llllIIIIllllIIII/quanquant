@@ -76,3 +76,21 @@ def test_list_users_sorted(session, henry):
     service.create_user(session, "amy", "pw")
     names = [u.username for u in service.list_users(session)]
     assert names == ["amy", "henry"]
+
+
+def test_set_color_scheme_valid_persists(session, henry):
+    assert service.set_color_scheme(session, henry, "red_up") is True
+    reloaded = service.get_by_username(session, "henry")
+    assert reloaded.chart_color_scheme == "red_up"
+
+
+def test_set_color_scheme_rejects_invalid(session, henry):
+    assert service.set_color_scheme(session, henry, "rainbow") is False
+    reloaded = service.get_by_username(session, "henry")
+    assert reloaded.chart_color_scheme is None  # 未寫入
+
+
+def test_set_color_scheme_does_not_bump_token_version(session, henry):
+    before = henry.token_version
+    service.set_color_scheme(session, henry, "green_up")
+    assert henry.token_version == before

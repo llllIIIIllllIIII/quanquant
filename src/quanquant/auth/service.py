@@ -111,3 +111,17 @@ def set_role(db: Session, user: User, role: str) -> None:
 
 def list_users(db: Session) -> list[User]:
     return list(db.exec(select(User).order_by(User.username)))
+
+
+VALID_COLOR_SCHEMES = {"green_up", "red_up"}
+
+
+def set_color_scheme(db: Session, user: User, scheme: str) -> bool:
+    """設定使用者 K 線配色。scheme 非法則回 False 且不寫入。"""
+    if scheme not in VALID_COLOR_SCHEMES:
+        return False
+    user.chart_color_scheme = scheme
+    user.updated_at = _utcnow()
+    db.add(user)
+    db.commit()
+    return True
