@@ -343,3 +343,26 @@ body.chart-fullscreen #kchart { height: calc(100vh - 130px); }
 .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 24rem)); gap: 1rem; }
 .settings-card { margin: 0; padding: 1.25rem; border-radius: var(--qq-radius-lg); }
 .settings-card h3 { font-size: 1rem; margin-bottom: 0.75rem; }
+
+/* ---- responsive polish ---- */
+@media (max-width: 767px) {
+  .chart-toolbar { gap: 0.4rem; }
+  .tb-tfs { order: 3; width: 100%; }           /* 時框列自成一列 */
+  .tb-right { margin-left: auto; }
+  .tf-btn { padding: 0.5rem 0.7rem; }          /* 觸控目標放大 */
+  .chart-row { flex-direction: column; }
+  .draw-rail {
+    flex-direction: row; flex: none; width: 100%;
+    border-right: 1px solid var(--qq-border); border-bottom: none;
+    border-radius: var(--qq-radius-sm) var(--qq-radius-sm) 0 0;
+  }
+  .rail-btn { width: auto; aspect-ratio: auto; padding: 0.45rem 0.6rem; }
+  #kchart { border-radius: 0 0 var(--qq-radius-sm) var(--qq-radius-sm); }
+  .quote { gap: 0.5rem 1rem; }
+  .quote-side { margin-left: 0; width: 100%; flex-direction: row; justify-content: space-between; }
+  .cards { grid-template-columns: repeat(2, 1fr); }
+  .stat-card.focus { grid-column: span 2; }
+}
+@media (min-width: 768px) and (max-width: 1023px) {
+  .cards { grid-template-columns: repeat(3, 1fr); }
+}
