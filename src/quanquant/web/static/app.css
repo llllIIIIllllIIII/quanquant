@@ -97,55 +97,75 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
 .tv-wrap small { display: block; margin-top: 0.4rem; }
 .muted { color: var(--pico-muted-color); }
 
-.chart-head { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
-.chart-head h3 { margin: 0; }
-.chart-head-actions { display: flex; gap: 0.4rem; align-items: center; }
-
-/* Unified control group: select + buttons share one height / radius / type scale */
-.chart-head-actions .mini,
-.chart-head-actions .session-sel {
-  margin: 0;
-  width: auto;
-  height: 2.3rem;
-  font-size: 0.85rem;
-  line-height: 1;
-  border-radius: 0.45rem;
+/* ---- chart toolbar: [title+session] [timeframes] [actions] ---- */
+.chart-toolbar {
+  display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+  padding: 0.5rem 0.75rem; margin-bottom: 0.4rem;
+  background: var(--qq-surface); border: 1px solid var(--qq-border);
+  border-radius: var(--qq-radius-lg);
 }
-.chart-head-actions .mini {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0 0.95rem;
-  white-space: nowrap;
-}
+.tb-left { display: flex; align-items: center; gap: 0.6rem; }
+.chart-title { margin: 0; font-size: 1rem; display: flex; align-items: baseline; gap: 0.4rem; }
+.chart-title small { font-size: 0.72rem; }
 .session-sel {
-  /* keep room for Pico's chevron on the right */
-  padding: 0 2rem 0 0.85rem;
-  background-position: right 0.7rem center;
-  /* match the outline buttons: transparent fill, primary border + text */
-  background-color: transparent;
-  border-color: var(--pico-primary);
-  color: var(--pico-primary);
+  margin: 0; width: auto; height: 2rem; font-size: 0.82rem; line-height: 1;
+  border-radius: var(--qq-radius-sm);
+  padding: 0 1.8rem 0 0.7rem; background-position: right 0.6rem center;
+  background-color: transparent; border-color: var(--qq-border-strong); color: var(--qq-text);
 }
-.session-sel:hover { border-color: var(--pico-primary-hover); }
+.tb-tfs { display: flex; flex-wrap: wrap; gap: 2px; }
+.tf-btn {
+  margin: 0; width: auto; padding: 0.25rem 0.55rem; font-size: 0.78rem;
+  background: transparent; border: 1px solid transparent; color: var(--qq-text-muted);
+  border-radius: var(--qq-radius-sm);
+}
+.tf-btn:hover { color: var(--qq-text); background: var(--qq-surface-2); }
+.tf-btn.active { background: var(--qq-accent); color: #fff; font-weight: 700; }
+.tb-right { display: flex; align-items: center; gap: 0.35rem; margin-left: auto; }
+.tb-btn {
+  margin: 0; width: auto; height: 2rem; padding: 0 0.65rem;
+  display: inline-flex; align-items: center; gap: 0.35rem;
+  font-size: 0.82rem; line-height: 1; white-space: nowrap;
+  background: transparent; border: 1px solid var(--qq-border-strong);
+  color: var(--qq-text); border-radius: var(--qq-radius-sm);
+}
+.tb-btn:hover { border-color: var(--qq-accent); color: var(--qq-accent); }
 
-/* Market Pulse heart-beat toggle: tighter for the ♥ glyph; red + pulsing when on */
-.chart-head-actions .pulse-toggle { padding: 0 0.7rem; font-size: 1rem; }
-.chart-head-actions .pulse-toggle.active {
-  color: var(--down);
-  border-color: var(--down);
-  animation: qq-heartbeat 1s ease-in-out infinite;
+/* ⋯ more menu */
+.more-wrap { position: relative; }
+.more-btn { position: relative; padding: 0 0.5rem; }
+.more-dot {
+  display: none; position: absolute; top: 4px; right: 4px;
+  width: 6px; height: 6px; border-radius: 50%; background: var(--qq-accent);
 }
+/* any tracked toggle active → dot on the trigger (pulse.js toggles .active itself) */
+.more-wrap:has(.menu-row.active) .more-dot,
+.more-wrap:has(.pulse-toggle.active) .more-dot,
+.more-wrap:has(.pulse-tg-toggle.active) .more-dot { display: block; }
+.more-menu {
+  position: absolute; right: 0; top: calc(100% + 4px); z-index: 50;
+  min-width: 13.5rem; padding: 0.3rem;
+  background: var(--qq-surface); border: 1px solid var(--qq-border-strong);
+  border-radius: var(--qq-radius-sm); box-shadow: var(--qq-shadow-1);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.menu-row {
+  margin: 0; width: 100%; display: flex; align-items: center; gap: 0.5rem;
+  padding: 0.45rem 0.6rem; font-size: 0.82rem; text-align: left;
+  background: transparent; border: 1px solid transparent;
+  color: var(--qq-text); border-radius: var(--qq-radius-sm);
+}
+.menu-row:hover { background: var(--qq-surface-2); }
+.menu-row > span:nth-child(2) { flex: 1 1 auto; }
+.row-state { font-size: 0.72rem; color: var(--qq-text-muted); }
+.menu-row.active, .menu-row.active .row-state { color: var(--qq-accent); }
+.menu-row.pulse-toggle.active { color: var(--down); animation: qq-heartbeat 1s ease-in-out infinite; }
+.menu-row.pulse-tg-toggle.active { color: var(--up); }
 @keyframes qq-heartbeat {
   0%, 100% { transform: scale(1); }
-  15% { transform: scale(1.18); }
-  30% { transform: scale(1); }
-  45% { transform: scale(1.12); }
+  15% { transform: scale(1.04); }
+  45% { transform: scale(1.02); }
 }
-
-/* Market Pulse Telegram toggle: green when notifications are on */
-.chart-head-actions .pulse-tg-toggle { padding: 0 0.6rem; font-size: 0.95rem; }
-.chart-head-actions .pulse-tg-toggle.active { color: var(--up); border-color: var(--up); }
 
 /* chart area: vertical drawing rail (left) + chart (right), TradingView-style */
 .chart-row { display: flex; align-items: stretch; gap: 0; margin-top: 0.4rem; }
@@ -158,10 +178,10 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
 .rail-btn {
   margin: 0; width: 100%; aspect-ratio: 1; padding: 0;
   display: flex; align-items: center; justify-content: center;
-  font-size: 1rem; line-height: 1; background: transparent;
-  border: 1px solid transparent; color: var(--pico-color); border-radius: 0.35rem;
+  line-height: 1; background: transparent;
+  border: 1px solid transparent; color: var(--qq-text-muted); border-radius: 0.35rem;
 }
-.rail-btn:hover { border-color: var(--pico-muted-border-color); background: rgba(255,255,255,0.04); }
+.rail-btn:hover { border-color: var(--pico-muted-border-color); background: rgba(255,255,255,0.04); color: var(--qq-text); }
 .rail-btn.danger { color: var(--down); }
 .rail-btn svg { display: block; }
 /* drawings hidden: dim the eye-off toggle so the "off" state reads at a glance */
@@ -187,31 +207,6 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
   font-size: 0.9rem;
   pointer-events: none;
   z-index: 2;
-}
-
-/* timeframe bar */
-.tf-bar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  align-items: center;
-  margin: 0.6rem 0;
-}
-.tf-btn {
-  margin: 0;
-  width: auto;
-  padding: 0.2rem 0.6rem;
-  font-size: 0.8rem;
-  background: transparent;
-  border: 1px solid var(--pico-muted-border-color);
-  color: var(--pico-color);
-  border-radius: 0.35rem;
-}
-.tf-btn.active {
-  background: var(--pico-primary);
-  border-color: var(--pico-primary);
-  color: var(--pico-primary-inverse);
-  font-weight: 700;
 }
 
 /* alerts dialog + toasts */

@@ -8,36 +8,103 @@
 </section>
 
 <section x-data="chartPanel()">
-  <div class="chart-head">
-    <h3>{{ symbol }} 走勢圖 <small class="muted">· 本系統即時資料</small></h3>
-    <div class="chart-head-actions">
+  <div class="chart-toolbar" @click.outside="moreOpen = false">
+    <div class="tb-left">
+      <h3 class="chart-title">{{ symbol }}<small class="muted">即時</small></h3>
       <select class="session-sel" x-model="session" @change="setSession(session)"
               aria-label="價格時段">
         <template x-for="s in sessions" :key="s.code">
           <option :value="s.code" x-text="s.label"></option>
         </template>
       </select>
-      <button class="outline mini" @click="openSettings()">指標設定</button>
-      <button class="outline mini" @click="openAlerts()">警示</button>
-      <button type="button" id="pulse-toggle" class="outline mini pulse-toggle"
-              aria-pressed="false" aria-label="市場脈搏音效"
-              title="市場脈搏音效：關（點擊開啟）">♥</button>
-      <button type="button" id="pulse-tg-toggle" class="outline mini pulse-tg-toggle"
-              aria-pressed="false" aria-label="Telegram 通知"
-              title="Telegram 通知：載入中…">🔔</button>
-      <button type="button" class="outline mini color-scheme-toggle"
-              @click="toggleColorScheme()"
-              :title="colorScheme === 'red_up' ? 'K線配色：紅漲綠跌（點擊切換）' : 'K線配色：綠漲紅跌（點擊切換）'"
-              x-text="colorScheme === 'red_up' ? '🔴漲' : '🟢漲'"></button>
-      <button type="button" class="outline mini ded-toggle" :class="{active: deductionOn}"
-              @click="toggleDeduction()" :aria-pressed="deductionOn" aria-label="均線扣抵"
-              :title="deductionOn ? '均線扣抵：開（點擊關閉）' : '均線扣抵：關（點擊開啟）'">▽ 扣抵</button>
-      <button type="button" class="outline mini draw-scope-toggle" @click="toggleDrawScope()"
-              :aria-pressed="drawScope === 'all'" aria-label="畫線跨時框模式"
-              :title="drawScope === 'hybrid'
-                ? '畫線跨時框：智慧混合（水平線/價格線跨所有時框，位置鎖定；趨勢線/射線/通道等只在繪製的時框顯示）。點擊改為全部時框'
-                : '畫線跨時框：全部時框顯示（所有畫線都出現在每個時框，趨勢線在較粗時框可能被壓縮）。點擊改回智慧混合'"
-              x-text="drawScope === 'hybrid' ? '跨框:智慧' : '跨框:全部'"></button>
+    </div>
+    <div class="tb-tfs" role="group" aria-label="時間週期">
+      <template x-for="t in tfs" :key="t.code">
+        <button class="tf-btn" :class="{active: tf === t.code}"
+                @click="setTf(t.code)" x-text="t.label"></button>
+      </template>
+    </div>
+    <div class="tb-right">
+      <button type="button" class="tb-btn" x-show="!!toggleFullscreen" x-cloak
+              @click="toggleFullscreen()" aria-label="全螢幕" title="全螢幕（Esc 退出）">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3"/>
+        </svg>
+      </button>
+      <button type="button" class="tb-btn" @click="openSettings()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M12 2v3m0 14v3M2 12h3m14 0h3M4.9 4.9l2.1 2.1m10 10 2.1 2.1M19.1 4.9l-2.1 2.1m-10 10-2.1 2.1"/>
+        </svg>
+        指標
+      </button>
+      <button type="button" class="tb-btn" @click="openAlerts()">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>
+        </svg>
+        警示
+      </button>
+      <div class="more-wrap">
+        <button type="button" class="tb-btn more-btn" @click="moreOpen = !moreOpen"
+                :aria-expanded="moreOpen" aria-label="更多圖表功能" title="更多圖表功能">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <circle cx="5" cy="12" r="1.6"/><circle cx="12" cy="12" r="1.6"/><circle cx="19" cy="12" r="1.6"/>
+          </svg>
+          <span class="more-dot" aria-hidden="true"></span>
+        </button>
+        <div class="more-menu" x-show="moreOpen" x-cloak>
+          <button type="button" id="pulse-toggle" class="menu-row pulse-toggle"
+                  aria-pressed="false" aria-label="市場脈搏音效"
+                  title="市場脈搏音效：關（點擊開啟）">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z"/>
+            </svg>
+            <span>市場脈搏音效</span><span class="row-state"></span>
+          </button>
+          <button type="button" id="pulse-tg-toggle" class="menu-row pulse-tg-toggle"
+                  aria-pressed="false" aria-label="Telegram 通知"
+                  title="Telegram 通知：載入中…">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>
+            </svg>
+            <span>Telegram 通知</span><span class="row-state"></span>
+          </button>
+          <button type="button" class="menu-row" @click="toggleColorScheme()">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M8 6v12M8 9h-3v6h3M16 4v16M16 7h3v8h-3"/>
+            </svg>
+            <span>K 線配色</span>
+            <span class="row-state" x-text="colorScheme === 'red_up' ? '紅漲' : '綠漲'"></span>
+          </button>
+          <button type="button" class="menu-row" :class="{active: deductionOn}"
+                  @click="toggleDeduction()" :aria-pressed="deductionOn">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 19V5M5 12l7-7 7 7"/>
+            </svg>
+            <span>均線扣抵</span>
+            <span class="row-state" x-text="deductionOn ? '開' : '關'"></span>
+          </button>
+          <button type="button" class="menu-row" @click="toggleDrawScope()"
+                  :aria-pressed="drawScope === 'all'"
+                  :title="drawScope === 'hybrid'
+                    ? '畫線跨時框：智慧混合（水平線/價格線跨所有時框；趨勢線只在繪製時框顯示）。點擊改為全部時框'
+                    : '畫線跨時框：全部時框顯示。點擊改回智慧混合'">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <path d="M2 12h20M12 2v20"/>
+            </svg>
+            <span>畫線跨時框</span>
+            <span class="row-state" x-text="drawScope === 'hybrid' ? '智慧' : '全部'"></span>
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -55,22 +122,50 @@
     </template>
   </div>
 
-  <div class="tf-bar" role="group">
-    <template x-for="t in tfs" :key="t.code">
-      <button class="tf-btn" :class="{active: tf === t.code}"
-              @click="setTf(t.code)" x-text="t.label"></button>
-    </template>
-  </div>
-
   <div class="chart-row">
     <div class="draw-rail" role="toolbar" aria-label="繪圖工具">
-      <button class="rail-btn" @click="draw('segment')" title="趨勢線" aria-label="趨勢線">╱</button>
-      <button class="rail-btn" @click="draw('rayLine')" title="射線" aria-label="射線">↗</button>
-      <button class="rail-btn" @click="draw('horizontalStraightLine')" title="水平線" aria-label="水平線">━</button>
-      <button class="rail-btn" @click="draw('verticalStraightLine')" title="垂直線" aria-label="垂直線">┃</button>
-      <button class="rail-btn" @click="draw('priceChannelLine')" title="平行通道" aria-label="平行通道">∥</button>
-      <button class="rail-btn" @click="draw('priceLine')" title="價格線" aria-label="價格線">⊢</button>
-      <button class="rail-btn" @click="draw('fibonacciLine')" title="Fibonacci" aria-label="Fibonacci">≣</button>
+      <button class="rail-btn" @click="draw('segment')" title="趨勢線" aria-label="趨勢線">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="4" y1="20" x2="20" y2="4"/><circle cx="4" cy="20" r="1.5" fill="currentColor"/><circle cx="20" cy="4" r="1.5" fill="currentColor"/>
+        </svg>
+      </button>
+      <button class="rail-btn" @click="draw('rayLine')" title="射線" aria-label="射線">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="4" y1="20" x2="17" y2="7"/><path d="M14 4h6v6"/>
+        </svg>
+      </button>
+      <button class="rail-btn" @click="draw('horizontalStraightLine')" title="水平線" aria-label="水平線">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="3" y1="12" x2="21" y2="12"/>
+        </svg>
+      </button>
+      <button class="rail-btn" @click="draw('verticalStraightLine')" title="垂直線" aria-label="垂直線">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="12" y1="3" x2="12" y2="21"/>
+        </svg>
+      </button>
+      <button class="rail-btn" @click="draw('priceChannelLine')" title="平行通道" aria-label="平行通道">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="3" y1="16" x2="21" y2="8"/><line x1="3" y1="21" x2="21" y2="13"/>
+        </svg>
+      </button>
+      <button class="rail-btn" @click="draw('priceLine')" title="價格線" aria-label="價格線">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="3" y1="12" x2="15" y2="12"/><path d="M18 9v6M16.5 10.5h3"/>
+        </svg>
+      </button>
+      <button class="rail-btn" @click="draw('fibonacciLine')" title="Fibonacci" aria-label="Fibonacci">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+        </svg>
+      </button>
       <button type="button" class="rail-btn draw-vis-toggle" :class="{off: !drawingsVisible}"
               @click="toggleDrawingsVisible()" :aria-pressed="!drawingsVisible"
               :aria-label="drawingsVisible ? '隱藏所有繪圖' : '顯示所有繪圖'"
@@ -87,7 +182,12 @@
           <line x1="1" y1="1" x2="23" y2="23"/>
         </svg>
       </button>
-      <button class="rail-btn danger" @click="clearDrawings()" title="清除全部" aria-label="清除全部">✕</button>
+      <button class="rail-btn danger" @click="clearDrawings()" title="清除全部" aria-label="清除全部">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" aria-hidden="true">
+          <path d="M3 6h18M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/>
+        </svg>
+      </button>
     </div>
     <div id="kchart">
       <div id="chart-empty" class="muted">資料累積中…（盤中每 5 秒記錄，累積約 1 分鐘出現第一根 K 棒）</div>

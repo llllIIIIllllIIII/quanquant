@@ -752,6 +752,7 @@
       { code: "night", label: "只夜盤" },
     ],
     settingsOpen: false,
+    moreOpen: false,
     deductionOn: false,
     deductionLegend: [],
     drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
