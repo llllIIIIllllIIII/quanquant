@@ -50,6 +50,9 @@ def _prompt_password(args) -> str:
     if args.password:
         return args.password
     pw = getpass.getpass("密碼: ")
+    if not pw:
+        print("密碼不可為空", file=sys.stderr)
+        raise SystemExit(1)
     if getpass.getpass("再輸入一次: ") != pw:
         print("兩次輸入不一致", file=sys.stderr)
         raise SystemExit(1)

@@ -1,4 +1,5 @@
 """bootstrap: first admin + claiming pre-account data."""
+import argparse
 import datetime as dt
 from decimal import Decimal
 
@@ -6,7 +7,7 @@ import pytest
 from sqlmodel import select
 
 from quanquant.db.models import Alert, ChartState, Trade, UserChartState
-from quanquant.user_cli import bootstrap_admin
+from quanquant.user_cli import _prompt_password, bootstrap_admin
 
 
 @pytest.fixture
@@ -59,3 +60,14 @@ def test_bootstrap_claims_only_orphans(session, legacy_data, user):
     admin = bootstrap_admin(session, "henry", "pw12345")
     session.refresh(owned)
     assert owned.user_id == user.id  # untouched
+
+
+def test_prompt_password_rejects_empty(monkeypatch):
+    monkeypatch.setattr("quanquant.user_cli.getpass.getpass", lambda _: "")
+    with pytest.raises(SystemExit):
+        _prompt_password(argparse.Namespace(password=None))
+
+
+def test_prompt_password_accepts_nonempty(monkeypatch):
+    monkeypatch.setattr("quanquant.user_cli.getpass.getpass", lambda _: "pw12345")
+    assert _prompt_password(argparse.Namespace(password=None)) == "pw12345"
