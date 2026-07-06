@@ -67,3 +67,25 @@ def test_navbar_shows_user_menu(client):
     body = client.get("/").text
     assert "Tester" in body           # display_name
     assert "/logout" in body
+
+
+def test_account_page_shows_color_scheme_radio(client):
+    body = client.get("/account").text
+    assert 'name="scheme"' in body
+    assert "green_up" in body and "red_up" in body
+
+
+def test_set_color_scheme_via_account_form(client):
+    r = client.post("/account/color-scheme", data={"scheme": "red_up"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/account"
+    # 重新載入帳戶頁，red_up 被預選
+    body = client.get("/account").text
+    assert 'value="red_up" checked' in body
+
+
+def test_set_color_scheme_invalid_shows_error(client):
+    r = client.post("/account/color-scheme", data={"scheme": "bad"})
+    assert r.status_code == 200
+    assert "配色設定無效" in r.text

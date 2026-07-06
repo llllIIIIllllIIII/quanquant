@@ -11,4 +11,18 @@
   </label>
   <button type="submit">修改密碼（其他裝置將被登出）</button>
 </form>
+<h3>K 線配色</h3>
+<form method="post" action="/account/color-scheme" style="max-width: 24rem;">
+  <fieldset>
+    <label>
+      <input type="radio" name="scheme" value="green_up" {% if color_scheme == 'green_up' %}checked{% endif %}>
+      綠漲紅跌（歐美慣例）
+    </label>
+    <label>
+      <input type="radio" name="scheme" value="red_up" {% if color_scheme == 'red_up' %}checked{% endif %}>
+      紅漲綠跌（台灣慣例）
+    </label>
+  </fieldset>
+  <button type="submit">儲存配色</button>
+</form>
 {% endblock %}

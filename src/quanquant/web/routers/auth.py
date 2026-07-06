@@ -58,8 +58,26 @@ def logout():
 @router.get("/account", response_class=HTMLResponse)
 def account_page(request: Request, user: User = Depends(get_current_user)):
     return templates.TemplateResponse(
-        request, "account.html", {"active": "account", "error": None}
+        request, "account.html",
+        {"active": "account", "error": None,
+         "color_scheme": user.chart_color_scheme or "green_up"},
     )
+
+
+@router.post("/account/color-scheme")
+def change_color_scheme(
+    request: Request,
+    scheme: str = Form(...),
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    if not service.set_color_scheme(session, user, scheme):
+        return templates.TemplateResponse(
+            request, "account.html",
+            {"active": "account", "error": "配色設定無效",
+             "color_scheme": user.chart_color_scheme or "green_up"},
+        )
+    return RedirectResponse("/account", status_code=303)
 
 
 @router.post("/account/password")
