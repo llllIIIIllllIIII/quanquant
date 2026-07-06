@@ -140,3 +140,19 @@ async def put_color_scheme(
         raise HTTPException(status_code=422, detail="invalid color scheme")
     return Response(status_code=204)
 
+
+@router.put("/api/user/theme")
+async def put_theme(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    theme = body.get("theme") if isinstance(body, dict) else None
+    if not isinstance(theme, str) or not service.set_theme(session, user, theme):
+        raise HTTPException(status_code=422, detail="invalid theme")
+    return Response(status_code=204)
+

@@ -126,3 +126,25 @@ def test_navbar_brand_links_home(client):
 def test_base_loads_tokens_css(client):
     r = client.get("/account")
     assert '/static/tokens.css' in r.text
+
+
+def test_put_theme_api_persists(client):
+    r = client.put("/api/user/theme", json={"theme": "light"})
+    assert r.status_code == 204
+
+
+def test_put_theme_api_rejects_invalid(client):
+    r = client.put("/api/user/theme", json={"theme": "neon"})
+    assert r.status_code == 422
+
+
+def test_put_theme_api_requires_auth(anon_client):
+    r = anon_client.put("/api/user/theme", json={"theme": "light"},
+                        follow_redirects=False)
+    assert r.status_code in (401, 303, 307)
+
+
+def test_put_theme_api_bad_body(client):
+    r = client.put("/api/user/theme", content=b"not json",
+                   headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
