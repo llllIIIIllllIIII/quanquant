@@ -165,6 +165,7 @@ class User(SQLModel, table=True):
     is_active: bool = True
     token_version: int = 0                                # bump → 所有舊 cookie 失效
     telegram_chat_id: str | None = None                   # 第二階段深度連結綁定用
+    chart_color_scheme: str | None = None                 # "green_up"(綠漲紅跌,預設) | "red_up"(紅漲綠跌)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
