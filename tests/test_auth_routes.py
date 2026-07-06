@@ -115,3 +115,14 @@ def test_put_color_scheme_api_bad_body(client):
     r = client.put("/api/user/color-scheme", content=b"not json",
                    headers={"Content-Type": "application/json"})
     assert r.status_code == 422
+
+
+def test_navbar_brand_links_home(client):
+    r = client.get("/account")  # 任一套用 base.html 的頁面
+    assert r.status_code == 200
+    assert '<a href="/" class="brand"' in r.text
+
+
+def test_base_loads_tokens_css(client):
+    r = client.get("/account")
+    assert '/static/tokens.css' in r.text

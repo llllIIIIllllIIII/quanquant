@@ -1,10 +1,53 @@
-:root {
-  --up: #16c784;
-  --down: #ea3943;
+/* ---- top navigation ---- */
+.topnav {
+  position: sticky; top: 0; z-index: 100;
+  display: flex; align-items: center; gap: 1.25rem;
+  background: var(--qq-surface);
+  border-bottom: 1px solid var(--qq-border);
+  padding-top: 0.4rem; padding-bottom: 0.4rem;
 }
+.brand {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  color: var(--qq-text); text-decoration: none;
+}
+.brand:hover { color: var(--qq-accent); }
+.brand svg { color: var(--qq-accent); }
+.nav-links { display: flex; gap: 0.25rem; flex: 1 1 auto; }
+.nav-link {
+  padding: 0.55rem 0.8rem; color: var(--qq-text-muted); text-decoration: none;
+  border-bottom: 2px solid transparent; font-size: 0.92rem;
+}
+.nav-link:hover { color: var(--qq-text); }
+.nav-link.active {
+  color: var(--qq-text); font-weight: 700;
+  border-bottom-color: var(--qq-accent);
+}
+.nav-right { display: flex; align-items: center; gap: 0.6rem; margin-left: auto; }
+.nav-burger { display: none; margin: 0; width: auto; padding: 0.35rem 0.5rem;
+  background: transparent; border: 1px solid transparent; color: var(--qq-text); }
+.user-menu summary {
+  display: inline-flex; align-items: center; gap: 0.45rem;
+  border: 1px solid var(--qq-border); border-radius: var(--qq-radius-sm);
+  background: transparent; color: var(--qq-text);
+}
+.avatar {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 1.6rem; height: 1.6rem; border-radius: 50%;
+  background: var(--qq-accent); color: #fff; font-size: 0.8rem; font-weight: 700;
+}
+.user-menu .menu-sep { border-top: 1px solid var(--qq-border); margin-top: 0.25rem; padding-top: 0.25rem; }
+.user-menu a.danger { color: var(--down); }
 
-.topnav { align-items: center; }
-.topnav a.active { font-weight: 700; }
+@media (max-width: 767px) {
+  .nav-burger { display: inline-flex; }
+  .nav-links {
+    display: none; position: absolute; top: 100%; left: 0; right: 0;
+    flex-direction: column; background: var(--qq-surface);
+    border-bottom: 1px solid var(--qq-border); padding: 0.4rem 1rem;
+  }
+  .nav-links.open { display: flex; }
+  .user-name { display: none; }
+}
 
 /* ---- Live quote panel ---- */
 .quote-panel { margin: 1rem 0 1.5rem; }

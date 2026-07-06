@@ -4,36 +4,56 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>QuanQuant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/app.css">
   <script src="https://unpkg.com/htmx.org@2.0.4"></script>
   <script src="https://unpkg.com/htmx-ext-sse@2.2.2/sse.js"></script>
   <script defer src="https://unpkg.com/alpinejs@3.14.8/dist/cdn.min.js"></script>
 </head>
 <body>
-  <nav class="container-fluid topnav">
-    <ul>
-      <li><strong>QuanQuant</strong></li>
-    </ul>
-    <ul>
-      <li><a href="/" {% if active == 'dashboard' %}class="active"{% endif %}>儀表板</a></li>
-      <li><a href="/journal" {% if active == 'journal' %}class="active"{% endif %}>交易日記</a></li>
-      <li><a href="/stats" {% if active == 'stats' %}class="active"{% endif %}>績效統計</a></li>
-      {% set u = request.state.user if request.state.user is defined else None %}
+  {% set u = request.state.user if request.state.user is defined else None %}
+  <nav class="container-fluid topnav" x-data="{ navOpen: false }">
+    <a href="/" class="brand" aria-label="回到儀表板首頁">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <path d="M8 6v12M8 9h-3v6h3M16 4v16M16 7h3v8h-3"/>
+      </svg>
+      <strong>QuanQuant</strong>
+    </a>
+    <button class="nav-burger" @click="navOpen = !navOpen" aria-label="開啟選單"
+            :aria-expanded="navOpen">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" aria-hidden="true">
+        <line x1="4" y1="7" x2="20" y2="7"/><line x1="4" y1="12" x2="20" y2="12"/>
+        <line x1="4" y1="17" x2="20" y2="17"/>
+      </svg>
+    </button>
+    <div class="nav-links" :class="{ open: navOpen }">
+      <a href="/" class="nav-link {% if active == 'dashboard' %}active{% endif %}">儀表板</a>
+      <a href="/journal" class="nav-link {% if active == 'journal' %}active{% endif %}">交易日記</a>
+      <a href="/stats" class="nav-link {% if active == 'stats' %}active{% endif %}">績效統計</a>
+    </div>
+    <div class="nav-right">
       {% if u %}
-      <li>
-        <details class="dropdown">
-          <summary>{{ u.display_name }}</summary>
-          <ul dir="rtl">
-            {% if u.role == 'admin' %}<li><a href="/admin/users">使用者管理</a></li>{% endif %}
-            <li><a href="/account">帳戶設定</a></li>
-            <li><a href="#" onclick="document.getElementById('logout-form').submit(); return false;">登出</a></li>
-          </ul>
-        </details>
-        <form id="logout-form" method="post" action="/logout" hidden></form>
-      </li>
+      <details class="dropdown user-menu">
+        <summary>
+          <span class="avatar">{{ u.display_name[:1] }}</span>
+          <span class="user-name">{{ u.display_name }}</span>
+        </summary>
+        <ul dir="rtl">
+          {% if u.role == 'admin' %}<li><a href="/admin/users">使用者管理</a></li>{% endif %}
+          <li><a href="/account">帳戶設定</a></li>
+          <li class="menu-sep"><a href="#" class="danger"
+              onclick="document.getElementById('logout-form').submit(); return false;">登出</a></li>
+        </ul>
+      </details>
+      <form id="logout-form" method="post" action="/logout" hidden></form>
       {% endif %}
-    </ul>
+    </div>
   </nav>
   <main class="container">
     {% block content %}{% endblock %}

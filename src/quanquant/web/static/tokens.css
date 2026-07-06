@@ -1,0 +1,71 @@
+/* QuanQuant design tokens — trading-terminal restyle (2026-07 redesign).
+   Dark is the primary theme; light swaps the same token names.
+   Tokens are mapped onto Pico's --pico-* vars so stock Pico widgets
+   (forms, dialogs, dropdowns) pick up the palette for free. */
+
+:root {
+  --qq-font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --qq-radius-sm: 6px;
+  --qq-radius-lg: 10px;
+  --qq-shadow-1: 0 4px 12px rgba(0, 0, 0, 0.35);
+  --qq-shadow-2: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --up: #16c784;
+  --down: #ea3943;
+}
+
+html[data-theme="dark"] {
+  --qq-bg: #020617;
+  --qq-surface: #0e1223;
+  --qq-surface-2: #1a1e2f;
+  --qq-border: #26304a;
+  --qq-border-strong: #334155;
+  --qq-text: #f8fafc;
+  --qq-text-muted: #94a3b8;
+  --qq-accent: #3b82f6;
+}
+
+html[data-theme="light"] {
+  --qq-bg: #f1f5f9;
+  --qq-surface: #ffffff;
+  --qq-surface-2: #e2e8f0;
+  --qq-border: #cbd5e1;
+  --qq-border-strong: #94a3b8;
+  --qq-text: #0f172a;
+  --qq-text-muted: #475569;
+  --qq-accent: #2563eb;
+  --qq-shadow-1: 0 4px 12px rgba(15, 23, 42, 0.12);
+  --qq-shadow-2: 0 8px 24px rgba(15, 23, 42, 0.18);
+}
+
+/* map onto Pico so its widgets follow the theme */
+html[data-theme="dark"], html[data-theme="light"] {
+  --pico-background-color: var(--qq-bg);
+  --pico-card-background-color: var(--qq-surface);
+  --pico-card-sectioning-background-color: var(--qq-surface-2);
+  --pico-color: var(--qq-text);
+  --pico-muted-color: var(--qq-text-muted);
+  --pico-muted-border-color: var(--qq-border);
+  --pico-primary: var(--qq-accent);
+  --pico-primary-hover: color-mix(in srgb, var(--qq-accent) 85%, white);
+  --pico-primary-focus: color-mix(in srgb, var(--qq-accent) 40%, transparent);
+  --pico-border-radius: var(--qq-radius-sm);
+  --pico-font-family: "Noto Sans TC", system-ui, -apple-system, "Segoe UI",
+    "PingFang TC", "Microsoft JhengHei", sans-serif;
+}
+
+body { font-family: var(--pico-font-family); }
+
+/* data numerals: prices, stats, table number cells */
+.num, .quote .price, .quote .chg, .cards .big, .numcell {
+  font-family: var(--qq-font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* motion discipline */
+button, a, select, input, [role="button"] { transition: border-color 150ms ease-out,
+  background-color 150ms ease-out, color 150ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+
+[x-cloak] { display: none !important; }
