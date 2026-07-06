@@ -91,3 +91,21 @@ def test_set_color_scheme_invalid_shows_error(client):
     r = client.post("/account/color-scheme", data={"scheme": "bad"})
     assert r.status_code == 200
     assert "配色設定無效" in r.text
+
+
+def test_put_color_scheme_api_persists(client):
+    r = client.put("/api/user/color-scheme", json={"scheme": "red_up"})
+    assert r.status_code == 204
+    # 帳戶頁反映新值（同一欄位）
+    assert 'value="red_up" checked' in client.get("/account").text
+
+
+def test_put_color_scheme_api_rejects_invalid(client):
+    r = client.put("/api/user/color-scheme", json={"scheme": "nope"})
+    assert r.status_code == 422
+
+
+def test_put_color_scheme_api_requires_auth(anon_client):
+    r = anon_client.put("/api/user/color-scheme", json={"scheme": "red_up"},
+                        follow_redirects=False)
+    assert r.status_code in (401, 303, 307)
