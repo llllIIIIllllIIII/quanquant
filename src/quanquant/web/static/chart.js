@@ -167,6 +167,7 @@
 
       this.session = localStorage.getItem("qq_session") || "all";
       this.chart.loadMore((ts) => this.loadMore(ts));
+      window.addEventListener("qq:theme-changed", (e) => this.applyTheme(e.detail));
 
       let state = { indicators: null, drawings: null };
       try {
@@ -191,7 +192,6 @@
         this.chart.resize();
         this._watchdog(); // rapid resizes can wedge the render loop too
       });
-      window.addEventListener("qq:theme-changed", (e) => this.applyTheme(e.detail));
       document.addEventListener("visibilitychange", () => {
         if (!document.hidden) this.pollLatest(); // catch up right away
       });
