@@ -17,7 +17,7 @@
 | 靜態 IP | `35.229.185.30`（`quanquant-ip`，保留制）|
 | 對外網址 | https://quant.35-229-185-30.sslip.io |
 | TLS | Caddy 自動簽發 Let's Encrypt（有效至 2026-09-09，自動續期）|
-| 存取控管 | Caddy `basic_auth` 共用帳密（`/healthz` 免認證供監控）|
+| 存取控管 | app 層 session 登入（帳戶系統）；`/login`／`/healthz` 免認證，其餘全站需登入 |
 | OS | Ubuntu 24.04 LTS + Docker Engine 29 + Compose v5 |
 | 程式碼遞送 | 私有 GitHub repo + VM 唯讀 deploy key |
 
@@ -123,10 +123,11 @@ git commit → git push → ./scripts/deploy.sh
 
 1. VM 的 `.env` 加 `SESSION_SECRET`（`openssl rand -base64 32` 產生）。
 2. 照固定三步部署 app：`git commit → git push → ./scripts/deploy.sh`。
-3. VM 上建第一個 admin 並認領舊資料：
+   ⚠️ 本次部署會**同時移除 Caddy `basic_auth`**（本分支的 Caddyfile 已改純反向代理，改由 app 層登入把關）。部署完成到下一步 bootstrap 之間，全站要求登入但**尚無任何帳號** → 所有路由 redirect `/login` 且無法登入。這是 **fail-closed 的預期安全狀態，非故障**；因此第 3 步務必緊接著做。
+3. 立即在 VM 建第一個 admin 並認領舊資料：
    `docker compose exec app quanquant-user bootstrap <帳號>`（互動輸入密碼）。
-4. 瀏覽器登入驗證（此時 Caddy basic_auth 與 app 登入並存，安全無虞）。
-5. 確認可登入後部署移除 basic_auth 的 Caddyfile：`docker compose up -d caddy`。
+   此指令走 `docker compose exec`／SSH、不經瀏覽器，**不受上述登入鎖定影響**。
+4. 用剛建立的 admin 帳號瀏覽器登入驗證。
 
 日常帳號管理：Web `/admin/users`（admin），或 SSH 備援
 `docker compose exec app quanquant-user create|reset-password|list`。
