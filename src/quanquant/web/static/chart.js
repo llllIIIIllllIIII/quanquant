@@ -804,6 +804,8 @@
       QQChart.init();
       this._initAlerts();
       window.addEventListener("keydown", (e) => {
+        if (document.querySelector("dialog[open]")) return;
+        if (QQChart._drawingId) return;
         if (e.key === "Escape" && this.fullscreen) this.toggleFullscreen();
       });
     },
