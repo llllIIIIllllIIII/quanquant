@@ -54,6 +54,8 @@ def test_change_password_flow(client):
     r = client.post("/account/password",
                     data={"old_password": "WRONG", "new_password": "brand-new"})
     assert "舊密碼錯誤" in r.text
+    # color_scheme must still be present and a radio pre-checked (regression fix)
+    assert 'value="green_up" checked' in r.text
 
     r = client.post("/account/password",
                     data={"old_password": "test-pw", "new_password": "brand-new"},

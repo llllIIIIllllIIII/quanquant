@@ -90,7 +90,8 @@ def change_password(
 ):
     if not service.change_password(session, user, old_password, new_password):
         return templates.TemplateResponse(
-            request, "account.html", {"active": "account", "error": "舊密碼錯誤"}
+            request, "account.html", {"active": "account", "error": "舊密碼錯誤",
+             "color_scheme": user.chart_color_scheme or "green_up"}
         )
     # token_version was bumped — re-issue THIS device's cookie; other devices log out
     response = RedirectResponse("/", status_code=303)
