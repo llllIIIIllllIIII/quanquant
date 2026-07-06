@@ -49,6 +49,13 @@
   .user-name { display: none; }
 }
 
+/* theme toggle: show the icon of the mode you'd switch TO */
+.theme-toggle { margin: 0; width: auto; padding: 0.4rem 0.55rem; background: transparent;
+  border: 1px solid var(--qq-border); color: var(--qq-text-muted); border-radius: var(--qq-radius-sm); }
+.theme-toggle:hover { color: var(--qq-text); border-color: var(--qq-border-strong); }
+html[data-theme="dark"] .theme-toggle .icon-moon { display: none; }
+html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+
 /* ---- Live quote panel ---- */
 .quote-panel { margin: 1rem 0 1.5rem; }
 .quote {

@@ -4,8 +4,17 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>登入 — QuanQuant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/app.css">
+  <script>
+    // anonymous page: honor the last chosen theme before first paint (no FOUC)
+    var t = localStorage.getItem("qq_theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  </script>
 </head>
 <body>
   <main class="container" style="max-width: 24rem; padding-top: 8vh;">

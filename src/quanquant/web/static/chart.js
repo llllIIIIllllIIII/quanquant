@@ -77,6 +77,27 @@
     separator: { color: "#33333d" },
   };
 
+  const LIGHT_STYLES = {
+    grid: {
+      horizontal: { color: "#e5e9f0" },
+      vertical: { color: "#e5e9f0" },
+    },
+    candle: {
+      tooltip: { text: { color: "#475569" } },
+    },
+    xAxis: { axisLine: { color: "#cbd5e1" }, tickText: { color: "#475569" } },
+    yAxis: { axisLine: { color: "#cbd5e1" }, tickText: { color: "#475569" } },
+    crosshair: {
+      horizontal: { line: { color: "#94a3b8" } },
+      vertical: { line: { color: "#94a3b8" } },
+    },
+    separator: { color: "#cbd5e1" },
+  };
+
+  function themeStyles(theme) {
+    return theme === "light" ? LIGHT_STYLES : DARK_STYLES;
+  }
+
   function candleColorStyles(scheme) {
     const up = scheme === "red_up" ? "#ea3943" : "#16c784";
     const down = scheme === "red_up" ? "#16c784" : "#ea3943";
@@ -132,10 +153,10 @@
         return;
       }
       this.colorScheme = window.QQ_COLOR_SCHEME || "green_up";
-      const styles = JSON.parse(JSON.stringify(DARK_STYLES));
+      const initTheme = document.documentElement.getAttribute("data-theme") === "light" ? "light" : "dark";
+      const styles = JSON.parse(JSON.stringify(themeStyles(initTheme)));
       const cc = candleColorStyles(this.colorScheme).candle;
-      styles.candle.bar = cc.bar;
-      styles.candle.priceMark = cc.priceMark;
+      styles.candle = Object.assign({}, styles.candle, { bar: cc.bar, priceMark: cc.priceMark });
       this.chart = klinecharts.init("kchart", {
         timezone: "Asia/Taipei",
         locale: "zh-CN", // v9 built-ins: en-US / zh-CN only (zh-TW unregistered)
@@ -170,6 +191,7 @@
         this.chart.resize();
         this._watchdog(); // rapid resizes can wedge the render loop too
       });
+      window.addEventListener("qq:theme-changed", (e) => this.applyTheme(e.detail));
       document.addEventListener("visibilitychange", () => {
         if (!document.hidden) this.pollLatest(); // catch up right away
       });
@@ -376,6 +398,14 @@
       this.colorScheme = scheme;
       if (this.chart && this.chart.setStyles) {
         this.chart.setStyles(candleColorStyles(scheme));
+      }
+    },
+
+    applyTheme(theme) {
+      if (this.chart && this.chart.setStyles) {
+        this.chart.setStyles(themeStyles(theme));
+        // K 棒漲跌色由紅漲/綠漲偏好控制，主題切換後重套一次以免被覆蓋
+        this.chart.setStyles(candleColorStyles(this.colorScheme));
       }
     },
 

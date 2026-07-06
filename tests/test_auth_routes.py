@@ -148,3 +148,14 @@ def test_put_theme_api_bad_body(client):
     r = client.put("/api/user/theme", content=b"not json",
                    headers={"Content-Type": "application/json"})
     assert r.status_code == 422
+
+
+def test_base_renders_user_theme(client):
+    client.put("/api/user/theme", json={"theme": "light"})
+    r = client.get("/account")
+    assert 'data-theme="light"' in r.text
+
+
+def test_base_theme_defaults_dark(client):
+    r = client.get("/account")
+    assert 'data-theme="dark"' in r.text
