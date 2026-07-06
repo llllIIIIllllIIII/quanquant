@@ -54,3 +54,26 @@ def test_chart_color_scheme_idempotent(tmp_path):
     ensure_columns(eng)  # 第二次不得 raise
     insp = inspect(eng)
     assert "chart_color_scheme" in {c["name"] for c in insp.get_columns("users")}
+
+
+def test_adds_theme_to_users(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_users3.db'}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)"
+        ))
+    ensure_columns(eng)
+    insp = inspect(eng)
+    assert "theme" in {c["name"] for c in insp.get_columns("users")}
+
+
+def test_theme_idempotent(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_users4.db'}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)"
+        ))
+    ensure_columns(eng)
+    ensure_columns(eng)  # 第二次不得 raise
+    insp = inspect(eng)
+    assert "theme" in {c["name"] for c in insp.get_columns("users")}
