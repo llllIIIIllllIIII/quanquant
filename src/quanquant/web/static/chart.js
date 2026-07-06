@@ -144,6 +144,7 @@
     settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     deductionEnabled: false,   // 均線扣抵開關（由 Alpine 依 localStorage 設定）
     onDeductionUpdate: null,   // (results) => void：把扣抵結果交給狀態列
+    onEditIndicator: null,     // () => void：點擊指標 tooltip icon → 打開指標設定
     _deductionSig: "",         // 上次已畫三角的幾何簽章；相同則跳過重畫
     _deductionDrawn: false,    // 目前是否有扣抵三角在圖上（關閉時只清一次）
 
@@ -164,6 +165,21 @@
       });
       if (this.chart.setTimezone) this.chart.setTimezone("Asia/Taipei");
       if (this.chart.setPriceVolumePrecision) this.chart.setPriceVolumePrecision(0, 0);
+
+      // 指標 tooltip 上的「編輯」icon → 打開指標設定 dialog
+      this.chart.setStyles({
+        indicator: { tooltip: { icons: [{
+          id: "qq-edit", position: "middle", marginLeft: 8, marginTop: 6,
+          marginRight: 0, marginBottom: 0, paddingLeft: 2, paddingTop: 2,
+          paddingRight: 2, paddingBottom: 2, size: 14, color: "#94a3b8",
+          activeColor: "#3b82f6", backgroundColor: "transparent",
+          activeBackgroundColor: "rgba(59,130,246,0.15)",
+          icon: "✎", fontFamily: "sans-serif",
+        }] } },
+      });
+      this.chart.subscribeAction("onTooltipIconClick", (data) => {
+        if (data && data.iconId === "qq-edit" && this.onEditIndicator) this.onEditIndicator();
+      });
 
       this.session = localStorage.getItem("qq_session") || "all";
       this.chart.loadMore((ts) => this.loadMore(ts));
@@ -797,6 +813,7 @@
       this.drawScope = localStorage.getItem("qq_draw_scope") || "hybrid";
       this.drawingsVisible = localStorage.getItem("qq_draw_visible") !== "0";
       QQChart.onDeductionUpdate = (results) => { this.deductionLegend = results; };
+      QQChart.onEditIndicator = () => this.openSettings();
       QQChart.deductionEnabled = this.deductionOn;
       QQChart.drawScope = this.drawScope;
       QQChart.drawingsVisible = this.drawingsVisible;
