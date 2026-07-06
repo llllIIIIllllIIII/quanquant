@@ -77,6 +77,21 @@
     separator: { color: "#33333d" },
   };
 
+  function candleColorStyles(scheme) {
+    const up = scheme === "red_up" ? "#ea3943" : "#16c784";
+    const down = scheme === "red_up" ? "#16c784" : "#ea3943";
+    return {
+      candle: {
+        bar: {
+          upColor: up, downColor: down, noChangeColor: "#888888",
+          upBorderColor: up, downBorderColor: down, noChangeBorderColor: "#888888",
+          upWickColor: up, downWickColor: down, noChangeWickColor: "#888888",
+        },
+        priceMark: { last: { upColor: up, downColor: down } },
+      },
+    };
+  }
+
   const QQChart = {
     chart: null,
     tf: "1m",
@@ -99,6 +114,7 @@
     // every overlay without touching the master list. Set by the Alpine layer
     // from localStorage before init().
     drawingsVisible: true,
+    colorScheme: "green_up",   // 由 Alpine 於 init 前依 window.QQ_COLOR_SCHEME 設定
     _suppressRemoveTracking: false, // true while re-rendering (ignore onRemoved)
     _drawingId: null,    // overlay currently being drawn (ESC cancels it)
     _hoverId: null,      // overlay under the cursor (Delete target)
@@ -115,10 +131,15 @@
         console.error("klinecharts failed to load");
         return;
       }
+      this.colorScheme = window.QQ_COLOR_SCHEME || "green_up";
+      const styles = JSON.parse(JSON.stringify(DARK_STYLES));
+      const cc = candleColorStyles(this.colorScheme).candle;
+      styles.candle.bar = cc.bar;
+      styles.candle.priceMark = cc.priceMark;
       this.chart = klinecharts.init("kchart", {
         timezone: "Asia/Taipei",
         locale: "zh-CN", // v9 built-ins: en-US / zh-CN only (zh-TW unregistered)
-        styles: DARK_STYLES,
+        styles,
       });
       if (this.chart.setTimezone) this.chart.setTimezone("Asia/Taipei");
       if (this.chart.setPriceVolumePrecision) this.chart.setPriceVolumePrecision(0, 0);
@@ -349,6 +370,13 @@
     // whole chart (including candles) stops rendering.
     _lineStyle(color) {
       return { color, size: 1, style: "solid", smooth: false, dashedValue: [2, 2] };
+    },
+
+    applyColorScheme(scheme) {
+      this.colorScheme = scheme;
+      if (this.chart && this.chart.setStyles) {
+        this.chart.setStyles(candleColorStyles(scheme));
+      }
     },
 
     _nextFrame() {
@@ -698,6 +726,7 @@
     deductionLegend: [],
     drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
     drawingsVisible: true, // master show/hide switch for the whole drawing layer
+    colorScheme: window.QQ_COLOR_SCHEME || "green_up",
     form: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
     indicatorDefs: [
       { key: "ma", title: "均線 MA", hint: "疊於主圖" },
@@ -739,6 +768,7 @@
       QQChart.deductionEnabled = this.deductionOn;
       QQChart.drawScope = this.drawScope;
       QQChart.drawingsVisible = this.drawingsVisible;
+      QQChart.colorScheme = this.colorScheme;
       QQChart.init();
       this._initAlerts();
     },
@@ -849,6 +879,17 @@
       this.drawingsVisible = !this.drawingsVisible;
       QQChart.setDrawingsVisible(this.drawingsVisible);
     },
+
+    toggleColorScheme() {
+      this.colorScheme = this.colorScheme === "red_up" ? "green_up" : "red_up";
+      QQChart.applyColorScheme(this.colorScheme);
+      fetch("/api/user/color-scheme", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scheme: this.colorScheme }),
+      }).catch(() => { /* 即時已套用；存回失敗僅影響下次載入 */ });
+    },
+
     dedArrow(status) {
       return { upward: "↑", downward: "↓", flat: "→" }[status] || "—";
     },

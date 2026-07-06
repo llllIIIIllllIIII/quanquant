@@ -11,6 +11,7 @@ from sqlalchemy import inspect, text
 _MIGRATIONS = [
     ("trades", "user_id", "INTEGER"),
     ("alerts", "user_id", "INTEGER"),
+    ("users", "chart_color_scheme", "VARCHAR"),
 ]
 
 

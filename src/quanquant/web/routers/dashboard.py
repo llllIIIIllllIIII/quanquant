@@ -45,12 +45,14 @@ def _quote_context(
 @router.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
     settings = get_settings()
+    user = request.state.user
     return templates.TemplateResponse(
         request,
         "dashboard.html",
         {
             "active": "dashboard",
             "symbol": settings.symbol,
+            "color_scheme": (user.chart_color_scheme if user else None) or "green_up",
         },
     )
 

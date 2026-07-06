@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from sqlmodel import Session, select
 
+from quanquant.auth import service
 from quanquant.candles.service import get_candles, get_latest
 from quanquant.candles.timeframes import TIMEFRAMES
 from quanquant.db.models import User, UserChartState, _utcnow
@@ -121,5 +122,21 @@ async def put_chart_state(
         row.updated_at = _utcnow()
     session.add(row)
     session.commit()
+    return Response(status_code=204)
+
+
+@router.put("/api/user/color-scheme")
+async def put_color_scheme(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    scheme = body.get("scheme") if isinstance(body, dict) else None
+    if not isinstance(scheme, str) or not service.set_color_scheme(session, user, scheme):
+        raise HTTPException(status_code=422, detail="invalid color scheme")
     return Response(status_code=204)
 

@@ -54,6 +54,8 @@ def test_change_password_flow(client):
     r = client.post("/account/password",
                     data={"old_password": "WRONG", "new_password": "brand-new"})
     assert "舊密碼錯誤" in r.text
+    # color_scheme must still be present and a radio pre-checked (regression fix)
+    assert 'value="green_up" checked' in r.text
 
     r = client.post("/account/password",
                     data={"old_password": "test-pw", "new_password": "brand-new"},
@@ -67,3 +69,49 @@ def test_navbar_shows_user_menu(client):
     body = client.get("/").text
     assert "Tester" in body           # display_name
     assert "/logout" in body
+
+
+def test_account_page_shows_color_scheme_radio(client):
+    body = client.get("/account").text
+    assert 'name="scheme"' in body
+    assert "green_up" in body and "red_up" in body
+
+
+def test_set_color_scheme_via_account_form(client):
+    r = client.post("/account/color-scheme", data={"scheme": "red_up"},
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/account"
+    # 重新載入帳戶頁，red_up 被預選
+    body = client.get("/account").text
+    assert 'value="red_up" checked' in body
+
+
+def test_set_color_scheme_invalid_shows_error(client):
+    r = client.post("/account/color-scheme", data={"scheme": "bad"})
+    assert r.status_code == 200
+    assert "配色設定無效" in r.text
+
+
+def test_put_color_scheme_api_persists(client):
+    r = client.put("/api/user/color-scheme", json={"scheme": "red_up"})
+    assert r.status_code == 204
+    # 帳戶頁反映新值（同一欄位）
+    assert 'value="red_up" checked' in client.get("/account").text
+
+
+def test_put_color_scheme_api_rejects_invalid(client):
+    r = client.put("/api/user/color-scheme", json={"scheme": "nope"})
+    assert r.status_code == 422
+
+
+def test_put_color_scheme_api_requires_auth(anon_client):
+    r = anon_client.put("/api/user/color-scheme", json={"scheme": "red_up"},
+                        follow_redirects=False)
+    assert r.status_code in (401, 303, 307)
+
+
+def test_put_color_scheme_api_bad_body(client):
+    r = client.put("/api/user/color-scheme", content=b"not json",
+                   headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
