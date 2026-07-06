@@ -131,7 +131,10 @@ async def put_color_scheme(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
     scheme = body.get("scheme") if isinstance(body, dict) else None
     if not isinstance(scheme, str) or not service.set_color_scheme(session, user, scheme):
         raise HTTPException(status_code=422, detail="invalid color scheme")

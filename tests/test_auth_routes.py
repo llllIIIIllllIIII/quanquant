@@ -109,3 +109,9 @@ def test_put_color_scheme_api_requires_auth(anon_client):
     r = anon_client.put("/api/user/color-scheme", json={"scheme": "red_up"},
                         follow_redirects=False)
     assert r.status_code in (401, 303, 307)
+
+
+def test_put_color_scheme_api_bad_body(client):
+    r = client.put("/api/user/color-scheme", content=b"not json",
+                   headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
