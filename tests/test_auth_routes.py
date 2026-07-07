@@ -167,3 +167,8 @@ def test_base_renders_user_theme(client):
 def test_base_theme_defaults_dark(client):
     r = client.get("/account")
     assert 'data-theme="dark"' in r.text
+
+
+def test_dashboard_loads_indicators_module(client):
+    body = client.get("/").text
+    assert "/static/indicators.js" in body
