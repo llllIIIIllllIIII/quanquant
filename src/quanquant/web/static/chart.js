@@ -416,45 +416,10 @@
     // no exception). Spacing the create calls across animation frames avoids
     // the race, and _watchdog() self-heals if it ever happens anyway.
     async applyIndicators() {
-      const s = this.settings;
-
-      // MA overlaid on the candle pane (multi-period, per-line colors)
-      try {
-        if (s.ma.enabled && s.ma.params.length) {
-          const override = {
-            name: "MA",
-            calcParams: s.ma.params.map((p) => p.period),
-            styles: { lines: s.ma.params.map((p) => this._lineStyle(p.color)) },
-          };
-          if (!this.paneIds.ma) {
-            this.chart.createIndicator(override, true, { id: "candle_pane" });
-            this.paneIds.ma = true;
-          } else {
-            this.chart.overrideIndicator(override, "candle_pane");
-          }
-        } else if (this.paneIds.ma) {
-          this.chart.removeIndicator("candle_pane", "MA");
-          this.paneIds.ma = false;
-        }
-      } catch (e) { console.error("MA indicator failed:", e); }
-
-      // sub-pane indicators — one per frame
-      await this._nextFrame();
-      this.applySubIndicator("WR", "wr", s.wr);
-      await this._nextFrame();
-      this.applySubIndicator("BIAS", "bias", s.bias);
-      await this._nextFrame();
-
-      // volume pane
-      try {
-        if (s.vol.enabled && !this.paneIds.vol) {
-          this.paneIds.vol = this.chart.createIndicator("VOL", false, { height: 90 });
-        } else if (!s.vol.enabled && this.paneIds.vol) {
-          this.chart.removeIndicator(this.paneIds.vol);
-          this.paneIds.vol = null;
-        }
-      } catch (e) { console.error("VOL indicator failed:", e); }
-
+      for (const entry of window.QQIndicators.list) {
+        this._applyIndicator(entry, this.settings[entry.key]);
+        if (entry.pane === "sub") await this._nextFrame(); // 逐格建立，避免同 tick 建多 pane 卡渲染
+      }
       // force a clean relayout/repaint after pane changes
       await this._nextFrame();
       this.chart.resize();
@@ -486,25 +451,43 @@
       this._wdTimers = [setTimeout(check, 1200), setTimeout(check, 3500)];
     },
 
-    applySubIndicator(name, key, conf) {
+    _applyIndicator(entry, conf) {
+      const key = entry.key;
+      const onMain = entry.pane === "main";
       try {
-        const active = conf.enabled && conf.params.length;
+        const enabled = !!(conf && conf.enabled);
+        // repeatable：需至少一條線；fixed（含無參數 VOL）：啟用即算
+        const active = enabled && (entry.repeatable ? (conf.params || []).length > 0 : true);
         if (active) {
           const override = {
-            name,
-            calcParams: conf.params.map((p) => p.period),
-            styles: { lines: conf.params.map((p) => this._lineStyle(p.color)) },
+            name: entry.klineName,
+            calcParams: window.QQIndicators.calcParams(entry, conf),
           };
+          if (entry.repeatable) {
+            override.styles = { lines: conf.params.map((p) => this._lineStyle(p.color)) };
+          }
           if (!this.paneIds[key]) {
-            this.paneIds[key] = this.chart.createIndicator(override, false, { height: 90 });
+            if (onMain) {
+              this.chart.createIndicator(override, true, { id: "candle_pane" });
+              this.paneIds[key] = true;
+            } else {
+              this.paneIds[key] = this.chart.createIndicator(override, false, { height: 90 });
+            }
+          } else if (onMain) {
+            this.chart.overrideIndicator(override, "candle_pane");
           } else {
             this.chart.overrideIndicator(override, this.paneIds[key]);
           }
         } else if (this.paneIds[key]) {
-          this.chart.removeIndicator(this.paneIds[key]);
-          this.paneIds[key] = null;
+          if (onMain) {
+            this.chart.removeIndicator("candle_pane", entry.klineName);
+            this.paneIds[key] = false;
+          } else {
+            this.chart.removeIndicator(this.paneIds[key]);
+            this.paneIds[key] = null;
+          }
         }
-      } catch (e) { console.error(name + " indicator failed:", e); }
+      } catch (e) { console.error(entry.klineName + " indicator failed:", e); }
     },
 
     async saveIndicators() {
