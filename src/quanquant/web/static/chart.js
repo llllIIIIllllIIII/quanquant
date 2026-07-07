@@ -741,11 +741,9 @@
     drawingsVisible: true, // master show/hide switch for the whole drawing layer
     colorScheme: window.QQ_COLOR_SCHEME || "green_up",
     form: window.QQIndicators.defaults(),
-    indicatorDefs: [
-      { key: "ma", title: "均線 MA", hint: "疊於主圖" },
-      { key: "wr", title: "威廉指標 WR", hint: "副圖" },
-      { key: "bias", title: "乖離率 BIAS", hint: "副圖" },
-    ],
+    indicators: window.QQIndicators.list,   // registry（主從式清單/目錄的來源）
+    activeIndicator: null,                  // 右欄正在編輯的指標 key
+    catalogOpen: false,                     // 「新增指標」目錄是否展開
 
     // ---- alerts ----
     alertsOpen: false,
@@ -928,18 +926,29 @@
       return `MA${r.period} 即時扣抵\n扣抵位置：${r.period} 根前\n扣抵價：${dv}\n基準價：${bp}\n差距：${pct}\n狀態：MA${r.period} ${lbl}`;
     },
 
-    openSettings() {
+    openSettings(key) {
       this.form = JSON.parse(JSON.stringify(QQChart.settings)); // edit a copy
+      // 預設選取：帶入的 key → 否則第一個已啟用指標 → 否則第一個
+      const enabledKeys = this.indicators.filter((e) => this.form[e.key] && this.form[e.key].enabled).map((e) => e.key);
+      this.activeIndicator = key || enabledKeys[0] || this.indicators[0].key;
+      this.catalogOpen = false;
       this.settingsOpen = true;
     },
 
     async saveSettings() {
-      // sanitize: positive integer periods only
-      for (const key of ["ma", "wr", "bias"]) {
-        this.form[key].params = this.form[key].params.filter(
-          (p) => Number.isFinite(p.period) && p.period >= 1
-        );
-        this.form[key].params.forEach((p) => { p.period = Math.round(p.period); });
+      for (const entry of this.indicators) {
+        const conf = this.form[entry.key];
+        if (!conf) continue;
+        if (entry.repeatable) {
+          conf.params = (conf.params || []).filter((p) => Number.isFinite(p.period) && p.period >= 1);
+          conf.params.forEach((p) => { p.period = Math.round(p.period); });
+        } else {
+          for (const f of entry.paramSchema) {
+            if (f.type !== "number") continue;
+            const v = Math.round(conf.params[f.field]);
+            conf.params[f.field] = Number.isFinite(v) && v >= 1 ? v : (entry.defaults.params[f.field] || 1);
+          }
+        }
       }
       QQChart.settings = JSON.parse(JSON.stringify(this.form));
       await QQChart.saveIndicators();

@@ -365,3 +365,16 @@ body.chart-fullscreen #kchart { height: calc(100vh - 130px); }
 @media (min-width: 768px) and (max-width: 1023px) {
   .cards { grid-template-columns: repeat(3, 1fr); }
 }
+
+/* ---- 指標設定主從式 ---- */
+.ind-settings { min-width: min(560px, 92vw); }
+.ind-split { display: flex; gap: 1rem; }
+.ind-list { flex: 0 0 40%; border-right: 1px solid var(--qq-border); padding-right: 0.75rem; }
+.ind-detail { flex: 1; }
+.ind-item { display: flex; justify-content: space-between; align-items: center;
+  padding: 0.35rem 0.5rem; border-radius: var(--qq-radius-sm); cursor: pointer; }
+.ind-item.active { background: var(--qq-surface-2); }
+.ind-catalog { display: flex; flex-direction: column; gap: 0.25rem; margin-top: 0.4rem; }
+.param-fixed { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.5rem; }
+@media (max-width: 767px) { .ind-split { flex-direction: column; }
+  .ind-list { flex-basis: auto; border-right: none; border-bottom: 1px solid var(--qq-border); padding-right: 0; } }

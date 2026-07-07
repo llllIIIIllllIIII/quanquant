@@ -198,39 +198,79 @@
     分鐘 K 僅涵蓋系統開始記錄之後的期間。
   </small>
 
-  <!-- 指標設定 dialog -->
+  <!-- 指標設定 dialog（主從式：左清單/目錄，右參數） -->
   <dialog :open="settingsOpen">
-    <article class="modal-card">
+    <article class="modal-card ind-settings">
       <header>
         <button aria-label="Close" rel="prev" @click="settingsOpen = false"></button>
         <strong>指標設定</strong>
       </header>
 
-      <template x-for="ind in indicatorDefs" :key="ind.key">
-        <fieldset class="ind-block">
-          <label>
-            <input type="checkbox" x-model="form[ind.key].enabled">
-            <strong x-text="ind.title"></strong> <small class="muted" x-text="ind.hint"></small>
-          </label>
-          <template x-for="(p, i) in form[ind.key].params" :key="i">
-            <div class="param-row">
-              <input type="number" min="1" step="1" x-model.number="p.period" placeholder="週期">
-              <input type="color" x-model="p.color">
+      <div class="ind-split">
+        <!-- 左欄：已啟用清單 + 新增指標目錄 -->
+        <aside class="ind-list">
+          <template x-for="e in indicators.filter((x) => form[x.key] && form[x.key].enabled)" :key="e.key">
+            <div class="ind-item" :class="{active: activeIndicator === e.key}"
+                 @click="activeIndicator = e.key; catalogOpen = false">
+              <span x-text="e.title"></span>
               <button type="button" class="outline mini danger"
-                      @click="form[ind.key].params.splice(i, 1)">−</button>
+                      @click.stop="form[e.key].enabled = false; if (activeIndicator === e.key) activeIndicator = null">−</button>
             </div>
           </template>
-          <button type="button" class="outline mini"
-                  @click="form[ind.key].params.push({period: 10, color: '#f0b90b'})">＋ 加一條</button>
-        </fieldset>
-      </template>
 
-      <fieldset class="ind-block">
-        <label>
-          <input type="checkbox" x-model="form.vol.enabled">
-          <strong>成交量 VOL</strong>
-        </label>
-      </fieldset>
+          <hr>
+          <button type="button" class="outline mini" @click="catalogOpen = !catalogOpen">＋ 新增指標</button>
+          <div class="ind-catalog" x-show="catalogOpen" x-cloak>
+            <template x-for="e in indicators.filter((x) => !(form[x.key] && form[x.key].enabled))" :key="e.key">
+              <button type="button" class="outline mini catalog-item"
+                      @click="form[e.key].enabled = true; activeIndicator = e.key; catalogOpen = false"
+                      x-text="e.title"></button>
+            </template>
+            <p class="muted" x-show="indicators.every((x) => form[x.key] && form[x.key].enabled)">全部指標已啟用</p>
+          </div>
+        </aside>
+
+        <!-- 右欄：選取指標的參數（由 paramSchema 生成） -->
+        <section class="ind-detail" x-show="activeIndicator" x-cloak>
+          <template x-for="e in indicators.filter((x) => x.key === activeIndicator)" :key="e.key">
+            <div>
+              <strong x-text="e.title"></strong> <small class="muted" x-text="e.hint"></small>
+
+              <!-- repeatable：多條線 -->
+              <template x-if="e.repeatable">
+                <div>
+                  <template x-for="(p, i) in form[e.key].params" :key="i">
+                    <div class="param-row">
+                      <input type="number" min="1" step="1" x-model.number="p.period" placeholder="週期">
+                      <input type="color" x-model="p.color">
+                      <button type="button" class="outline mini danger"
+                              @click="form[e.key].params.splice(i, 1)">−</button>
+                    </div>
+                  </template>
+                  <button type="button" class="outline mini"
+                          @click="form[e.key].params.push({period: 10, color: '#f0b90b'})">＋ 加一條</button>
+                </div>
+              </template>
+
+              <!-- fixed：單一物件，依 paramSchema 鋪 number 欄位 -->
+              <template x-if="!e.repeatable && e.paramSchema.length">
+                <div class="param-fixed">
+                  <template x-for="f in e.paramSchema" :key="f.field">
+                    <label x-text="f.label">
+                      <input type="number" :min="f.min" :step="f.step" x-model.number="form[e.key].params[f.field]">
+                    </label>
+                  </template>
+                </div>
+              </template>
+
+              <!-- 無參數指標（VOL） -->
+              <template x-if="!e.repeatable && !e.paramSchema.length">
+                <p class="muted">此指標無可調參數。</p>
+              </template>
+            </div>
+          </template>
+        </section>
+      </div>
 
       <footer class="form-actions">
         <button type="button" class="secondary" @click="settingsOpen = false">取消</button>

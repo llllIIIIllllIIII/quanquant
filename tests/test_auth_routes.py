@@ -172,3 +172,10 @@ def test_base_theme_defaults_dark(client):
 def test_dashboard_loads_indicators_module(client):
     body = client.get("/").text
     assert "/static/indicators.js" in body
+
+
+def test_indicator_dialog_is_master_detail(client):
+    body = client.get("/").text
+    # 主從式版面容器 + 由 registry 衍生（不再有寫死的 indicatorDefs 迴圈）
+    assert 'class="ind-split"' in body
+    assert 'x-text="e.title"' in body
