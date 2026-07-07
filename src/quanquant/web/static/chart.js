@@ -39,20 +39,6 @@
     return `${a.timeframe}｜${L} ${OP_LABELS[a.op]} ${R}`;
   }
 
-  const DEFAULT_SETTINGS = {
-    ma: { enabled: true, params: [
-      { period: 5, color: "#f0b90b" }, { period: 10, color: "#ff9800" },
-      { period: 20, color: "#2196f3" }, { period: 60, color: "#e91e63" },
-    ]},
-    wr: { enabled: false, params: [
-      { period: 14, color: "#f0b90b" }, { period: 28, color: "#2196f3" },
-    ]},
-    bias: { enabled: false, params: [
-      { period: 6, color: "#f0b90b" }, { period: 12, color: "#2196f3" },
-      { period: 24, color: "#e91e63" },
-    ]},
-    vol: { enabled: true },
-  };
 
   const DARK_STYLES = {
     grid: {
@@ -141,7 +127,7 @@
     _hoverId: null,      // overlay under the cursor (Delete target)
     _selectedId: null,   // overlay last clicked/selected (sticky Delete target)
     tfCache: new Map(),  // (session|tf) -> {bars, hasMore} — instant switching
-    settings: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
+    settings: window.QQIndicators.defaults(),
     deductionEnabled: false,   // 均線扣抵開關（由 Alpine 依 localStorage 設定）
     onDeductionUpdate: null,   // (results) => void：把扣抵結果交給狀態列
     onEditIndicator: null,     // () => void：點擊指標 tooltip icon → 打開指標設定
@@ -214,13 +200,7 @@
     },
 
     mergeSettings(saved) {
-      const merged = JSON.parse(JSON.stringify(DEFAULT_SETTINGS));
-      for (const key of ["ma", "wr", "bias", "vol"]) {
-        if (saved[key] && typeof saved[key] === "object") {
-          merged[key] = { ...merged[key], ...saved[key] };
-        }
-      }
-      return merged;
+      return window.QQIndicators.merge(saved);
     },
 
     // ---- data ----
@@ -777,7 +757,7 @@
     drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
     drawingsVisible: true, // master show/hide switch for the whole drawing layer
     colorScheme: window.QQ_COLOR_SCHEME || "green_up",
-    form: JSON.parse(JSON.stringify(DEFAULT_SETTINGS)),
+    form: window.QQIndicators.defaults(),
     indicatorDefs: [
       { key: "ma", title: "均線 MA", hint: "疊於主圖" },
       { key: "wr", title: "威廉指標 WR", hint: "副圖" },
