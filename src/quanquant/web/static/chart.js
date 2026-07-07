@@ -751,14 +751,8 @@
     alertEvents: [],
     toasts: [],
     _toastId: 0,
-    indTargets: [
-      { code: "price", label: "收盤價" }, { code: "ma", label: "MA 均線" },
-      { code: "wr", label: "WR 威廉" }, { code: "bias", label: "BIAS 乖離" },
-    ],
-    rightTargets: [
-      { code: "const", label: "固定值" }, { code: "ma", label: "MA 均線" },
-      { code: "wr", label: "WR 威廉" }, { code: "bias", label: "BIAS 乖離" },
-    ],
+    indTargets: [{ code: "price", label: "收盤價" }, ...window.QQIndicators.alertTargets()],
+    rightTargets: [{ code: "const", label: "固定值" }, ...window.QQIndicators.alertTargets()],
     ops: [
       { code: "cross_up", label: "向上突破" }, { code: "cross_down", label: "向下突破" },
       { code: "gte", label: "≥ 大於等於" }, { code: "lte", label: "≤ 小於等於" },
