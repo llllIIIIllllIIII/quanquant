@@ -52,6 +52,16 @@
       paramSchema: [],
       defaults: { enabled: true, params: {} },
     },
+    {
+      key: "macd", title: "MACD", hint: "副圖",
+      pane: "sub", klineName: "MACD", alertTarget: false, repeatable: false,
+      paramSchema: [
+        { field: "fast", type: "number", label: "快線", min: 1, step: 1 },
+        { field: "slow", type: "number", label: "慢線", min: 1, step: 1 },
+        { field: "signal", type: "number", label: "訊號", min: 1, step: 1 },
+      ],
+      defaults: { enabled: false, params: { fast: 12, slow: 26, signal: 9 } },
+    },
   ];
 
   function clone(x) { return JSON.parse(JSON.stringify(x)); }

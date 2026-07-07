@@ -7,7 +7,7 @@ const QQI = require('../../src/quanquant/web/static/indicators.js');
 
 test('list 含 ma/wr/bias/vol，欄位齊全', () => {
   const keys = QQI.list.map((e) => e.key);
-  assert.deepEqual(keys, ['ma', 'wr', 'bias', 'vol']);
+  assert.deepEqual(keys, ['ma', 'wr', 'bias', 'vol', 'macd']);
   const ma = QQI.byKey('ma');
   assert.equal(ma.pane, 'main');
   assert.equal(ma.klineName, 'MA');
@@ -24,7 +24,7 @@ test('byKlineName 反查', () => {
 
 test('defaults() 等同舊 DEFAULT_SETTINGS 結構', () => {
   const d = QQI.defaults();
-  assert.deepEqual(Object.keys(d), ['ma', 'wr', 'bias', 'vol']);
+  assert.deepEqual(Object.keys(d), ['ma', 'wr', 'bias', 'vol', 'macd']);
   assert.equal(d.ma.enabled, true);
   assert.equal(d.ma.params.length, 4);
   assert.equal(d.ma.params[0].period, 5);
@@ -41,7 +41,7 @@ test('merge: 舊存檔（無新指標）載入後含全部 key 且舊值保留',
   assert.equal(m.ma.enabled, false);
   assert.equal(m.ma.params[0].period, 7);
   assert.equal(m.wr.enabled, false);       // 未存 → 用 defaults
-  assert.deepEqual(Object.keys(m), ['ma', 'wr', 'bias', 'vol']);
+  assert.deepEqual(Object.keys(m), ['ma', 'wr', 'bias', 'vol', 'macd']);
 });
 
 test('merge: 存檔含 registry 已無的 key → 略過', () => {
@@ -81,4 +81,21 @@ test('calcParams fixed: 依 paramSchema number 欄位順序', () => {
 test('calcParams: 空/缺 conf 安全回空陣列', () => {
   assert.deepEqual(QQI.calcParams(QQI.byKey('vol'), { params: {} }), []);
   assert.deepEqual(QQI.calcParams(null, null), []);
+});
+
+test('macd 已註冊為 fixed 指標，calcParams 為 [fast, slow, signal]', () => {
+  const macd = QQI.byKey('macd');
+  assert.ok(macd, 'macd 應存在於 registry');
+  assert.equal(macd.repeatable, false);
+  assert.equal(macd.pane, 'sub');
+  assert.equal(macd.klineName, 'MACD');
+  assert.deepEqual(QQI.calcParams(macd, macd.defaults), [12, 26, 9]);
+});
+
+test('macd 預設不啟用，merge 後既有 key 不受影響', () => {
+  const d = QQI.defaults();
+  assert.equal(d.macd.enabled, false);
+  const m = QQI.merge({ ma: { enabled: false } });
+  assert.equal(m.ma.enabled, false);
+  assert.equal(m.macd.enabled, false); // 舊存檔無 macd → 用 defaults 補
 });
