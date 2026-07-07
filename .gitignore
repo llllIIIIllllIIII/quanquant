@@ -22,6 +22,10 @@ docker-compose.override.yml
 
 # Local tooling
 .claude/
+.superpowers/
+
+# graphify skill output (build artifact, not source)
+graphify-out/
 
 # Shioaji client runtime log
 shioaji.log

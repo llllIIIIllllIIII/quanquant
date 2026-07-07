@@ -930,7 +930,7 @@
       this.form = JSON.parse(JSON.stringify(QQChart.settings)); // edit a copy
       // 預設選取：帶入的 key → 否則第一個已啟用指標 → 否則第一個
       const enabledKeys = this.indicators.filter((e) => this.form[e.key] && this.form[e.key].enabled).map((e) => e.key);
-      this.activeIndicator = key || enabledKeys[0] || this.indicators[0].key;
+      this.activeIndicator = key || enabledKeys[0] || this.indicators[0]?.key || null;
       this.catalogOpen = false;
       this.settingsOpen = true;
     },

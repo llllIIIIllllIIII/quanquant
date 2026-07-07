@@ -256,7 +256,8 @@
               <template x-if="!e.repeatable && e.paramSchema.length">
                 <div class="param-fixed">
                   <template x-for="f in e.paramSchema" :key="f.field">
-                    <label x-text="f.label">
+                    <label>
+                      <span x-text="f.label"></span>
                       <input type="number" :min="f.min" :step="f.step" x-model.number="form[e.key].params[f.field]">
                     </label>
                   </template>
