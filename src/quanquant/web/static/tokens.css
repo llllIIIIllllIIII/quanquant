@@ -11,6 +11,16 @@
   --qq-shadow-2: 0 8px 24px rgba(0, 0, 0, 0.45);
   --up: #16c784;
   --down: #ea3943;
+  /* price-direction colours: flip with the K-line colour scheme.
+     green_up (default): rise=green, fall=red. red_up: rise=red, fall=green.
+     --up/--down stay fixed (profit/loss semantics on stats cards). */
+  --rise: var(--up);
+  --fall: var(--down);
+}
+
+html[data-scheme="red_up"] {
+  --rise: var(--down);
+  --fall: var(--up);
 }
 
 html[data-theme="dark"] {

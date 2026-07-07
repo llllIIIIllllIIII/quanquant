@@ -71,6 +71,14 @@ def test_navbar_shows_user_menu(client):
     assert "/logout" in body
 
 
+def test_dashboard_wires_data_scheme_from_color_scheme(client):
+    # the quote panel's rise/fall colour flips with the K-line colour scheme
+    # via html[data-scheme]; the dashboard must seed it from QQ_COLOR_SCHEME
+    # on a persistent ancestor (survives the periodic HTMX quote swap).
+    body = client.get("/").text
+    assert 'documentElement.setAttribute("data-scheme"' in body
+
+
 def test_account_page_shows_color_scheme_radio(client):
     body = client.get("/account").text
     assert 'name="scheme"' in body

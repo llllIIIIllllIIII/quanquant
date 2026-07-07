@@ -73,10 +73,10 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
   border-radius: 999px; font-family: var(--qq-font-mono);
   font-variant-numeric: tabular-nums;
 }
-.quote.up .price { color: var(--up); }
-.quote.down .price { color: var(--down); }
-.quote.up .chg-pill { color: var(--up); background: color-mix(in srgb, var(--up) 12%, transparent); }
-.quote.down .chg-pill { color: var(--down); background: color-mix(in srgb, var(--down) 12%, transparent); }
+.quote.up .price { color: var(--rise); }
+.quote.down .price { color: var(--fall); }
+.quote.up .chg-pill { color: var(--rise); background: color-mix(in srgb, var(--rise) 12%, transparent); }
+.quote.down .chg-pill { color: var(--fall); background: color-mix(in srgb, var(--fall) 12%, transparent); }
 .quote.err { color: var(--down); }
 .quote-fields { display: flex; gap: 1.25rem; }
 .qf { display: flex; flex-direction: column; line-height: 1.25; }

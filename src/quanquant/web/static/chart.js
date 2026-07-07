@@ -412,6 +412,8 @@
 
     applyColorScheme(scheme) {
       this.colorScheme = scheme;
+      // quote panel rise/fall colour follows the scheme via html[data-scheme]
+      document.documentElement.setAttribute("data-scheme", scheme);
       if (this.chart && this.chart.setStyles) {
         this.chart.setStyles(candleColorStyles(scheme));
       }
