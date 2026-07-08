@@ -144,9 +144,17 @@
       const styles = JSON.parse(JSON.stringify(themeStyles(initTheme)));
       const cc = candleColorStyles(this.colorScheme).candle;
       styles.candle = Object.assign({}, styles.candle, { bar: cc.bar, priceMark: cc.priceMark });
+      // v9 內建只有 en-US / zh-CN（zh-CN 的十字游標標籤是簡體）。
+      // 註冊繁體 zh-TW 覆寫全部 8 個 i18n key，確保網頁不出現簡體字。
+      if (klinecharts.registerLocale) {
+        klinecharts.registerLocale("zh-TW", {
+          time: "時間：", open: "開：", high: "高：", low: "低：",
+          close: "收：", volume: "成交量：", turnover: "成交額：", change: "漲幅：",
+        });
+      }
       this.chart = klinecharts.init("kchart", {
         timezone: "Asia/Taipei",
-        locale: "zh-CN", // v9 built-ins: en-US / zh-CN only (zh-TW unregistered)
+        locale: "zh-TW",
         styles,
       });
       if (this.chart.setTimezone) this.chart.setTimezone("Asia/Taipei");

@@ -28,6 +28,7 @@ git commit → git push → ./scripts/deploy.sh
 - 資料庫雙方言：本機 SQLite / 雲端 Postgres — 新增 raw SQL 必須兩邊可攜（named params、dialect-aware upsert，參考 `candles/repo.py`）
 - pyproject 的 hatch wheel 設定**不可加 force-include**（與 packages 重複收錄會炸 Docker build）
 - KLineCharts 釘版 v9.8.12，升版前先驗證（v10 改 API 名）；`chart.js` 的四道渲染防線勿移除
+- KLineCharts locale 必須用繁體 `zh-TW`（`chart.js` 以 `registerLocale` 註冊，勿改回內建 `zh-CN`，否則十字游標標籤時間/開/高/低/收/成交量會變回簡體）；全站中文一律繁體台灣
 - 本機 `quanquant.db` 含珍貴回補歷史，驗證清理時勿刪
 - candle 讀取路徑走 raw-SQL→float（FastCandle），routes 為 sync `def` — 勿改 async/ORM
 - `.env` 與 `*.dump` 不進 git
