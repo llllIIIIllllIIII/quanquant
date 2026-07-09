@@ -113,6 +113,8 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
   padding: 0 1.8rem 0 0.7rem; background-position: right 0.6rem center;
   background-color: transparent; border-color: var(--qq-border-strong); color: var(--qq-text);
 }
+/* 展開的原生下拉選項在深色模式需明確底色，否則淺字白底看不見 */
+.session-sel option { color: var(--qq-text); background-color: var(--qq-surface); }
 .tb-tfs { display: flex; flex-wrap: wrap; gap: 2px; }
 .tf-btn {
   margin: 0; width: auto; padding: 0.25rem 0.55rem; font-size: 0.78rem;
@@ -300,24 +302,13 @@ a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
   padding: 0.6rem 0.8rem; border-radius: 0.4rem; margin-bottom: 0.6rem; font-size: 0.85rem;
 }
 
-/* 均線扣抵 */
 [x-cloak] { display: none !important; }
-.ded-legend {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
-  margin: 4px 0 2px; font-variant-numeric: tabular-nums;
-}
-.ded-legend-label { font-size: 12px; }
-.ded-chip {
-  display: inline-flex; align-items: center; gap: 4px;
-  font-size: 12px; font-weight: 600;
-}
-.ded-chip .ded-arrow { font-weight: 700; }
 
 /* ---- chart fullscreen mode ---- */
-body.chart-fullscreen .topnav,
-body.chart-fullscreen .quote-panel { display: none; }
+body.chart-fullscreen .topnav { display: none; }
+body.chart-fullscreen .quote-panel { margin: 0.4rem 0 0.6rem; }
 body.chart-fullscreen main.container { max-width: none; padding: 0.5rem 0.75rem; }
-body.chart-fullscreen #kchart { height: calc(100vh - 130px); }
+body.chart-fullscreen #kchart { height: calc(100vh - 205px); }
 
 /* ---- login & settings ---- */
 .login-body { display: flex; align-items: flex-start; justify-content: center; min-height: 100dvh; padding-top: 14vh; }

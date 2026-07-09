@@ -82,44 +82,21 @@
             <span>K 線配色</span>
             <span class="row-state" x-text="colorScheme === 'red_up' ? '紅漲' : '綠漲'"></span>
           </button>
-          <button type="button" class="menu-row" :class="{active: deductionOn}"
-                  @click="toggleDeduction()" :aria-pressed="deductionOn">
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M12 19V5M5 12l7-7 7 7"/>
-            </svg>
-            <span>均線扣抵</span>
-            <span class="row-state" x-text="deductionOn ? '開' : '關'"></span>
-          </button>
           <button type="button" class="menu-row" @click="toggleDrawScope()"
                   :aria-pressed="drawScope === 'all'"
                   :title="drawScope === 'hybrid'
-                    ? '畫線跨時框：智慧混合（水平線/價格線跨所有時框；趨勢線只在繪製時框顯示）。點擊改為全部時框'
-                    : '畫線跨時框：全部時框顯示。點擊改回智慧混合'">
+                    ? '畫線跨時框：單一模式（水平線/價格線跨所有時框；趨勢線只在繪製時框顯示）。點擊改為全部時框'
+                    : '畫線跨時框：全部時框顯示。點擊改回單一模式'">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                  stroke-width="2" stroke-linecap="round" aria-hidden="true">
               <path d="M2 12h20M12 2v20"/>
             </svg>
             <span>畫線跨時框</span>
-            <span class="row-state" x-text="drawScope === 'hybrid' ? '智慧' : '全部'"></span>
+            <span class="row-state" x-text="drawScope === 'hybrid' ? '單一' : '全部'"></span>
           </button>
         </div>
       </div>
     </div>
-  </div>
-
-  <div class="ded-legend" x-show="deductionOn" x-cloak>
-    <span class="muted ded-legend-label">即時扣抵</span>
-    <template x-if="deductionLegend.length === 0">
-      <small class="muted">請先在指標設定加入 MA</small>
-    </template>
-    <template x-for="(r, index) in deductionLegend" :key="r.period + '_' + index">
-      <span class="ded-chip" :style="`color:${r.color}`" :title="dedTitle(r)">
-        <span x-text="'MA' + r.period"></span>
-        <span x-text="r.status === 'insufficient-data' ? '—' : Math.round(r.deductionValue).toLocaleString()"></span>
-        <span class="ded-arrow" x-text="dedArrow(r.status)"></span>
-      </span>
-    </template>
   </div>
 
   <div class="chart-row">
@@ -367,7 +344,6 @@
 <script src="https://unpkg.com/klinecharts@9.8.12/dist/umd/klinecharts.min.js"></script>
 <script>window.QQ_SYMBOL = "{{ symbol }}"; window.QQ_COLOR_SCHEME = {{ color_scheme | tojson }};
 document.documentElement.setAttribute("data-scheme", window.QQ_COLOR_SCHEME || "green_up");</script>
-<script src="/static/ma_deduction.js"></script>
 <script src="/static/indicators.js"></script>
 <script src="/static/chart.js"></script>
 <script src="/static/pulse.js"></script>
