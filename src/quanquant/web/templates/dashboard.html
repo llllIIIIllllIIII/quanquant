@@ -82,6 +82,16 @@
             <span>K 線配色</span>
             <span class="row-state" x-text="colorScheme === 'red_up' ? '紅漲' : '綠漲'"></span>
           </button>
+          <button type="button" class="menu-row" :class="{active: deductionOn}"
+                  @click="toggleDeduction()" :aria-pressed="deductionOn"
+                  title="扣抵三角：在 K 線圖標出各 MA 的扣抵位置（開/關）">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 19V5M5 12l7-7 7 7"/>
+            </svg>
+            <span>扣抵三角</span>
+            <span class="row-state" x-text="deductionOn ? '開' : '關'"></span>
+          </button>
           <button type="button" class="menu-row" @click="toggleDrawScope()"
                   :aria-pressed="drawScope === 'all'"
                   :title="drawScope === 'hybrid'
@@ -344,6 +354,7 @@
 <script src="https://unpkg.com/klinecharts@9.8.12/dist/umd/klinecharts.min.js"></script>
 <script>window.QQ_SYMBOL = "{{ symbol }}"; window.QQ_COLOR_SCHEME = {{ color_scheme | tojson }};
 document.documentElement.setAttribute("data-scheme", window.QQ_COLOR_SCHEME || "green_up");</script>
+<script src="/static/ma_deduction.js"></script>
 <script src="/static/indicators.js"></script>
 <script src="/static/chart.js"></script>
 <script src="/static/pulse.js"></script>
