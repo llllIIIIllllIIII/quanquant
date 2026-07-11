@@ -334,7 +334,10 @@
       const sync = () => {
         const node = el.querySelector("[data-qq-price]");
         if (!node) return;
-        this.onQuote(parseFloat(node.dataset.qqPrice), node.dataset.qqSession);
+        this.onQuote(parseFloat(node.dataset.qqPrice), node.dataset.qqSession, {
+          status: node.dataset.qqMarketStatus,
+          fresh: node.dataset.qqFresh === "true",
+        });
       };
       // htmx fires afterSwap on the target after each SSE message is swapped in.
       document.body.addEventListener("htmx:afterSwap", (e) => {
@@ -343,8 +346,10 @@
       sync(); // pick up the first quote already rendered via hx-get on load
     },
 
-    onQuote(price, quoteSession) {
+    onQuote(price, quoteSession, meta) {
       if (!Number.isFinite(price)) return;
+      // 休市／停滯（非 open 或非 fresh）時，不可用凍結報價覆寫最後一根真棒。
+      if (meta && (meta.fresh === false || (meta.status && meta.status !== "open"))) return;
       // A day/night-filtered chart intentionally shows that session's last bar; a
       // live quote from the other session must not overwrite it. Only sync when
       // the chart shows the combined series (matches the quote's contract).
