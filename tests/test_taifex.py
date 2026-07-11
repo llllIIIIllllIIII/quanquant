@@ -95,10 +95,15 @@ async def test_missing_ctime_gives_none_trade_time():
     assert snap.trade_time is None
 
 
+# 同時提供日盤(-F)與夜盤(-M)結算價列：_select_nearest_contract 的 settlement
+# fallback（require_price=False）只試當下 session 的 primary_suffix，故兩者皆備，
+# 測試才不受執行時段（日/夜盤）影響；兩列 CLastPrice 皆空 → is_fresh 恆 False。
 _SAMPLE_CLOSED = {
     "RtCode": "0", "RtMsg": "OK",
     "RtData": {"QuoteList": [
         {"SymbolID": "TXFF6-F", "CLastPrice": "", "CRefPrice": "17950",
+         "SettlementPrice": "17950", "CTotalVolume": "12345", "CDate": "2026-06-01"},
+        {"SymbolID": "TXFF6-M", "CLastPrice": "", "CRefPrice": "17950",
          "SettlementPrice": "17950", "CTotalVolume": "12345", "CDate": "2026-06-01"},
     ]},
 }
