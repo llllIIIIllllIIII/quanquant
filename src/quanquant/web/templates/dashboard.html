@@ -274,6 +274,20 @@
                 </div>
               </template>
 
+              <!-- 固定線型指標（MACD/BOLL/KDJ）：每條子線顏色 + 恢復預設 -->
+              <template x-if="e.lines && e.lines.length">
+                <div class="ind-colors">
+                  <template x-for="(ln, i) in e.lines" :key="ln.key">
+                    <label class="ind-color-row">
+                      <span x-text="ln.label"></span>
+                      <input type="color" x-model="form[e.key].colors[i]">
+                    </label>
+                  </template>
+                  <button type="button" class="outline mini"
+                          @click="form[e.key].colors = window.QQIndicators.defaultColors(e)">恢復預設色</button>
+                </div>
+              </template>
+
               <!-- 無參數指標（VOL） -->
               <template x-if="!e.repeatable && !e.paramSchema.length">
                 <p class="muted">此指標無可調參數。</p>
