@@ -27,6 +27,7 @@ def _quote_context(
     as_of: datetime | None = None,
     pulse: PulseEngine | None = None,
     poller: QuotePoller | None = None,
+    flash: bool = False,
 ) -> dict:
     now = datetime.now(timezone.utc)
     sess = session_now(now)  # "day"/"night"/None（calendar-aware，含假日）
@@ -45,6 +46,7 @@ def _quote_context(
         "as_of": as_of,  # "live as of now" clock for the SSE heartbeat; None = use data time
         "pulse_level": pulse_level,
         "pulse_state": pulse_state,
+        "flash": flash,  # 僅在價格較上次推播有變動時 True → 前端才播閃爍動畫
     }
 
 
@@ -90,8 +92,11 @@ async def quote_stream(
     min_interval = get_settings().sse_min_interval
 
     async def event_generator():
+        # 追蹤上次推播的價格：只有價格改變才讓 fragment 帶 flash，避免每秒心跳重發同價也閃。
+        last_price = None
         try:
             if poller.last is not None:
+                last_price = poller.last.price
                 yield {
                     "data": render_partial(
                         "partials/quote.html",
@@ -118,10 +123,15 @@ async def quote_stream(
                         continue
                     snap, error, as_of = poller.last, None, datetime.now(timezone.utc)
                 last_emit = time.monotonic()
+                changed = snap is not None and snap.price != last_price
+                if snap is not None:
+                    last_price = snap.price
                 yield {
                     "data": render_partial(
                         "partials/quote.html",
-                        **_quote_context(snap, error, as_of, pulse=pulse, poller=poller),
+                        **_quote_context(
+                            snap, error, as_of, pulse=pulse, poller=poller, flash=changed
+                        ),
                     )
                 }
         finally:

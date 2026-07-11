@@ -28,3 +28,13 @@ def test_quote_partial_renders_status_attrs():
     html = render_partial("partials/quote.html", **ctx)
     assert "data-qq-market-status" in html
     assert "data-qq-fresh" in html
+
+
+def test_flash_class_only_when_flag_set():
+    # 預設不帶 flash（心跳/同價重發不閃）
+    ctx = _quote_context(_snap(), None, poller=None)
+    assert ctx["flash"] is False
+    assert "flash" not in render_partial("partials/quote.html", **ctx)
+    # 價格有變動時 flash=True → fragment 帶 flash class
+    ctx = _quote_context(_snap(), None, poller=None, flash=True)
+    assert 'class="quote up flash"' in render_partial("partials/quote.html", **ctx)

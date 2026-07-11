@@ -89,10 +89,11 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
 .sess-day { color: var(--up); }
 .sess-night { color: #f0b90b; }
 .sess-closed { color: var(--qq-text-muted); }
-/* SSE swap flash: subtle background pulse on update */
+/* SSE swap flash: subtle background pulse only when the price actually changed
+   (server adds .flash to the fragment; heartbeats re-emitting the same price don't) */
 @keyframes qq-quote-flash { from { background: var(--qq-surface-2); } to { background: var(--qq-surface); } }
-#quote > .quote { animation: qq-quote-flash 300ms ease-out; }
-@media (prefers-reduced-motion: reduce) { #quote > .quote { animation: none; } }
+#quote > .quote.flash { animation: qq-quote-flash 300ms ease-out; }
+@media (prefers-reduced-motion: reduce) { #quote > .quote.flash { animation: none; } }
 
 .tv-wrap small { display: block; margin-top: 0.4rem; }
 .muted { color: var(--pico-muted-color); }

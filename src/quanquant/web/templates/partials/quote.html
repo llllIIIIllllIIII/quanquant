@@ -1,5 +1,5 @@
 {% if snap %}
-<div class="quote {{ 'up' if snap.change >= 0 else 'down' }}"
+<div class="quote {{ 'up' if snap.change >= 0 else 'down' }}{{ ' flash' if flash else '' }}"
      data-qq-price="{{ snap.price }}" data-qq-session="{{ session }}"
      data-qq-market-status="{{ market_status }}"
      data-qq-fresh="{{ 'true' if snap.is_fresh else 'false' }}"
