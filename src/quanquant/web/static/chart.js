@@ -230,6 +230,14 @@
     },
 
     _applyBar(bar) {
+      // 資料防呆：OHLC + timestamp 必須有限；亂序（早於已見最後一根）直接丟棄，
+      // 避免休市/來源異常造成的 NaN 破圖與「K 線亂跳」。
+      const finite = (v) => Number.isFinite(v);
+      if (!bar || !finite(bar.timestamp) ||
+          !finite(bar.open) || !finite(bar.high) ||
+          !finite(bar.low) || !finite(bar.close)) return;
+      if (this.lastBarTs && bar.timestamp < this.lastBarTs) return; // 亂序 → 丟棄
+
       // keep chart + tfCache consistent for one updated/appended bar
       this.chart.updateData(bar);
       const cached = this.tfCache.get(this._cacheKey());
