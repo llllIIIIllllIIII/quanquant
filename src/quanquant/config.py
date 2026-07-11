@@ -37,6 +37,10 @@ class Settings(BaseSettings):
     pulse_telegram_cooldown: float = 60.0  # seconds between Telegram pushes (edge-triggered)
     pulse_telegram_enabled: bool = False  # default OFF; toggle on from the web (persisted in DB)
 
+    # 臨時休市（颱風）覆寫：逗號分隔 ISO 日期（YYYY-MM-DD），與內建假日清單 union。
+    # 用 env（非資料檔）以避開 wheel/Docker force-include 限制；VM 設 env 重啟即生效。
+    extra_holidays: str = ""
+
     # Web / dashboard
     # Account system — signs the session cookie. MUST be set in production
     # (.env on the VM); unset → a transient per-process key (dev only).

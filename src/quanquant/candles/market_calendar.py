@@ -18,8 +18,10 @@ night session running to Saturday 05:00 anchors to Friday and stays valid, while
 Saturday/Sunday daytime and holiday sessions are excluded).
 """
 from datetime import date, datetime, time
+from functools import lru_cache
 
 from quanquant.candles.bucketing import session_bounds_cst, third_wednesday
+from quanquant.config import get_settings
 from quanquant.market_hours import CST
 
 # Market-closed weekday dates (weekends are excluded separately). Source: TAIFEX /
@@ -54,9 +56,28 @@ _HOLIDAYS: frozenset[date] = frozenset(
 _SETTLEMENT_DAY_CLOSE = time(13, 30)  # expiring contract's day session ends here
 
 
+@lru_cache(maxsize=8)
+def _parse_holidays(raw: str) -> frozenset[date]:
+    """解析 EXTRA_HOLIDAYS（逗號分隔 ISO 日期）；壞值略過（防禦式）。"""
+    out: set[date] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(date.fromisoformat(part))
+        except ValueError:
+            continue
+    return frozenset(out)
+
+
 def is_trading_day(d: date) -> bool:
-    """Mon–Fri and not a TAIFEX holiday."""
-    return d.weekday() < 5 and d not in _HOLIDAYS
+    """Mon–Fri 且不在 TAIFEX 假日（內建清單 ∪ EXTRA_HOLIDAYS env）。"""
+    if d.weekday() >= 5:
+        return False
+    if d in _HOLIDAYS:
+        return False
+    return d not in _parse_holidays(get_settings().extra_holidays)
 
 
 def session_anchor_date(ts_ms: int) -> tuple[date, str] | None:

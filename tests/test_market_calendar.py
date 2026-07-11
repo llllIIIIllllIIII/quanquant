@@ -7,6 +7,8 @@ from quanquant.candles.market_calendar import (
     is_trading_session,
     session_anchor_date,
 )
+from quanquant.candles import market_calendar
+from quanquant.config import get_settings
 from quanquant.market_hours import CST
 from quanquant.models import FuturesSnapshot
 
@@ -104,3 +106,25 @@ def test_builder_staleness_net_allows_fresh_and_empty():
     assert b.on_snapshot(snap(ms(2026, 6, 16, 10, 0), data_date="2026/06/16"))  # fresh
     b2 = CandleBuilder("TXF")
     assert b2.on_snapshot(snap(ms(2026, 6, 16, 10, 1), data_date=""))  # empty → not blocked
+
+
+# --- EXTRA_HOLIDAYS env override ---
+
+
+def test_extra_holidays_env_makes_weekday_non_trading(monkeypatch):
+    monkeypatch.setenv("EXTRA_HOLIDAYS", "2026-07-23")  # 週四，颱風臨時休市
+    get_settings.cache_clear()
+    market_calendar._parse_holidays.cache_clear()
+    try:
+        assert is_trading_day(date(2026, 7, 23)) is False
+        assert is_trading_session(ms(2026, 7, 23, 10, 0)) is None
+    finally:
+        monkeypatch.delenv("EXTRA_HOLIDAYS", raising=False)
+        get_settings.cache_clear()
+        market_calendar._parse_holidays.cache_clear()
+
+
+def test_parse_holidays_skips_malformed():
+    assert market_calendar._parse_holidays("2026-07-23, , not-a-date,2026-08-01") == frozenset(
+        {date(2026, 7, 23), date(2026, 8, 1)}
+    )
