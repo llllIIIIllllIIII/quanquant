@@ -131,6 +131,19 @@ def test_chart_state_roundtrip(client):
     assert client.get("/api/chart/state").json()["indicators"] == ind2  # upserted
 
 
+def test_chart_state_preserves_visible_field(client):
+    # 眼睛隱藏（visible:false）跟帳號：payload 以原始 JSON 整包存取，
+    # 任意欄位（含 visible）須原樣往返，不被 schema 過濾掉。
+    ind = {
+        "ma": {"enabled": True, "visible": False, "params": [{"period": 5, "color": "#f0b90b"}]},
+        "vol": {"enabled": True, "visible": True, "params": {}},
+    }
+    assert client.put("/api/chart/state/indicators", json=ind).status_code == 204
+    got = client.get("/api/chart/state").json()["indicators"]
+    assert got == ind
+    assert got["ma"]["visible"] is False
+
+
 def test_chart_state_unknown_kind_404(client):
     assert client.put("/api/chart/state/nope", json={}).status_code == 404
 
