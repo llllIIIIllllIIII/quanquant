@@ -369,3 +369,26 @@ body.chart-fullscreen #kchart { height: calc(100vh - 205px); }
 .param-fixed { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.5rem; }
 @media (max-width: 767px) { .ind-split { flex-direction: column; }
   .ind-list { flex-basis: auto; border-right: none; border-bottom: 1px solid var(--qq-border); padding-right: 0; } }
+
+/* ---- 休市／資料停滯狀態 banner ---- */
+.market-banner {
+  font-size: 0.78rem;
+  padding: 2px 8px;
+  border-radius: var(--qq-radius-sm);
+  margin-bottom: 6px;
+  text-align: center;
+}
+/* 疑似臨時休市／資料停滯：沿用既有琥珀色（同 .sess-night / .badge.open 用色），
+   深色模式對比已足夠；淺色模式因底色偏白，加深文字色以符合 WCAG AA（見下方 light 覆寫） */
+.market-banner.halt {
+  background: rgba(240, 185, 11, 0.18);
+  color: #f0b90b;
+}
+html[data-theme="light"] .market-banner.halt {
+  color: #906500;
+}
+/* 非交易時段：沿用既有 --qq-surface-2 / --qq-text-muted token，深淺模式對比已由 tokens.css 保證 */
+.market-banner.closed {
+  background: var(--qq-surface-2);
+  color: var(--qq-text-muted);
+}
