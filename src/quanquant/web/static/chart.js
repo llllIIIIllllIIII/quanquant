@@ -31,11 +31,11 @@
     { code: "1w", label: "週" }, { code: "1M", label: "月" },
   ];
 
-  const IND_NAMES = { ma: "MA", wr: "WR", bias: "BIAS" };
   const OP_LABELS = { gte: "≥", lte: "≤", cross_up: "向上突破", cross_down: "向下突破" };
   function alertLabel(a) {
-    const L = a.left_kind === "price" ? "收盤" : `${IND_NAMES[a.left_name]}(${a.left_period})`;
-    const R = a.right_kind === "const" ? a.right_value : `${IND_NAMES[a.right_name]}(${a.right_period})`;
+    const short = (k) => window.QQIndicators.shortName(k);
+    const L = a.left_kind === "price" ? "收盤" : `${short(a.left_name)}(${a.left_period})`;
+    const R = a.right_kind === "const" ? a.right_value : `${short(a.right_name)}(${a.right_period})`;
     return `${a.timeframe}｜${L} ${OP_LABELS[a.op]} ${R}`;
   }
 

@@ -161,3 +161,10 @@ test('alertTargets 不含 boll/kdj（只畫圖不進警示）', () => {
   const codes = QQI.alertTargets().map((x) => x.code);
   assert.deepEqual(codes, ['ma', 'wr', 'bias']);
 });
+
+test('shortName: registry 有則回 klineName，未知 key 回原字串', () => {
+  assert.equal(QQI.shortName('ma'), 'MA');
+  assert.equal(QQI.shortName('bias'), 'BIAS');
+  assert.equal(QQI.shortName('kdj'), 'KDJ');
+  assert.equal(QQI.shortName('unknown'), 'unknown');
+});

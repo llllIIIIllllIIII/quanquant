@@ -86,6 +86,7 @@
   function clone(x) { return JSON.parse(JSON.stringify(x)); }
   function byKey(key) { return REGISTRY.find((e) => e.key === key) || null; }
   function byKlineName(name) { return REGISTRY.find((e) => e.klineName === name) || null; }
+  function shortName(key) { const e = byKey(key); return (e && e.klineName) || key; }
 
   function defaults() {
     const out = {};
@@ -130,5 +131,5 @@
     return true;
   }
 
-  return { list: REGISTRY, byKey, byKlineName, defaults, merge, alertTargets, calcParams, resolveVisibility };
+  return { list: REGISTRY, byKey, byKlineName, defaults, merge, alertTargets, calcParams, resolveVisibility, shortName };
 });
