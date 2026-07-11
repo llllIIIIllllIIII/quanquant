@@ -129,6 +129,7 @@
     tfCache: new Map(),  // (session|tf) -> {bars, hasMore} — instant switching
     settings: window.QQIndicators.defaults(),
     deductionEnabled: false,   // 均線扣抵三角開關（由 Alpine 依 localStorage 設定）
+    nakedK: false,             // 全域裸K：true 時隱藏所有指標與扣抵三角（由 Alpine 依 localStorage 設定）
     onEditIndicator: null,     // (key) => void：點擊指標 tooltip icon → 打開該指標設定
     _deductionSig: "",         // 上次已畫三角的幾何簽章；相同則跳過重畫
     _deductionDrawn: false,    // 目前是否有扣抵三角在圖上（關閉時只清一次）
@@ -474,9 +475,8 @@
       const key = entry.key;
       const onMain = entry.pane === "main";
       try {
-        const enabled = !!(conf && conf.enabled);
-        // repeatable：需至少一條線；fixed（含無參數 VOL）：啟用即算
-        const active = enabled && (entry.repeatable ? (conf.params || []).length > 0 : true);
+        // 可見性集中判定（含裸K/單指標隱藏/repeatable 空線）——見 indicators.js
+        const active = window.QQIndicators.resolveVisibility(entry, conf, this.nakedK);
         if (active) {
           const override = {
             name: entry.klineName,
@@ -528,11 +528,18 @@
       this.refreshDeduction();
     },
 
+    // 全域裸K開關：重套所有指標（resolveVisibility 依 nakedK 決定畫或移除）並刷新扣抵。
+    setNakedK(on) {
+      this.nakedK = !!on;
+      this.applyIndicators();
+      this.refreshDeduction();
+    },
+
     // 以最新 K 棒重算各啟用 MA 的扣抵；狀態列每 tick 更新，三角僅在扣抵 K 棒
     // 組合改變（新棒）時重畫，避免每 5 秒輪詢重建造成閃爍與 hover 文字斷裂。
     refreshDeduction() {
       if (!this.chart || !window.MADeduction) return;
-      if (!this.deductionEnabled) {
+      if (!this.deductionEnabled || this.nakedK) {
         if (this._deductionDrawn) {
           window.MADeduction.clear(this.chart);
           this._deductionDrawn = false;
