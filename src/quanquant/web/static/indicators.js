@@ -62,6 +62,25 @@
       ],
       defaults: { enabled: false, visible: true, params: { fast: 12, slow: 26, signal: 9 } },
     },
+    {
+      key: "boll", title: "布林通道 BOLL", hint: "疊於主圖",
+      pane: "main", klineName: "BOLL", alertTarget: false, repeatable: false,
+      paramSchema: [
+        { field: "period", type: "number", label: "週期", min: 2, step: 1 },
+        { field: "std", type: "number", label: "標準差", min: 1, step: 1 },
+      ],
+      defaults: { enabled: false, visible: true, params: { period: 20, std: 2 } },
+    },
+    {
+      key: "kdj", title: "KDJ", hint: "副圖",
+      pane: "sub", klineName: "KDJ", alertTarget: false, repeatable: false,
+      paramSchema: [
+        { field: "k", type: "number", label: "K", min: 1, step: 1 },
+        { field: "d", type: "number", label: "D", min: 1, step: 1 },
+        { field: "j", type: "number", label: "J", min: 1, step: 1 },
+      ],
+      defaults: { enabled: false, visible: true, params: { k: 9, d: 3, j: 3 } },
+    },
   ];
 
   function clone(x) { return JSON.parse(JSON.stringify(x)); }

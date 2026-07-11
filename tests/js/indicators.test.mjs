@@ -7,7 +7,7 @@ const QQI = require('../../src/quanquant/web/static/indicators.js');
 
 test('list 含 ma/wr/bias/vol，欄位齊全', () => {
   const keys = QQI.list.map((e) => e.key);
-  assert.deepEqual(keys, ['ma', 'wr', 'bias', 'vol', 'macd']);
+  assert.deepEqual(keys, ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']);
   const ma = QQI.byKey('ma');
   assert.equal(ma.pane, 'main');
   assert.equal(ma.klineName, 'MA');
@@ -24,7 +24,7 @@ test('byKlineName 反查', () => {
 
 test('defaults() 等同舊 DEFAULT_SETTINGS 結構', () => {
   const d = QQI.defaults();
-  assert.deepEqual(Object.keys(d), ['ma', 'wr', 'bias', 'vol', 'macd']);
+  assert.deepEqual(Object.keys(d), ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']);
   assert.equal(d.ma.enabled, true);
   assert.equal(d.ma.params.length, 4);
   assert.equal(d.ma.params[0].period, 5);
@@ -41,7 +41,7 @@ test('merge: 舊存檔（無新指標）載入後含全部 key 且舊值保留',
   assert.equal(m.ma.enabled, false);
   assert.equal(m.ma.params[0].period, 7);
   assert.equal(m.wr.enabled, false);       // 未存 → 用 defaults
-  assert.deepEqual(Object.keys(m), ['ma', 'wr', 'bias', 'vol', 'macd']);
+  assert.deepEqual(Object.keys(m), ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']);
 });
 
 test('merge: 存檔含 registry 已無的 key → 略過', () => {
@@ -102,7 +102,7 @@ test('macd 預設不啟用，merge 後既有 key 不受影響', () => {
 
 test('defaults() 每指標帶 visible:true', () => {
   const d = QQI.defaults();
-  for (const k of ['ma', 'wr', 'bias', 'vol', 'macd']) {
+  for (const k of ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']) {
     assert.equal(d[k].visible, true, `${k} 應預設 visible:true`);
   }
 });
@@ -133,4 +133,31 @@ test('resolveVisibility: enabled×visible×nakedK 組合', () => {
   // 缺 conf/entry 安全回 false
   assert.equal(QQI.resolveVisibility(ma, null, false), false);
   assert.equal(QQI.resolveVisibility(null, withMA(), false), false);
+});
+
+test('boll 註冊為 main/fixed，calcParams [20, 2]', () => {
+  const boll = QQI.byKey('boll');
+  assert.ok(boll, 'boll 應存在');
+  assert.equal(boll.pane, 'main');
+  assert.equal(boll.klineName, 'BOLL');
+  assert.equal(boll.repeatable, false);
+  assert.equal(boll.alertTarget, false);
+  assert.deepEqual(QQI.calcParams(boll, boll.defaults), [20, 2]);
+  assert.equal(boll.defaults.visible, true);
+});
+
+test('kdj 註冊為 sub/fixed，calcParams [9, 3, 3]', () => {
+  const kdj = QQI.byKey('kdj');
+  assert.ok(kdj, 'kdj 應存在');
+  assert.equal(kdj.pane, 'sub');
+  assert.equal(kdj.klineName, 'KDJ');
+  assert.equal(kdj.repeatable, false);
+  assert.equal(kdj.alertTarget, false);
+  assert.deepEqual(QQI.calcParams(kdj, kdj.defaults), [9, 3, 3]);
+  assert.equal(kdj.defaults.visible, true);
+});
+
+test('alertTargets 不含 boll/kdj（只畫圖不進警示）', () => {
+  const codes = QQI.alertTargets().map((x) => x.code);
+  assert.deepEqual(codes, ['ma', 'wr', 'bias']);
 });
