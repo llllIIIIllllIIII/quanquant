@@ -1,7 +1,14 @@
 {% if snap %}
 <div class="quote {{ 'up' if snap.change >= 0 else 'down' }}"
      data-qq-price="{{ snap.price }}" data-qq-session="{{ session }}"
+     data-qq-market-status="{{ market_status }}"
+     data-qq-fresh="{{ 'true' if snap.is_fresh else 'false' }}"
      data-qq-pulse-level="{{ pulse_level }}" data-qq-pulse-state="{{ pulse_state }}">
+  {% if market_status == 'suspected_halt' %}
+  <div class="market-banner halt">疑似臨時休市／資料停滯，圖表已凍結</div>
+  {% elif market_status == 'closed' %}
+  <div class="market-banner closed">非交易時段</div>
+  {% endif %}
   <div class="quote-main">
     <span class="sym">{{ snap.symbol }}</span>
     <span class="price">{{ snap.price | num }}</span>

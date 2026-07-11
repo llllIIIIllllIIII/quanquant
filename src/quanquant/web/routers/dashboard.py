@@ -10,8 +10,8 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
 from sse_starlette.sse import EventSourceResponse
 
+from quanquant.candles.market_calendar import resolve_market_status, session_now
 from quanquant.config import get_settings
-from quanquant.market_hours import get_session
 from quanquant.models import FuturesSnapshot
 from quanquant.poller import QuotePoller
 from quanquant.pulse.engine import PulseEngine
@@ -26,8 +26,13 @@ def _quote_context(
     error: str | None,
     as_of: datetime | None = None,
     pulse: PulseEngine | None = None,
+    poller: QuotePoller | None = None,
 ) -> dict:
-    session = get_session()
+    now = datetime.now(timezone.utc)
+    sess = session_now(now)  # "day"/"night"/None（calendar-aware，含假日）
+    session = sess or "closed"
+    last_adv = poller.freshness.last_advance_at if poller is not None else None
+    market_status = resolve_market_status(now, last_adv)
     pulse_level, pulse_state = (0, "silent")
     if pulse is not None:
         pulse_level, pulse_state = pulse.level_at()
@@ -36,6 +41,7 @@ def _quote_context(
         "error": error,
         "session": session,
         "session_label": SESSION_LABEL.get(session, SESSION_LABEL["closed"]),
+        "market_status": market_status,
         "as_of": as_of,  # "live as of now" clock for the SSE heartbeat; None = use data time
         "pulse_level": pulse_level,
         "pulse_state": pulse_state,
@@ -65,7 +71,9 @@ async def quote_now(
 ):
     snap = poller.last if poller else None
     return HTMLResponse(
-        render_partial("partials/quote.html", **_quote_context(snap, None, pulse=pulse))
+        render_partial(
+            "partials/quote.html", **_quote_context(snap, None, pulse=pulse, poller=poller)
+        )
     )
 
 
@@ -86,7 +94,8 @@ async def quote_stream(
             if poller.last is not None:
                 yield {
                     "data": render_partial(
-                        "partials/quote.html", **_quote_context(poller.last, None, pulse=pulse)
+                        "partials/quote.html",
+                        **_quote_context(poller.last, None, pulse=pulse, poller=poller),
                     )
                 }
             last_emit = time.monotonic()
@@ -111,7 +120,8 @@ async def quote_stream(
                 last_emit = time.monotonic()
                 yield {
                     "data": render_partial(
-                        "partials/quote.html", **_quote_context(snap, error, as_of, pulse=pulse)
+                        "partials/quote.html",
+                        **_quote_context(snap, error, as_of, pulse=pulse, poller=poller),
                     )
                 }
         finally:
