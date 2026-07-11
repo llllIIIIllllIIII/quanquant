@@ -759,6 +759,7 @@
     moreOpen: false,
     fullscreen: false,
     deductionOn: false,
+    nakedK: false,       // 全域裸K（此裝置看盤模式，存 localStorage）
     drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
     drawingsVisible: true, // master show/hide switch for the whole drawing layer
     colorScheme: window.QQ_COLOR_SCHEME || "green_up",
@@ -789,10 +790,12 @@
     init() {
       this.session = localStorage.getItem("qq_session") || "all";
       this.deductionOn = localStorage.getItem("qq_ma_deduction") === "1";
+      this.nakedK = localStorage.getItem("qq_naked_k") === "1";
       this.drawScope = localStorage.getItem("qq_draw_scope") || "hybrid";
       this.drawingsVisible = localStorage.getItem("qq_draw_visible") !== "0";
       QQChart.onEditIndicator = (key) => this.openSettings(key);
       QQChart.deductionEnabled = this.deductionOn;
+      QQChart.nakedK = this.nakedK;
       QQChart.drawScope = this.drawScope;
       QQChart.drawingsVisible = this.drawingsVisible;
       QQChart.colorScheme = this.colorScheme;
@@ -900,6 +903,12 @@
       this.deductionOn = !this.deductionOn;
       localStorage.setItem("qq_ma_deduction", this.deductionOn ? "1" : "0");
       QQChart.setDeduction(this.deductionOn);
+    },
+
+    toggleNakedK() {
+      this.nakedK = !this.nakedK;
+      localStorage.setItem("qq_naked_k", this.nakedK ? "1" : "0");
+      QQChart.setNakedK(this.nakedK);
     },
 
     toggleDrawScope() {

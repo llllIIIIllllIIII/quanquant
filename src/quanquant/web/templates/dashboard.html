@@ -92,6 +92,16 @@
             <span>扣抵三角</span>
             <span class="row-state" x-text="deductionOn ? '開' : '關'"></span>
           </button>
+          <button type="button" class="menu-row" :class="{active: nakedK}"
+                  @click="toggleNakedK()" :aria-pressed="nakedK"
+                  title="裸K：只顯示 K 線，隱藏所有指標與扣抵三角（開/關）">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                 stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M6 3v18M6 7h5v5H6M14 12v9M14 12h4v6h-4"/>
+            </svg>
+            <span>裸K</span>
+            <span class="row-state" x-text="nakedK ? '開' : '關'"></span>
+          </button>
           <button type="button" class="menu-row" @click="toggleDrawScope()"
                   :aria-pressed="drawScope === 'all'"
                   :title="drawScope === 'hybrid'
@@ -197,11 +207,24 @@
         <!-- 左欄：已啟用清單 + 新增指標目錄 -->
         <aside class="ind-list">
           <template x-for="e in indicators.filter((x) => form[x.key] && form[x.key].enabled)" :key="e.key">
-            <div class="ind-item" :class="{active: activeIndicator === e.key}"
+            <div class="ind-item" :class="{active: activeIndicator === e.key, 'ind-hidden': form[e.key].visible === false}"
                  @click="activeIndicator = e.key; catalogOpen = false">
               <span x-text="e.title"></span>
-              <button type="button" class="outline mini danger"
-                      @click.stop="form[e.key].enabled = false; if (activeIndicator === e.key) activeIndicator = null">−</button>
+              <span class="ind-item-actions">
+                <button type="button" class="outline mini ind-eye"
+                        @click.stop="form[e.key].visible = (form[e.key].visible === false)"
+                        :aria-pressed="form[e.key].visible !== false"
+                        :aria-label="(form[e.key].visible !== false) ? '隱藏此指標' : '顯示此指標'"
+                        :title="(form[e.key].visible !== false) ? '顯示中（點擊隱藏）' : '已隱藏（點擊顯示）'">
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                       stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/>
+                    <line x1="3" y1="3" x2="21" y2="21" x-show="form[e.key].visible === false"/>
+                  </svg>
+                </button>
+                <button type="button" class="outline mini danger"
+                        @click.stop="form[e.key].enabled = false; if (activeIndicator === e.key) activeIndicator = null">−</button>
+              </span>
             </div>
           </template>
 

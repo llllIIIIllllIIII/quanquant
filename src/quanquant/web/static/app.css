@@ -393,3 +393,7 @@ html[data-theme="light"] .market-banner.halt {
   background: var(--qq-surface-2);
   color: var(--qq-text-muted);
 }
+/* 指標設定清單：被單獨隱藏（眼睛關）的指標淡化，仍可點擊編輯/重新顯示 */
+.ind-item.ind-hidden > span:first-child { opacity: .45; }
+.ind-item-actions { display: inline-flex; gap: 4px; align-items: center; }
+.ind-eye[aria-pressed="false"] { opacity: .6; }
