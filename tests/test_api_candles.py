@@ -144,6 +144,20 @@ def test_chart_state_preserves_visible_field(client):
     assert got["ma"]["visible"] is False
 
 
+def test_chart_state_preserves_colors_field(client):
+    # 子線顏色（colors 陣列）跟帳號：payload 整包 JSON 存取，colors 須原樣往返。
+    ind = {
+        "boll": {"enabled": True, "visible": True, "params": {"period": 20, "std": 2},
+                 "colors": ["#111111", "#222222", "#333333"]},
+        "macd": {"enabled": True, "visible": True, "params": {"fast": 12, "slow": 26, "signal": 9},
+                 "colors": ["#aabbcc", "#ddeeff"]},
+    }
+    assert client.put("/api/chart/state/indicators", json=ind).status_code == 204
+    got = client.get("/api/chart/state").json()["indicators"]
+    assert got == ind
+    assert got["boll"]["colors"] == ["#111111", "#222222", "#333333"]
+
+
 def test_chart_state_unknown_kind_404(client):
     assert client.put("/api/chart/state/nope", json={}).status_code == 404
 
