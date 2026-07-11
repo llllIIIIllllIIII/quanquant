@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -86,3 +87,24 @@ def test_source_switch_does_not_diff_across_cumulative_baselines():
     # Stream resumes: first tick re-baselines (0), then diffs within the same source.
     assert b.on_snapshot(snap(4, 51, 30, "18012", 360, contract="TXFG6"))[-1].volume == 0
     assert b.on_snapshot(snap(4, 51, 50, "18015", 380, contract="TXFG6"))[-1].volume == 20
+
+
+def test_stale_snapshot_emits_nothing_and_preserves_bar():
+    b = CandleBuilder("TXF")
+    b.on_snapshot(snap(9, 0, 0, "18000", 1000))          # fresh（預設 is_fresh=True）
+    stale = replace(snap(9, 0, 20, "17990", 1000), is_fresh=False)
+    rows = b.on_snapshot(stale)
+    assert rows == []                                     # 停滯 → 不出棒
+    # in-progress bar 仍在：下一筆 fresh 同分鐘應合併回同一根
+    rows2 = b.on_snapshot(snap(9, 0, 40, "18050", 1010))
+    assert len(rows2) == 1
+    assert rows2[0].ts == ms(9, 0)
+    assert rows2[0].close == Decimal("18050")
+    assert rows2[0].volume == 0 + 10                      # 只累加 fresh 的量差
+
+
+def test_stale_snapshot_in_night_session_also_gated():
+    b = CandleBuilder("TXF")
+    b.on_snapshot(snap(16, 0, 0, "18000", 5000))         # 夜盤 fresh
+    stale = replace(snap(16, 0, 20, "18000", 5000), is_fresh=False)
+    assert b.on_snapshot(stale) == []                    # 夜盤停滯也被擋

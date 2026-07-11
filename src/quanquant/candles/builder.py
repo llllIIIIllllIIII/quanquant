@@ -45,6 +45,11 @@ class CandleBuilder:
             self._cur = None
             return []
 
+        # 資料級新鮮度閘門（日/夜盤皆適用）：非新成交 → 凍結 in-progress bar，不出棒。
+        # 不重置 _cur / _prev_cum_vol，讓下一筆 fresh 能接續同一根並正確累加量差。
+        if not snap.is_fresh:
+            return []
+
         bucket = bucket_start_ms(ts_ms, "1m")
         assert bucket is not None  # session is open
 
