@@ -3,7 +3,7 @@ from decimal import Decimal, InvalidOperation
 
 import httpx
 
-from quanquant.market_hours import get_session
+from quanquant.market_hours import CST, get_session
 from quanquant.models import FuturesSnapshot
 from quanquant.sources.base import DataSource
 
@@ -19,6 +19,21 @@ def _d(value: str, fallback: str = "0") -> Decimal:
         return Decimal(value) if value else Decimal(fallback)
     except InvalidOperation:
         return Decimal(fallback)
+
+
+def _parse_trade_time(cdate: str, ctime: str) -> datetime | None:
+    """由 MIS CDate + CTime 合成 CST 成交時間；格式異常回 None（防禦式）。"""
+    d = "".join(ch for ch in (cdate or "") if ch.isdigit())
+    t = "".join(ch for ch in (ctime or "") if ch.isdigit())
+    if len(d) < 8 or len(t) < 6:
+        return None
+    try:
+        return datetime(
+            int(d[:4]), int(d[4:6]), int(d[6:8]),
+            int(t[:2]), int(t[2:4]), int(t[4:6]), tzinfo=CST,
+        )
+    except ValueError:
+        return None
 
 
 class TaifexSource(DataSource):
@@ -105,6 +120,8 @@ class TaifexSource(DataSource):
             fetched_at=datetime.now(timezone.utc),
             data_date=row.get("CDate", ""),
             contract_month=row.get("SymbolID", ""),
+            trade_time=_parse_trade_time(row.get("CDate", ""), row.get("CTime", "")),
+            is_fresh=bool(row["CLastPrice"]),  # 無 CLastPrice（休市結算價 fallback）→ 標非新成交（實作 spec ③）
         )
 
     async def close(self) -> None:
