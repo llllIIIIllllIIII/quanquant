@@ -60,7 +60,11 @@
         { field: "slow", type: "number", label: "慢線", min: 1, step: 1 },
         { field: "signal", type: "number", label: "訊號", min: 1, step: 1 },
       ],
-      defaults: { enabled: false, visible: true, params: { fast: 12, slow: 26, signal: 9 } },
+      lines: [
+        { key: "dif", label: "DIF", default: "#FF9600" },
+        { key: "dea", label: "DEA", default: "#935EBD" },
+      ],
+      defaults: { enabled: false, visible: true, params: { fast: 12, slow: 26, signal: 9 }, colors: ["#FF9600", "#935EBD"] },
     },
     {
       key: "boll", title: "布林通道 BOLL", hint: "疊於主圖",
@@ -69,7 +73,12 @@
         { field: "period", type: "number", label: "週期", min: 2, step: 1 },
         { field: "std", type: "number", label: "標準差", min: 1, step: 1 },
       ],
-      defaults: { enabled: false, visible: true, params: { period: 20, std: 2 } },
+      lines: [
+        { key: "up", label: "上軌", default: "#FF9600" },
+        { key: "mid", label: "中軌", default: "#935EBD" },
+        { key: "dn", label: "下軌", default: "#1677FF" },
+      ],
+      defaults: { enabled: false, visible: true, params: { period: 20, std: 2 }, colors: ["#FF9600", "#935EBD", "#1677FF"] },
     },
     {
       key: "kdj", title: "KDJ", hint: "副圖",
@@ -79,7 +88,12 @@
         { field: "d", type: "number", label: "D", min: 1, step: 1 },
         { field: "j", type: "number", label: "J", min: 1, step: 1 },
       ],
-      defaults: { enabled: false, visible: true, params: { k: 9, d: 3, j: 3 } },
+      lines: [
+        { key: "k", label: "K", default: "#FF9600" },
+        { key: "d", label: "D", default: "#935EBD" },
+        { key: "j", label: "J", default: "#1677FF" },
+      ],
+      defaults: { enabled: false, visible: true, params: { k: 9, d: 3, j: 3 }, colors: ["#FF9600", "#935EBD", "#1677FF"] },
     },
   ];
 
@@ -103,6 +117,10 @@
       }
     }
     return out;
+  }
+
+  function defaultColors(entry) {
+    return (entry && entry.lines) ? entry.lines.map((l) => l.default) : [];
   }
 
   function alertTargets() {
@@ -131,5 +149,5 @@
     return true;
   }
 
-  return { list: REGISTRY, byKey, byKlineName, defaults, merge, alertTargets, calcParams, resolveVisibility, shortName };
+  return { list: REGISTRY, byKey, byKlineName, defaults, merge, alertTargets, calcParams, resolveVisibility, shortName, defaultColors };
 });

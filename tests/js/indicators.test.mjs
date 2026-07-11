@@ -168,3 +168,33 @@ test('shortName: registry 有則回 klineName，未知 key 回原字串', () => 
   assert.equal(QQI.shortName('kdj'), 'KDJ');
   assert.equal(QQI.shortName('unknown'), 'unknown');
 });
+
+test('macd/boll/kdj 有 lines 描述，長度 2/3/3、label 正確', () => {
+  assert.deepEqual(QQI.byKey('macd').lines.map((l) => l.label), ['DIF', 'DEA']);
+  assert.deepEqual(QQI.byKey('boll').lines.map((l) => l.label), ['上軌', '中軌', '下軌']);
+  assert.deepEqual(QQI.byKey('kdj').lines.map((l) => l.label), ['K', 'D', 'J']);
+  assert.deepEqual(QQI.byKey('boll').lines.map((l) => l.key), ['up', 'mid', 'dn']);
+});
+
+test('defaults() 三者 colors 種子＝各 lines 預設（palette 起算，外觀不變）', () => {
+  const d = QQI.defaults();
+  assert.deepEqual(d.macd.colors, ['#FF9600', '#935EBD']);
+  assert.deepEqual(d.boll.colors, ['#FF9600', '#935EBD', '#1677FF']);
+  assert.deepEqual(d.kdj.colors, ['#FF9600', '#935EBD', '#1677FF']);
+});
+
+test('defaultColors: 有 lines 回預設陣列、無 lines（ma/vol）回 []', () => {
+  assert.deepEqual(QQI.defaultColors(QQI.byKey('boll')), ['#FF9600', '#935EBD', '#1677FF']);
+  assert.deepEqual(QQI.defaultColors(QQI.byKey('ma')), []);
+  assert.deepEqual(QQI.defaultColors(QQI.byKey('vol')), []);
+  assert.deepEqual(QQI.defaultColors(null), []);
+  // 與 defaults 種子一致（防漂移）
+  assert.deepEqual(QQI.defaults().boll.colors, QQI.defaultColors(QQI.byKey('boll')));
+});
+
+test('merge 保留使用者存的 colors；缺 colors → 補預設（通用 shallow-spread）', () => {
+  const saved = { boll: { enabled: true, visible: true, params: { period: 20, std: 2 }, colors: ['#111111', '#222222', '#333333'] } };
+  const m = QQI.merge(saved);
+  assert.deepEqual(m.boll.colors, ['#111111', '#222222', '#333333']);
+  assert.deepEqual(m.kdj.colors, ['#FF9600', '#935EBD', '#1677FF']); // 未存 → 預設
+});
