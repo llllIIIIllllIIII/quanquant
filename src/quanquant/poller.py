@@ -6,9 +6,10 @@ as subscribers, so one upstream poll serves all consumers (and all browser tabs)
 """
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
+from quanquant.freshness import FreshnessTracker
 from quanquant.models import FuturesSnapshot
 from quanquant.sources.base import DataSource
 
@@ -38,17 +39,25 @@ class QuotePoller:
         self._subscribers: set[asyncio.Queue[QuoteEvent]] = set()
         self._last: FuturesSnapshot | None = None
         self._last_snapshot_at: float | None = None  # time.monotonic() of last snapshot
+        self._freshness = FreshnessTracker()
 
     @property
     def last(self) -> FuturesSnapshot | None:
         """The most recent successful snapshot, for late-joining subscribers."""
         return self._last
 
+    @property
+    def freshness(self) -> FreshnessTracker:
+        """共用的新鮮度判斷器（供報價路由讀 last_advance_at）。"""
+        return self._freshness
+
     def publish(self, event: QuoteEvent) -> None:
         """Record + fan out one event. The single entry point for every producer
         (this poller's own loop, the MIS fallback, and the Shioaji streamer)."""
         if event.snapshot is not None:
-            self._last = event.snapshot
+            snap = self._freshness.evaluate(event.snapshot)
+            event = replace(event, snapshot=snap)
+            self._last = snap
             self._last_snapshot_at = time.monotonic()
         self._broadcast(event)
 

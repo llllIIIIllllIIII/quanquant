@@ -1,9 +1,10 @@
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from quanquant.freshness import FreshnessTracker
 from quanquant.models import FuturesSnapshot
+from quanquant.poller import QuoteEvent, QuotePoller
 
 _AT = datetime(2026, 6, 16, 10, 0, tzinfo=timezone.utc)
 
@@ -68,3 +69,26 @@ def test_source_marked_not_fresh_is_respected():
     t = FreshnessTracker()
     s = replace(snap(1000), is_fresh=False)  # 來源（結算價 fallback）已標記 not-fresh
     assert t.evaluate(s).is_fresh is False   # tracker 不上升級
+
+
+def _event(vol, at=_AT, contract="TXFF6-F"):
+    return QuoteEvent(snapshot=snap(vol, contract=contract, at=at), error=None, at=at)
+
+
+def test_poller_publish_annotates_is_fresh_and_advance():
+    p = QuotePoller(source=None, symbol="TXF", interval=5.0)
+    p.publish(_event(1000, at=_AT))
+    assert p.last.is_fresh is True
+    assert p.freshness.last_advance_at == _AT
+
+    later = _AT + timedelta(minutes=1)
+    p.publish(_event(1000, at=later))  # 停滯
+    assert p.last.is_fresh is False
+    assert p.freshness.last_advance_at == _AT  # 未推進
+
+
+def test_poller_publish_ignores_error_events():
+    p = QuotePoller(source=None, symbol="TXF", interval=5.0)
+    p.publish(QuoteEvent(snapshot=None, error="boom", at=_AT))
+    assert p.last is None
+    assert p.freshness.last_advance_at is None

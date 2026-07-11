@@ -80,7 +80,13 @@ def test_publish_records_last_and_clears_staleness():
     poller = QuotePoller(FakeSource(["1"]), "TXF", 0.01)
     snap = _snap("18500")
     poller.publish(QuoteEvent(snapshot=snap, error=None, at=snap.fetched_at))
-    assert poller.last is snap
+    # publish() now runs the snapshot through FreshnessTracker.evaluate(), which
+    # returns a `dataclasses.replace`d copy (is_fresh set) rather than the same
+    # object — so compare the fields that identify "this is the same quote"
+    # instead of object identity.
+    assert poller.last is not None
+    assert poller.last.price == snap.price
+    assert poller.last.volume == snap.volume
     assert poller.seconds_since_snapshot() < 1.0
     assert poller.is_stale(5.0) is False
 
