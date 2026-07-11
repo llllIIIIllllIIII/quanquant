@@ -108,3 +108,27 @@ def is_trading_session(ts_ms: int) -> str | None:
         if (t.hour, t.minute) > (_SETTLEMENT_DAY_CLOSE.hour, _SETTLEMENT_DAY_CLOSE.minute):
             return None
     return sess
+
+
+_HALT_THRESHOLD_SECONDS = 300.0  # 該開盤但無新成交達 5 分鐘 → 疑似臨時休市
+
+
+def session_now(now: datetime) -> str | None:
+    """以牆鐘瞬間 `now`（tz-aware）判定交易時段（calendar-aware）。"""
+    return is_trading_session(int(now.timestamp() * 1000))
+
+
+def resolve_market_status(now: datetime, last_advance_at: datetime | None) -> str:
+    """市場狀態：
+
+    closed         — 非交易時段（週末/假日/盤間）
+    suspected_halt — 該開盤但無新成交 >= 5 分鐘
+    open           — 正常交易
+    """
+    if session_now(now) is None:
+        return "closed"
+    if last_advance_at is None:
+        return "open"  # 尚無快照 — 冷啟動不誤報 halt
+    if (now - last_advance_at).total_seconds() >= _HALT_THRESHOLD_SECONDS:
+        return "suspected_halt"
+    return "open"

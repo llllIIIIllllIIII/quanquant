@@ -128,3 +128,25 @@ def test_parse_holidays_skips_malformed():
     assert market_calendar._parse_holidays("2026-07-23, , not-a-date,2026-08-01") == frozenset(
         {date(2026, 7, 23), date(2026, 8, 1)}
     )
+
+
+# --- session_now / resolve_market_status ---
+
+from datetime import timedelta
+
+from quanquant.candles.market_calendar import resolve_market_status, session_now
+
+
+def test_session_now_normal_and_holiday():
+    assert session_now(datetime(2026, 6, 16, 10, 0, tzinfo=CST)) == "day"    # Tue 日盤
+    assert session_now(datetime(2026, 6, 16, 16, 0, tzinfo=CST)) == "night"  # 夜盤
+    assert session_now(datetime(2026, 6, 19, 10, 0, tzinfo=CST)) is None     # 端午假日
+
+
+def test_resolve_market_status_states():
+    day = datetime(2026, 6, 16, 10, 0, tzinfo=CST)          # 日盤中
+    assert resolve_market_status(day, day - timedelta(seconds=10)) == "open"
+    assert resolve_market_status(day, day - timedelta(minutes=6)) == "suspected_halt"
+    assert resolve_market_status(day, None) == "open"       # 冷啟動不誤報
+    gap = datetime(2026, 6, 16, 14, 0, tzinfo=CST)          # 盤間 14:00
+    assert resolve_market_status(gap, gap - timedelta(seconds=10)) == "closed"
