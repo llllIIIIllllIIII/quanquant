@@ -18,7 +18,7 @@
         { field: "period", type: "number", label: "週期", min: 1, step: 1 },
         { field: "color", type: "color", label: "顏色" },
       ],
-      defaults: { enabled: true, params: [
+      defaults: { enabled: true, visible: true, params: [
         { period: 5, color: "#f0b90b" }, { period: 10, color: "#ff9800" },
         { period: 20, color: "#2196f3" }, { period: 60, color: "#e91e63" },
       ] },
@@ -30,7 +30,7 @@
         { field: "period", type: "number", label: "週期", min: 1, step: 1 },
         { field: "color", type: "color", label: "顏色" },
       ],
-      defaults: { enabled: false, params: [
+      defaults: { enabled: false, visible: true, params: [
         { period: 14, color: "#f0b90b" }, { period: 28, color: "#2196f3" },
       ] },
     },
@@ -41,7 +41,7 @@
         { field: "period", type: "number", label: "週期", min: 1, step: 1 },
         { field: "color", type: "color", label: "顏色" },
       ],
-      defaults: { enabled: false, params: [
+      defaults: { enabled: false, visible: true, params: [
         { period: 6, color: "#f0b90b" }, { period: 12, color: "#2196f3" },
         { period: 24, color: "#e91e63" },
       ] },
@@ -50,7 +50,7 @@
       key: "vol", title: "成交量 VOL", hint: "副圖",
       pane: "sub", klineName: "VOL", alertTarget: false, repeatable: false,
       paramSchema: [],
-      defaults: { enabled: true, params: {} },
+      defaults: { enabled: true, visible: true, params: {} },
     },
     {
       key: "macd", title: "MACD", hint: "副圖",
@@ -60,7 +60,7 @@
         { field: "slow", type: "number", label: "慢線", min: 1, step: 1 },
         { field: "signal", type: "number", label: "訊號", min: 1, step: 1 },
       ],
-      defaults: { enabled: false, params: { fast: 12, slow: 26, signal: 9 } },
+      defaults: { enabled: false, visible: true, params: { fast: 12, slow: 26, signal: 9 } },
     },
   ];
 
@@ -101,5 +101,15 @@
       .filter((n) => Number.isFinite(n));
   }
 
-  return { list: REGISTRY, byKey, byKlineName, defaults, merge, alertTargets, calcParams };
+  // 集中判定「這根指標當前要不要畫」。nakedK（全域裸K）優先蓋掉一切；
+  // 其次看使用者是否啟用、是否單獨隱藏（visible===false）；repeatable 需至少一條線。
+  function resolveVisibility(entry, conf, nakedK) {
+    if (nakedK) return false;
+    if (!entry || !conf || !conf.enabled) return false;
+    if (conf.visible === false) return false;
+    if (entry.repeatable) return (conf.params || []).length > 0;
+    return true;
+  }
+
+  return { list: REGISTRY, byKey, byKlineName, defaults, merge, alertTargets, calcParams, resolveVisibility };
 });

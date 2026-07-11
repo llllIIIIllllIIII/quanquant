@@ -99,3 +99,38 @@ test('macd 預設不啟用，merge 後既有 key 不受影響', () => {
   assert.equal(m.ma.enabled, false);
   assert.equal(m.macd.enabled, false); // 舊存檔無 macd → 用 defaults 補
 });
+
+test('defaults() 每指標帶 visible:true', () => {
+  const d = QQI.defaults();
+  for (const k of ['ma', 'wr', 'bias', 'vol', 'macd']) {
+    assert.equal(d[k].visible, true, `${k} 應預設 visible:true`);
+  }
+});
+
+test('merge 保留使用者存的 visible:false；舊存檔無 visible → 補 true', () => {
+  const m = QQI.merge({ ma: { visible: false }, wr: { enabled: true } });
+  assert.equal(m.ma.visible, false);   // 使用者關掉的保留
+  assert.equal(m.wr.visible, true);    // 舊存檔無 visible → defaults 補
+  assert.equal(m.vol.visible, true);
+});
+
+test('resolveVisibility: enabled×visible×nakedK 組合', () => {
+  const ma = QQI.byKey('ma');       // repeatable
+  const vol = QQI.byKey('vol');     // fixed
+  const withMA = (o) => ({ enabled: true, visible: true, params: [{ period: 5 }], ...o });
+  // 正常顯示
+  assert.equal(QQI.resolveVisibility(ma, withMA(), false), true);
+  // 裸K → 一律不畫
+  assert.equal(QQI.resolveVisibility(ma, withMA(), true), false);
+  // 單指標隱藏
+  assert.equal(QQI.resolveVisibility(ma, withMA({ visible: false }), false), false);
+  // 未啟用
+  assert.equal(QQI.resolveVisibility(ma, withMA({ enabled: false }), false), false);
+  // repeatable 但無線 → 不畫
+  assert.equal(QQI.resolveVisibility(ma, withMA({ params: [] }), false), false);
+  // fixed 啟用即畫；visible 預設缺省視為顯示
+  assert.equal(QQI.resolveVisibility(vol, { enabled: true, params: {} }, false), true);
+  // 缺 conf/entry 安全回 false
+  assert.equal(QQI.resolveVisibility(ma, null, false), false);
+  assert.equal(QQI.resolveVisibility(null, withMA(), false), false);
+});
