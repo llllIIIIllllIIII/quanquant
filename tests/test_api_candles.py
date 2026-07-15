@@ -158,6 +158,20 @@ def test_chart_state_preserves_colors_field(client):
     assert got["boll"]["colors"] == ["#111111", "#222222", "#333333"]
 
 
+def test_chart_state_preserves_vol_ma_params(client):
+    # VOL 量能均線（params 為 {period,color} 陣列）跟帳號：整包 JSON 存取，
+    # 陣列須原樣往返，不被 schema 過濾。
+    ind = {
+        "vol": {"enabled": True, "visible": True,
+                "params": [{"period": 5, "color": "#f0b90b"},
+                           {"period": 10, "color": "#935EBD"}]},
+    }
+    assert client.put("/api/chart/state/indicators", json=ind).status_code == 204
+    got = client.get("/api/chart/state").json()["indicators"]
+    assert got == ind
+    assert [p["period"] for p in got["vol"]["params"]] == [5, 10]
+
+
 def test_chart_state_unknown_kind_404(client):
     assert client.put("/api/chart/state/nope", json={}).status_code == 404
 
