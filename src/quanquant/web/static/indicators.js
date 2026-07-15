@@ -48,9 +48,14 @@
     },
     {
       key: "vol", title: "成交量 VOL", hint: "副圖",
-      pane: "sub", klineName: "VOL", alertTarget: false, repeatable: false,
-      paramSchema: [],
-      defaults: { enabled: true, visible: true, params: {} },
+      pane: "sub", klineName: "VOL", alertTarget: false, repeatable: true, bars: true,
+      paramSchema: [
+        { field: "period", type: "number", label: "週期", min: 1, step: 1 },
+        { field: "color", type: "color", label: "顏色" },
+      ],
+      defaults: { enabled: true, visible: true, params: [
+        { period: 5, color: "#f0b90b" }, { period: 10, color: "#935EBD" },
+      ] },
     },
     {
       key: "macd", title: "MACD", hint: "副圖",
@@ -116,6 +121,11 @@
         if (s && typeof s === "object") out[e.key] = { ...out[e.key], ...s };
       }
     }
+    // repeatable 指標的 params 契約為線陣列；舊存檔（如 VOL 的 {}）正規化為 []，
+    // 確保 UI「＋加一條」的 .push 與下游消費一律面對陣列。
+    for (const e of REGISTRY) {
+      if (e.repeatable && !Array.isArray(out[e.key].params)) out[e.key].params = [];
+    }
     return out;
   }
 
@@ -130,7 +140,8 @@
   function calcParams(entry, conf) {
     if (!entry || !conf) return [];
     if (entry.repeatable) {
-      return (conf.params || []).map((p) => Math.round(p && p.period));
+      const arr = Array.isArray(conf.params) ? conf.params : [];
+      return arr.map((p) => Math.round(p && p.period));
     }
     const p = conf.params || {};
     return entry.paramSchema
@@ -140,12 +151,13 @@
   }
 
   // 集中判定「這根指標當前要不要畫」。nakedK（全域裸K）優先蓋掉一切；
-  // 其次看使用者是否啟用、是否單獨隱藏（visible===false）；repeatable 需至少一條線。
+  // 其次看使用者是否啟用、是否單獨隱藏（visible===false）；
+  // repeatable 需至少一條線；有 bars（VOL）者 enabled 即畫。
   function resolveVisibility(entry, conf, nakedK) {
     if (nakedK) return false;
     if (!entry || !conf || !conf.enabled) return false;
     if (conf.visible === false) return false;
-    if (entry.repeatable) return (conf.params || []).length > 0;
+    if (entry.repeatable) return !!entry.bars || (Array.isArray(conf.params) && conf.params.length > 0);
     return true;
   }
 
