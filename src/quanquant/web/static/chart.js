@@ -483,7 +483,8 @@
             calcParams: window.QQIndicators.calcParams(entry, conf),
           };
           if (entry.repeatable) {
-            override.styles = { lines: conf.params.map((p) => this._lineStyle(p.color)) };
+            const lineParams = Array.isArray(conf.params) ? conf.params : [];
+            override.styles = { lines: lineParams.map((p) => this._lineStyle(p.color)) };
           } else if (entry.lines) {
             // 固定線型指標（MACD/BOLL/KDJ）：每條子線依 colors 上色，順序對齊 KLineCharts line figure；
             // 以 entry.lines 為長度來源，colors 缺值退回 registry 預設（長度安全，毋須動 merge）。
