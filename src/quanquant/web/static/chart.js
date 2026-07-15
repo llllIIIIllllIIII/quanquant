@@ -957,7 +957,7 @@
         const conf = this.form[entry.key];
         if (!conf) continue;
         if (entry.repeatable) {
-          conf.params = (conf.params || []).filter((p) => Number.isFinite(p.period) && p.period >= 1);
+          conf.params = (Array.isArray(conf.params) ? conf.params : []).filter((p) => Number.isFinite(p.period) && p.period >= 1);
           conf.params.forEach((p) => { p.period = Math.round(p.period); });
         } else {
           for (const f of entry.paramSchema) {

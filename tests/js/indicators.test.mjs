@@ -118,7 +118,7 @@ test('merge 保留使用者存的 visible:false；舊存檔無 visible → 補 t
 
 test('resolveVisibility: enabled×visible×nakedK 組合', () => {
   const ma = QQI.byKey('ma');       // repeatable
-  const vol = QQI.byKey('vol');     // fixed
+  const vol = QQI.byKey('vol');     // repeatable+bars
   const withMA = (o) => ({ enabled: true, visible: true, params: [{ period: 5 }], ...o });
   // 正常顯示
   assert.equal(QQI.resolveVisibility(ma, withMA(), false), true);
