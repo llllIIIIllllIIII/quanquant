@@ -122,7 +122,7 @@
       }
     }
     // repeatable 指標的 params 契約為線陣列；舊存檔（如 VOL 的 {}）正規化為 []，
-    // 確保 UI「＋加一條」的 .push 與下游消費一律面對陣列。
+    // 確保 UI「＋新增」的 .push 與下游消費一律面對陣列。
     for (const e of REGISTRY) {
       if (e.repeatable && !Array.isArray(out[e.key].params)) out[e.key].params = [];
     }
