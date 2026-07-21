@@ -499,7 +499,9 @@
       const onMain = entry.pane === "main";
       try {
         // 可見性集中判定（含裸K/單指標隱藏/repeatable 空線）——見 indicators.js
-        const active = window.QQIndicators.resolveVisibility(entry, conf, this.nakedK);
+        // 分時模式只留 VWAP（avg），其餘指標一律隱藏（仿 nakedK：不動 enabled，退出自動還原）
+        const active = window.QQIndicators.resolveVisibility(entry, conf, this.nakedK)
+          && !(this.intradayMode && entry.key !== "avg");
         if (active) {
           const override = {
             name: entry.klineName,
@@ -567,7 +569,7 @@
     // 組合改變（新棒）時重畫，避免每 5 秒輪詢重建造成閃爍與 hover 文字斷裂。
     refreshDeduction() {
       if (!this.chart || !window.MADeduction) return;
-      if (!this.deductionEnabled || this.nakedK) {
+      if (!this.deductionEnabled || this.nakedK || this.intradayMode) {
         if (this._deductionDrawn) {
           window.MADeduction.clear(this.chart);
           this._deductionDrawn = false;
