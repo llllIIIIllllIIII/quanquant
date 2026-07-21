@@ -18,6 +18,9 @@
         </template>
       </select>
     </div>
+    <button type="button" class="tf-btn intraday-btn" :class="{active: intradayMode}"
+            @click="toggleIntraday()" :aria-pressed="intradayMode"
+            title="分時走勢：當日 area 走勢線＋VWAP 均價線（鎖 1分/日盤）">分時</button>
     <div class="tb-tfs" role="group" aria-label="時間週期">
       <template x-for="t in tfs" :key="t.code">
         <button class="tf-btn" :class="{active: tf === t.code}"
@@ -394,6 +397,7 @@ document.documentElement.setAttribute("data-scheme", window.QQ_COLOR_SCHEME || "
 <script src="/static/ma_deduction.js"></script>
 <script src="/static/indicators.js"></script>
 <script src="/static/chart-guards.js"></script>
+<script src="/static/avg_price.js"></script>
 <script src="/static/chart.js"></script>
 <script src="/static/pulse.js"></script>
 {% endblock %}

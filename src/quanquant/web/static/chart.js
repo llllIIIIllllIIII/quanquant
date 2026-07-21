@@ -133,6 +133,8 @@
     onEditIndicator: null,     // (key) => void：點擊指標 tooltip icon → 打開該指標設定
     _deductionSig: "",         // 上次已畫三角的幾何簽章；相同則跳過重畫
     _deductionDrawn: false,    // 目前是否有扣抵三角在圖上（關閉時只清一次）
+    intradayMode: false,       // 分時模式（純檢視、不持久化）
+    _prevAvgEnabled: false,    // 進入分時前 AVG 啟用狀態，退出時還原
 
     async init() {
       if (!window.klinecharts) {
@@ -190,6 +192,7 @@
 
       // load data BEFORE indicators: even if an indicator fails, candles render
       if (window.MADeduction) window.MADeduction.register();
+      if (window.QQAvgPrice) window.QQAvgPrice.register(); // 分時 VWAP：createIndicator("AVG") 前先註冊
       await this.loadInitial();
       await this.applyIndicators();
       this.restoreDrawings(Array.isArray(state.drawings) ? state.drawings : []);
@@ -417,6 +420,26 @@
       if (this.chart && this.chart.setStyles) {
         this.chart.setStyles(candleColorStyles(scheme));
       }
+    },
+
+    // 分時走勢模式：主圖切 area 走勢線並強制顯示 AVG（VWAP）均價線；退出時還原
+    // K 線與使用者漲跌配色。純檢視——settings.avg 的啟用只在記憶體暫存，不持久化。
+    setIntraday(on) {
+      this.intradayMode = !!on;
+      if (!this.chart) return;
+      const avg = this.settings.avg;
+      if (this.intradayMode) {
+        this._prevAvgEnabled = !!(avg && avg.enabled);
+        if (avg) avg.enabled = true;
+        this.chart.setStyles({ candle: { type: "area" } });
+      } else {
+        if (avg) avg.enabled = this._prevAvgEnabled;
+        this.chart.setStyles({ candle: { type: "candle_solid" } });
+        // area 模式不吃 bar 漲跌色，切回 K 線需重套使用者配色
+        this.chart.setStyles(candleColorStyles(this.colorScheme));
+      }
+      this.applyIndicators();
+      this.refreshDeduction();
     },
 
     applyTheme(theme) {
@@ -764,6 +787,9 @@
     moreOpen: false,
     fullscreen: false,
     deductionOn: false,
+    intradayMode: false, // 分時走勢（純檢視、不持久化）
+    _prevTf: "1m",       // 進入分時前的週期，退出時還原
+    _prevSession: "all", // 進入分時前的時段，退出時還原
     nakedK: false,       // 全域裸K（此裝置看盤模式，存 localStorage）
     drawScope: "hybrid", // "hybrid" | "all" — cross-timeframe drawing visibility
     drawingsVisible: true, // master show/hide switch for the whole drawing layer
@@ -890,11 +916,13 @@
     },
 
     async setTf(tf) {
+      if (this.intradayMode) { this.intradayMode = false; QQChart.setIntraday(false); }
       this.tf = tf;
       await QQChart.setTf(tf);
     },
 
     async setSession(mode) {
+      if (this.intradayMode) { this.intradayMode = false; QQChart.setIntraday(false); }
       this.session = mode;
       await QQChart.setSession(mode);
     },
@@ -914,6 +942,22 @@
       this.nakedK = !this.nakedK;
       localStorage.setItem("qq_naked_k", this.nakedK ? "1" : "0");
       QQChart.setNakedK(this.nakedK);
+    },
+
+    // 分時走勢：鎖 1分/日盤 + area 走勢線 + VWAP 均價線；退出還原前一 tf/session。
+    // 直接呼叫 QQChart.setTf/setSession（繞過 Alpine 層守衛），避免進入時被守衛立即關掉。
+    async toggleIntraday() {
+      this.intradayMode = !this.intradayMode;
+      if (this.intradayMode) {
+        this._prevTf = this.tf; this._prevSession = this.session;
+        if (this.session !== "day") { this.session = "day"; await QQChart.setSession("day"); }
+        if (this.tf !== "1m") { this.tf = "1m"; await QQChart.setTf("1m"); }
+        QQChart.setIntraday(true);
+      } else {
+        QQChart.setIntraday(false);
+        if (this.session !== this._prevSession) { this.session = this._prevSession; await QQChart.setSession(this._prevSession); }
+        if (this.tf !== this._prevTf) { this.tf = this._prevTf; await QQChart.setTf(this._prevTf); }
+      }
     },
 
     toggleDrawScope() {

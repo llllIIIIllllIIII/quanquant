@@ -7,7 +7,7 @@ const QQI = require('../../src/quanquant/web/static/indicators.js');
 
 test('list 含 ma/wr/bias/vol，欄位齊全', () => {
   const keys = QQI.list.map((e) => e.key);
-  assert.deepEqual(keys, ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']);
+  assert.deepEqual(keys, ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj', 'avg']);
   const ma = QQI.byKey('ma');
   assert.equal(ma.pane, 'main');
   assert.equal(ma.klineName, 'MA');
@@ -24,7 +24,7 @@ test('byKlineName 反查', () => {
 
 test('defaults() 等同舊 DEFAULT_SETTINGS 結構', () => {
   const d = QQI.defaults();
-  assert.deepEqual(Object.keys(d), ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']);
+  assert.deepEqual(Object.keys(d), ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj', 'avg']);
   assert.equal(d.ma.enabled, true);
   assert.equal(d.ma.params.length, 4);
   assert.equal(d.ma.params[0].period, 5);
@@ -43,7 +43,7 @@ test('merge: 舊存檔（無新指標）載入後含全部 key 且舊值保留',
   assert.equal(m.ma.enabled, false);
   assert.equal(m.ma.params[0].period, 7);
   assert.equal(m.wr.enabled, false);       // 未存 → 用 defaults
-  assert.deepEqual(Object.keys(m), ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']);
+  assert.deepEqual(Object.keys(m), ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj', 'avg']);
 });
 
 test('merge: 存檔含 registry 已無的 key → 略過', () => {
@@ -104,7 +104,7 @@ test('macd 預設不啟用，merge 後既有 key 不受影響', () => {
 
 test('defaults() 每指標帶 visible:true', () => {
   const d = QQI.defaults();
-  for (const k of ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj']) {
+  for (const k of ['ma', 'wr', 'bias', 'vol', 'macd', 'boll', 'kdj', 'avg']) {
     assert.equal(d[k].visible, true, `${k} 應預設 visible:true`);
   }
 });
@@ -247,4 +247,28 @@ test('merge: repeatable 指標 params 非陣列一律正規化為 []（VOL 舊�
   // 使用者已存陣列 → 原樣保留
   const keep = QQI.merge({ vol: { enabled: true, params: [{ period: 20, color: '#123456' }] } });
   assert.deepEqual(keep.vol.params, [{ period: 20, color: '#123456' }]);
+});
+
+test('avg 註冊為 main/fixed 疊線：calcParams []、defaultColors 金色、不進警示', () => {
+  const avg = QQI.byKey('avg');
+  assert.ok(avg, 'avg 應存在');
+  assert.equal(avg.pane, 'main');
+  assert.equal(avg.klineName, 'AVG');
+  assert.equal(avg.repeatable, false);
+  assert.equal(avg.alertTarget, false);
+  assert.deepEqual(avg.paramSchema, []);
+  assert.deepEqual(QQI.calcParams(avg, avg.defaults), []); // 無 number 參數
+  assert.deepEqual(QQI.defaultColors(avg), ['#e8b64c']);
+  assert.equal(avg.defaults.enabled, false);
+  assert.equal(avg.defaults.visible, true);
+  assert.equal(QQI.byKlineName('AVG').key, 'avg');
+  assert.ok(!QQI.alertTargets().map((x) => x.code).includes('avg'));
+});
+
+test('avg resolveVisibility：enabled 即畫、關閉不畫、裸K 蓋掉', () => {
+  const avg = QQI.byKey('avg');
+  assert.equal(QQI.resolveVisibility(avg, { enabled: true, visible: true }, false), true);
+  assert.equal(QQI.resolveVisibility(avg, { enabled: false, visible: true }, false), false);
+  assert.equal(QQI.resolveVisibility(avg, { enabled: true, visible: false }, false), false);
+  assert.equal(QQI.resolveVisibility(avg, { enabled: true, visible: true }, true), false);
 });

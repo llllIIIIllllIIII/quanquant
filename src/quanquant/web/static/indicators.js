@@ -100,6 +100,13 @@
       ],
       defaults: { enabled: false, visible: true, params: { k: 9, d: 3, j: 3 }, colors: ["#FF9600", "#935EBD", "#1677FF"] },
     },
+    {
+      key: "avg", title: "分時均價 VWAP", hint: "疊於主圖（分時）",
+      pane: "main", klineName: "AVG", alertTarget: false, repeatable: false,
+      paramSchema: [],
+      lines: [{ key: "avg", label: "均價線", default: "#e8b64c" }],
+      defaults: { enabled: false, visible: true, params: {}, colors: ["#e8b64c"] },
+    },
   ];
 
   function clone(x) { return JSON.parse(JSON.stringify(x)); }
