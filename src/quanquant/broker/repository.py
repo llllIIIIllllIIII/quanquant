@@ -621,6 +621,21 @@ def release_quota(session: Session, *, reservation_id: str) -> bool:
     return ok
 
 
+def reservation_id_for_update(*, client_order_id: str, request_hash: str) -> str:
+    """update 專用配額保留冪等鍵（round3 #4）：place 直接用 client_order_id 本身當
+    reservation_id；update 額外併入 request_hash，讓「同一委託改成不同內容」的每次改單
+    嘗試各自佔用獨立保留列，不與 place 的保留或彼此互撞——同一次重試（相同
+    client_order_id+相同 request_hash）則視為同一筆保留（reserve_quota 本身的冪等保證）。
+
+    Task 7 `RiskGuard.check_update` 與 Task 6 `ShioajiAdapter.update` 都呼叫本函式（而非
+    各自各寫一份字串樣板），確保兩端算出同一個 reservation_id，quota confirm/release
+    才能命中正確的列——這正是本函式放在 repository.py（兩者共同已依賴的模組）而不是
+    risk.py 的原因：shioaji_adapter.py 刻意不 import risk.py（見該檔頂部說明），放在
+    repository.py 才能讓兩邊零額外耦合地共用同一套推導公式。
+    """
+    return f"{client_order_id}:update:{request_hash}"
+
+
 def quota_used_today(session: Session, *, user_id: int, mode: str, trading_day: str) -> int:
     """目前已用配額（reserved+confirmed 加總）。純讀取、不具 CAS 保證——供 Task 7 guard
     做預檢/UI 顯示用；真正決定「這筆能不能保留」一律要呼叫 reserve_quota（單一陳述式

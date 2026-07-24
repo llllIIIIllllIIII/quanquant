@@ -194,15 +194,22 @@ class ShioajiAdapter:
                 return await asyncio.to_thread(self._place_blocking, req)
             except RiskError:
                 # send gate 擋下（如 kill switch）：確定沒送出，直接標 failed，不留在
-                # pending 卡死（V3-2 修 BLOCKER#13 TOCTOU 的收尾）。quota reservation 的
-                # 建立/釋放歸 risk_guard（Task 7）自己的職責——Task 6 這裡沒有
-                # reservation_id 可用，不猜測呼叫 brepo.release_quota。
+                # pending 卡死（V3-2 修 BLOCKER#13 TOCTOU 的收尾）。round3 #4 收尾：確定
+                # 沒送出 → 退還這筆保留的配額（reservation_id 就是 client_order_id，與
+                # RiskGuard.check_place 建立保留列時用的同一把鍵——見 repository.reserve_quota
+                # 的呼叫端冪等鍵慣例）；沒有 risk_guard 時本來就沒有保留列可退。
                 with self._session_factory() as fail_session:
                     fail_order = fail_session.get(Order, order_id)
                     brepo.mark_order_status(fail_session, fail_order, status="failed")
+                    if self._risk_guard is not None:
+                        brepo.release_quota(fail_session, reservation_id=req.client_order_id)
                     fail_session.commit()
                 raise
             except Exception as exc:
+                # 結果不明（可能已經送到券商、只是回應逾時/連線中斷）：不 release、不
+                # confirm，保留列維持 reserved，留給 Task 8 watchdog reconcile 決議
+                # （round3 #4：unknown 不得立即 release，否則若其實已送達會讓配額被
+                # 誤退還、變相突破日限）。
                 with self._session_factory() as fail_session:
                     fail_order = fail_session.get(Order, order_id)
                     brepo.mark_order_status(fail_session, fail_order, status="unknown")
@@ -216,6 +223,9 @@ class ShioajiAdapter:
                 session, order_id, broker_order_id=ack_fields["broker_order_id"],
                 ordno=ack_fields["ordno"], status="submitted",
             )
+            if self._risk_guard is not None:
+                # 送出成功 → 這筆保留的配額永久計入今日已用（round3 #4 收尾）。
+                brepo.confirm_quota(session, reservation_id=req.client_order_id)
             session.commit()
         return OrderAck(
             client_order_id=client_order_id, broker_order_id=ack_fields["broker_order_id"],
@@ -257,7 +267,11 @@ class ShioajiAdapter:
                 raise OrderError(f"找不到委託 broker_order_id={broker_order_id!r}")
             if self._risk_guard is not None:
                 self._risk_guard.assert_owner(actor_user_id)
-            elif order.user_id != actor_user_id:
+            # round3 #6：owner allowlist 過了不代表這張委託是這個 owner 的——多 owner
+            # 情境下若只驗 assert_owner 就直接放行，owner A 能取消 owner B 的委託。這裡
+            # 一律再以 (user_id,broker,mode,broker_order_id) 驗真正委託所有權（先前版本
+            # 這行只在沒有 risk_guard 時的 elif 分支才會跑，risk_guard 存在時被跳過）。
+            if order.user_id != actor_user_id:
                 raise AuthorizationError("非委託所有人不得取消")
             order_id, ordno, client_order_id = order.id, order.ordno, order.client_order_id
 
@@ -312,16 +326,44 @@ class ShioajiAdapter:
                 raise AuthorizationError("非委託所有人不得改單")
             order_id, ordno, client_order_id = order.id, order.ordno, order.client_order_id
 
+        # round3 #4/#11 收尾：這次改單「若有」保留的 delta 配額（RiskGuard.check_update 只在
+        # new_qty 較原本增加時才會建立這列，見 repository.reservation_id_for_update），送出
+        # 成功/失敗後在這裡 confirm/release；沒有 risk_guard 就沒有保留列，不猜測呼叫。
+        reservation_id = (
+            brepo.reservation_id_for_update(client_order_id=client_order_id, request_hash=request_hash)
+            if self._risk_guard is not None else None
+        )
+
         async def _do_update() -> None:
             await self._send_gate()
             await asyncio.to_thread(self._update_blocking, ordno, new_price, new_qty)
 
-        await self._supervisor.run(_do_update)
+        try:
+            await self._supervisor.run(_do_update)
+        except RiskError:
+            # send gate 擋下（如 kill switch 剛好在改單當下被打開）：確定沒送出，退還這次
+            # 改單嘗試「若有」保留的 delta 配額（沒有保留列時 release_quota 是 no-op）；
+            # 委託本身的狀態不變（改單失敗不代表委託本身壞了，不比照 place 標 failed）。
+            if reservation_id is not None:
+                with self._session_factory() as fail_session:
+                    brepo.release_quota(fail_session, reservation_id=reservation_id)
+                    fail_session.commit()
+            raise
+        except Exception as exc:
+            # 結果不明：不 release、不 confirm，留給 Task 8 watchdog reconcile 決議
+            # （同 place 的 round3 #4 收尾邏輯）。
+            with self._session_factory() as fail_session:
+                fail_order = fail_session.get(Order, order_id)
+                brepo.mark_order_status(fail_session, fail_order, status="unknown")
+                fail_session.commit()
+            raise OrderError(f"改單失敗，委託標記 unknown 待 reconcile：{exc}") from exc
 
         with self._session_factory() as session:
             order = session.get(Order, order_id)
             order.price, order.qty = new_price, new_qty
             brepo.mark_order_status(session, order, status="submitted")
+            if reservation_id is not None:
+                brepo.confirm_quota(session, reservation_id=reservation_id)
             session.commit()
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="submitted")
 

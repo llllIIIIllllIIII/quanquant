@@ -50,6 +50,17 @@ class Settings(BaseSettings):
     port: int = 8000
     tv_symbol: str = "TAIFEX:TXF1!"  # TradingView chart symbol (TAIEX Futures 台指期大台; 小台=MXF1!)
 
+    # Shioaji 下單風控（Task 7 RiskGuard 建構參數的最小必要欄位；Task 8 lifespan 用
+    # broker.risk.parse_owner_ids/parse_whitelist 解析後傳入 RiskGuard，未設定 owner
+    # id 時 Task 8 應軟性停用下單子系統，不崩站——本檔只加欄位，不在這裡連線/驗證）。
+    order_owner_user_ids: str = ""       # 逗號分隔 user id 白名單（owner-only 授權）
+    order_symbol_whitelist: str = "TXF"  # 逗號分隔可下單商品白名單
+    order_max_qty_per_order: int = 5
+    order_max_qty_per_day: int = 20
+    order_max_orders_per_day: int = 20
+    order_confirm_token_ttl_seconds: int = 120  # real 兩階段確認 token 有效秒數
+    order_kill_switch_initial: bool = False     # 啟動時的 kill switch 初始值（可即時切換，非快照）
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

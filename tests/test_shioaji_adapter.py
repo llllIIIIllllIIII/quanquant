@@ -17,10 +17,11 @@ from sqlmodel import Session, select
 from quanquant.broker import repository as brepo
 from quanquant.broker import shioaji_adapter as shioaji_adapter_module
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
+from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import OrderRequest
-from quanquant.db.models import Order, RawInbox
+from quanquant.db.models import Order, QuotaReservation, RawInbox
 
 
 class _FakeOrderHandle:
@@ -303,6 +304,137 @@ def test_close_goes_through_supervisor_and_clears_api(engine):
     adapter = _adapter(engine)
     asyncio.run(adapter.close())
     assert adapter._api is None
+
+
+# ---- Task 7 round3 #4：quota reservation confirm/release 收尾（真 RiskGuard，不用假 guard，
+#      驗證 adapter 與 RiskGuard 兩端算出的 reservation_id 一致、confirm/release 真的命中） ----
+
+def _real_guard(engine, **over):
+    base = dict(
+        secret="s", owner_user_ids=frozenset({1, 2}), symbol_whitelist=frozenset({"TXF"}),
+        max_qty_per_order=10, max_qty_per_day=50, max_orders_per_day=50,
+    )
+    base.update(over)
+    return RiskGuard(session_factory=lambda: Session(engine), **base)
+
+
+def test_place_confirms_quota_reservation_on_successful_send(engine):
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    asyncio.run(adapter.place(_req(), actor_user_id=1))
+    with Session(engine) as s:
+        row = s.exec(select(QuotaReservation)).first()
+        assert row is not None
+        assert row.reservation_id == "C1"  # place 用 client_order_id 當 reservation_id
+        assert row.state == "confirmed"  # 送出成功 → 收尾 confirm
+
+
+def test_place_releases_quota_reservation_when_send_gate_raises_riskerror(engine):
+    """round3 #4 收尾：send gate（如 kill switch TOCTOU 窗口）擋下時，確定沒送出，
+    退還這筆保留的配額，不留死配額。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+
+    async def _blocked_gate():
+        raise RiskError("kill switch 已啟動，拒絕送出")
+
+    adapter._send_gate = _blocked_gate
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    assert len(adapter._api.placed) == 0  # 送單前就被擋，沒有送出
+    with Session(engine) as s:
+        row = s.exec(select(QuotaReservation)).first()
+        assert row is not None and row.state == "released"
+        order = s.exec(select(Order)).first()
+        assert order.status == "failed"
+
+
+def test_place_leaves_quota_reservation_reserved_when_send_outcome_unknown(engine):
+    """round3 #4：native 呼叫結果不明（例如網路逾時，不確定券商是否已收到）不得擅自
+    release——若其實已送達，誤退還配額會變相突破日限，留給 Task 8 watchdog reconcile 決議。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+
+    def _boom(contract, order):
+        raise RuntimeError("網路逾時")
+
+    adapter._api.place_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    with Session(engine) as s:
+        row = s.exec(select(QuotaReservation)).first()
+        assert row is not None and row.state == "reserved"
+        order = s.exec(select(Order)).first()
+        assert order.status == "unknown"
+
+
+def test_update_confirms_delta_quota_reservation_on_successful_send(engine):
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+    ack2 = asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    assert ack2.status == "submitted"
+    with Session(engine) as s:
+        rows = list(s.exec(select(QuotaReservation)))
+        assert len(rows) == 2
+        place_row = next(r for r in rows if r.reservation_id == "C1")
+        update_row = next(r for r in rows if r.reservation_id != "C1")
+        assert place_row.state == "confirmed"
+        assert update_row.state == "confirmed"
+        assert update_row.qty == 3  # delta = 5-2
+
+
+def test_update_releases_delta_quota_reservation_when_send_gate_raises_riskerror(engine):
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+
+    async def _blocked_gate():
+        raise RiskError("kill switch 已啟動，拒絕送出")
+
+    adapter._send_gate = _blocked_gate
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    with Session(engine) as s:
+        rows = list(s.exec(select(QuotaReservation)))
+        update_row = next(r for r in rows if r.reservation_id != "C1")
+        assert update_row.state == "released"
+        order = s.exec(select(Order)).first()
+        assert order.status == "submitted"  # 改單失敗不影響委託本身既有狀態（仍是 place 時的狀態）
+
+
+def test_update_marks_order_unknown_without_touching_reservation_when_send_outcome_unknown(engine):
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+
+    def _boom(ordno, **kw):
+        raise RuntimeError("網路逾時")
+
+    adapter._api.update_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    with Session(engine) as s:
+        rows = list(s.exec(select(QuotaReservation)))
+        update_row = next(r for r in rows if r.reservation_id != "C1")
+        assert update_row.state == "reserved"  # 結果不明，不擅自 release
+        order = s.exec(select(Order)).first()
+        assert order.status == "unknown"
+
+
+# ---- Task 7 round3 #6：cancel 除了 assert_owner，仍要驗真正委託所有權 ----
+
+def test_cancel_rejects_non_owner_of_order_even_when_actor_is_a_different_owner(engine):
+    """多 owner 情境下，owner A 的委託不能被 owner B 取消——先前版本只在沒有 risk_guard
+    時才會驗 order.user_id，risk_guard 存在時被跳過，是個真正的跨人越權漏洞。"""
+    guard = _real_guard(engine)  # owner_user_ids={1,2}
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(), actor_user_id=1))
+    with pytest.raises(AuthorizationError):
+        asyncio.run(adapter.cancel(ack.broker_order_id, actor_user_id=2))
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "submitted"  # 沒有被取消
 
 
 # ---- mapper：嚴格驗證 ----
