@@ -1,0 +1,16 @@
+<form hx-put="/orders/{{ order.broker_order_id }}" hx-target="this" hx-swap="outerHTML">
+  {% if error %}<div class="error-banner">⚠ {{ error }}</div>{% endif %}
+  <p>{{ order.symbol }} {{ '買' if order.action == 'Buy' else '賣' }}　目前 {{ order.qty }} 口 @ {{ order.price }}</p>
+  <div class="grid">
+    <label>新口數
+      <input name="qty" type="number" min="1" value="{{ qty }}">
+    </label>
+    <label>新價格
+      <input name="price" type="text" value="{{ price }}">
+    </label>
+  </div>
+  <footer class="form-actions">
+    <button type="button" class="secondary" @click="open = false">取消</button>
+    <button type="submit">送出改單</button>
+  </footer>
+</form>

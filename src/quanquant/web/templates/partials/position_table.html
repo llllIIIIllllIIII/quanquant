@@ -1,0 +1,16 @@
+<table>
+  <thead><tr><th>商品</th><th>方向</th><th>口數</th><th>均價</th></tr></thead>
+  <tbody>
+    {% if not positions %}
+    <tr class="empty"><td colspan="4">目前無部位。</td></tr>
+    {% endif %}
+    {% for p in positions %}
+    <tr>
+      <td>{{ p.symbol }}</td>
+      <td><span class="dir {{ 'long' if p.direction == 'long' else 'short' }}">{{ '多' if p.direction == 'long' else '空' }}</span></td>
+      <td class="numcell">{{ p.qty }}</td>
+      <td class="numcell">{{ p.avg_price }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

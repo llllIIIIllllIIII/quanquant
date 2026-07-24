@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+<div x-data="{ open: false }" @closeordermodal.window="open = false">
+
+  <div class="journal-head">
+    <h3>下單</h3>
+  </div>
+
+  {% if not service_available %}
+  <p class="error-banner">下單子系統目前未啟用，無法送出新委託（歷史委託仍可查看）。</p>
+  {% endif %}
+
+  <div class="form-error-slot"></div>
+
+  <form hx-post="/orders" hx-swap="none">
+    <input type="hidden" name="client_order_id" value="{{ client_order_id }}">
+    <div class="grid">
+      <label>商品
+        <select name="symbol">{% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
+      </label>
+      <label>方向
+        <select name="action"><option value="Buy">買</option><option value="Sell">賣</option></select>
+      </label>
+      <label>口數
+        <input name="qty" type="number" min="1" value="1">
+      </label>
+    </div>
+    <div class="grid">
+      <label>價格
+        <input name="price" type="text" placeholder="18000">
+      </label>
+      <label>價格類型
+        <select name="price_type"><option value="LMT">限價</option><option value="MKT">市價</option></select>
+      </label>
+      <label>委託類型
+        <select name="order_type"><option value="ROD">ROD</option><option value="IOC">IOC</option><option value="FOK">FOK</option></select>
+      </label>
+      <label>倉別
+        <select name="octype"><option value="New">新倉</option><option value="Cover">平倉</option><option value="Auto">自動</option></select>
+      </label>
+    </div>
+    <footer class="form-actions">
+      <button type="submit" {% if not service_available %}disabled{% endif %}>送出</button>
+    </footer>
+  </form>
+
+  <div class="confirm-slot"></div>
+
+  <div class="mode-tabs" role="tablist">
+    <a role="button" class="{{ '' if mode == 'real' else 'contrast' }}" href="/orders?mode=real">正式</a>
+    <a role="button" class="{{ 'contrast' if mode == 'sim' else '' }}" href="/orders?mode=sim">模擬</a>
+  </div>
+
+  <h4>委託</h4>
+  <div hx-get="/orders/list?mode={{ mode }}" hx-trigger="load, refreshorders from:body" hx-swap="innerHTML"></div>
+
+  <h4>部位</h4>
+  <div hx-get="/orders/positions" hx-trigger="load, refreshorders from:body" hx-swap="innerHTML"></div>
+
+  <!-- 改單 modal -->
+  <dialog :open="open">
+    <article class="modal-card">
+      <header>
+        <button aria-label="Close" rel="prev" @click="open = false"></button>
+        <strong>改單</strong>
+      </header>
+      <div id="order-edit-modal"></div>
+    </article>
+  </dialog>
+
+</div>
+{% endblock %}

@@ -1,0 +1,17 @@
+<p>確認送出（正式環境，真實成交）：{{ symbol }} {{ '買' if side == 'Buy' else '賣' }} {{ qty }} 口 @ {{ price }}</p>
+<form {% if kind == 'place' %}hx-post="/orders" hx-swap="none"{% else %}hx-put="/orders/{{ broker_order_id }}" hx-target="this" hx-swap="outerHTML"{% endif %}>
+  {% if kind == 'place' %}
+  <input type="hidden" name="client_order_id" value="{{ client_order_id }}">
+  <input type="hidden" name="symbol" value="{{ symbol }}">
+  <input type="hidden" name="action" value="{{ side }}">
+  <input type="hidden" name="price_type" value="{{ price_type }}">
+  <input type="hidden" name="order_type" value="{{ order_type }}">
+  <input type="hidden" name="octype" value="{{ octype }}">
+  {% endif %}
+  <input type="hidden" name="qty" value="{{ qty }}">
+  <input type="hidden" name="price" value="{{ price }}">
+  <input type="hidden" name="confirm_token" value="{{ token }}">
+  <footer class="form-actions">
+    <button type="submit">確認送出</button>
+  </footer>
+</form>
