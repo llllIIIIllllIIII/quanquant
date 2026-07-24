@@ -22,6 +22,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 from quanquant.broker import repository as brepo
+from quanquant.broker.redaction import redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,8 @@ async def _probe_healthy(adapter) -> bool:
     try:
         return bool(await probe())
     except Exception as exc:
-        log.warning("watchdog health_probe 呼叫本身失敗（視為不健康）: %s", exc)
+        message = redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", []))
+        log.warning("watchdog health_probe 呼叫本身失敗（視為不健康）: %s", message)
         return False
 
 
@@ -74,8 +76,12 @@ async def run_order_watchdog(
                 state.mark_ready()
                 backoff = interval
             except Exception as exc:
-                log.warning("watchdog 重連失敗: %s", exc)
-                state.mark_unhealthy(str(exc))
+                # F8：exc 可能是 shioaji login/activate_ca 拋出、原文夾帶 api_key/ca_passwd/
+                # person_id 的例外——這裡的訊息會存進 state.last_error，經 /healthz（未認證
+                # 公開端點）直接回顯，redact 不可省略。
+                message = redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", []))
+                log.warning("watchdog 重連失敗: %s", message)
+                state.mark_unhealthy(message)
                 state.reconnect_attempts += 1
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
                 await asyncio.sleep(backoff)
@@ -87,14 +93,20 @@ async def run_order_watchdog(
             try:
                 await _retry_quarantined(adapter, unquarantine_after_seconds)
             except Exception as exc:
-                log.warning("watchdog unquarantine 失敗: %s", exc)
+                log.warning(
+                    "watchdog unquarantine 失敗: %s",
+                    redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", [])),
+                )
 
         if now_monotonic - last_unknown_reconcile_monotonic >= max(unknown_reconcile_grace_seconds, interval):
             last_unknown_reconcile_monotonic = now_monotonic
             try:
                 await _reconcile_unknown_quota(adapter, unknown_reconcile_grace_seconds)
             except Exception as exc:
-                log.warning("watchdog unknown quota reconcile 失敗: %s", exc)
+                log.warning(
+                    "watchdog unknown quota reconcile 失敗: %s",
+                    redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", [])),
+                )
 
 
 async def _retry_quarantined(adapter, older_than_seconds: float) -> None:

@@ -29,12 +29,20 @@ from sqlmodel import Session
 
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
+from quanquant.broker.redaction import redact_secrets
 from quanquant.broker.types import OrderRequest, canonical_payload_hash
 from quanquant.db.models import User
 from quanquant.web.deps import get_current_user, get_session
 from quanquant.web.templating import render_partial, templates
 
 router = APIRouter()
+
+
+def _safe_str(exc: Exception, service) -> str:
+    """F8：`OrderError`/`RiskError` 訊息可能源自 adapter 未 redact 的路徑（防禦性，即使
+    adapter 內部已對已知分支 redact，這裡是回顯給瀏覽器前的最後一道防線）。`service` 就是
+    `ShioajiAdapter` instance，經 `secrets_to_redact` property 取得同一份秘密清單。"""
+    return redact_secrets(str(exc), secrets=getattr(service, "secrets_to_redact", []))
 
 
 def get_order_service(request: Request):
@@ -213,9 +221,9 @@ async def place_order(
                 session, risk_guard, actor_user_id=user.id, req=req,
                 account=getattr(service, "account", ""), mode=service.mode,
             )
-        return _form_error(str(exc))
+        return _form_error(_safe_str(exc, service))
     except OrderError as exc:
-        return _form_error(str(exc))
+        return _form_error(_safe_str(exc, service))
     return _orders_trigger()
 
 
@@ -250,7 +258,7 @@ async def cancel_order(
     except AuthorizationError:
         raise HTTPException(status_code=403, detail="not owner")
     except OrderError as exc:
-        return _form_error(str(exc))
+        return _form_error(_safe_str(exc, service))
     return _orders_trigger()
 
 
@@ -284,7 +292,7 @@ async def update_order(
                 session, risk_guard, service, actor_user_id=user.id,
                 broker_order_id=broker_order_id, price=price, qty=qty,
             )
-        return _edit_form_error(session, service, broker_order_id, str(exc), price=price, qty=qty)
+        return _edit_form_error(session, service, broker_order_id, _safe_str(exc, service), price=price, qty=qty)
     except OrderError as exc:
-        return _edit_form_error(session, service, broker_order_id, str(exc), price=price, qty=qty)
+        return _edit_form_error(session, service, broker_order_id, _safe_str(exc, service), price=price, qty=qty)
     return _orders_trigger(close_modal=True)

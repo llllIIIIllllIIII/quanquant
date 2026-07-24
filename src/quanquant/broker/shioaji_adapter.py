@@ -46,6 +46,7 @@ from sqlmodel import Session
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
 from quanquant.broker.inbox_worker import OrderReport, commit_raw_callback
+from quanquant.broker.redaction import redact_secrets as _redact_secrets
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill, Mode, OrderAck, OrderRequest, Position, canonical_payload_hash
 from quanquant.db.models import Order
@@ -85,6 +86,11 @@ class ShioajiAdapter:
         self._ca_path = ca_path
         self._ca_passwd = ca_passwd
         self._person_id = person_id
+        # F8（round3 中央化 redaction）：這個 adapter instance 認得的所有秘密值，供
+        # place/update/health_probe 的例外訊息、以及 watchdog/lifespan/HTTP 路由（經
+        # `secrets_to_redact` 這個 public property 讀取）呼叫 broker.redaction.redact_secrets
+        # 時使用，確保任何可能夾帶這些值的上游例外文字落地/回顯前一律先過濾。
+        self._secrets_to_redact = [s for s in (api_key, secret_key, ca_passwd, person_id) if s]
         self.symbol = symbol
         self.mode: Mode = mode
         self.broker = broker
@@ -147,6 +153,14 @@ class ShioajiAdapter:
         不經過 `.run()`（那是給 native shioaji API 呼叫用的通道，round3 #11）。"""
         return self._supervisor
 
+    @property
+    def secrets_to_redact(self) -> list[str]:
+        """F8：watchdog/lifespan/HTTP 路由沒有直接持有 api_key/secret_key/ca_passwd/
+        person_id，但持有這個 adapter instance——經這個 property 取得同一份秘密清單，統一
+        呼叫 `broker.redaction.redact_secrets`，不需要各自另外接收/保存一份秘密。回傳
+        copy（不是內部 list 的參照），避免呼叫端意外修改到 adapter 內部狀態。"""
+        return list(self._secrets_to_redact)
+
     # ---- health probe（round3 #10：序列化 broker health probe，不只看 `_api is not None`） ----
 
     async def health_probe(self) -> bool:
@@ -162,7 +176,10 @@ class ShioajiAdapter:
                 await asyncio.to_thread(self._probe_blocking)
                 return True
             except Exception as exc:
-                log.warning("health_probe 失敗（視為不健康，觸發重連）: %s", exc)
+                log.warning(
+                    "health_probe 失敗（視為不健康，觸發重連）: %s",
+                    _redact_secrets(str(exc), secrets=self._secrets_to_redact),
+                )
                 return False
 
         return await self._supervisor.run(_do_probe)
@@ -328,7 +345,10 @@ class ShioajiAdapter:
                     fail_order = fail_session.get(Order, order_id)
                     brepo.mark_order_status(fail_session, fail_order, status="unknown")
                     fail_session.commit()
-                raise OrderError(f"送單失敗，委託標記 unknown 待 reconcile：{exc}") from exc
+                raise OrderError(
+                    f"送單失敗，委託標記 unknown 待 reconcile："
+                    f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
+                ) from exc
 
         ack_fields = await self._supervisor.run(_do_place)
 
@@ -470,7 +490,10 @@ class ShioajiAdapter:
                 fail_order = fail_session.get(Order, order_id)
                 brepo.mark_order_status(fail_session, fail_order, status="unknown")
                 fail_session.commit()
-            raise OrderError(f"改單失敗，委託標記 unknown 待 reconcile：{exc}") from exc
+            raise OrderError(
+                f"改單失敗，委託標記 unknown 待 reconcile："
+                f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
+            ) from exc
 
         with self._session_factory() as session:
             order = session.get(Order, order_id)

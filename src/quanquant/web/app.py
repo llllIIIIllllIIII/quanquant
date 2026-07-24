@@ -16,6 +16,7 @@ from sqlmodel import Session
 from quanquant.alerts.engine import run_alert_engine
 from quanquant.broker.lifecycle import run_confirm_token_cleanup, shutdown_order_subsystem
 from quanquant.broker.preflight import order_subsystem_preflight
+from quanquant.broker.redaction import redact_secrets
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.broker.watchdog import run_order_watchdog
 from quanquant.candles.builder import CandleBuilder
@@ -187,8 +188,15 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     except Exception as exc:
         # readiness gate（round3）：connect 未成功不 publish app.state.order_service，
         # fail closed，不留 detached task 吞例外。
-        order_state.mark_unhealthy(f"connect 失敗，下單子系統停用: {exc}")
-        log.error("下單子系統 connect 失敗（fail closed）: %s", exc)
+        # F8：connect() 內部呼叫 shioaji login/activate_ca，例外原文可能夾帶
+        # api_key/secret_key/ca_passwd/person_id——這則訊息會存進 order_state.last_error，
+        # 經 /healthz（未認證公開端點，見 web/routers/health.py）直接回顯給任何呼叫者，
+        # redact 是這裡不可省略的一步（不只 log，還包括對外回應）。
+        message = redact_secrets(
+            f"connect 失敗，下單子系統停用: {exc}", secrets=getattr(adapter, "secrets_to_redact", [])
+        )
+        order_state.mark_unhealthy(message)
+        log.error("下單子系統 connect 失敗（fail closed）: %s", message)
         return
 
     order_state.mark_ready()

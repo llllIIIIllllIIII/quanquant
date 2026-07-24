@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from sqlmodel import Session
 
 from quanquant.broker import repository as brepo
+from quanquant.broker.redaction import redact_secrets
 
 log = logging.getLogger(__name__)
 
@@ -37,7 +38,9 @@ async def shutdown_order_subsystem(
             log.error("shutdown_order_subsystem: order_service.close() 逾時（ingress 未確定關閉）")
         except Exception as exc:
             ok = False
-            log.error("shutdown_order_subsystem: order_service.close() 失敗: %s", exc)
+            # F8：order_service.close() 內部呼叫 native logout，例外原文理論上可能夾帶秘密。
+            message = redact_secrets(str(exc), secrets=getattr(order_service, "secrets_to_redact", []))
+            log.error("shutdown_order_subsystem: order_service.close() 失敗: %s", message)
 
     if inbox_worker is not None:
         drained = await inbox_worker.stop_and_drain(timeout=timeout)
