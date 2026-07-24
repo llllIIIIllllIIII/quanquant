@@ -227,6 +227,50 @@ class OrderAudit(SQLModel, table):            # append-only 稽核（不含秘�
 
 ---
 
+## 修訂 v3（依 codex round2 覆核；本節與前文衝突時以本節為準）
+
+依 `reviews/2026-07-24-shioaji-order-codex-review-round2.md` 的 4 blocker + 架構級發現，設計補強三塊：
+
+### V3-1 部位帳務改 lot ledger（修 PnL 錯算 + fee 重複計）
+- `BrokerPosition` 改為**逐筆開倉 lot 帳本**：每個 open lot 存 `(qty, entry_price, remaining)`；或同表持久化 `total_opened_qty`、`entry_notional`、`total_fee` 三個累計欄位，**永不用「剩餘口數」回推歷史入場均價**。
+- 平倉 FIFO 消耗 lot：round-trip 結算的 `size`=總開倉量、`entry`=`entry_notional/total_opened_qty`（真實加權），非剩餘量推估。
+- **超額 Cover 的 fee 依 consumed/excess 比例拆分**，斷言「所有 position/trade 的 fee 合計 == 原 fill fee」。
+
+### V3-2 callback → durable raw-inbox → 單一序列化 broker supervisor（修丟單/競態/TOCTOU/單-worker 假設）
+- **callback 首先寫 durable raw-inbox（DB spool）**，不進任何 volatile `asyncio.Queue`；worker 從 DB 拉未處理列。QueueFull/worker 例外/處理中 crash 都不丟單。
+- **單一 broker-operation supervisor**：place/update/cancel/positions/close/connect/reconnect/retry_quarantined **全部**經同一個序列化 command 通道（單一 asyncio 鎖或單 consumer command queue）。`BrokerPosition`/quota 的所有寫入只在此通道內發生 → 真正序列化，取代「單 uvicorn worker」這個不成立的假設（背景 thread + watchdog 會破壞它）。
+- **send gate**：所有 broker mutation 在「呼叫 native API 的線性化點」最後一次檢查 kill switch 與就緒狀態（修 kill-switch/就緒 TOCTOU）。
+- **watchdog 做 broker cursor reconciliation**：重連後主動拉券商委託/成交補回 raw-inbox（不只 retry 本地 quarantine）；backoff 用指數退避 + login 節流。
+- **Order 狀態由 fill 更新**：處理 fill 的同一交易內單調更新對應 `Order.filled_qty/avg_fill_price/status`（FuturesOrder 委託回報也吃進來更新）。
+
+### V3-3 canonical payload hash + token claim 次序 + CAS quota（修改單鎖死/token 篡改/並行超限/冪等重送）
+- **canonical order payload hash**：單一 helper 產生，涵蓋**所有可執行欄位**（symbol/action/qty/price/price_type/order_type/octype/account/mode）。place 與 update **簽發與驗證共用同一 helper**（修「real update 因 broker_order_id vs client_order_id 不符而鎖死」與「確認 LMT/ROD 後篡改 MKT/IOC/FOK」）。
+- **冪等先於 token**：`place` 先以 `(client_order_id + request_hash)` 查既有 Order——命中且非終態→回既有狀態（不重送、不燒 token）；同 key 不同 payload→拒絕。確認 token 只在「通過所有可失敗檢查後、真正送單前」原子 claim。
+- **client_order_id 穩定性**：表單首次渲染即生成 hidden `client_order_id` 並隨表單送出（HTTP retry 不會每次生新 UUID）。
+- **確認 token 用 TTL 的 DB/JTI row**（非記憶體無界 set），claim 為原子 UPDATE。
+- **CAS/持久化 quota reservation**：日限額以 DB reservation（條件 UPDATE/版本欄位 CAS）保留，與建單同一交易；broker 失敗/unknown 由 reconcile 釋放；**不跨網路持有長 DB transaction**（reserve→commit→送單→依結果 confirm/release）。
+- **委託關聯 scope**：解析 fill→order 一律用 `(broker, account, mode, ordno)` 或 `(broker, account, mode, broker_order_id)` 複合鍵查詢（加索引），**不用裸單鍵 `.first()`**（修成交寫錯 user）；解不到→quarantine。
+
+### V3-4 其餘 PARTIAL/驗證補強
+- **Fill/raw callback 嚴格驗證**：raw callback 先 durable quarantine；`Fill` 驗 `action/octype/qty>0/price>0/fill_id/ts/account` 皆合法才進帳務，缺值不猜（不填空字串/0/Auto）。
+- **fill 去重只認真實 deal id**：缺 deal id → quarantine/reconcile，**不用 `ordno`/`seqno` fallback 冒充 fill_id**。
+- `Deal` 補 `broker_order_id` 欄位（D5）。
+- `mode` 於 DB 層加 CHECK（`Trade`、`OrderAudit`、`Order`、`Deal`、`BrokerPosition` 的 mode 限 sim/real；SQLite/Postgres 皆可攜的 CHECK 或等價）。
+- **shutdown**：sentinel 停 ingress → 等 command worker/DB thread 真正結束 → 超時資料 spool 並保持 unhealthy（不留背景 thread）。
+- **部署**：驗檔案 owner UID；例外訊息 redaction 確保上游秘密不進 log。
+- **Postgres 可攜性驗證**：加 PG dialect `CreateTable` compile smoke（新表 UniqueConstraint/DEFAULT/BigInteger/CHECK）。
+
+### V3 測試補強（每條都要「會抓到 bug」）
+- lot ledger：開2@100→平1→再開1@200→全平，斷言結算 entry=加權真值（非 150 推估）、fee 合計守恆。
+- durable raw-inbox：QueueFull/worker 例外/處理中 crash **零丟單**（重啟後 raw-inbox 仍在、最終恰一次 effect）。
+- 序列化 supervisor：live fill 與 watchdog retry 同時發生**不並發改同一 BrokerPosition**（走同一通道）。
+- send-gate TOCTOU：風控通過後、送單前打開 kill switch → 該單被擋。
+- canonical hash：real update round-trip 成功；逐欄 mutation（price_type/order_type/…）令 token 失效。
+- token 次序：HTTP retry 同 key/token 回既有 Order（不被 token 已消費擋死）。
+- CAS quota：兩並行 update/place 併發時**日限額不被突破**（一過一擋）。
+- 關聯 scope：跨 account/mode 同 ordno 衝突 fixture → 不寫錯 user。
+- 非法 callback：缺 action/octype、qty=0、price=0、空 fill_id → quarantine，不進帳務。
+
 ## 未來（Phase 2+）
 
 - 多使用者：per-user 加密憑證金庫（信封加密/KMS）、多帳戶 per-account 部位 scoping、永豐官方 HTTP server 模式或一帳戶一容器、per-IP 節流、**法遵（代客操作/全權委託執照）**、多 worker 需補 DB lock/reservation（取代單-worker 不變量）。
