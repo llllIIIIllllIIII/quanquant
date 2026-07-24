@@ -42,6 +42,34 @@ from quanquant.db.models import (
 _CST = timezone(timedelta(hours=8))
 _ACTIVE_QUOTA_STATES = ("reserved", "confirmed")
 
+# ---- Order 狀態偏序（round3 #12：晚到/重播的狀態回報不得回退已達成的進度） ----
+_ORDER_STATUS_RANK = {"pending": 0, "sending": 1, "submitted": 2, "partfilled": 3, "filled": 4}
+_ORDER_TERMINAL_STATUSES = frozenset({"cancelled", "failed"})
+
+
+class PositionConcurrencyError(Exception):
+    """BrokerPosition 樂觀鎖 version CAS 衝突（見 cas_update_broker_position）：代表寫入當下
+    版本已被別的寫入者搶先更動，呼叫端應重新讀取整筆 BrokerPosition 後重試，不可假裝成功、
+    也不可直接覆寫（那正是 CAS 要防的 lost update）。"""
+
+
+def _order_status_transition_allowed(current: str, new: str) -> bool:
+    """狀態偏序守衛（round3 #12）：pending<sending<submitted<partfilled<filled；
+    cancelled/failed 為終態。規則：
+    - 終態（cancelled/failed）一旦達成即不可逆——任何後續狀態回報一律忽略。
+    - 新狀態若是終態，只有在目前**尚未完全成交**（current != "filled"）時才允許
+      （避免晚到/重播的 cancelled 覆蓋掉已經 filled 的委託，讓正式紀錄失真）。
+    - 兩者皆是進度性狀態時，只有嚴格前進（new 的 rank 高於 current）才允許——
+      避免晚到/重播的 Submitted 把已經 partfilled/filled 的委託往回蓋。
+    """
+    if current == new:
+        return False
+    if current in _ORDER_TERMINAL_STATUSES:
+        return False
+    if new in _ORDER_TERMINAL_STATUSES:
+        return current != "filled"
+    return _ORDER_STATUS_RANK.get(new, -1) > _ORDER_STATUS_RANK.get(current, -1)
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -169,13 +197,19 @@ def apply_order_fill(
 
     數學上安全：filled_qty 只增不減（一張委託的成交只會累加，不像 BrokerPosition 有
     「中途平倉」這種會讓歷史貢獻被錯誤覆寫的操作），故 (old_avg*old_qty + new_price*new_qty)/(old+new)
-    是精確的加權平均，不是估計。"""
+    是精確的加權平均，不是估計。
+
+    round3 #12：filled_qty/avg_fill_price 永遠累加（真實成交量沒有「回退」這件事），但
+    `status` 的寫入受 `_order_status_transition_allowed` 守衛——晚到/重播的低序狀態
+    （或非法把已 filled 覆寫成 cancelled）一律忽略，不回退。"""
     prior_qty = order.filled_qty
     prior_notional = (order.avg_fill_price or Decimal(0)) * prior_qty
     new_qty = prior_qty + fill_qty
     order.avg_fill_price = (prior_notional + fill_price * fill_qty) / new_qty
     order.filled_qty = new_qty
-    order.status = terminal_status or ("filled" if new_qty >= order.qty else "partfilled")
+    candidate_status = terminal_status or ("filled" if new_qty >= order.qty else "partfilled")
+    if _order_status_transition_allowed(order.status, candidate_status):
+        order.status = candidate_status
     order.updated_at = _utcnow()
     session.add(order)
     session.flush()
@@ -183,7 +217,12 @@ def apply_order_fill(
 
 
 def mark_order_status(session: Session, order: Order, *, status: str) -> Order:
-    """純狀態回報（委託回報 callback，如 cancelled/failed/submitted），不動 filled_qty。"""
+    """純狀態回報（委託回報 callback，如 cancelled/failed/submitted），不動 filled_qty。
+
+    round3 #12：狀態寫入受 `_order_status_transition_allowed` 守衛，晚到/重播的回報
+    不得回退已達成的進度（不符合的呼叫直接 no-op，不寫入、不 flush）。"""
+    if not _order_status_transition_allowed(order.status, status):
+        return order
     order.status = status
     order.updated_at = _utcnow()
     session.add(order)
@@ -361,6 +400,38 @@ def avg_entry_price(pos: BrokerPosition) -> Decimal:
 
 def avg_exit_price(pos: BrokerPosition) -> Decimal:
     return pos.exit_notional / pos.closed_qty
+
+
+def cas_update_broker_position(session: Session, pos: BrokerPosition, **values: object) -> BrokerPosition:
+    """樂觀鎖版本 CAS 更新 BrokerPosition（round3 #15 version 欄位的實際用法）：呼叫端在
+    Python 端算好新的絕對值（Decimal 算術一律在 Python 端做——`entry_notional`/`exit_notional`
+    等欄位是 DecimalText/TEXT column，SQL 層級做加法不安全，見 db/models.py DecimalText），
+    本函式只負責用單一 `UPDATE ... WHERE id=? AND version=?` 陳述式原子地把它們寫入並把
+    version 推進一格；`rowcount != 1` 代表寫入當下已被別的寫入者搶先更動版本（並發競態），
+    拋 `PositionConcurrencyError`，呼叫端應重新讀取整筆 BrokerPosition 後重試，不可假裝成功。
+
+    成功後直接把新值 setattr 回傳入的 `pos`（同時把它在 session identity map 的已知快照
+    對齊），避免呼叫端另外重新查詢一次；不可讓 `pos` 之後又被 ORM 預設 flush 覆寫回舊值。"""
+    t = BrokerPosition.__table__
+    current_version = pos.version
+    payload = dict(values)
+    payload["version"] = current_version + 1
+    payload.setdefault("updated_at", _utcnow())
+    stmt = (
+        update(t)
+        .where(t.c.id == pos.id, t.c.version == current_version)
+        .values(**payload)
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    if result.rowcount != 1:
+        raise PositionConcurrencyError(
+            f"BrokerPosition id={pos.id} 版本衝突（預期 version={current_version}），"
+            "疑似並發寫入，請重新讀取後重試"
+        )
+    session.flush()
+    for key, value in payload.items():
+        setattr(pos, key, value)
+    return pos
 
 
 # ---- OrderAudit ----

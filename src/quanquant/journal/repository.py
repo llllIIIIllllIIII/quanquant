@@ -24,7 +24,10 @@ def _recompute_pnl(trade: Trade) -> None:
         )
 
 
-def create_trade(session: Session, data: TradeCreate, *, user_id: int) -> Trade:
+def create_trade(session: Session, data: TradeCreate, *, user_id: int, commit: bool = True) -> Trade:
+    """`commit=False`（Task 4）：只 flush，不 commit/refresh——供 broker fill 交易把
+    「BrokerPosition 帳務 + 這筆 Trade」包進呼叫端自己的同一個 commit（round-trip 完成時）。
+    預設 `True` 保持既有（手動日誌 CRUD）行為不回歸。"""
     trade = Trade(
         user_id=user_id,
         symbol=data.symbol,
@@ -47,8 +50,11 @@ def create_trade(session: Session, data: TradeCreate, *, user_id: int) -> Trade:
     )
     _recompute_pnl(trade)
     session.add(trade)
-    session.commit()
-    session.refresh(trade)
+    if commit:
+        session.commit()
+        session.refresh(trade)
+    else:
+        session.flush()
     return trade
 
 

@@ -118,3 +118,20 @@ def test_fresh_db_rejects_null_mode(engine):
     with pytest.raises(IntegrityError):
         with engine.begin() as conn:
             conn.execute(text(_INSERT_TRADE_SQL.format(mode="NULL", source="'manual'")))
+
+
+# --- Task 4：create_trade(commit=False) 供 broker fill 交易併入同一個 commit ---
+
+def test_create_trade_uncommitted_leaves_transaction_open(session, user):
+    repo.create_trade(session, make_create(), user_id=user.id, commit=False)
+    session.rollback()
+    from quanquant.db.models import Trade
+    assert session.exec(__import__("sqlmodel").select(Trade)).first() is None  # rollback 後不留痕跡
+
+
+def test_create_trade_default_commit_true_unchanged(session, user):
+    trade = repo.create_trade(session, make_create(), user_id=user.id)  # 不傳 commit，維持舊行為
+    assert trade.id is not None
+    session.rollback()  # 已經 commit 過，rollback 對已提交資料無效
+    from quanquant.db.models import Trade
+    assert session.exec(__import__("sqlmodel").select(Trade)).first() is not None
