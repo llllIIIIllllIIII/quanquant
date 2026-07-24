@@ -130,6 +130,30 @@ def test_mark_order_status_does_not_touch_filled_qty(session):
     assert o.status == "cancelled" and o.filled_qty == 0
 
 
+def test_mark_order_status_unknown_transition_and_reconcile_can_override(session):
+    """Task 6：native 呼叫失敗但不確定是否已送達券商時標 unknown；待 reconcile 之後任何
+    進度/終態回報都可以覆蓋 unknown（暫態，不是進度序列/終態的一部分）。"""
+    o = brepo.create_order(session, **_order_kwargs())
+    session.commit()
+    brepo.mark_order_status(session, o, status="unknown")
+    session.commit()
+    assert o.status == "unknown"
+    brepo.mark_order_status(session, o, status="submitted")
+    session.commit()
+    assert o.status == "submitted"
+
+
+def test_mark_order_status_unknown_does_not_override_filled(session):
+    o = brepo.create_order(session, **_order_kwargs(qty=1))
+    session.commit()
+    brepo.apply_order_fill(session, o, fill_qty=1, fill_price=Decimal("18000"))
+    session.commit()
+    assert o.status == "filled"
+    brepo.mark_order_status(session, o, status="unknown")
+    session.commit()
+    assert o.status == "filled"  # 已成交不可回退成 unknown
+
+
 def test_count_and_sum_qty_today_scoped_by_mode_and_trading_day(session):
     brepo.create_order(session, **_order_kwargs(client_order_id="S1", mode="sim", qty=2))
     brepo.create_order(session, **_order_kwargs(client_order_id="R1", mode="real", qty=5, request_hash="H-R1"))

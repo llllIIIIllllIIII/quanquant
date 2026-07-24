@@ -61,6 +61,14 @@ def _order_status_transition_allowed(current: str, new: str) -> bool:
       （避免晚到/重播的 cancelled 覆蓋掉已經 filled 的委託，讓正式紀錄失真）。
     - 兩者皆是進度性狀態時，只有嚴格前進（new 的 rank 高於 current）才允許——
       避免晚到/重播的 Submitted 把已經 partfilled/filled 的委託往回蓋。
+
+    Task 6 補充：`"unknown"`（native 呼叫失敗但不確定是否已送達券商，見
+    ShioajiAdapter.place 的 except 分支）不在 `_ORDER_STATUS_RANK` 之列，若不特判，
+    fallback 的 rank 比較會讓 pending→unknown 被誤判為「沒有嚴格前進」而擋下
+    （`_ORDER_STATUS_RANK.get("unknown", -1)` 恆為 -1）。`"unknown"` 是待 watchdog
+    reconcile 決議的暫態、不是終態，也不是進度序列的一部分：
+    - 只要目前**尚未完全成交**都可以標成 unknown（同終態保護精神，已成交不可回退成不明）。
+    - 從 unknown 之後，任何進度/終態回報都視為 reconcile 決議完成，一律放行覆蓋。
     """
     if current == new:
         return False
@@ -68,6 +76,10 @@ def _order_status_transition_allowed(current: str, new: str) -> bool:
         return False
     if new in _ORDER_TERMINAL_STATUSES:
         return current != "filled"
+    if new == "unknown":
+        return current != "filled"
+    if current == "unknown":
+        return True
     return _ORDER_STATUS_RANK.get(new, -1) > _ORDER_STATUS_RANK.get(current, -1)
 
 
