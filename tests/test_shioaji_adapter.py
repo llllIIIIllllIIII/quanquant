@@ -9,6 +9,7 @@ BrokerSupervisor.run() 同一個 command executor 序列化（round3 #11）、_m
 import asyncio
 import json
 import time
+from datetime import datetime
 from decimal import Decimal
 
 import pytest
@@ -477,3 +478,113 @@ def test_map_order_report_rejects_missing_ordno_and_broker_order_id():
     adapter = _adapter_stub_for_mapper()
     with pytest.raises(ValueError):
         adapter._map_order_report({"status": "Cancelled"})  # order_id/seqno 都缺
+
+
+# ---- Task 8：supervisor property / health_probe（round3 #10）/ reconcile（round3 #2） ----
+
+class _FakeOrderHandle2:
+    def __init__(self, id_, seqno):
+        self.id = id_
+        self.seqno = seqno
+
+
+class _FakeTradeStatus:
+    def __init__(self, status, order_datetime=None):
+        self.status = status
+        self.order_datetime = order_datetime
+
+
+class _FakeTrade2:
+    def __init__(self, id_, seqno, status, order_datetime=None):
+        self.order = _FakeOrderHandle2(id_, seqno)
+        self.status = _FakeTradeStatus(status, order_datetime=order_datetime)
+
+
+def test_supervisor_property_returns_injected_instance(engine):
+    sup = BrokerSupervisor()
+    adapter = ShioajiAdapter(
+        api_key="k", secret_key="s", ca_path=None, ca_passwd=None, person_id=None,
+        symbol="TXF", mode="sim", session_factory=lambda: Session(engine), supervisor=sup,
+    )
+    assert adapter.supervisor is sup
+
+
+def test_health_probe_false_when_api_none(engine):
+    adapter = _adapter(engine)
+    adapter._api = None
+    assert asyncio.run(adapter.health_probe()) is False
+
+
+def test_health_probe_true_via_list_accounts(engine):
+    adapter = _adapter(engine)
+    adapter._api.list_accounts = lambda: []
+    assert asyncio.run(adapter.health_probe()) is True
+
+
+def test_health_probe_false_when_probe_raises_even_though_api_object_still_present(engine):
+    """round3 #10 核心斷言：`_api` 物件還在（不是 None）但底層連線其實已死時，探測必須
+    回 False——不能只憑 `_api is not None` 判斷健康。"""
+    adapter = _adapter(engine)
+
+    def _boom():
+        raise RuntimeError("連線已死")
+
+    adapter._api.list_accounts = _boom
+    assert adapter._api is not None
+    assert asyncio.run(adapter.health_probe()) is False
+
+
+def test_health_probe_true_via_futopt_account_fallback_when_no_list_accounts(engine):
+    adapter = _adapter(engine)
+    assert not hasattr(adapter._api, "list_accounts")  # _FakeApi 本來就沒有這個方法
+    assert asyncio.run(adapter.health_probe()) is True  # 退回讀 futopt_account 屬性驗證存活
+
+
+def test_reconcile_stages_order_report_rows_not_deal_report_and_persists_cursor(engine):
+    adapter = _adapter(engine)
+    t1 = datetime(2026, 6, 16, 9, 0)
+    t2 = datetime(2026, 6, 16, 9, 5)
+    adapter._api.list_trades = lambda: [
+        _FakeTrade2("ORD1", "SEQ1", "Submitted", order_datetime=t1),
+        _FakeTrade2("ORD2", "SEQ2", "Cancelled", order_datetime=t2),
+    ]
+    asyncio.run(adapter.reconcile())
+
+    with Session(engine) as s:
+        rows = list(s.exec(select(RawInbox)))
+        assert len(rows) == 2
+        assert all(r.kind == "order_report" for r in rows)  # round3 #2：不是全部塞 deal_report
+        cursor = brepo.get_reconcile_cursor(s, broker="shioaji", account="F1", mode="sim")
+        assert cursor == t2  # watermark 推進到最新委託時間戳
+
+
+def test_reconcile_second_call_skips_trades_already_covered_by_cursor(engine):
+    adapter = _adapter(engine)
+    t1 = datetime(2026, 6, 16, 9, 0)
+    adapter._api.list_trades = lambda: [_FakeTrade2("ORD1", "SEQ1", "Submitted", order_datetime=t1)]
+    asyncio.run(adapter.reconcile())
+    with Session(engine) as s:
+        assert len(list(s.exec(select(RawInbox)))) == 1
+
+    # 同一批舊委託，第二次對帳（模擬 watchdog 週期呼叫）不該重複塞 RawInbox（重啟續接/週期補洞）
+    asyncio.run(adapter.reconcile())
+    with Session(engine) as s:
+        assert len(list(s.exec(select(RawInbox)))) == 1
+
+    # 有新委託（時間戳晚於 cursor）才會補
+    t2 = datetime(2026, 6, 16, 9, 10)
+    adapter._api.list_trades = lambda: [
+        _FakeTrade2("ORD1", "SEQ1", "Submitted", order_datetime=t1),
+        _FakeTrade2("ORD2", "SEQ2", "Filled", order_datetime=t2),
+    ]
+    asyncio.run(adapter.reconcile())
+    with Session(engine) as s:
+        assert len(list(s.exec(select(RawInbox)))) == 2
+
+
+def test_reconcile_noop_when_api_none_does_not_raise(engine):
+    adapter = _adapter(engine)
+    adapter._api = None
+    asyncio.run(adapter.reconcile())  # 不應拋例外（尚未連線時 watchdog 也可能呼叫到）
+    with Session(engine) as s:
+        assert list(s.exec(select(RawInbox))) == []

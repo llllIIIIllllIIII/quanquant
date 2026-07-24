@@ -61,6 +61,24 @@ class Settings(BaseSettings):
     order_confirm_token_ttl_seconds: int = 120  # real 兩階段確認 token 有效秒數
     order_kill_switch_initial: bool = False     # 啟動時的 kill switch 初始值（可即時切換，非快照）
 
+    # Shioaji 下單子系統連線 + lifespan（Task 8）——秘密只在 .env，不進 git。
+    # order_mode 刻意用 str（非 Literal）：`broker.preflight.order_subsystem_preflight` 才能
+    # 對「拼錯值」做出「拒絕啟動下單子系統」的明確 RuntimeError（若這裡用 Literal，pydantic
+    # 會在 Settings() 建構當下就整個拒絕，行為上等同讓整個 app 起不來，不符合「app 其餘正常」
+    # 的要求，見 web/app.py lifespan 對 preflight RuntimeError 的處理）。
+    shioaji_trade_api_key: str = ""
+    shioaji_trade_secret_key: str = ""
+    shioaji_ca_path: str = ""
+    shioaji_ca_passwd: str = ""
+    shioaji_person_id: str = ""
+    order_mode: str = "sim"                          # "sim" | "real"；拼錯拒絕啟動下單子系統
+    order_sim_fee_per_lot: str = "20"                 # sim 成交 fee 缺值時的估算基準（Decimal 字串）
+    order_watchdog_interval_seconds: float = 15.0
+    order_login_min_interval_seconds: float = 30.0    # login 節流（配額 5連線/1000 login/day）
+    order_unquarantine_after_seconds: float = 300.0   # 較慢週期：多久沒解隔離的 raw_inbox 再重試
+    order_unknown_reconcile_grace_seconds: float = 300.0  # unknown 委託等多久才判定失敗+釋放配額
+    order_confirm_token_cleanup_interval_seconds: float = 3600.0  # 過期/已消費 token 清理週期
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:

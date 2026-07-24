@@ -189,3 +189,28 @@ def test_healthz(client):
     r = client.get("/healthz")
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
+
+
+def test_healthz_order_subsystem_none_when_lifespan_not_run(client):
+    """TestClient（未用 `with` context）不會跑真正的 lifespan，app.state.order_session_state
+    自然不存在——/healthz 對此情況回傳 order_subsystem=None，不是錯誤。"""
+    r = client.get("/healthz")
+    assert r.json()["order_subsystem"] is None
+
+
+def test_healthz_reflects_order_session_state_when_present(client):
+    from quanquant.broker.session_state import OrderSessionState
+    from quanquant.web.deps import get_order_session_state
+
+    state = OrderSessionState()
+    state.mark_unhealthy("connect 失敗，下單子系統停用: boom")
+    state.reconnect_attempts = 3
+    client.app.dependency_overrides[get_order_session_state] = lambda: state
+
+    r = client.get("/healthz")
+    body = r.json()["order_subsystem"]
+    assert body == {
+        "ready": False, "last_error": "connect 失敗，下單子系統停用: boom", "reconnect_attempts": 3,
+    }
+
+    del client.app.dependency_overrides[get_order_session_state]

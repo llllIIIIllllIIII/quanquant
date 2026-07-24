@@ -24,13 +24,14 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import func, insert, literal, update
+from sqlalchemy import delete, func, insert, literal, or_, update
 from sqlalchemy import select as sa_select
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from quanquant.db.models import (
     BrokerPosition,
+    BrokerReconcileCursor,
     ConfirmToken,
     Deal,
     Order,
@@ -264,6 +265,21 @@ def sum_qty_today(session: Session, *, user_id: int, mode: str, trading_day: str
         Order.user_id == user_id, Order.mode == mode, Order.trading_day == trading_day
     )
     return sum(o.qty for o in session.exec(stmt))
+
+
+def list_unknown_orders_older_than(
+    session: Session, *, older_than: datetime, limit: int = 200
+) -> list[Order]:
+    """Task 8 watchdog「quota unknown reconcile」用：找出送單結果不明（status="unknown"，見
+    ShioajiAdapter.place/update 的 except 分支）且已經卡了一段時間（updated_at < older_than，
+    給 reconcile() 對帳流程一段時間自然解決）的委託，交給 watchdog 依券商真實狀態決議。"""
+    stmt = (
+        select(Order)
+        .where(Order.status == "unknown", Order.updated_at < older_than)
+        .order_by(Order.id)
+        .limit(limit)
+    )
+    return list(session.exec(stmt))
 
 
 # ---- RawInbox（durable callback spool，V3-2） ----
@@ -509,6 +525,49 @@ def claim_confirm_token(
     if ok:
         session.flush()
     return ok
+
+
+def cleanup_expired_confirm_tokens(session: Session, *, now: datetime) -> int:
+    """round3 #16：定期清理過期或已消費的 ConfirmToken 列，避免 DB 無界成長（token 本身沒有
+    保留價值——過期的驗證不過、已消費的不能重放，兩者都是純垃圾）。回傳刪除筆數。"""
+    t = ConfirmToken.__table__
+    stmt = delete(t).where(or_(t.c.expires_at < now, t.c.consumed_at.is_not(None)))
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    session.flush()
+    return result.rowcount
+
+
+# ---- BrokerReconcileCursor（round3 #2：持久對帳 watermark） ----
+
+def get_reconcile_cursor(
+    session: Session, *, broker: str, account: str, mode: str
+) -> datetime | None:
+    stmt = select(BrokerReconcileCursor).where(
+        BrokerReconcileCursor.broker == broker, BrokerReconcileCursor.account == account,
+        BrokerReconcileCursor.mode == mode,
+    )
+    row = session.exec(stmt).first()
+    return row.last_reconciled_at if row is not None else None
+
+
+def upsert_reconcile_cursor(
+    session: Session, *, broker: str, account: str, mode: str, at: datetime
+) -> None:
+    """單一寫入者（watchdog，經 supervisor.lock 序列化），不需要 CAS——單純
+    select-then-write 已足夠安全，比照本檔其餘僅低頻背景寫入的慣例（非配額/委託身分那類
+    高併發路徑）。"""
+    stmt = select(BrokerReconcileCursor).where(
+        BrokerReconcileCursor.broker == broker, BrokerReconcileCursor.account == account,
+        BrokerReconcileCursor.mode == mode,
+    )
+    row = session.exec(stmt).first()
+    if row is None:
+        row = BrokerReconcileCursor(broker=broker, account=account, mode=mode, last_reconciled_at=at)
+    else:
+        row.last_reconciled_at = at
+        row.updated_at = _utcnow()
+    session.add(row)
+    session.flush()
 
 
 # ---- QuotaReservation（round3 #4：per-reservation id + 狀態機，CAS 原語） ----

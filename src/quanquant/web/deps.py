@@ -5,12 +5,13 @@ from fastapi import Depends, HTTPException, Request
 from sqlmodel import Session
 
 from quanquant.auth.tokens import SESSION_COOKIE, load_session
+from quanquant.broker.session_state import OrderSessionState
 from quanquant.db.engine import get_session  # re-exported for routers
 from quanquant.db.models import User
 from quanquant.poller import QuotePoller
 from quanquant.pulse.engine import PulseEngine
 
-__all__ = ["get_session", "get_poller", "get_pulse", "parse_date",
+__all__ = ["get_session", "get_poller", "get_pulse", "get_order_session_state", "parse_date",
            "get_current_user", "require_admin"]
 
 
@@ -22,6 +23,12 @@ def get_poller(request: Request) -> QuotePoller | None:
 def get_pulse(request: Request) -> PulseEngine | None:
     """The shared Market Pulse engine from app state; None if disabled / in tests."""
     return getattr(request.app.state, "pulse", None)
+
+
+def get_order_session_state(request: Request) -> OrderSessionState | None:
+    """下單子系統目前狀態（Task 8）；None 代表 lifespan 尚未跑過（如測試環境）——
+    /healthz 對此情況一律回傳 order_subsystem=None，不視為錯誤。"""
+    return getattr(request.app.state, "order_session_state", None)
 
 
 def parse_date(value: str | None, *, end: bool = False) -> datetime | None:

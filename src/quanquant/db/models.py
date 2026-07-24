@@ -462,3 +462,24 @@ class QuotaReservation(SQLModel, table=True):
     state: str = Field(default="reserved", index=True)  # "reserved" | "confirmed" | "released"
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
+
+
+class BrokerReconcileCursor(SQLModel, table=True):
+    """Task 8 watchdog 對帳用的持久 watermark（round3 #2：重連後拉券商委託補回 RawInbox 需要
+    「上次對帳到哪裡」的持久狀態，才能做到週期補洞+重啟續接，而不是每次都重新灌一次全量
+    snapshot、或重啟後完全遺失進度只能從零開始）。每個 (broker,account,mode) scope 各自一列，
+    只記最後一次對帳涵蓋到的委託時間戳（naive UTC）；寫入頻率低（watchdog 對帳週期），
+    由 supervisor.lock 序列化保護，單一寫入者，不需要 CAS。"""
+
+    __tablename__ = "broker_reconcile_cursors"
+    __table_args__ = (
+        UniqueConstraint("broker", "account", "mode", name="uq_broker_reconcile_cursor_scope"),
+        CheckConstraint("mode IS NOT NULL AND mode IN ('sim','real')", name="ck_broker_reconcile_cursor_mode"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    broker: str
+    account: str
+    mode: str = Field(index=True)
+    last_reconciled_at: datetime  # naive UTC watermark：只補這個時間點之後有新進展的委託
+    updated_at: datetime = Field(default_factory=_utcnow)

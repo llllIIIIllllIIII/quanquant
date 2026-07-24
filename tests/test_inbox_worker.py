@@ -271,8 +271,21 @@ def test_stop_and_drain_waits_for_in_flight_batch(engine):
             assert not drain_task.done()  # 鎖被佔用時 drain 應該還在等
         await drain_task
         assert drain_task.done()
+        return drain_task.result()
 
-    asyncio.run(scenario())
+    assert asyncio.run(scenario()) is True  # 鎖釋放後真正 drain 完成 → True
+
+
+def test_stop_and_drain_returns_false_on_timeout_not_claiming_success(engine):
+    """round3 #17：逾時必須回 False，不得讓呼叫端誤以為背景工作已經真的停下來。"""
+    supervisor = BrokerSupervisor()
+    worker = _worker(engine, supervisor=supervisor)
+
+    async def scenario():
+        async with supervisor.lock:
+            return await worker.stop_and_drain(timeout=0.05)  # 鎖全程被佔用 → 必逾時
+
+    assert asyncio.run(scenario()) is False
 
 
 def test_worker_run_processes_pending_row_then_idles(engine):

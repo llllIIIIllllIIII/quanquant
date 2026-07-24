@@ -565,3 +565,65 @@ def test_epoch_ms_columns_use_biginteger_not_integer():
 
     assert isinstance(Deal.__table__.c.ts.type, sa.BigInteger)
     assert isinstance(OrderAudit.__table__.c.ts.type, sa.BigInteger)
+
+
+# ---- Task 8：unknown 委託 reconcile 候選 / confirm token 清理 / 對帳 cursor ----
+
+def test_list_unknown_orders_older_than_scopes_by_status_and_age(session):
+    old = brepo.create_order(session, **_order_kwargs(client_order_id="U-OLD", request_hash="H1"))
+    old.status = "unknown"
+    old.updated_at = dt.datetime(2026, 6, 1, 0, 0)
+    session.add(old)
+    fresh = brepo.create_order(session, **_order_kwargs(client_order_id="U-FRESH", request_hash="H2"))
+    fresh.status = "unknown"
+    fresh.updated_at = dt.datetime(2026, 6, 16, 12, 30)  # 還沒過 grace period（晚於 cutoff）
+    session.add(fresh)
+    not_unknown = brepo.create_order(session, **_order_kwargs(client_order_id="U-OK", request_hash="H3"))
+    session.commit()
+    assert not_unknown.status != "unknown"
+
+    stuck = brepo.list_unknown_orders_older_than(session, older_than=dt.datetime(2026, 6, 16, 12, 0))
+    ids = {o.client_order_id for o in stuck}
+    assert ids == {"U-OLD"}  # 太新的 unknown 還沒過 grace period，非 unknown 的不列入
+
+
+def test_cleanup_expired_confirm_tokens_removes_expired_and_consumed_keeps_valid(session):
+    brepo.create_confirm_token_row(
+        session, jti="EXPIRED", actor_user_id=1, payload_hash="H1",
+        expires_at=dt.datetime(2026, 6, 16, 11, 0),
+    )
+    brepo.create_confirm_token_row(
+        session, jti="CONSUMED", actor_user_id=1, payload_hash="H1",
+        expires_at=dt.datetime(2026, 6, 16, 13, 0),
+    )
+    brepo.create_confirm_token_row(
+        session, jti="VALID", actor_user_id=1, payload_hash="H1",
+        expires_at=dt.datetime(2026, 6, 16, 13, 0),
+    )
+    session.commit()
+    now = dt.datetime(2026, 6, 16, 12, 0)
+    assert brepo.claim_confirm_token(session, jti="CONSUMED", actor_user_id=1, payload_hash="H1", now=now) is True
+    session.commit()
+
+    removed = brepo.cleanup_expired_confirm_tokens(session, now=now)
+    session.commit()
+    assert removed == 2  # EXPIRED（過期）+ CONSUMED（已消費）
+
+    remaining = {row.jti for row in session.exec(select(ConfirmToken))}
+    assert remaining == {"VALID"}
+
+
+def test_reconcile_cursor_get_defaults_none_then_upsert_roundtrips(session):
+    assert brepo.get_reconcile_cursor(session, broker="shioaji", account="F1", mode="sim") is None
+
+    at1 = dt.datetime(2026, 6, 16, 9, 0)
+    brepo.upsert_reconcile_cursor(session, broker="shioaji", account="F1", mode="sim", at=at1)
+    session.commit()
+    assert brepo.get_reconcile_cursor(session, broker="shioaji", account="F1", mode="sim") == at1
+
+    at2 = dt.datetime(2026, 6, 16, 9, 30)
+    brepo.upsert_reconcile_cursor(session, broker="shioaji", account="F1", mode="sim", at=at2)
+    session.commit()
+    assert brepo.get_reconcile_cursor(session, broker="shioaji", account="F1", mode="sim") == at2
+    # 另一個 scope（不同 account）互不影響
+    assert brepo.get_reconcile_cursor(session, broker="shioaji", account="F2", mode="sim") is None

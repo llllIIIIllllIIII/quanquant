@@ -34,8 +34,10 @@ crash/等 supervisor lock 時 payload 仍會遺失）；callback 內**不**碰�
 `_ack_fields_from_trade` / `_map_deal_report` / `_map_order_report`。
 """
 import asyncio
+import json
 import logging
 from collections.abc import Callable
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
@@ -138,6 +140,118 @@ class ShioajiAdapter:
 
     def on_fill(self, handler: Callable[[Fill], None]) -> None:
         self._fill_handler = handler  # 目前無呼叫端；保留供未來 push 通知擴充
+
+    @property
+    def supervisor(self) -> BrokerSupervisor:
+        """Task 8 watchdog 需要直接拿鎖做 DB-only 背景工作（unquarantine/unknown reconcile），
+        不經過 `.run()`（那是給 native shioaji API 呼叫用的通道，round3 #11）。"""
+        return self._supervisor
+
+    # ---- health probe（round3 #10：序列化 broker health probe，不只看 `_api is not None`） ----
+
+    async def health_probe(self) -> bool:
+        """探測底層連線是否還活著。`self._api` 是 python object，就算底層 TCP/會話已經斷線，
+        object 本身通常還在——只檢查 `_api is not None` 會讓 watchdog 永遠以為連線健康、
+        永不重連（round3 #10 抓到的漏洞）。這裡經 supervisor.run() 同一通道做一次輕量、
+        無副作用的 native 呼叫，失敗（含任何例外）一律視為不健康。"""
+
+        async def _do_probe() -> bool:
+            if self._api is None:
+                return False
+            try:
+                await asyncio.to_thread(self._probe_blocking)
+                return True
+            except Exception as exc:
+                log.warning("health_probe 失敗（視為不健康，觸發重連）: %s", exc)
+                return False
+
+        return await self._supervisor.run(_do_probe)
+
+    def _probe_blocking(self) -> None:
+        """SDK 確切探測 API 待實機驗證，以 getattr 防禦性存取（同檔一貫慣例，見模組頂部
+        說明）：優先用 `list_accounts()`（存在即代表 session 仍能來回一次 native 呼叫）；
+        找不到時 fallback 讀 `futopt_account`（純屬性存取，至少能驗證 client 物件仍持有
+        登入後才會有的狀態，AttributeError 會被呼叫端當成探測失敗）。"""
+        probe_fn = getattr(self._api, "list_accounts", None)
+        if callable(probe_fn):
+            probe_fn()
+            return
+        _ = self._api.futopt_account
+
+    # ---- reconcile（round3 #2：重連後對帳，持久 cursor + 分辨委託/成交，不只 retry 本地 quarantine） ----
+
+    async def reconcile(self) -> None:
+        """重連後對帳：拉券商目前委託回報補回 RawInbox（kind="order_report"，不是 round3 覆核前
+        草稿版本把所有列都當 deal_report 那個 bug）。用持久 `BrokerReconcileCursor` watermark
+        只補「上次對帳後有新進展」的委託——重啟後從 DB 讀回 cursor 續接，不會每次都重新灌一次
+        全量 snapshot，也不會因為重啟就遺失對帳進度。
+
+        已知限制（誠實記錄，非本檔可單方面解決）：Shioaji 的 `list_trades()` 只回傳委託層級的
+        彙總狀態（含 `deal_quantity` 累計數），不含逐筆真實 deal_id；V3-4 明文禁止用
+        ordno/seqno 等 fallback 冒充 fill_id 建構 Fill（見 broker/types.py），因此本函式刻意
+        不嘗試從這裡重建成交明細——成交回報一律只信任 durable callback
+        （`_on_order_cb`→`commit_raw_callback`，已保證同步落地不遺失，見模組頂部說明）。若
+        真的發生「斷線期間券商 callback 完全沒送達」的成交缺口，需要券商提供逐筆歷史回放
+        API 才能完整補齊，超出目前高階 SDK 介面下可靠實作的範圍。
+        """
+        await self._supervisor.run(lambda: asyncio.to_thread(self._reconcile_blocking))
+
+    def _reconcile_blocking(self) -> None:
+        if self._api is None:
+            return
+        with self._session_factory() as session:
+            cursor = brepo.get_reconcile_cursor(session, broker=self.broker, account=self.account, mode=self.mode)
+
+        list_trades = getattr(self._api, "list_trades", None)
+        trades = list_trades() if callable(list_trades) else []
+
+        newest = cursor
+        staged: list[dict] = []
+        for trade in trades:
+            watermark = self._trade_watermark(trade)
+            if cursor is not None and watermark is not None and watermark <= cursor:
+                continue  # 已對帳過，週期補洞只補新進展
+            order = getattr(trade, "order", None)
+            status = getattr(trade, "status", None)
+            ordno = getattr(order, "id", None) if order is not None else None
+            seqno = (getattr(order, "seqno", None) if order is not None else None) or ordno
+            if not ordno and not seqno:
+                continue  # 無法關聯到任何委託，略過（不硬塞垃圾進 RawInbox）
+            status_raw = getattr(status, "status", None) if status is not None else None
+            staged.append({
+                "order_id": ordno, "seqno": seqno,
+                "status": str(status_raw) if status_raw is not None else None,
+            })
+            if watermark is not None and (newest is None or watermark > newest):
+                newest = watermark
+
+        if not staged and newest == cursor:
+            return  # 沒有新東西，連 cursor 都不動（避免每次 watchdog 週期都無意義地寫 DB）
+
+        with self._session_factory() as session:
+            for payload in staged:
+                brepo.stage_raw_inbox(session, kind="order_report", broker=self.broker, payload=json.dumps(payload))
+            brepo.upsert_reconcile_cursor(
+                session, broker=self.broker, account=self.account, mode=self.mode,
+                at=newest if newest is not None else _utcnow_naive(),
+            )
+            session.commit()
+
+    @staticmethod
+    def _trade_watermark(trade) -> datetime | None:
+        """防禦性抽取 Trade 的時間戳（欄位名稱待實機 SDK 驗證）；抽不到就回 None（呼叫端視為
+        「無法判斷新舊」，保守地一律納入這次對帳，最多是重複補一次——下游 order_report
+        處理本身是冪等/單調的，重複補不會造成錯誤，只是白工）。"""
+        status = getattr(trade, "status", None)
+        raw = getattr(status, "order_datetime", None) if status is not None else None
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw
+        try:
+            return datetime.fromisoformat(str(raw))
+        except (TypeError, ValueError):
+            return None
 
     # ---- send gate（V3-2，鎖內、native 呼叫前的最後線性化點） ----
 
@@ -474,3 +588,7 @@ def _now_ms() -> float:
     import time
 
     return time.time() * 1000
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)

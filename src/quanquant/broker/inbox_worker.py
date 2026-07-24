@@ -95,15 +95,22 @@ class RawInboxWorker:
                 except TimeoutError:
                     pass
 
-    async def stop_and_drain(self, timeout: float = 5.0) -> None:
-        """設停止旗標；等目前持鎖中的 batch 結束（拿得到鎖代表沒有 batch 在跑）或逾時。"""
+    async def stop_and_drain(self, timeout: float = 5.0) -> bool:
+        """設停止旗標；等目前持鎖中的 batch 結束（拿得到鎖代表沒有 batch 在跑）或逾時。
+
+        round3 #17：回傳 True/False 讓呼叫端（Task 8 shutdown sentinel）能明確知道是否真的
+        drain 完成——逾時只代表「不再等了」，不代表背景 to_thread 已經真的停下來（asyncio
+        無法砍掉正在跑的 native thread），呼叫端不得把逾時當成功處理，DB 裡已落地的
+        RawInbox 資料本身不受影響，仍安全保留供下次啟動時的 worker 撿起繼續處理。"""
         self._stop.set()
         try:
             async with asyncio.timeout(timeout):
                 async with self._supervisor.lock:
                     pass
+            return True
         except TimeoutError:
             log.warning("RawInboxWorker.stop_and_drain 逾時（%.1fs），可能仍有 batch 在跑", timeout)
+            return False
 
     def process_batch_once(self) -> int:
         """同步、可直接測試。回傳「確定處理完」（processed 或 quarantine）的列數；

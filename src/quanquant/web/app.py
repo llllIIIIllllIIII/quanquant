@@ -14,9 +14,13 @@ from fastapi.staticfiles import StaticFiles
 from sqlmodel import Session
 
 from quanquant.alerts.engine import run_alert_engine
+from quanquant.broker.lifecycle import run_confirm_token_cleanup, shutdown_order_subsystem
+from quanquant.broker.preflight import order_subsystem_preflight
+from quanquant.broker.session_state import OrderSessionState
+from quanquant.broker.watchdog import run_order_watchdog
 from quanquant.candles.builder import CandleBuilder
 from quanquant.candles.repo import prune_quotes, upsert_candles
-from quanquant.config import get_settings
+from quanquant.config import Settings, get_settings
 from quanquant.db.engine import get_engine, init_db
 from quanquant.db.models import Quote
 from quanquant.notify import TelegramNotifier, build_notify
@@ -117,6 +121,92 @@ async def _prune_quotes_loop() -> None:
         await asyncio.sleep(24 * 3600)
 
 
+async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) -> None:
+    """Task 8 readiness gate：ORDER_MODE 拼錯（`order_subsystem_preflight` raise
+    RuntimeError）只讓下單子系統停用並反映在 `/healthz`——**不**讓整個 app 起不來，行情/日誌
+    等其餘系統仍正常啟動。其餘軟性停用原因（缺 key/owner/CA）同樣只停用下單子系統。
+
+    `app.state.order_service` 只有在 `adapter.connect()` 真正成功後才會被 publish（fail
+    closed）；connect 失敗直接標 unhealthy 並 return，不留 detached task 吞例外。
+    """
+    order_state = OrderSessionState()
+    app.state.order_session_state = order_state
+    app.state.order_service = None
+    app.state.order_risk_guard = None
+    app.state.order_inbox_worker = None
+
+    try:
+        order_enabled, order_disabled_reason = order_subsystem_preflight(settings)
+    except RuntimeError as exc:
+        order_state.mark_unhealthy(str(exc))
+        log.error("下單子系統設定錯誤，下單子系統停用（app 其餘功能正常）: %s", exc)
+        return
+
+    if not order_enabled:
+        order_state.mark_unhealthy(order_disabled_reason or "下單子系統未啟用")
+        log.info("下單子系統未啟用: %s", order_disabled_reason)
+        return
+
+    from decimal import Decimal
+
+    from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
+    from quanquant.broker.shioaji_adapter import ShioajiAdapter
+    from quanquant.broker.supervisor import BrokerSupervisor
+
+    supervisor = BrokerSupervisor()
+
+    def _order_session() -> Session:
+        return Session(get_engine())
+
+    risk_guard = RiskGuard(
+        session_factory=_order_session, secret=settings.session_secret or "dev-only-insecure",
+        owner_user_ids=parse_owner_ids(settings.order_owner_user_ids),
+        symbol_whitelist=parse_whitelist(settings.order_symbol_whitelist),
+        max_qty_per_order=settings.order_max_qty_per_order,
+        max_qty_per_day=settings.order_max_qty_per_day,
+        max_orders_per_day=settings.order_max_orders_per_day,
+        confirm_token_ttl_seconds=settings.order_confirm_token_ttl_seconds,
+        kill_switch_initial=settings.order_kill_switch_initial,
+    )
+    adapter = ShioajiAdapter(
+        api_key=settings.shioaji_trade_api_key, secret_key=settings.shioaji_trade_secret_key,
+        ca_path=settings.shioaji_ca_path or None, ca_passwd=settings.shioaji_ca_passwd or None,
+        person_id=settings.shioaji_person_id or None, symbol=settings.symbol,
+        mode=settings.order_mode, session_factory=_order_session, supervisor=supervisor,
+        risk_guard=risk_guard, sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+    )
+    inbox_worker = RawInboxWorker(
+        session_factory=_order_session, supervisor=supervisor,
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+
+    try:
+        await adapter.connect()
+    except Exception as exc:
+        # readiness gate（round3）：connect 未成功不 publish app.state.order_service，
+        # fail closed，不留 detached task 吞例外。
+        order_state.mark_unhealthy(f"connect 失敗，下單子系統停用: {exc}")
+        log.error("下單子系統 connect 失敗（fail closed）: %s", exc)
+        return
+
+    order_state.mark_ready()
+    app.state.order_service = adapter
+    app.state.order_risk_guard = risk_guard
+    app.state.order_inbox_worker = inbox_worker
+    tasks.append(asyncio.create_task(inbox_worker.run()))
+    tasks.append(asyncio.create_task(run_order_watchdog(
+        adapter, order_state, interval=settings.order_watchdog_interval_seconds,
+        login_min_interval=settings.order_login_min_interval_seconds,
+        unquarantine_after_seconds=settings.order_unquarantine_after_seconds,
+        unknown_reconcile_grace_seconds=settings.order_unknown_reconcile_grace_seconds,
+    )))
+    tasks.append(asyncio.create_task(run_confirm_token_cleanup(
+        _order_session, interval=settings.order_confirm_token_cleanup_interval_seconds,
+    )))
+    log.info("下單子系統就緒：mode=%s account=%s", adapter.mode, adapter.account)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -183,9 +273,23 @@ async def lifespan(app: FastAPI):
     else:
         tasks.append(asyncio.create_task(poller.run()))
 
+    await _start_order_subsystem(app, settings, tasks)
+
     try:
         yield
     finally:
+        # round3 #17：shutdown sentinel——原子關 ingress（先登出，斷線後底層才不會再有新的
+        # native callback 落地）→ 等 RawInboxWorker 把已落地的 batch 真正處理完，這一步必須
+        # 在下面「一次性 cancel 所有背景 task」之前完成，否則 worker.run() 的迴圈可能被砍在
+        # 一半、drain 就沒有意義了。逾時只會標 unhealthy，不影響其餘系統的正常關閉。
+        order_ok = await shutdown_order_subsystem(
+            order_service=getattr(app.state, "order_service", None),
+            inbox_worker=getattr(app.state, "order_inbox_worker", None),
+            state=getattr(app.state, "order_session_state", None),
+            timeout=5.0,
+        )
+        if not order_ok:
+            log.error("下單子系統 shutdown 未完全成功（已標 unhealthy；資料仍安全留在 DB，未遺失）")
         for task in tasks:
             task.cancel()
         for task in tasks:
