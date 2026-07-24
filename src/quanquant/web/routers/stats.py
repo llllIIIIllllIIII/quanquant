@@ -16,10 +16,11 @@ router = APIRouter()
 _XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 
-def _filtered(session: Session, user_id: int, symbol, tag, date_from, date_to):
+def _filtered(session: Session, user_id: int, mode, symbol, tag, date_from, date_to):
     closed = repo.list_for_stats(
         session,
         user_id=user_id,
+        mode=mode,
         symbol=symbol or None,
         tag=tag or None,
         date_from=parse_date(date_from),
@@ -28,6 +29,7 @@ def _filtered(session: Session, user_id: int, symbol, tag, date_from, date_to):
     detail = repo.list_trades(
         session,
         user_id=user_id,
+        mode=mode,
         symbol=symbol or None,
         tag=tag or None,
         date_from=parse_date(date_from),
@@ -42,12 +44,13 @@ async def stats_page(
     request: Request,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
+    mode: str = Query("real"),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
-    _, closed = _filtered(session, user.id, symbol, tag, date_from, date_to)
+    _, closed = _filtered(session, user.id, mode, symbol, tag, date_from, date_to)
     result = compute_stats(closed)
     return templates.TemplateResponse(
         request,
@@ -58,7 +61,7 @@ async def stats_page(
             "symbols": repo.list_symbols(session, user_id=user.id),
             "all_tags": repo.list_all_tags(session, user_id=user.id),
             "f": {"symbol": symbol or "", "tag": tag or "", "date_from": date_from or "",
-                  "date_to": date_to or ""},
+                  "date_to": date_to or "", "mode": mode},
         },
     )
 
@@ -67,12 +70,13 @@ async def stats_page(
 async def stats_data(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
+    mode: str = Query("real"),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
-    _, closed = _filtered(session, user.id, symbol, tag, date_from, date_to)
+    _, closed = _filtered(session, user.id, mode, symbol, tag, date_from, date_to)
     return JSONResponse(jsonable_encoder(compute_stats(closed)))
 
 
@@ -80,12 +84,13 @@ async def stats_data(
 async def export_csv(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
+    mode: str = Query("real"),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
-    detail, _ = _filtered(session, user.id, symbol, tag, date_from, date_to)
+    detail, _ = _filtered(session, user.id, mode, symbol, tag, date_from, date_to)
     return Response(
         content=to_csv_bytes(detail),
         media_type="text/csv",
@@ -97,12 +102,13 @@ async def export_csv(
 async def export_xlsx(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
+    mode: str = Query("real"),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
-    detail, closed = _filtered(session, user.id, symbol, tag, date_from, date_to)
+    detail, closed = _filtered(session, user.id, mode, symbol, tag, date_from, date_to)
     return Response(
         content=to_xlsx_bytes(detail, compute_stats(closed)),
         media_type=_XLSX_MIME,

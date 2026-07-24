@@ -7,7 +7,7 @@ naive local (Asia/Taipei) values as entered; audit timestamps are naive UTC.
 from datetime import datetime, timezone
 from decimal import Decimal
 
-from sqlalchemy import BigInteger, Column, String, TypeDecorator, UniqueConstraint
+from sqlalchemy import BigInteger, CheckConstraint, Column, String, TypeDecorator, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -30,6 +30,15 @@ def _utcnow() -> datetime:
 
 class Trade(SQLModel, table=True):
     __tablename__ = "trades"
+    # C2（round3 覆核）：fresh DB 走 create_all 建表，不會經過 db/migrate.py 的
+    # ALTER ... CHECK，所以要在這裡另外掛一份等價 CheckConstraint，否則 fresh DB
+    # 的 Trade 表完全沒有 mode/source 的 DB 層防呆。IS NOT NULL 與 ALTER 版一致
+    # （即使本欄位目前是 NOT NULL 而非本 CHECK 唯一防線，仍保留以防未來欄位改
+    # nullable 時防線失效）。
+    __table_args__ = (
+        CheckConstraint("mode IS NOT NULL AND mode IN ('sim','real')", name="ck_trades_mode"),
+        CheckConstraint("source IS NOT NULL AND source IN ('manual','shioaji')", name="ck_trades_source"),
+    )
 
     id: int | None = Field(default=None, primary_key=True)
 
@@ -54,6 +63,9 @@ class Trade(SQLModel, table=True):
 
     note: str | None = None                               # 備註
     tags: str | None = None                               # 標籤 (逗號連接, e.g. "突破,均線")
+
+    mode: str = Field(default="real", index=True)          # "real"（正式/手動）| "sim"（模擬/紙上）
+    source: str = Field(default="manual", index=True)      # "manual"（人工輸入）| "shioaji"（broker 自動）
 
     user_id: int | None = Field(default=None, index=True)  # 擁有者（帳戶系統後必填）
     created_at: datetime = Field(default_factory=_utcnow)

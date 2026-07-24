@@ -8,11 +8,17 @@ nullable column is portable across SQLite and Postgres.
 from sqlalchemy import inspect, text
 
 # (table, column, DDL type) — nullable so ALTER works on populated tables.
+# mode/source 的 DDL 帶 DEFAULT（既有列自動回填）+ CHECK（DB 層拒絕非法值）。
+# CHECK 用 "col IS NOT NULL AND col IN (...)" 而非單純 "col IN (...)"：ALTER 出的
+# 欄位仍是 nullable，若只寫 IN(...)，明確 INSERT NULL 時 CHECK 對 NULL 求值是
+# UNKNOWN（非 FALSE）會被當作通過，等於防線形同虛設（round3 覆核 C2）。
 _MIGRATIONS = [
     ("trades", "user_id", "INTEGER"),
     ("alerts", "user_id", "INTEGER"),
     ("users", "chart_color_scheme", "VARCHAR"),
     ("users", "theme", "VARCHAR"),
+    ("trades", "mode", "VARCHAR DEFAULT 'real' CHECK (mode IS NOT NULL AND mode IN ('sim','real'))"),
+    ("trades", "source", "VARCHAR DEFAULT 'manual' CHECK (source IS NOT NULL AND source IN ('manual','shioaji'))"),
 ]
 
 

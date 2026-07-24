@@ -6,6 +6,8 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 Direction = Literal["long", "short"]
+Mode = Literal["sim", "real"]
+Source = Literal["manual", "shioaji"]
 
 
 def split_tags(raw: str | None) -> list[str]:
@@ -36,6 +38,8 @@ class TradeCreate(BaseModel):
     pnl: Decimal | None = None  # if provided, treated as a manual override
     note: str | None = None
     tags: list[str] = Field(default_factory=list)
+    mode: Mode = "real"
+    source: Source = "manual"
 
     @model_validator(mode="after")
     def _exit_pair(self) -> "TradeCreate":
@@ -59,6 +63,8 @@ class TradeUpdate(BaseModel):
     pnl: Decimal | None = None
     note: str | None = None
     tags: list[str] | None = None
+    mode: Mode | None = None
+    source: Source | None = None
 
 
 class TradeRead(BaseModel):
@@ -78,6 +84,8 @@ class TradeRead(BaseModel):
     pnl_is_manual: bool
     note: str | None
     tags: list[str]
+    mode: str
+    source: str
     is_open: bool
     created_at: datetime
     updated_at: datetime
@@ -101,6 +109,8 @@ class TradeRead(BaseModel):
             pnl_is_manual=t.pnl_is_manual,
             note=t.note,
             tags=split_tags(t.tags),
+            mode=t.mode,
+            source=t.source,
             is_open=t.exit_time is None,
             created_at=t.created_at,
             updated_at=t.updated_at,

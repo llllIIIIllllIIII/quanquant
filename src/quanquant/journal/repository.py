@@ -40,6 +40,8 @@ def create_trade(session: Session, data: TradeCreate, *, user_id: int) -> Trade:
         fee=data.fee,
         note=data.note,
         tags=join_tags(data.tags),
+        mode=data.mode,
+        source=data.source,
         pnl_is_manual=data.pnl is not None,
         pnl=data.pnl,
     )
@@ -96,13 +98,14 @@ def list_trades(
     session: Session,
     *,
     user_id: int,
+    mode: str = "real",
     symbol: str | None = None,
     tag: str | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
     status: str = "all",  # "all" | "open" | "closed"
 ) -> list[Trade]:
-    stmt = select(Trade).where(Trade.user_id == user_id)
+    stmt = select(Trade).where(Trade.user_id == user_id, Trade.mode == mode)
     if symbol:
         stmt = stmt.where(Trade.symbol == symbol)
     if status == "open":
@@ -125,6 +128,7 @@ def list_for_stats(
     session: Session,
     *,
     user_id: int,
+    mode: str = "real",
     symbol: str | None = None,
     tag: str | None = None,
     date_from: datetime | None = None,
@@ -134,6 +138,7 @@ def list_for_stats(
     trades = list_trades(
         session,
         user_id=user_id,
+        mode=mode,
         symbol=symbol,
         tag=tag,
         date_from=date_from,

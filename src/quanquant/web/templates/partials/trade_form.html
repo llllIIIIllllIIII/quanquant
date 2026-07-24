@@ -1,6 +1,7 @@
 <form {% if v.action == 'post' %}hx-post="{{ v.url }}"{% else %}hx-put="{{ v.url }}"{% endif %}
       hx-swap="none" hx-disabled-elt="find button[type='submit']">
   <div class="form-error-slot"></div>
+  <input type="hidden" name="mode" value="{{ v.mode }}">
   <div class="grid">
     <label>商品名稱
       <input name="symbol" value="{{ v.symbol }}" placeholder="TXF" required>

@@ -1,5 +1,7 @@
 """Startup migration: ALTER TABLE adds user_id to pre-account-era tables."""
+import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from quanquant.db.migrate import ensure_columns
 
@@ -77,3 +79,69 @@ def test_theme_idempotent(tmp_path):
     ensure_columns(eng)  # 第二次不得 raise
     insp = inspect(eng)
     assert "theme" in {c["name"] for c in insp.get_columns("users")}
+
+
+def test_adds_mode_and_source_to_trades_with_defaults(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_mode.db'}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE trades (id INTEGER PRIMARY KEY, symbol TEXT)"))
+        conn.execute(text("INSERT INTO trades (id, symbol) VALUES (1, 'TXF')"))
+    ensure_columns(eng)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("trades")}
+    assert "mode" in cols and "source" in cols
+    with eng.begin() as conn:
+        row = conn.execute(text("SELECT mode, source FROM trades WHERE id = 1")).one()
+    assert row[0] == "real" and row[1] == "manual"  # 既有列以 DEFAULT 回填
+
+
+def test_mode_source_migration_idempotent(tmp_path):
+    eng = _old_engine(tmp_path)
+    ensure_columns(eng)
+    ensure_columns(eng)  # 第二次不得 raise
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("trades")}
+    assert "mode" in cols and "source" in cols
+
+
+def test_mode_check_constraint_rejects_illegal_value_after_migration(tmp_path):
+    """V3-4：mode 於 DB 層加 CHECK，非法值連 pydantic 都不用就被 DB 擋下。"""
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_mode_check.db'}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE trades (id INTEGER PRIMARY KEY, symbol TEXT)"))
+    ensure_columns(eng)
+    with pytest.raises(IntegrityError):
+        with eng.begin() as conn:
+            conn.execute(text("INSERT INTO trades (id, symbol, mode) VALUES (1, 'TXF', 'paper')"))
+
+
+def test_source_check_constraint_rejects_illegal_value_after_migration(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_source_check.db'}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE trades (id INTEGER PRIMARY KEY, symbol TEXT)"))
+    ensure_columns(eng)
+    with pytest.raises(IntegrityError):
+        with eng.begin() as conn:
+            conn.execute(text("INSERT INTO trades (id, symbol, source) VALUES (1, 'TXF', 'auto')"))
+
+
+def test_mode_check_constraint_rejects_explicit_null_after_migration(tmp_path):
+    """C2：nullable ALTER 的 CHECK(mode IN(...)) 對 NULL 為 UNKNOWN 而非 FALSE，
+    改成 CHECK(mode IS NOT NULL AND mode IN(...)) 後明確 NULL 也要被擋下。"""
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_mode_null.db'}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE trades (id INTEGER PRIMARY KEY, symbol TEXT)"))
+    ensure_columns(eng)
+    with pytest.raises(IntegrityError):
+        with eng.begin() as conn:
+            conn.execute(text("INSERT INTO trades (id, symbol, mode) VALUES (1, 'TXF', NULL)"))
+
+
+def test_source_check_constraint_rejects_explicit_null_after_migration(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_source_null.db'}")
+    with eng.begin() as conn:
+        conn.execute(text("CREATE TABLE trades (id INTEGER PRIMARY KEY, symbol TEXT)"))
+    ensure_columns(eng)
+    with pytest.raises(IntegrityError):
+        with eng.begin() as conn:
+            conn.execute(text("INSERT INTO trades (id, symbol, source) VALUES (1, 'TXF', NULL)"))
