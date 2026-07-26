@@ -31,6 +31,9 @@ graphify-out/
 shioaji.log
 *.log
 
+# Shioaji CA 憑證檔（下單子系統 real 模式；唯讀 bind-mount 進容器，絕不進 git）
+*.pfx
+
 # OS
 .DS_Store
 dist/

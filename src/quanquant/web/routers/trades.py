@@ -53,6 +53,7 @@ async def _clean_form(request: Request) -> dict:
         "pnl": g("pnl"),
         "note": g("note"),
         "tags": split_tags(form.get("tags")),
+        "mode": form.get("mode") or "real",
     }
 
 
@@ -83,10 +84,12 @@ async def journal_page(
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     status: str = Query("all"),
+    mode: str = Query("real"),
 ):
     trades = repo.list_trades(
         session,
         user_id=user.id,
+        mode=mode,
         symbol=symbol or None,
         tag=tag or None,
         date_from=parse_date(date_from),
@@ -102,7 +105,7 @@ async def journal_page(
             "symbols": repo.list_symbols(session, user_id=user.id),
             "all_tags": repo.list_all_tags(session, user_id=user.id),
             "f": {"symbol": symbol or "", "tag": tag or "", "date_from": date_from or "",
-                  "date_to": date_to or "", "status": status},
+                  "date_to": date_to or "", "status": status, "mode": mode},
         },
     )
 
@@ -117,10 +120,12 @@ async def list_trades_fragment(
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     status: str = Query("all"),
+    mode: str = Query("real"),
 ):
     trades = repo.list_trades(
         session,
         user_id=user.id,
+        mode=mode,
         symbol=symbol or None,
         tag=tag or None,
         date_from=parse_date(date_from),
@@ -138,13 +143,14 @@ def _s(value) -> str:
     return "" if value is None else str(value)
 
 
-def _form_values(t=None) -> dict:
+def _form_values(t=None, mode: str = "real") -> dict:
     if t is None:
         return {
             "action": "post", "url": "/trades", "title": "新增交易",
             "symbol": "TXF", "direction": "long", "entry_time": "", "entry_price": "",
             "exit_time": "", "exit_price": "", "stop_loss_price": "", "take_profit_strategy": "",
             "size": "1", "point_value": "200", "fee": "", "pnl": "", "note": "", "tags": "",
+            "mode": mode,
         }
     return {
         "action": "put", "url": f"/trades/{t.id}", "title": "編輯交易",
@@ -155,6 +161,7 @@ def _form_values(t=None) -> dict:
         "size": _s(t.size), "point_value": _s(t.point_value), "fee": _s(t.fee),
         "pnl": _s(t.pnl) if t.pnl_is_manual else "",
         "note": _s(t.note), "tags": ",".join(split_tags(t.tags)),
+        "mode": t.mode,
     }
 
 
@@ -163,11 +170,12 @@ async def new_trade_form(
     request: Request,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
+    mode: str = Query("real"),
 ):
     return templates.TemplateResponse(
         request,
         "partials/trade_form.html",
-        {"v": _form_values(None), "all_tags": repo.list_all_tags(session, user_id=user.id)},
+        {"v": _form_values(None, mode), "all_tags": repo.list_all_tags(session, user_id=user.id)},
     )
 
 

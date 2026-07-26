@@ -117,6 +117,80 @@ git commit → git push → ./scripts/deploy.sh
 - VM 服務帳戶 scopes：`storage-rw`（備份上傳，bucket 已授 `objectAdmin`）、`logging-write`、`monitoring-write`
 - GitHub deploy key：唯讀，僅供 VM pull
 
+## 10. 下單子系統部署（Shioaji，Task 10 收尾）
+
+下單子系統（`ORDER_MODE=sim|real`）是選用模組：未設定對應環境變數時 `order_subsystem_preflight`
+軟性停用，app 其餘功能（行情/日誌/交易紀錄）不受影響，`/healthz.order_subsystem` 會反映
+`ready=false` 與停用原因。
+
+### 10.1 環境變數
+
+| 變數 | 說明 |
+|---|---|
+| `ORDER_MODE` | `sim`（預設，Shioaji simulation）或 `real`（正式下單）；拼錯直接拒絕啟動下單子系統（其餘系統仍正常） |
+| `SHIOAJI_TRADE_API_KEY` / `SHIOAJI_TRADE_SECRET_KEY` | 下單專用 API 金鑰（與行情用的 `SHIOAJI_API_KEY` 分開，最小權限原則） |
+| `ORDER_OWNER_USER_IDS` | 逗號分隔的 user id 白名單，唯一允許下單/取消/改單的帳號 |
+| `ORDER_SYMBOL_WHITELIST` / `ORDER_MAX_QTY_PER_ORDER` / `ORDER_MAX_QTY_PER_DAY` / `ORDER_MAX_ORDERS_PER_DAY` | 風控：商品白名單、單筆/單日口數上限、單日委託次數上限 |
+| `ORDER_KILL_SWITCH_INITIAL` | 啟動時 kill switch 預設狀態（`true` 時啟動即擋所有送單，取消單仍允許） |
+| `SHIOAJI_CA_PATH` / `SHIOAJI_CA_PASSWD` / `SHIOAJI_PERSON_ID` | **僅 `real` 模式需要**：CA 憑證（`.pfx`）路徑、密碼、身分證字號 |
+
+### 10.2 CA 憑證檔（`.pfx`）部署規則（round3 F8）
+
+- **絕不進 git**：`.gitignore` 已含 `*.pfx`；`tests/test_deployment_safety.py::test_no_pfx_files_tracked_in_git` 每次測試都驗證 git 追蹤清單裡沒有任何 `.pfx`。
+- **唯讀 bind-mount 進容器**：VM 上的 `.pfx` 放在 `~/quanquant/secrets/`（不進 git 的目錄），docker-compose 用 `:ro` 掛進容器，容器內程序無法修改宿主機檔案。
+- **權限 0600 + owner 等於執行 process 的 UID**：`order_subsystem_preflight`（`src/quanquant/broker/preflight.py::_ca_file_permissions_ok`）啟動時強制檢查——權限不是恰好 `0600`，或檔案 owner 不是目前執行 process 的 UID，一律拒絕啟動下單子系統（軟性停用，不崩站，`/healthz` 反映原因）。VM 上部署前手動執行：
+  ```bash
+  chmod 600 ~/quanquant/secrets/sinopac.pfx
+  chown <app容器內執行使用者對應的宿主 UID> ~/quanquant/secrets/sinopac.pfx
+  ```
+
+### 10.3 例外訊息 redaction（round3 F8，中央化）
+
+`src/quanquant/broker/redaction.py::redact_secrets` 是唯一的秘密遮蔽實作，套用在**所有**
+可能夾帶 `api_key`/`secret_key`/`ca_passwd`/`person_id` 的例外訊息落地/回顯路徑：
+`ShioajiAdapter.place/update/health_probe`、watchdog 重連失敗（`OrderSessionState.last_error`，
+會經**未認證的 `/healthz`** 直接回顯）、`shutdown_order_subsystem`、lifespan `_start_order_subsystem`
+的 connect 失敗、以及 `web/routers/orders.py` 所有把例外文字回顯到 HTMX 表單錯誤訊息的路徑
+——不是只有 place 錯誤那一處。見 `tests/test_deployment_safety.py` 的端到端 redaction 回歸
+（故意讓 adapter/watchdog/lifespan 各自拋出含 api_key/ca_passwd/person_id 的例外，驗證外顯
+訊息不含明文）。
+
+### 10.4 部署前必做：Postgres schema smoke（round3 #20）
+
+`tests/test_deployment_safety.py` 對 8 張新表（`orders`/`deals`/`raw_inbox`/
+`broker_positions`/`order_audits`/`confirm_tokens`/`quota_reservations`/
+`broker_reconcile_cursors`）在 PG 方言下逐項斷言 `CreateTable` 編譯出的 DDL（BigInteger→
+BIGINT、CHECK constraint 全文、UniqueConstraint 名稱與欄位、`broker_positions` 的
+partial unique index），但這只是**編譯層級**驗證，不保證真連線建表成功。**首次啟用下單
+子系統前**（或這 8 張表的 schema 有任何變更後）必須額外跑一次真實 Postgres 驗證：
+
+```bash
+# 起一個一次性 Postgres 容器（跟正式環境同版本 postgres:16）
+docker run -d --rm --name qq-pg-smoke \
+  -e POSTGRES_USER=quanquant -e POSTGRES_PASSWORD=smokepw -e POSTGRES_DB=quanquant \
+  -p 55432:5432 postgres:16
+# 等待就緒後，用專案既有的 init_db()（create_all + ensure_columns，與正式啟動同一條路徑）
+DB_URL="postgresql+psycopg://quanquant:smokepw@localhost:55432/quanquant" \
+  uv run python -c "from quanquant.db.engine import init_db; init_db()"
+# 人工或用一次性腳本驗證：非法 mode/direction/state 值被 CHECK 擋、
+# 同 scope 兩筆 open BrokerPosition 被 partial unique index 擋、Deal.ts 大 epoch-ms 值不溢位
+docker rm -f qq-pg-smoke
+```
+
+已於 Task 10 實作完成時人工執行過一次（見完成報告），全數通過（8 張表建表成功、
+`ck_orders_mode`/`ck_broker_positions_direction`/`ck_broker_positions_total_opened_qty_positive`/
+`uq_broker_positions_active_scope`/`ck_quota_reservations_state` 皆正確擋下非法列、
+`Deal.ts` 以 epoch-ms 量級的值往返無溢位）。這不是常態 pytest（避免沒有 docker 的機器
+整批測試變 flaky），**部署到會真正啟用 `ORDER_MODE=real`（或任何動到這 8 張表 schema）
+的環境前，必須重新跑一次**。
+
+### 10.5 secret scan（人工，非自動化）
+
+```bash
+git grep -nE "SHIOAJI_(TRADE_)?(API_KEY|SECRET_KEY)\s*=\s*['\"][A-Za-z0-9]" -- . ':!*.md' || echo "clean"
+```
+確認除 `.env`（已在 `.gitignore`）外沒有其他檔案硬編碼真實金鑰樣式。
+
 ## 帳戶系統部署（首次啟用）
 
 依序執行：

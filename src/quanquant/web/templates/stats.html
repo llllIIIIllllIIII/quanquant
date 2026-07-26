@@ -39,7 +39,7 @@
 {% endmacro %}
 
 {% block content %}
-{% set qs = 'symbol=' ~ (f.symbol | urlencode) ~ '&tag=' ~ (f.tag | urlencode) ~ '&date_from=' ~ f.date_from ~ '&date_to=' ~ f.date_to %}
+{% set qs = 'mode=' ~ f.mode ~ '&symbol=' ~ (f.symbol | urlencode) ~ '&tag=' ~ (f.tag | urlencode) ~ '&date_from=' ~ f.date_from ~ '&date_to=' ~ f.date_to %}
 
 <div class="journal-head">
   <h3>績效統計</h3>
@@ -49,7 +49,13 @@
   </div>
 </div>
 
+<div class="mode-tabs" role="tablist">
+  <a role="button" class="{{ '' if f.mode == 'sim' else 'contrast' }}" href="/stats?mode=real">正式</a>
+  <a role="button" class="{{ 'contrast' if f.mode == 'sim' else '' }}" href="/stats?mode=sim">模擬</a>
+</div>
+
 <form class="filterbar card-bar" method="get" action="/stats">
+  <input type="hidden" name="mode" value="{{ f.mode }}">
   <select name="symbol" aria-label="商品">
     <option value="">全部商品</option>
     {% for s in symbols %}<option value="{{ s }}" {% if f.symbol == s %}selected{% endif %}>{{ s }}</option>{% endfor %}

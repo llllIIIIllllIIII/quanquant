@@ -1,0 +1,28 @@
+<table>
+  <thead><tr><th>商品</th><th>方向</th><th>口數</th><th>價格</th><th>狀態</th><th>成交</th><th>操作</th></tr></thead>
+  <tbody>
+    {% if not orders %}
+    <tr class="empty"><td colspan="7">尚無委託紀錄。</td></tr>
+    {% endif %}
+    {% for o in orders %}
+    <tr id="order-{{ o.id }}">
+      <td>{{ o.symbol }}</td>
+      <td><span class="dir {{ 'long' if o.action == 'Buy' else 'short' }}">{{ '買' if o.action == 'Buy' else '賣' }}</span></td>
+      <td class="numcell">{{ o.qty }}</td>
+      <td class="numcell">{{ o.price }}</td>
+      <td>{{ o.status }}</td>
+      <td class="numcell">{{ o.filled_qty }}/{{ o.qty }}</td>
+      <td class="nowrap">
+        {% if o.status in ("submitted", "partfilled") and o.broker_order_id and o.mode == live_mode %}
+        <a href="#" role="button" class="outline mini"
+           hx-get="/orders/{{ o.broker_order_id }}/edit" hx-target="#order-edit-modal" hx-swap="innerHTML"
+           @click="open = true">改單</a>
+        <a href="#" role="button" class="outline mini contrast"
+           hx-delete="/orders/{{ o.broker_order_id }}" hx-swap="none"
+           hx-confirm="確定取消這筆委託？">取消</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

@@ -4,13 +4,19 @@
 
   <div class="journal-head">
     <h3>交易日記</h3>
-    <button hx-get="/trades/new" hx-target="#modal-body" hx-swap="innerHTML" @click="open = true">
+    <button hx-get="/trades/new?mode={{ f.mode }}" hx-target="#modal-body" hx-swap="innerHTML" @click="open = true">
       + 新增交易
     </button>
   </div>
 
+  <div class="mode-tabs" role="tablist">
+    <a role="button" class="{{ '' if f.mode == 'sim' else 'contrast' }}" href="/journal?mode=real">正式</a>
+    <a role="button" class="{{ 'contrast' if f.mode == 'sim' else '' }}" href="/journal?mode=sim">模擬</a>
+  </div>
+
   <form class="filterbar card-bar" hx-get="/trades" hx-target="#trade-tbody" hx-swap="innerHTML"
         hx-trigger="change, submit, refreshtable from:body" @submit.prevent>
+    <input type="hidden" name="mode" value="{{ f.mode }}">
     <select name="symbol" aria-label="商品">
       <option value="">全部商品</option>
       {% for s in symbols %}<option value="{{ s }}" {% if f.symbol == s %}selected{% endif %}>{{ s }}</option>{% endfor %}
