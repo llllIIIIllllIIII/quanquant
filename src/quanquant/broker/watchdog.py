@@ -6,11 +6,18 @@ backoff）→ 重連成功後 `adapter.reconcile()` 對帳（拉券商委託補�
 2. 「quota unknown reconcile」：`Order.status == "unknown"`（送單/改單結果不明，見
    ShioajiAdapter.place/update 的 except 分支）且卡了超過 grace period 的委託——若從未拿到
    任何券商識別碼（ordno/broker_order_id 皆 NULL），代表 native 呼叫幾乎確定沒送達券商，
-   判定失敗並釋放對應的 QuotaReservation；有 ordno/broker_order_id 的（多半是 update 造成
-   的 unknown，委託本身早已存在）留給 reconcile() 的 order_report pipeline 自然解決，不猜測
-   （避免誤判造成重複下單或錯誤釋放仍在途的配額）。`release_quota`/`confirm_quota` 皆是
+   判定失敗並釋放對應的 QuotaReservation；委託身分已知（有 ordno/broker_order_id，多半是
+   update 造成的 unknown，委託本身早已存在）時，委託本身狀態仍留給 reconcile() 的
+   order_report pipeline 自然解決（不猜測狀態），**但**這裡會另外收尾 update-path 為 delta
+   建立的保留列（round3 獨立驗收殘留1）：查出該委託目前仍 `reserved` 的 update 保留列
+   （`repository.list_reserved_update_reservations`），呼叫
+   `adapter._query_order_qty_blocking` 直接向券商查詢這筆委託目前的真實口數，與「改單前
+   口數」（`order.qty`，因為 unknown 分支不會覆寫它）/「改單後目標口數」（`order.qty +
+   reservation.qty`）比對：吻合改單後目標 → 改單其實生效，`confirm_quota`；吻合改單前
+   原值 → 改單其實沒生效，`release_quota`；兩者皆不符（含查無此委託、adapter 未實作查詢
+   能力）一律不猜測，留到下一輪 grace period 後再試。`release_quota`/`confirm_quota` 皆是
    `UPDATE ... WHERE state='reserved'` 的原子一次性轉移，重複呼叫本身就是安全的 no-op，
-   「不重複釋放」不需要 watchdog 額外加鎖判斷。
+   「不重複釋放/確認」不需要 watchdog 額外加鎖判斷。
 
 round3 #10：health probe 用 `adapter.health_probe()`（序列化探測底層連線，不只看
 `_api is not None`）；為相容沒有實作 `health_probe` 的極簡假 adapter（測試用），找不到這個
@@ -130,6 +137,7 @@ async def _reconcile_unknown_quota(adapter, grace_seconds: float) -> None:
 
 def _reconcile_unknown_quota_blocking(adapter, grace_seconds: float) -> None:
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=grace_seconds)
+    query_qty = getattr(adapter, "_query_order_qty_blocking", None)
     with adapter._session_factory() as session:
         stuck = brepo.list_unknown_orders_older_than(session, older_than=cutoff)
         resolved = 0
@@ -140,8 +148,31 @@ def _reconcile_unknown_quota_blocking(adapter, grace_seconds: float) -> None:
                 brepo.mark_order_status(session, order, status="failed")
                 brepo.release_quota(session, reservation_id=order.client_order_id)
                 resolved += 1
-            # else：已有 ordno/broker_order_id，委託身分已知，留給 reconcile() 的
-            # order_report pipeline 自然解決，這裡不猜測。
+                continue
+            # 已有 ordno/broker_order_id：委託身分已知（多半是 update 造成的 unknown），
+            # 委託本身狀態留給 reconcile() 的 order_report pipeline 自然解決，這裡不猜測。
+            # 但要收尾 update-path 為 delta 建立的保留列（round3 殘留1）——否則會永遠卡
+            # reserved，當日配額被逾時改單靜默侵蝕。沒有 ordno（只有裸 broker_order_id）
+            # 或 adapter 沒實作查詢能力時，同樣不猜測，跳過留待下一輪。
+            if order.ordno is None or query_qty is None:
+                continue
+            pending = brepo.list_reserved_update_reservations(session, client_order_id=order.client_order_id)
+            if not pending:
+                continue
+            real_qty = query_qty(order.ordno)
+            if real_qty is None:
+                continue  # 券商目前清單查無此委託，無法判斷，不猜測
+            for reservation in pending:
+                target_qty = order.qty + reservation.qty  # order.qty 是改單前原值（unknown 分支未覆寫）
+                if real_qty == target_qty:
+                    # 改單其實生效（口數已是改單後目標值）→ 這筆 delta 保留永久計入已用配額。
+                    if brepo.confirm_quota(session, reservation_id=reservation.reservation_id):
+                        resolved += 1
+                elif real_qty == order.qty:
+                    # 改單其實沒生效（口數仍是改單前原值）→ 退還這筆 delta 保留。
+                    if brepo.release_quota(session, reservation_id=reservation.reservation_id):
+                        resolved += 1
+                # 其餘：口數既非改單前也非改單後，無法判斷是哪次改單造成，不猜測，留待下一輪。
         session.commit()
         if resolved:
-            log.info("watchdog 判定 %d 筆送單結果不明的委託失敗並釋放配額", resolved)
+            log.info("watchdog 判定 %d 筆送單/改單結果不明的委託（或其保留列）完成配額收尾", resolved)

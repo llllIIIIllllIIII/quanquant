@@ -270,6 +270,33 @@ class ShioajiAdapter:
         except (TypeError, ValueError):
             return None
 
+    def _query_order_qty_blocking(self, ordno: str) -> int | None:
+        """Task 8 watchdog「quota unknown reconcile」收尾用（round3 殘留1）：查詢券商目前對
+        這筆委託回報的口數（quantity），供 watchdog 判斷 update 逾時（unknown）後這次改單
+        究竟是否真的生效——比對這個回傳值與「改單前口數」/「改單後目標口數」，才能決定
+        對應的 delta QuotaReservation 該 confirm 還是 release（見 watchdog.py
+        `_reconcile_unknown_quota_blocking`）。
+
+        **呼叫端責任（避免鎖重入死結）**：本函式刻意設計成單純同步、自己不取
+        `supervisor` 鎖——watchdog 對這批「DB-only 背景工作」是直接
+        `async with adapter.supervisor.lock:` 整段包住（見本檔 `supervisor` property 說明、
+        watchdog.py 模組頂部），本函式若再呼叫 `supervisor.run()` 會在同一顆
+        `asyncio.Lock` 上重入，永久卡死；因此只能在「呼叫端已經持有鎖」的前提下直接呼叫。
+
+        找不到這筆委託（已從 `list_trades()` 目前清單消失，例如已完全結案）回 None，
+        呼叫端視為無法判斷、不猜測。欄位名稱（`order.id`/`order.quantity`）待實機 SDK
+        驗證（同檔一貫 getattr 防禦性慣例，見模組頂部說明）。"""
+        if self._api is None:
+            return None
+        list_trades = getattr(self._api, "list_trades", None)
+        trades = list_trades() if callable(list_trades) else []
+        for trade in trades:
+            order = getattr(trade, "order", None)
+            if order is not None and getattr(order, "id", None) == ordno:
+                qty = getattr(order, "quantity", None)
+                return int(qty) if qty is not None else None
+        return None
+
     # ---- send gate（V3-2，鎖內、native 呼叫前的最後線性化點） ----
 
     async def _send_gate(self) -> None:

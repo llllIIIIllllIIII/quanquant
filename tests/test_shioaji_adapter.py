@@ -9,7 +9,7 @@ BrokerSupervisor.run() 同一個 command executor 序列化（round3 #11）、_m
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -17,6 +17,7 @@ from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
 from quanquant.broker import shioaji_adapter as shioaji_adapter_module
+from quanquant.broker import watchdog as watchdog_module
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
 from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
@@ -405,6 +406,15 @@ def test_update_releases_delta_quota_reservation_when_send_gate_raises_riskerror
 
 
 def test_update_marks_order_unknown_without_touching_reservation_when_send_outcome_unknown(engine):
+    """round3 獨立驗收殘留1：update 逾時當下（native 呼叫結果不明）不得擅自 release/confirm——
+    這一刻仍然「不知道」券商到底有沒有收到，reservation 必須維持 reserved（若其實已送達，
+    誤退還配額會變相突破日限；若其實沒送達，誤確認會讓當日配額被靜默侵蝕，兩者都不可以）。
+
+    但「當下不猜測」不等於「永遠卡 reserved」——過了 grace period，watchdog 的 unknown quota
+    reconcile 應該主動向券商查詢這筆委託目前真實口數，依查到的結果 confirm（改單其實生效）
+    或 release（改單其實沒生效）該筆 delta 保留，不讓配額被永久侵蝕。以下延續同一個
+    adapter/order/reservation，模擬 watchdog 過了 grace period 後查到「改單其實生效」的
+    情境，驗證 reservation 最終會被 confirm，不是永遠停在 reserved。"""
     guard = _real_guard(engine)
     adapter = _adapter(engine, risk_guard=guard)
     ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
@@ -418,9 +428,61 @@ def test_update_marks_order_unknown_without_touching_reservation_when_send_outco
     with Session(engine) as s:
         rows = list(s.exec(select(QuotaReservation)))
         update_row = next(r for r in rows if r.reservation_id != "C1")
-        assert update_row.state == "reserved"  # 結果不明，不擅自 release
+        update_row_id = update_row.id
+        assert update_row.state == "reserved"  # 結果不明，當下不擅自 release/confirm
         order = s.exec(select(Order)).first()
         assert order.status == "unknown"
+
+    # 過了 grace period：watchdog 向券商查詢，真實口數已是改單後目標值（2+3=5）——代表這次
+    # 改單其實生效，只是 ack 逾時沒收到。
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        order.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=9999)
+        s.add(order)
+        s.commit()
+        ordno, broker_order_id = order.ordno, order.broker_order_id
+    adapter._api.list_trades = lambda: [_FakeTrade2(ordno, broker_order_id, "Submitted", quantity=5)]
+
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))
+
+    with Session(engine) as s:
+        update_row = s.exec(
+            select(QuotaReservation).where(QuotaReservation.id == update_row_id)
+        ).first()
+        assert update_row.state == "confirmed"  # 改單其實生效，watchdog 收尾 confirm，不再永遠 reserved
+
+
+def test_watchdog_reconcile_releases_update_reservation_when_broker_shows_update_did_not_take_effect(engine):
+    """殘留1 對照情境：watchdog 向券商查到的真實口數仍是改單前原值（2），代表這次改單其實
+    沒生效（native 呼叫真的沒送達，不是 ack 遺失）——delta 保留應該 release，退還配額，
+    不讓它跟著委託一起被永久誤判為已用。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+
+    def _boom(ordno, **kw):
+        raise RuntimeError("網路逾時")
+
+    adapter._api.update_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        order.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=9999)
+        s.add(order)
+        s.commit()
+        update_row_id = next(
+            r.id for r in s.exec(select(QuotaReservation)) if r.reservation_id != "C1"
+        )
+        ordno, broker_order_id = order.ordno, order.broker_order_id
+    adapter._api.list_trades = lambda: [_FakeTrade2(ordno, broker_order_id, "Submitted", quantity=2)]
+
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))
+
+    with Session(engine) as s:
+        update_row = s.exec(select(QuotaReservation).where(QuotaReservation.id == update_row_id)).first()
+        assert update_row.state == "released"  # 改單其實沒生效，watchdog 收尾 release，退還配額
 
 
 # ---- Task 7 round3 #6：cancel 除了 assert_owner，仍要驗真正委託所有權 ----
@@ -483,9 +545,10 @@ def test_map_order_report_rejects_missing_ordno_and_broker_order_id():
 # ---- Task 8：supervisor property / health_probe（round3 #10）/ reconcile（round3 #2） ----
 
 class _FakeOrderHandle2:
-    def __init__(self, id_, seqno):
+    def __init__(self, id_, seqno, quantity=None):
         self.id = id_
         self.seqno = seqno
+        self.quantity = quantity
 
 
 class _FakeTradeStatus:
@@ -495,8 +558,8 @@ class _FakeTradeStatus:
 
 
 class _FakeTrade2:
-    def __init__(self, id_, seqno, status, order_datetime=None):
-        self.order = _FakeOrderHandle2(id_, seqno)
+    def __init__(self, id_, seqno, status, order_datetime=None, quantity=None):
+        self.order = _FakeOrderHandle2(id_, seqno, quantity=quantity)
         self.status = _FakeTradeStatus(status, order_datetime=order_datetime)
 
 

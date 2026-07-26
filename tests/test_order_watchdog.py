@@ -203,3 +203,178 @@ def test_unknown_quota_reconcile_ignores_orders_still_within_grace_period(engine
     with Session(engine) as s:
         refreshed = brepo.find_order_by_client_order_id(s, "C-TOO-FRESH")
         assert refreshed.status == "unknown"  # 還沒過 grace period，不動它
+
+
+# ---- round3 獨立驗收殘留1：update 路徑 quota unknown 未閉環 ----
+# update 逾時（native 呼叫結果不明）標 order.status="unknown" 時，該筆委託早已有
+# ordno/broker_order_id（委託本身在改單前就已存在），為這次改單 delta 建立的
+# QuotaReservation（reservation_id 見 repository.reservation_id_for_update）過去永遠停在
+# "reserved"——上面 `test_unknown_quota_reconcile_leaves_orders_with_known_broker_id_alone`
+# 只驗證了「委託本身狀態不被誤判」，沒有涵蓋這個 delta 保留列的收尾。以下測試餵一個支援
+# `_query_order_qty_blocking`（round3 殘留1 新增的 adapter 能力）的假 adapter，模擬「向券商
+# 查詢這筆委託目前真實口數」兩種情境，驗證 watchdog 能依真實狀態 confirm/release，不再永遠
+# 卡 reserved。
+
+
+class _QueryableAdapter(_MinimalAdapter):
+    """支援 `_query_order_qty_blocking` 的假 adapter：可設定回傳的「券商目前口數」，
+    模擬改單生效/未生效兩種情境（round3 殘留1）。"""
+
+    def __init__(self, session_factory, *, real_qty):
+        super().__init__(session_factory)
+        self._real_qty = real_qty
+        self.query_calls = 0
+
+    def _query_order_qty_blocking(self, ordno):
+        self.query_calls += 1
+        return self._real_qty
+
+
+def _make_unknown_order_with_update_reservation(
+    session, *, client_order_id, ordno, broker_order_id, original_qty, delta_qty, age_seconds=9999,
+):
+    """模擬「改單逾時」情境：委託本身以 original_qty 送出並早已有 ordno/broker_order_id，
+    這次改單想加量 delta_qty（RiskGuard.check_update 只在增加時才建 delta 保留列），native
+    呼叫逾時 → order.status 標 unknown，但 order.qty 維持 original_qty 不變（unknown 分支
+    不覆寫），delta 保留列停在 reserved。"""
+    order = brepo.create_order(
+        session, client_order_id=client_order_id, request_hash="H1", user_id=1, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=original_qty,
+        price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+        trading_day="2026-06-16",
+    )
+    order.status = "unknown"
+    order.ordno = ordno
+    order.broker_order_id = broker_order_id
+    order.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=age_seconds)
+    session.add(order)
+    session.flush()
+    reservation_id = brepo.reservation_id_for_update(client_order_id=client_order_id, request_hash="H2-UPDATE")
+    assert brepo.reserve_quota(
+        session, reservation_id=reservation_id, user_id=1, mode="sim",
+        trading_day="2026-06-16", qty=delta_qty, daily_limit=20,
+    )
+    return order, reservation_id
+
+
+def test_unknown_quota_reconcile_confirms_update_reservation_when_broker_shows_target_qty(engine):
+    """殘留1：券商真實狀態顯示口數已是改單後目標值 → 改單其實生效，delta 保留 confirm。"""
+    with Session(engine) as s:
+        order, reservation_id = _make_unknown_order_with_update_reservation(
+            s, client_order_id="C-UPD-OK", ordno="O1", broker_order_id="B1",
+            original_qty=2, delta_qty=3,  # 目標 = 2+3 = 5
+        )
+        s.commit()
+
+    adapter = _QueryableAdapter(lambda: Session(engine), real_qty=5)
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))
+
+    with Session(engine) as s:
+        reservation = s.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+        ).first()
+        assert reservation.state == "confirmed"
+        refreshed = brepo.find_order_by_client_order_id(s, "C-UPD-OK")
+        assert refreshed.status == "unknown"  # 委託本身狀態留給 order_report pipeline，這裡不動
+
+
+def test_unknown_quota_reconcile_releases_update_reservation_when_broker_shows_unchanged_qty(engine):
+    """殘留1 對照情境：券商真實狀態顯示口數仍是改單前原值 → 改單其實沒生效，delta 保留 release。"""
+    with Session(engine) as s:
+        order, reservation_id = _make_unknown_order_with_update_reservation(
+            s, client_order_id="C-UPD-FAIL", ordno="O2", broker_order_id="B2",
+            original_qty=2, delta_qty=3,
+        )
+        s.commit()
+
+    adapter = _QueryableAdapter(lambda: Session(engine), real_qty=2)  # 仍是改單前原值
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))
+
+    with Session(engine) as s:
+        reservation = s.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+        ).first()
+        assert reservation.state == "released"
+
+
+def test_unknown_quota_reconcile_update_reservation_leaves_ambiguous_qty_alone(engine):
+    """既非改單前也非改單後的口數 → 無法判斷是哪次改單造成，不猜測，留待下一輪。"""
+    with Session(engine) as s:
+        order, reservation_id = _make_unknown_order_with_update_reservation(
+            s, client_order_id="C-UPD-AMBIG", ordno="O3", broker_order_id="B3",
+            original_qty=2, delta_qty=3,
+        )
+        s.commit()
+
+    adapter = _QueryableAdapter(lambda: Session(engine), real_qty=99)
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))
+
+    with Session(engine) as s:
+        reservation = s.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+        ).first()
+        assert reservation.state == "reserved"
+
+
+def test_unknown_quota_reconcile_update_reservation_repeat_call_is_idempotent(engine):
+    """一次性收尾：重複呼叫 reconcile 不會把已 confirmed 的列改成別的狀態。第二次呼叫時
+    `list_reserved_update_reservations` 已經查不到這筆保留（狀態已離開 "reserved"），watchdog
+    連券商都不必再查——比 confirm_quota/release_quota 本身的原子一次性保證更早一步省下
+    白工，同樣達成「不重複釋放/確認」。"""
+    with Session(engine) as s:
+        order, reservation_id = _make_unknown_order_with_update_reservation(
+            s, client_order_id="C-UPD-REPEAT", ordno="O4", broker_order_id="B4",
+            original_qty=2, delta_qty=3,
+        )
+        s.commit()
+
+    adapter = _QueryableAdapter(lambda: Session(engine), real_qty=5)
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))  # 重複呼叫
+
+    with Session(engine) as s:
+        reservation = s.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+        ).first()
+        assert reservation.state == "confirmed"  # 沒有因為重複呼叫變成別的狀態
+    assert adapter.query_calls == 1  # 保留列已離開 reserved，第二次不必再查券商（省下白工）
+
+
+def test_unknown_quota_reconcile_update_reservation_ignores_orders_still_within_grace_period(engine):
+    """grace period 內完全不動——連券商都不該查。"""
+    with Session(engine) as s:
+        order, reservation_id = _make_unknown_order_with_update_reservation(
+            s, client_order_id="C-UPD-FRESH", ordno="O5", broker_order_id="B5",
+            original_qty=2, delta_qty=3, age_seconds=1,
+        )
+        s.commit()
+
+    adapter = _QueryableAdapter(lambda: Session(engine), real_qty=5)
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=9999))
+
+    with Session(engine) as s:
+        reservation = s.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+        ).first()
+        assert reservation.state == "reserved"
+    assert adapter.query_calls == 0
+
+
+def test_unknown_quota_reconcile_update_reservation_left_reserved_when_adapter_lacks_query_support(engine):
+    """相容沒有實作 `_query_order_qty_blocking` 的假 adapter（如既有 `_MinimalAdapter`）：
+    找不到查詢能力就不猜測，維持 reserved，不崩潰。"""
+    with Session(engine) as s:
+        order, reservation_id = _make_unknown_order_with_update_reservation(
+            s, client_order_id="C-UPD-NOQUERY", ordno="O6", broker_order_id="B6",
+            original_qty=2, delta_qty=3,
+        )
+        s.commit()
+
+    adapter = _MinimalAdapter(lambda: Session(engine))  # 沒有 _query_order_qty_blocking
+    asyncio.run(watchdog_module._reconcile_unknown_quota(adapter, grace_seconds=60))
+
+    with Session(engine) as s:
+        reservation = s.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+        ).first()
+        assert reservation.state == "reserved"

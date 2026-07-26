@@ -695,6 +695,31 @@ def reservation_id_for_update(*, client_order_id: str, request_hash: str) -> str
     return f"{client_order_id}:update:{request_hash}"
 
 
+def _escape_like(value: str) -> str:
+    """LIKE pattern 逐字比對安全化：client_order_id 為 URL-safe token（可能含 `_`，恰是 LIKE
+    的單字元萬用字元），不逃脫的話理論上可能被另一個「恰好在同一位置差一字元」的
+    client_order_id 誤配到（機率極低但非零）——這裡一律逃脫，讓比對是純字面值。"""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def list_reserved_update_reservations(session: Session, *, client_order_id: str) -> list[QuotaReservation]:
+    """Task 8 watchdog「quota unknown reconcile」收尾用（round3 殘留1）：找出這筆委託目前
+    仍是 `reserved` 的 update-path 保留列（reservation_id 格式見 reservation_id_for_update，
+    `f"{client_order_id}:update:{request_hash}"`）。每次改單嘗試各自帶不同 request_hash，
+    理論上同一委託可能同時卡著多列（連續多次改單皆逾時未決議）——回傳全部，呼叫端逐列
+    各自依券商真實狀態決議，不假設只有一列。"""
+    prefix = f"{_escape_like(client_order_id)}:update:"
+    stmt = (
+        select(QuotaReservation)
+        .where(
+            QuotaReservation.state == "reserved",
+            QuotaReservation.reservation_id.like(f"{prefix}%", escape="\\"),  # type: ignore[union-attr]
+        )
+        .order_by(QuotaReservation.id)
+    )
+    return list(session.exec(stmt))
+
+
 def quota_used_today(session: Session, *, user_id: int, mode: str, trading_day: str) -> int:
     """目前已用配額（reserved+confirmed 加總）。純讀取、不具 CAS 保證——供 Task 7 guard
     做預檢/UI 顯示用；真正決定「這筆能不能保留」一律要呼叫 reserve_quota（單一陳述式
