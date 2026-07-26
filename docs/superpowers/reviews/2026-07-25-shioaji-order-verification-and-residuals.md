@@ -12,7 +12,11 @@ real update 不鎖死（route 合併既有 Order + 同一 canonical hash + 真 a
 ## 測試敏感度抽查（驗收者故意改壞 → 對應測試確實 FAIL，已全數還原）
 quota 上限放大／canonical hash 拿掉 octype／owner 檢查短路 True／real 缺 fee 不 raise／狀態偏序 return True —— 五者對應測試皆 FAIL，證明測試非形同虛設。無 `assert ... or True`／no-op／無 assert 之虛設測試殘留。
 
-## ⚠️ 真錢上線前應收的殘留（皆 LOW、方向保守、不危及真錢；simtrade 開發不受影響）
+## ✅ 更新 2026-07-26：下方 2 殘留已收（commit `621a9fc` + `ea1ff70`，546 pytest 全綠）
+- 殘留2（order_report 雙鍵交叉驗證）：`inbox_worker._resolve_order_report_order` 比照 `PositionTracker._resolve_order`，兩鍵各自 scoped 查詢、矛盾即 quarantine；有實測（種兩張 Order 餵矛盾雙鍵→quarantine+兩張狀態不動）。**CLOSED**。
+- 殘留1（update 逾時 delta 配額）：watchdog unknown 對帳現也處理有 ordno 的 unknown 委託——`adapter._query_order_qty_blocking` 查券商真實口數，比對「改單前原值 `order.qty`」vs「目標值 `order.qty+reservation.qty`」→ 吻合目標 `confirm_quota`／吻合原值 `release_quota`（一次性），ambiguous 留下輪。**CLOSED（但依賴真 Shioaji `order.quantity` 欄位語意，屬下方「真 SDK 欄位待實機驗證」同源）**。
+
+## ⚠️ 真錢上線前應收的殘留（皆 LOW、方向保守、不危及真錢；simtrade 開發不受影響）— 已於 2026-07-26 收訖，保留原始記錄如下
 
 1. **update 路徑的 quota unknown 未閉環**（`broker/watchdog.py::_reconcile_unknown_quota_blocking`、`broker/shioaji_adapter.py::update` except 分支）：real 加量改單若 native 逾時（unknown），該 delta `QuotaReservation` 永遠停 `reserved`；watchdog 的 unknown 對帳只釋放「無任何券商 id」的委託，update 因委託早有 broker_order_id 被跳過，order_report pipeline 又只更新 status 不碰 quota。**淨效果保守**（高估用量→**不會超賣/突破日限**），但當日配額會被逾時改單靜默侵蝕。`test_update_marks_order_unknown_without_touching_reservation` 目前把「永遠 reserved」固化為預期。**修法**：watchdog 對 update-unknown 依券商真實狀態 confirm/release 該 reservation（一次性）。
 
