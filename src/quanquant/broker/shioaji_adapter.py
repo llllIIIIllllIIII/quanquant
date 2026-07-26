@@ -36,6 +36,7 @@ crash/等 supervisor lock 時 payload 仍會遺失）；callback 內**不**碰�
 import asyncio
 import json
 import logging
+import re
 from collections.abc import Callable
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -52,6 +53,42 @@ from quanquant.broker.types import Fill, Mode, OrderAck, OrderRequest, Position,
 from quanquant.db.models import Order
 
 log = logging.getLogger(__name__)
+
+# 券商「明確拒絕」偵測（本次精進）：HTTP 慣例的 4xx 代表「請求已被伺服器端處理、且明確
+# 拒絕」（例如 400 Bad Request、401/403 認證/授權失敗、404 Not Found、406 Not Acceptable、
+# 409 Conflict），語意上不同於逾時/連線中斷（那些代表「不確定伺服器有沒有處理到」）。
+# 真實踩過的案例：Shioaji `place_order` 丟出的例外訊息形如
+# `"place_order: ... code: 406, detail: Please sign ... first."`。
+_BROKER_REJECT_CODE_RE = re.compile(r"code[:=]\s*(4\d{2})\b", re.IGNORECASE)
+
+
+def _classify_place_failure(exc: Exception) -> str:
+    """分類送單/改單失敗的例外：回傳 `"failed"` 或 `"unknown"`。
+
+    - `"failed"`：**只在能確定券商已收到這筆委託並明確拒絕**時才回傳——代表這筆委託
+      **確定沒送出**，呼叫端可以安全地立即標記委託 failed 並釋放保留的配額（不必等
+      Task 8 watchdog reconcile）。
+    - `"unknown"`：其餘所有情況（逾時、連線中斷、無法辨識的例外形狀）——結果不明，
+      委託可能其實已經送達券商，必須維持既有 fail-safe（標 unknown、保留配額不動，
+      留給 watchdog reconcile 決議）。
+
+    **保守是鐵律**：危險方向是把「模稜兩可」的失敗誤判成 `"failed"`——那會讓其實已經
+    送達的委託被誤退還配額，變相突破日限。因此本函式的判斷刻意寧可漏判成 `"unknown"`，
+    也不可誤判成 `"failed"`：只有在例外訊息中辨認出「HTTP 式 4xx 回應碼」（`code: 4xx`）
+    這種代表券商端已明確處理並拒絕的訊號時，才會判定 `"failed"`；辨認不出來、或碼落在
+    4xx 以外（例如 5xx 伺服器錯誤、逾時)，一律回傳 `"unknown"`。
+
+    **待實機驗證**：這裡依賴的「Shioaji 例外訊息含 `code: 4xx`」字串形狀，是從實際踩到的
+    `place_order` 例外訊息歸納出來的，不是官方文件保證的介面——與模組頂部說明的其餘欄位
+    名稱（`order.id`/`order.seqno`/`status.id` 等）同屬「待實機驗證」等級：若正式 SDK
+    版本的例外訊息格式不同，只需局部調整這裡的判斷邏輯，不影響呼叫端（place/update）的
+    分支結構。
+    """
+    match = _BROKER_REJECT_CODE_RE.search(str(exc))
+    if match is None:
+        return "unknown"
+    code = int(match.group(1))
+    return "failed" if 400 <= code <= 499 else "unknown"
 
 
 class _RiskGuardLike(Protocol):
@@ -364,14 +401,26 @@ class ShioajiAdapter:
                     fail_session.commit()
                 raise
             except Exception as exc:
-                # 結果不明（可能已經送到券商、只是回應逾時/連線中斷）：不 release、不
-                # confirm，保留列維持 reserved，留給 Task 8 watchdog reconcile 決議
-                # （round3 #4：unknown 不得立即 release，否則若其實已送達會讓配額被
-                # 誤退還、變相突破日限）。
+                # 本次精進：先分類這個例外是否為「券商明確拒絕」（確定沒送出）——
+                # 是的話比照 RiskError 分支立即標 failed + 釋放配額，不必等 watchdog
+                # reconcile；分類不出來（逾時/連線中斷/無法辨識）一律維持原本 unknown
+                # fail-safe（round3 #4：不得擅自 release，否則若其實已送達會讓配額被
+                # 誤退還、變相突破日限）。見 `_classify_place_failure` docstring。
+                classification = _classify_place_failure(exc)
                 with self._session_factory() as fail_session:
                     fail_order = fail_session.get(Order, order_id)
-                    brepo.mark_order_status(fail_session, fail_order, status="unknown")
+                    if classification == "failed":
+                        brepo.mark_order_status(fail_session, fail_order, status="failed")
+                        if self._risk_guard is not None:
+                            brepo.release_quota(fail_session, reservation_id=req.client_order_id)
+                    else:
+                        brepo.mark_order_status(fail_session, fail_order, status="unknown")
                     fail_session.commit()
+                if classification == "failed":
+                    raise OrderError(
+                        f"送單遭券商明確拒絕，委託標記 failed 並已釋放配額："
+                        f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
+                    ) from exc
                 raise OrderError(
                     f"送單失敗，委託標記 unknown 待 reconcile："
                     f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
@@ -511,8 +560,22 @@ class ShioajiAdapter:
                     fail_session.commit()
             raise
         except Exception as exc:
-            # 結果不明：不 release、不 confirm，留給 Task 8 watchdog reconcile 決議
-            # （同 place 的 round3 #4 收尾邏輯）。
+            # 本次精進：同 place 分支，先分類是否為「券商明確拒絕」。是的話這次改單
+            # 嘗試確定沒生效——比照上面 RiskError 分支，立即釋放「若有」保留的 delta
+            # 配額，不必等 watchdog reconcile；委託本身狀態不變（改單失敗不代表委託
+            # 本身壞了，不比照 place 標 failed，同 RiskError 分支的既有原則）。分類不出來
+            # 一律維持原本 unknown fail-safe（結果不明，不 release、不 confirm，留給
+            # Task 8 watchdog reconcile 決議）。
+            classification = _classify_place_failure(exc)
+            if classification == "failed":
+                if reservation_id is not None:
+                    with self._session_factory() as fail_session:
+                        brepo.release_quota(fail_session, reservation_id=reservation_id)
+                        fail_session.commit()
+                raise OrderError(
+                    f"改單遭券商明確拒絕，delta 配額已釋放（委託本身狀態不變）："
+                    f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
+                ) from exc
             with self._session_factory() as fail_session:
                 fail_order = fail_session.get(Order, order_id)
                 brepo.mark_order_status(fail_session, fail_order, status="unknown")

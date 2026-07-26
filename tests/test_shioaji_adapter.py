@@ -122,6 +122,8 @@ def test_place_idempotent_hit_rejects_non_owner(engine):
 
 
 def test_place_broker_failure_marks_order_unknown_not_blind_resend(engine):
+    """模稜兩可（逾時/連線中斷，無法辨識的例外，沒有券商明確拒絕訊號）：結果不明，
+    維持 unknown fail-safe，不得誤判成 failed。"""
     adapter = _adapter(engine)
 
     def _boom(contract, order):
@@ -133,6 +135,33 @@ def test_place_broker_failure_marks_order_unknown_not_blind_resend(engine):
     with Session(engine) as s:
         order = s.exec(select(Order)).first()
         assert order.status == "unknown"  # 不盲送、待 reconcile，不是直接標 failed
+
+
+def test_place_broker_explicit_rejection_marks_order_failed(engine):
+    """本次精進：券商明確拒絕（Shioaji 例外訊息帶 HTTP 式 4xx 回應碼，真實案例為
+    `place_order: ... code: 406, detail: Please sign ... first.`）代表委託確定沒送出，
+    不必等 watchdog reconcile，應直接標 failed。"""
+    adapter = _adapter(engine)
+
+    def _boom(contract, order):
+        raise Exception("place_order: SubAccount not found. code: 406, detail: Please sign agreement first.")
+
+    adapter._api.place_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "failed"  # 明確拒絕，確定沒送出，不是 unknown
+
+
+def test_classify_place_failure_boundary_cases():
+    """分類器單元測試：只有能辨識出 4xx 明確拒絕訊號才判 failed，其餘（含 5xx、無法辨識
+    的一般例外）一律 unknown——寧可漏判成 unknown，不可誤判成 failed。"""
+    classify = shioaji_adapter_module._classify_place_failure
+    assert classify(Exception("place_order: ... code: 406, detail: Please sign ... first.")) == "failed"
+    assert classify(RuntimeError("網路逾時")) == "unknown"
+    assert classify(Exception("connection reset by peer")) == "unknown"
+    assert classify(Exception("internal server error, code: 500")) == "unknown"  # 5xx 非明確拒絕
 
 
 def test_place_persists_pending_correlation_before_native_call(engine):
@@ -370,6 +399,25 @@ def test_place_leaves_quota_reservation_reserved_when_send_outcome_unknown(engin
         assert order.status == "unknown"
 
 
+def test_place_releases_quota_reservation_on_broker_explicit_rejection(engine):
+    """本次精進，對照上一個 unknown 測試：券商明確拒絕（確定沒送出）不必等 watchdog
+    reconcile，應立即釋放保留的配額。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+
+    def _boom(contract, order):
+        raise Exception("place_order: ... code: 406, detail: Please sign ... first.")
+
+    adapter._api.place_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    with Session(engine) as s:
+        row = s.exec(select(QuotaReservation)).first()
+        assert row is not None and row.state == "released"  # 明確拒絕，立即退還配額
+        order = s.exec(select(Order)).first()
+        assert order.status == "failed"
+
+
 def test_update_confirms_delta_quota_reservation_on_successful_send(engine):
     guard = _real_guard(engine)
     adapter = _adapter(engine, risk_guard=guard)
@@ -450,6 +498,28 @@ def test_update_marks_order_unknown_without_touching_reservation_when_send_outco
             select(QuotaReservation).where(QuotaReservation.id == update_row_id)
         ).first()
         assert update_row.state == "confirmed"  # 改單其實生效，watchdog 收尾 confirm，不再永遠 reserved
+
+
+def test_update_releases_delta_quota_reservation_on_broker_explicit_rejection(engine):
+    """本次精進，對稱套用同一分類器：改單遭券商明確拒絕（確定沒生效）不必等 watchdog
+    reconcile，應立即釋放「若有」保留的 delta 配額；委託本身狀態不變（同既有 RiskError
+    分支原則——改單失敗不代表委託本身壞了，不比照 place 標 failed）。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+
+    def _boom(ordno, **kw):
+        raise Exception("update_order: ... code: 406, detail: Please sign ... first.")
+
+    adapter._api.update_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    with Session(engine) as s:
+        rows = list(s.exec(select(QuotaReservation)))
+        update_row = next(r for r in rows if r.reservation_id != "C1")
+        assert update_row.state == "released"  # 明確拒絕，確定沒生效，立即退還 delta 配額
+        order = s.exec(select(Order)).first()
+        assert order.status == "submitted"  # 委託本身狀態不變（同 RiskError 分支既有原則）
 
 
 def test_watchdog_reconcile_releases_update_reservation_when_broker_shows_update_did_not_take_effect(engine):
