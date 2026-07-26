@@ -190,6 +190,68 @@ def test_order_report_updates_status_via_composite_scope(session, engine):
         assert order.status == "cancelled" and order.filled_qty == 0
 
 
+def test_order_report_conflicting_dual_keys_quarantines_fail_closed(session, engine):
+    """殘留2（round3 獨立驗收）：deal_report 路徑經 PositionTracker._resolve_order 早已對
+    ordno/broker_order_id 雙鍵各自 scoped 查詢、矛盾即 quarantine（fail-closed）；
+    order_report 路徑先前只有 ordno 命中即用、broker_order_id 淪為 fallback，完全沒驗第二鍵
+    ——payload 若 ordno 指向某張 Order、broker_order_id 卻指向另一張，舊行為會直接任選
+    ordno 命中的那張改狀態。比照 _resolve_order 補上交叉驗證：矛盾必須 quarantine，
+    兩張 Order 的 status 都不得被亂改。"""
+    _seed_order(session)  # C1: ordno=O1, broker_order_id=B1
+    with Session(engine) as s:
+        other = brepo.create_order(s, **_order_kwargs(client_order_id="C2", request_hash="H2"))
+        brepo.set_order_ack(s, other.id, broker_order_id="B2", ordno="O2", status="submitted")
+        s.commit()
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B2", status="cancelled",
+        )))  # ordno 指向 C1，broker_order_id 指向 C2 —— 矛盾
+        s.commit()
+
+    worker = _worker(engine)
+    handled = worker.process_batch_once()
+    assert handled == 1  # quarantine 也算「確定處理完」
+
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True and row.processed is False
+        order_c1 = brepo.find_order_by_client_order_id(s, "C1")
+        order_c2 = brepo.find_order_by_client_order_id(s, "C2")
+        assert order_c1.status == "submitted"  # 沒被亂改
+        assert order_c2.status == "submitted"  # 沒被亂改
+
+
+def test_order_report_resolves_via_ordno_only_when_broker_order_id_missing(session, engine):
+    """殘留2 對照組：只帶單鍵（broker_order_id 缺）仍正常處理，不因加了交叉驗證而退化。"""
+    _seed_order(session)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id=None, status="cancelled",
+        )))
+        s.commit()
+    worker = _worker(engine)
+    assert worker.process_batch_once() == 1
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "cancelled"
+
+
+def test_order_report_resolves_via_broker_order_id_only_when_ordno_missing(session, engine):
+    """殘留2 對照組：只帶單鍵（ordno 缺）仍正常處理，不因加了交叉驗證而退化。"""
+    _seed_order(session)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno=None, broker_order_id="B1", status="cancelled",
+        )))
+        s.commit()
+    worker = _worker(engine)
+    assert worker.process_batch_once() == 1
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "cancelled"
+
+
 def test_callback_before_order_context_then_retry_resolves_ownership(session, engine):
     """round3 BLOCKER#2 情境：fill 先於 order context 建立就到（callback-before-ack）。
     先 stage raw-inbox（此時還沒有任何 Order），worker drain 一次 → 無法解析委託關聯 → quarantine。

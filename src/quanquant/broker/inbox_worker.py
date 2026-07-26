@@ -31,7 +31,7 @@ from quanquant.broker import repository as brepo
 from quanquant.broker.position_tracker import PositionMismatchError, PositionTracker
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill
-from quanquant.db.models import RawInbox
+from quanquant.db.models import Order, RawInbox
 
 log = logging.getLogger(__name__)
 
@@ -205,17 +205,7 @@ class RawInboxWorker:
 
     def _process_order_report(self, session: Session, row: RawInbox, payload: dict) -> None:
         report = self._order_report_mapper(payload)
-
-        order = None
-        if report.ordno:
-            order = brepo.find_order_by_ordno(
-                session, broker=report.broker, account=report.account, mode=report.mode, ordno=report.ordno
-            )
-        if order is None and report.broker_order_id:
-            order = brepo.find_order_by_broker_id(
-                session, broker=report.broker, account=report.account, mode=report.mode,
-                broker_order_id=report.broker_order_id,
-            )
+        order = self._resolve_order_report_order(session, report)
         if order is None:
             raise ValueError(
                 f"委託回報無法解析關聯（ordno={report.ordno!r}, broker_order_id={report.broker_order_id!r}）"
@@ -223,3 +213,33 @@ class RawInboxWorker:
         brepo.mark_order_status(session, order, status=report.status)
         brepo.mark_raw_inbox_processed(session, row)
         session.commit()
+
+    @staticmethod
+    def _resolve_order_report_order(session: Session, report: OrderReport) -> Order | None:
+        """比照 PositionTracker._resolve_order（round3 #3-new）的雙鍵交叉驗證範式：deal_report
+        路徑早已對 ordno/broker_order_id 各自 scoped 查詢、矛盾即 fail closed，
+        order_report 路徑先前只有 ordno 命中即用、broker_order_id 純 fallback，完全沒驗
+        第二鍵是否指向同一張 Order（獨立驗收殘留2）。這裡補上同款交叉驗證：兩把鍵各自
+        scoped 查詢，若都有命中但指向不同 Order，矛盾一律 raise（呼叫端 quarantine，不任選
+        其一）；只有其中一把鍵、或兩者查詢結果一致時正常處理，不退化既有單鍵 fallback 行為。"""
+        by_ordno = (
+            brepo.find_order_by_ordno(
+                session, broker=report.broker, account=report.account, mode=report.mode, ordno=report.ordno
+            )
+            if report.ordno
+            else None
+        )
+        by_broker_id = (
+            brepo.find_order_by_broker_id(
+                session, broker=report.broker, account=report.account, mode=report.mode,
+                broker_order_id=report.broker_order_id,
+            )
+            if report.broker_order_id
+            else None
+        )
+        if by_ordno is not None and by_broker_id is not None and by_ordno.id != by_broker_id.id:
+            raise ValueError(
+                f"order_report 的 ordno={report.ordno!r} 與 broker_order_id={report.broker_order_id!r} "
+                f"分別指向不同 Order（id={by_ordno.id} vs id={by_broker_id.id}），矛盾，fail closed 進 quarantine"
+            )
+        return by_ordno or by_broker_id
