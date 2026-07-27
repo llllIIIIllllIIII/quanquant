@@ -38,12 +38,23 @@ class _FakeTrade:
 
 
 class _FakeApi:
-    """假 shioaji client：不連真網路，place_order/cancel_order/update_order 皆同步回傳。"""
+    """假 shioaji client：不連真網路，place_order/cancel_order/update_order 皆同步回傳。
+
+    bug 2/3 修正後比照真實 SDK 契約（`.venv/.../shioaji/_core.pyi`）：`cancel_order(trade)`／
+    `update_order(trade, price=, qty=)` 一律收 `Trade` 物件——本 fake 收到非 Trade-like
+    （沒有 `.order` 屬性，例如呼叫端誤傳 ordno 字串）就 raise `TypeError`，模擬真實 SDK 對
+    型別的要求（先前直接塞字串在真實 SDK 會炸
+    `argument 'trade': 'str' object is not an instance of 'Trade'`）。`place_order` 送出後
+    把回傳的 Trade 記進 `_live_trades`（以 `order.id` 為 key，比照真實 SDK `list_trades()`
+    語意——已送出的委託會出現在列表中），`ShioajiAdapter._find_trade_by_ordno` 呼叫
+    `update_status()` + `list_trades()` 才找得到對應 Trade 物件。"""
 
     def __init__(self):
         self.placed = []
         self.futopt_account = type("Acc", (), {"account_id": "F1"})()
         self._seq = 0
+        self._live_trades: dict = {}
+        self.update_status_calls = 0
 
     def Order(self, **kw):
         return kw
@@ -51,13 +62,30 @@ class _FakeApi:
     def place_order(self, contract, order):
         self._seq += 1
         self.placed.append((contract, order))
-        return _FakeTrade(f"ORD{self._seq}", f"SEQ{self._seq}")
+        trade = _FakeTrade(f"ORD{self._seq}", f"SEQ{self._seq}")
+        self._live_trades[trade.order.id] = trade
+        return trade
 
-    def cancel_order(self, ordno):
-        return _FakeTrade(ordno, f"SEQ-{ordno}")
+    def update_status(self, account=None, **kw):
+        self.update_status_calls += 1
 
-    def update_order(self, ordno, **kw):
-        return _FakeTrade(ordno, f"SEQ-{ordno}")
+    def list_trades(self):
+        return list(self._live_trades.values())
+
+    @staticmethod
+    def _assert_trade(trade) -> None:
+        if not hasattr(trade, "order"):
+            raise TypeError(
+                f"argument 'trade': {type(trade).__name__!r} object is not an instance of 'Trade'"
+            )
+
+    def cancel_order(self, trade):
+        self._assert_trade(trade)
+        return trade
+
+    def update_order(self, trade, **kw):
+        self._assert_trade(trade)
+        return trade
 
     def logout(self):
         pass
@@ -217,13 +245,102 @@ def test_update_mkt_order_forces_zero_price_to_native_api(engine):
     calls = []
     orig_update_order = adapter._api.update_order
 
-    def spy_update_order(ordno, **kw):
+    def spy_update_order(trade, **kw):
         calls.append(kw)
-        return orig_update_order(ordno, **kw)
+        return orig_update_order(trade, **kw)
 
     adapter._api.update_order = spy_update_order
     asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
     assert calls[0]["price"] == 0.0
+
+
+# ---- bug 2/3：cancel/update 依 _core.pyi 真實簽章傳 Trade 物件，不是 ordno 字串 ----
+
+def test_cancel_passes_trade_object_not_ordno_string_to_native_cancel_order(engine):
+    """bug 3 回歸：真實 Shioaji `cancel_order(trade: Trade, ...)` 收 Trade 物件——先前
+    `_cancel_blocking` 直接塞 ordno 字串，在真實 SDK 會炸
+    `argument 'trade': 'str' object is not an instance of 'Trade'`（`_FakeApi.cancel_order`
+    現在會對非 Trade-like 輸入 raise TypeError，模擬這個真實行為，見 `_FakeApi` 說明）。"""
+    adapter = _adapter(engine)
+    ack = asyncio.run(adapter.place(_req(), actor_user_id=1))
+
+    received = []
+    orig_cancel_order = adapter._api.cancel_order
+
+    def spy_cancel_order(trade):
+        received.append(trade)
+        return orig_cancel_order(trade)
+
+    adapter._api.cancel_order = spy_cancel_order
+    ack2 = asyncio.run(adapter.cancel(ack.broker_order_id, actor_user_id=1))
+    assert ack2.status == "cancelled"
+    assert len(received) == 1
+    assert hasattr(received[0], "order")  # Trade-like，不是裸 ordno 字串
+    assert received[0].order.id == ack.ordno
+
+
+def test_update_passes_trade_object_not_ordno_string_to_native_update_order(engine):
+    """bug 2/3 回歸：真實 Shioaji `update_order(trade: Trade, price=, qty=, ...)` 收 Trade
+    物件，同 cancel 一樣不能是 ordno 字串。"""
+    adapter = _adapter(engine)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+
+    received = []
+    orig_update_order = adapter._api.update_order
+
+    def spy_update_order(trade, **kw):
+        received.append(trade)
+        return orig_update_order(trade, **kw)
+
+    adapter._api.update_order = spy_update_order
+    ack2 = asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    assert ack2.status == "submitted"
+    assert len(received) == 1
+    assert hasattr(received[0], "order")  # Trade-like，不是裸 ordno 字串
+    assert received[0].order.id == ack.ordno
+
+
+def test_cancel_refreshes_status_before_listing_trades(engine):
+    """cancel 前應先 update_status() 刷新，再 list_trades() 取回目前狀態（見
+    `_refresh_and_list_trades`），比對得到才把 Trade 物件傳給 native cancel_order。"""
+    adapter = _adapter(engine)
+    ack = asyncio.run(adapter.place(_req(), actor_user_id=1))
+    asyncio.run(adapter.cancel(ack.broker_order_id, actor_user_id=1))
+    assert adapter._api.update_status_calls == 1
+
+
+def test_cancel_raises_clear_error_when_no_matching_trade_found_not_blind_string(engine):
+    """找不到對應 Trade（例如已成交/已刪/跨日，list_trades() 目前清單已經沒有這筆委託）
+    ——明確 raise OrderError，不得盲目把 ordno 字串塞給 native cancel_order。委託本身狀態
+    不變（沒有被誤標 cancelled）。"""
+    adapter = _adapter(engine)
+    ack = asyncio.run(adapter.place(_req(), actor_user_id=1))
+    adapter._api.list_trades = lambda: []  # 模擬券商端已無這筆委託
+
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.cancel(ack.broker_order_id, actor_user_id=1))
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "submitted"  # 沒有被誤標 cancelled
+
+
+def test_update_raises_clear_error_and_releases_delta_quota_when_no_matching_trade_found(engine):
+    """找不到對應 Trade——update() 明確 raise，且委託狀態不誤標 unknown（根本沒有送出任何
+    native 呼叫，不是「結果不明」的 unknown fail-safe 範疇，見 `_TradeNotFoundError`
+    docstring）；這次改單嘗試「若有」保留的 delta 配額確定沒被使用，應立即釋放。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+    adapter._api.list_trades = lambda: []  # 模擬券商端已無這筆委託
+
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "submitted"  # 不誤標 unknown
+        rows = list(s.exec(select(QuotaReservation)))
+        update_row = next(r for r in rows if r.reservation_id != "C1")
+        assert update_row.state == "released"  # 確定沒生效，delta 配額立即釋放
 
 
 def test_order_request_has_no_mode_field_structural_rejection():
@@ -557,7 +674,7 @@ def test_update_marks_order_unknown_without_touching_reservation_when_send_outco
     adapter = _adapter(engine, risk_guard=guard)
     ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
 
-    def _boom(ordno, **kw):
+    def _boom(trade, **kw):
         raise RuntimeError("網路逾時")
 
     adapter._api.update_order = _boom
@@ -598,7 +715,7 @@ def test_update_releases_delta_quota_reservation_on_broker_explicit_rejection(en
     adapter = _adapter(engine, risk_guard=guard)
     ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
 
-    def _boom(ordno, **kw):
+    def _boom(trade, **kw):
         raise Exception("update_order: ... code: 406, detail: Please sign ... first.")
 
     adapter._api.update_order = _boom
@@ -620,7 +737,7 @@ def test_watchdog_reconcile_releases_update_reservation_when_broker_shows_update
     adapter = _adapter(engine, risk_guard=guard)
     ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
 
-    def _boom(ordno, **kw):
+    def _boom(trade, **kw):
         raise RuntimeError("網路逾時")
 
     adapter._api.update_order = _boom

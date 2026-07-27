@@ -91,6 +91,16 @@ def _classify_place_failure(exc: Exception) -> str:
     return "failed" if 400 <= code <= 499 else "unknown"
 
 
+class _TradeNotFoundError(OrderError):
+    """cancel/update 前刷新 + `list_trades()` 比對不到對應 `Trade`（bug 2/3 收尾）。
+
+    與其餘「送出失敗」的例外刻意分開一個型別：這種情況根本**沒有**送出任何 native
+    cancel_order/update_order 呼叫（找不到要傳的 Trade 物件，連送都送不出去），不屬於
+    `_classify_place_failure` 設計要處理的「結果不明」unknown fail-safe 範疇——`update()`
+    的例外分支需要能特判這個型別，避免被泛用的 `except Exception` 誤標委託 unknown（那
+    是給「native 呼叫本身失敗/逾時」用的語意，這裡連呼叫都沒發生）。"""
+
+
 class _RiskGuardLike(Protocol):
     """Task 7 RiskGuard 的結構型別（避免對 Task 7 模組的 import-time 相依）。"""
 
@@ -502,8 +512,46 @@ class ShioajiAdapter:
             session.commit()
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="cancelled")
 
+    def _refresh_and_list_trades(self) -> list:
+        """cancel/update 前的委託狀態刷新（bug 2/3）：依 `_core.pyi` 真實簽章，
+        `update_status(account=...)` 是純 side-effect 呼叫（回傳 `None`，不是 list——刷新
+        SDK 內部快取），刷新完才呼叫 `list_trades()` 取回目前的 `Trade` 物件清單。
+        `update_status`/`list_trades` 皆防禦性 `getattr`（比照本檔一貫慣例）：假
+        client／舊版 SDK 沒有這個方法時直接跳過，不影響後續清單（測試用的假 client 資料
+        本來就是即時的，不需要真的刷新）。"""
+        update_status = getattr(self._api, "update_status", None)
+        if callable(update_status):
+            update_status(getattr(self._api, "futopt_account", None))
+        list_trades = getattr(self._api, "list_trades", None)
+        return list_trades() if callable(list_trades) else []
+
+    def _find_trade_by_ordno(self, ordno: str | None):
+        """cancel/update 前先刷新 + `list_trades()` 比對回真正的 `Trade` 物件（bug 2/3
+        根因收尾）：`cancel_order`/`update_order` 依 `_core.pyi` 真實簽章要收 `Trade`
+        物件（`def cancel_order(self, trade: Trade, ...)`／
+        `def update_order(self, trade: Trade, price=..., qty=..., ...)`），不是委託單號
+        字串——先前直接塞 `ordno` 字串進去，在真實 SDK 會炸
+        `argument 'trade': 'str' object is not an instance of 'Trade'`。
+
+        比對鍵沿用 `_ack_fields_from_trade`/`_reconcile_blocking` 既有慣例：我方存的
+        `ordno` ← Shioaji `OrderResult.id`（同一組欄位，兩處對得起來才能正確關聯）。找不到
+        （已成交/已刪/跨日等，`list_trades()` 目前清單裡已經沒有這筆委託）回 `None`，
+        呼叫端（`_cancel_blocking`/`_update_blocking`）視為無法判斷、拒絕盲目操作，不得
+        猜測著把字串硬塞給 native API。"""
+        for trade in self._refresh_and_list_trades():
+            order = getattr(trade, "order", None)
+            if order is not None and getattr(order, "id", None) == ordno:
+                return trade
+        return None
+
     def _cancel_blocking(self, ordno: str) -> None:
-        self._api.cancel_order(ordno)
+        trade = self._find_trade_by_ordno(ordno)
+        if trade is None:
+            raise OrderError(
+                f"找不到券商對應委託（ordno={ordno!r}），可能已成交/已刪除/跨日，"
+                "拒絕在無法確認對應委託的情況下送出取消"
+            )
+        self._api.cancel_order(trade)
 
     # ---- update ----
 
@@ -563,6 +611,16 @@ class ShioajiAdapter:
                     brepo.release_quota(fail_session, reservation_id=reservation_id)
                     fail_session.commit()
             raise
+        except _TradeNotFoundError:
+            # bug 2/3 收尾：根本沒有送出任何 native update_order 呼叫（連對應 Trade 都找
+            # 不到——已成交/已刪/跨日等），不屬於下面 except Exception 分支「結果不明」的
+            # unknown fail-safe 範疇，不誤標委託狀態（委託本身狀態不變，同 RiskError 分支
+            # 既有原則）；這次改單嘗試「若有」保留的 delta 配額確定沒被使用，一律釋放。
+            if reservation_id is not None:
+                with self._session_factory() as fail_session:
+                    brepo.release_quota(fail_session, reservation_id=reservation_id)
+                    fail_session.commit()
+            raise
         except Exception as exc:
             # 本次精進：同 place 分支，先分類是否為「券商明確拒絕」。是的話這次改單
             # 嘗試確定沒生效——比照上面 RiskError 分支，立即釋放「若有」保留的 delta
@@ -599,9 +657,17 @@ class ShioajiAdapter:
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="submitted")
 
     def _update_blocking(self, ordno: str, price, qty: int, price_type: str | None = None) -> None:
+        # bug 2/3：先刷新 + list_trades() 比對回真正的 Trade 物件——update_order 依
+        # _core.pyi 真實簽章要收 Trade（見 _find_trade_by_ordno 說明），不是 ordno 字串。
+        trade = self._find_trade_by_ordno(ordno)
+        if trade is None:
+            raise _TradeNotFoundError(
+                f"找不到券商對應委託（ordno={ordno!r}），可能已成交/已刪除/跨日，"
+                "拒絕在無法確認對應委託的情況下送出改單"
+            )
         # 防禦（bug 2），同 _place_blocking：MKT 顯式送 0.0，不信任呼叫端算出的 price 當下的值。
         sendable_price = 0.0 if price_type == "MKT" else float(price)
-        self._api.update_order(ordno, price=sendable_price, qty=qty)
+        self._api.update_order(trade, price=sendable_price, qty=qty)
 
     # ---- positions（純讀 DB，不呼叫 native API——BrokerPosition 是唯一真相來源；
     #      仍經 supervisor.run 走同一通道，避免與 connect/reconnect 交錯讀到半新半舊狀態） ----
