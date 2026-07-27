@@ -443,8 +443,11 @@ class ShioajiAdapter:
         )
 
     def _place_blocking(self, req: OrderRequest) -> dict:
+        # 防禦（bug 2）：MKT 不需要價格，顯式送 0.0，不信任 req.price 當下的值（型別層只保證
+        # MKT 時 price>=0，不強制一定是 0）——語意清楚，也避免任何上游殘留非零值誤送給券商。
+        sendable_price = 0.0 if req.price_type == "MKT" else float(req.price)
         native_order = self._api.Order(
-            action=req.action, price=float(req.price), quantity=req.qty,
+            action=req.action, price=sendable_price, quantity=req.qty,
             price_type=req.price_type, order_type=req.order_type, octype=req.octype,
             account=self._api.futopt_account,
         )
@@ -535,6 +538,7 @@ class ShioajiAdapter:
             elif order.user_id != actor_user_id:
                 raise AuthorizationError("非委託所有人不得改單")
             order_id, ordno, client_order_id = order.id, order.ordno, order.client_order_id
+            price_type = order.price_type  # 改單不能改變 price_type，送出前判斷 MKT 用既有值
 
         # round3 #4/#11 收尾：這次改單「若有」保留的 delta 配額（RiskGuard.check_update 只在
         # new_qty 較原本增加時才會建立這列，見 repository.reservation_id_for_update），送出
@@ -546,7 +550,7 @@ class ShioajiAdapter:
 
         async def _do_update() -> None:
             await self._send_gate()
-            await asyncio.to_thread(self._update_blocking, ordno, new_price, new_qty)
+            await asyncio.to_thread(self._update_blocking, ordno, new_price, new_qty, price_type)
 
         try:
             await self._supervisor.run(_do_update)
@@ -594,8 +598,10 @@ class ShioajiAdapter:
             session.commit()
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="submitted")
 
-    def _update_blocking(self, ordno: str, price, qty: int) -> None:
-        self._api.update_order(ordno, price=float(price), qty=qty)
+    def _update_blocking(self, ordno: str, price, qty: int, price_type: str | None = None) -> None:
+        # 防禦（bug 2），同 _place_blocking：MKT 顯式送 0.0，不信任呼叫端算出的 price 當下的值。
+        sendable_price = 0.0 if price_type == "MKT" else float(price)
+        self._api.update_order(ordno, price=sendable_price, qty=qty)
 
     # ---- positions（純讀 DB，不呼叫 native API——BrokerPosition 是唯一真相來源；
     #      仍經 supervisor.run 走同一通道，避免與 connect/reconnect 交錯讀到半新半舊狀態） ----

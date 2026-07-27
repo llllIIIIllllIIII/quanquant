@@ -186,6 +186,46 @@ def test_place_persists_pending_correlation_before_native_call(engine):
     assert pending.ordno is None and pending.broker_order_id is None  # 佔位，ack 後才補上
 
 
+# ---- bug 2：市價單（MKT）不再因 price 而報 decimal.ConversionSyntax / 被 price>0 擋 ----
+
+def test_place_mkt_order_succeeds_and_forces_zero_price_to_native_api(engine):
+    """MKT 委託（price=0, order_type=IOC）走完整 place 流程（表單→OrderRequest→adapter）
+    應成功送出，且 native Order 收到的 price 一律是 0.0（防禦，見 _place_blocking）。"""
+    adapter = _adapter(engine)
+    req = _req(price_type="MKT", order_type="IOC", price=Decimal("0"))
+    ack = asyncio.run(adapter.place(req, actor_user_id=1))
+    assert ack.status == "submitted"
+    _contract, native_order = adapter._api.placed[0]
+    assert native_order["price"] == 0.0
+
+
+def test_place_mkt_order_forces_zero_price_even_if_req_price_nonzero(engine):
+    """型別層只保證 MKT 時 price>=0，不強制一定是 0——_place_blocking 仍必須顯式送 0.0，
+    不信任 req.price 當下殘留的值（本次精進的防禦線，見模組頂部說明）。"""
+    adapter = _adapter(engine)
+    req = _req(price_type="MKT", order_type="IOC", price=Decimal("100"))
+    asyncio.run(adapter.place(req, actor_user_id=1))
+    _contract, native_order = adapter._api.placed[0]
+    assert native_order["price"] == 0.0
+
+
+def test_update_mkt_order_forces_zero_price_to_native_api(engine):
+    adapter = _adapter(engine)
+    req = _req(price_type="MKT", order_type="IOC", price=Decimal("0"), qty=2)
+    ack = asyncio.run(adapter.place(req, actor_user_id=1))
+
+    calls = []
+    orig_update_order = adapter._api.update_order
+
+    def spy_update_order(ordno, **kw):
+        calls.append(kw)
+        return orig_update_order(ordno, **kw)
+
+    adapter._api.update_order = spy_update_order
+    asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    assert calls[0]["price"] == 0.0
+
+
 def test_order_request_has_no_mode_field_structural_rejection():
     """mode 僅 server-side：OrderRequest 結構上就沒有 mode 欄位，外部混入一律在
     建構當下被 dataclass 拒絕（TypeError），adapter 一律用 self.mode 蓋入。"""

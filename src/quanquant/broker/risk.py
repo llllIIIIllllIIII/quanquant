@@ -180,8 +180,14 @@ class RiskGuard:
                 raise AuthorizationError("非委託所有人不得改單")
             if new_qty <= 0:
                 raise RiskError(f"qty 必須 > 0，收到 {new_qty}")
-            if new_price is not None and new_price <= 0:
-                raise RiskError(f"price 必須 > 0，收到 {new_price}")
+            # price>0 檢查改成 price_type 感知（bug 2）：order.price_type 才是「這張委託」的
+            # 價格類型（改單不能改變 price_type），MKT 不需要價格、允許 0，只有 LMT 才要求
+            # price > 0；兩者皆不可為負。
+            if new_price is not None:
+                if order.price_type == "LMT" and new_price <= 0:
+                    raise RiskError(f"price 必須 > 0，收到 {new_price}")
+                if order.price_type != "LMT" and new_price < 0:
+                    raise RiskError(f"price 不可為負，收到 {new_price}")
             if self.kill_switch:
                 raise RiskError("kill switch 已啟動")
             if order.symbol not in self._symbol_whitelist:

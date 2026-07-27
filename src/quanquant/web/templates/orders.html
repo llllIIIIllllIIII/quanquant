@@ -12,7 +12,7 @@
 
   <div class="form-error-slot"></div>
 
-  <form hx-post="/orders" hx-swap="none">
+  <form hx-post="/orders" hx-swap="none" x-data="{ priceType: 'LMT', orderType: 'ROD' }">
     <input type="hidden" name="client_order_id" value="{{ client_order_id }}">
     <div class="grid">
       <label>商品
@@ -27,13 +27,23 @@
     </div>
     <div class="grid">
       <label>價格
-        <input name="price" type="text" placeholder="18000">
+        <!-- bug 2：MKT（市價單）不需要價格——停用時瀏覽器不會送出這個欄位，後端
+             _parse_order_price 對 MKT/空值一律視為 0（見 web/routers/orders.py）。 -->
+        <input name="price" type="text" placeholder="18000" x-bind:disabled="priceType === 'MKT'">
       </label>
       <label>價格類型
-        <select name="price_type"><option value="LMT">限價</option><option value="MKT">市價</option></select>
+        <select name="price_type" x-model="priceType"
+                x-on:change="if (priceType === 'MKT' && orderType === 'ROD') orderType = 'IOC'">
+          <option value="LMT">限價</option><option value="MKT">市價</option>
+        </select>
       </label>
       <label>委託類型
-        <select name="order_type"><option value="ROD">ROD</option><option value="IOC">IOC</option><option value="FOK">FOK</option></select>
+        <!-- TAIFEX 市價單不接受 ROD——MKT 時只能選 IOC/FOK，LMT 才可以 ROD。 -->
+        <select name="order_type" x-model="orderType">
+          <option value="ROD" x-bind:disabled="priceType === 'MKT'">ROD</option>
+          <option value="IOC">IOC</option>
+          <option value="FOK">FOK</option>
+        </select>
       </label>
       <label>倉別
         <select name="octype"><option value="New">新倉</option><option value="Cover">平倉</option><option value="Auto">自動</option></select>

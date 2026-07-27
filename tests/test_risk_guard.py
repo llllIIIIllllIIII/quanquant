@@ -302,6 +302,30 @@ def test_check_update_nonpositive_qty_or_price_rejected(session):
         guard.check_update(session, order_b, actor_user_id=1, new_qty=1, new_price=Decimal("0"), request_hash="n/a")
 
 
+def test_check_update_allows_zero_price_for_mkt_order(session):
+    """bug 2：check_update 的 new_price<=0 檢查只對 LMT 生效——MKT 委託改單時 price=0
+    不應被擋（order.price_type 才是這張委託真正的價格類型，改單不能改變它）。"""
+    guard = _guard(session_factory=lambda: session)
+    req = _req(price=Decimal("0"), price_type="MKT", order_type="IOC", client_order_id="C-MKT")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    guard.check_update(session, order, actor_user_id=1, new_qty=2, new_price=Decimal("0"),
+                       request_hash="n/a")  # 不應 raise
+    # check_update 本身不寫 order.qty（那是 ShioajiAdapter.update 送出成功後才做的事）；
+    # 這裡確認流程真的跑完到底（delta 配額有正確保留），而不是半途被別的檢查擋下。
+    assert brepo.quota_used_today(session, user_id=1, mode="sim", trading_day=order.trading_day) == 2
+
+
+def test_check_update_rejects_negative_price_even_for_mkt_order(session):
+    guard = _guard(session_factory=lambda: session)
+    req = _req(price=Decimal("0"), price_type="MKT", order_type="IOC", client_order_id="C-MKT2")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    with pytest.raises(RiskError):
+        guard.check_update(session, order, actor_user_id=1, new_qty=2, new_price=Decimal("-1"),
+                           request_hash="n/a")
+
+
 def test_check_update_rejects_non_owner_of_order_even_if_in_owner_allowlist(session):
     """round3 #6：owner allowlist 過了不代表這張委託是這個 owner 的——多 owner 情境下仍要
     以委託實際 user_id 驗真正所有權，不能只驗「是不是某個 owner」。"""

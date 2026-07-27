@@ -69,14 +69,27 @@ def _orders_trigger(*, close_modal: bool = False) -> HTMLResponse:
     return HTMLResponse("", headers={"HX-Trigger": events})
 
 
+def _parse_order_price(raw: str | None, *, price_type: str | None) -> Decimal:
+    """bug 2：MKT（市價單）不需要價格——`Decimal(form.get("price"))` 對 MKT 沒有特判，
+    空字串/缺欄位（MKT 的 price 欄位停用時瀏覽器不會送出這個欄位）一律 `decimal.
+    ConversionSyntax`/`TypeError`。MKT 或空值一律視為 0；OrderRequest.__post_init__ 已改成
+    price_type 感知（只有 LMT 才要求 price>0），這裡不需要重複判斷、也不吞掉 LMT 真正的
+    格式錯誤（非空但不合法的字串仍讓 Decimal() 自然拋錯，由呼叫端既有的 except 顯示錯誤）。"""
+    stripped = (raw or "").strip()
+    if price_type == "MKT" or not stripped:
+        return Decimal("0")
+    return Decimal(stripped)
+
+
 def _order_request_from_form(form, *, user_id: int) -> OrderRequest:
     """round3 #7：client_order_id 只在表單完全沒帶這個欄位時才 fallback 生新的
     （正常流程一律沿用 orders_page 首次渲染時寫進 hidden input 的那個值）。"""
     client_order_id = (form.get("client_order_id") or "").strip() or str(uuid.uuid4())
+    price_type = form.get("price_type")
     return OrderRequest(
         client_order_id=client_order_id,
         symbol=form.get("symbol"), action=form.get("action"), qty=int(form.get("qty")),
-        price=Decimal(form.get("price")), price_type=form.get("price_type"),
+        price=_parse_order_price(form.get("price"), price_type=price_type), price_type=price_type,
         order_type=form.get("order_type"), octype=form.get("octype"), user_id=user_id,
     )
 
@@ -275,8 +288,14 @@ async def update_order(
         raise HTTPException(status_code=404, detail="order subsystem disabled")
     form = await request.form()
     try:
-        price = Decimal(form["price"]) if form.get("price") else None
-        qty = int(form["qty"]) if form.get("qty") else None
+        # 同步 _parse_order_price 的空白安全處理（bug 2）：留白＝沿用既有值（None，見下方
+        # service.update 的合併規則），不強制歸零——price_type 不可經改單變更，MKT 委託的
+        # 既有 price 本來就已經是 0（下單當下由 _parse_order_price 定的），這裡留白直接沿用
+        # 既有值即可，不需要重新判斷 price_type。
+        raw_price = (form.get("price") or "").strip()
+        raw_qty = (form.get("qty") or "").strip()
+        price = Decimal(raw_price) if raw_price else None
+        qty = int(raw_qty) if raw_qty else None
     except (ValueError, InvalidOperation) as exc:
         return _edit_form_error(session, service, broker_order_id, str(exc))
 

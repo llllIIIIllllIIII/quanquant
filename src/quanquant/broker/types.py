@@ -60,14 +60,22 @@ class OrderRequest:
     def __post_init__(self) -> None:
         if self.qty <= 0:
             raise ValueError(f"qty 必須 > 0，收到 {self.qty}")
-        if self.price <= 0:
-            raise ValueError(f"price 必須 > 0，收到 {self.price}")
         if self.action not in _ACTIONS:
             raise ValueError(f"非法 action: {self.action!r}")
         if self.price_type not in _PRICE_TYPES:
             raise ValueError(f"非法 price_type: {self.price_type!r}")
+        # price 驗證改成 price_type 感知（bug 2）：MKT（市價單）不需要價格，TAIFEX 送出時
+        # 一律以 0 表示，只有 LMT（限價單）才需要 price > 0；兩者皆不可為負。
+        if self.price_type == "LMT":
+            if self.price <= 0:
+                raise ValueError(f"price 必須 > 0，收到 {self.price}")
+        elif self.price < 0:
+            raise ValueError(f"price 不可為負，收到 {self.price}")
         if self.order_type not in _ORDER_TYPES:
             raise ValueError(f"非法 order_type: {self.order_type!r}")
+        # TAIFEX 市價單（MKT）不接受 ROD——只能搭配 IOC 或 FOK；LMT 才可以用 ROD。
+        if self.price_type == "MKT" and self.order_type == "ROD":
+            raise ValueError("市價單（MKT）不接受 ROD，僅能搭配 IOC 或 FOK")
         if self.octype not in _OCTYPES:
             raise ValueError(f"非法 octype: {self.octype!r}")
 

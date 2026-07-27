@@ -152,6 +152,53 @@ def test_place_order_real_two_step_confirm_round_trip(order_client, fake_service
     assert len(fake_service.placed) == 1  # 帶 token 那次真的送出去了
 
 
+# ---- bug 2：市價單（MKT）不再因 price 而報 decimal.ConversionSyntax ----
+
+def test_place_order_mkt_with_empty_price_succeeds_defaults_to_zero(order_client, fake_service, user):
+    """MKT（市價單）price 欄位留白（Alpine 停用時瀏覽器也不會送出這個欄位）不應報
+    decimal.ConversionSyntax，應直接視為 price=0 成功送出。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-MKT", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "MKT", "order_type": "IOC", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 1
+    assert fake_service.placed[0].price == Decimal("0")
+
+
+def test_place_order_mkt_without_price_field_at_all_succeeds(order_client, fake_service, user):
+    """price 欄位整個缺席（HTML disabled input 不會被送出）也要一樣成功，不是只處理空字串。"""
+    form = {
+        "client_order_id": "C-MKT2", "symbol": "TXF", "action": "Buy", "qty": "1",
+        "price_type": "MKT", "order_type": "IOC", "octype": "New",
+    }
+    resp = order_client.post("/orders", data=form)
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 1
+    assert fake_service.placed[0].price == Decimal("0")
+
+
+def test_place_order_lmt_with_empty_price_shows_form_error_not_500(order_client, fake_service, user):
+    """LMT（限價單）留白仍要求價格——不強制歸零，只是不再拋出未經處理的 ConversionSyntax
+    原始例外訊息，而是走既有的表單錯誤流程（200 + 錯誤訊息，不是 500）。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-LMT-EMPTY", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 0
+
+
+def test_place_order_mkt_with_rod_rejected(order_client, fake_service, user):
+    """TAIFEX 市價單不接受 ROD，只能搭配 IOC/FOK。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-MKTROD", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "MKT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 0
+
+
 def test_place_order_without_service_shows_disabled_message(engine, user):
     def _session_override():
         with Session(engine) as s:
@@ -332,6 +379,25 @@ def test_real_place_two_step_confirm_round_trip_creates_order(engine, user):
 
     broker_order_id = _place_real_order(client, engine)
     assert broker_order_id  # 真的送出去了（adapter._api.place_order 有回 ordno/seqno）
+
+
+def test_real_place_mkt_order_with_empty_price_succeeds_through_full_pipeline(engine, user):
+    """bug 2 端到端驗收：表單→OrderRequest→RiskGuard→adapter 全走真實元件（sim 模式跳過
+    兩階段確認），MKT + 空/0 價格 + IOC 不再報 decimal.ConversionSyntax，也不被
+    price>0 檢查擋下。"""
+    guard = _real_guard(engine, owner_user_ids=frozenset({user.id}))
+    adapter = _real_adapter(engine, guard, mode="sim")
+    client = _real_client(engine, user, adapter, guard)
+
+    resp = client.post("/orders", data={
+        "client_order_id": "C-MKT-REAL", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "MKT", "order_type": "IOC", "octype": "New",
+    })
+    assert resp.status_code == 200
+    with Session(engine) as s:
+        order = brepo.find_order_by_client_order_id(s, "C-MKT-REAL")
+        assert order is not None and order.status == "submitted"
+        assert order.price == Decimal("0")
 
 
 def test_real_update_round_trip_price_only_does_not_deadlock(engine, user):
