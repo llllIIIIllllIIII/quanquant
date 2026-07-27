@@ -640,29 +640,73 @@ class ShioajiAdapter:
 
     @staticmethod
     def _json_safe(msg) -> dict:
-        if isinstance(msg, dict):
-            return msg
-        if hasattr(msg, "to_dict"):
-            try:
-                return msg.to_dict()
-            except Exception:
-                pass
-        return {"raw": str(msg)}
+        """把 shioaji callback 的 `msg` 轉成保證 JSON 可序列化的巢狀 dict/list（供
+        `commit_raw_callback` 的 `json.dumps` 落地）。
+
+        依 `_core.pyi` 實測確認（bug 1(b) 根因之一）：真實 callback 的 `msg` 是
+        `OrderEventDict`——有 `keys()`/`__getitem__`/`items()` 等 Mapping 協定方法，但**不是**
+        `dict` 子類、也**沒有** `to_dict()`；先前只判斷 `isinstance(dict)`/`hasattr(to_dict)`，
+        兩者都不中，直接落到 `{"raw": str(msg)}`，整包結構全部遺失。改用 `dict(msg)`（dict
+        constructor 認得任何有 `.keys()`+`__getitem__` 的 mapping）。
+
+        `FuturesOrderEvent` 是巢狀結構（`operation`/`order`/`status`/`contract` 各自可能也是
+        同款 Mapping-only 物件，不是原生 dict）——只轉最外層不夠，`json.dumps` 遇到巢狀的
+        非原生型別一樣會炸；因此這裡遞迴轉換每一層，確保回傳值全部由原生
+        dict/list/str/int/float/bool/None 組成。
+        """
+
+        def _convert(value):
+            if isinstance(value, dict):
+                return {k: _convert(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_convert(v) for v in value]
+            if hasattr(value, "to_dict"):
+                try:
+                    return _convert(value.to_dict())
+                except Exception:
+                    pass
+            if hasattr(value, "keys") and hasattr(value, "__getitem__"):
+                try:
+                    return {k: _convert(value[k]) for k in value.keys()}
+                except Exception:
+                    pass
+            return value
+
+        converted = _convert(msg)
+        return converted if isinstance(converted, dict) else {"raw": str(msg)}
 
     # ---- Task 5 DealMapper / OrderReportMapper 實作（V3-4 嚴格驗證） ----
+    #
+    # 欄位名稱依 `.venv/.../shioaji/_core.pyi` 的 `FuturesDealEvent`/`FuturesOrderEvent`
+    # TypedDict 實測校正（bug 1(b)）——先前假設的 key（deal_id/octype/order_id）在真實 SDK
+    # 裡不存在，導致所有成交/委託回報 100% quarantine。真實結構：
+    #   FuturesDealEvent：trade_id, seqno, ordno, exchange_seq, broker_id, account_id, action,
+    #     code, full_code, price, quantity, subaccount, security_type, delivery_month,
+    #     strike_price, option_right, market_type, combo, ts（epoch 秒 float，非 epoch-ms）。
+    #     **沒有 octype 欄位**——正確值由 `RawInboxWorker._process_deal` 解析出對應 Order 後
+    #     用 `order.octype` 覆蓋（見該檔說明），這裡只給一個滿足 `Fill.__post_init__` 型別
+    #     驗證的占位值。
+    #   FuturesOrderEvent：巢狀 {operation, order, status, contract}；委託關聯鍵在 `order`
+    #     內——比照既有 `_ack_fields_from_trade` 的慣例（`order.id`→我方 Order.ordno、
+    #     `order.seqno`→我方 Order.broker_order_id），這裡對齊同一組 key 才對得起來；
+    #     實際的「這次是什麼操作」在 `operation.op_type`
+    #     （New/Cancel/UpdatePrice/UpdateQty/Reject），**不是**一個現成的 Filled/Cancelled
+    #     狀態字串——`status`（`EventOrderStatusDict`）只有 id/exchange_ts/modified_price/
+    #     cancel_quantity/order_quantity/web_id 這類診斷欄位，沒有語意狀態值。Filled/
+    #     PartFilled 狀態一律由成交回報（deal_report）驅動的 `PositionTracker.apply_fill`→
+    #     `brepo.apply_order_fill` 更新，不經這個 mapper。
 
     def _map_deal_report(self, payload: dict) -> Fill:
         try:
-            fill_id = payload["deal_id"]
+            fill_id = payload["trade_id"]
             if not fill_id:
-                raise ValueError("deal_id 為空")
+                raise ValueError("trade_id 為空")
             action = payload["action"]
-            octype = payload["octype"]
             qty = int(payload["quantity"])
             price = Decimal(str(payload["price"]))
-            ts = int(payload["ts"])
+            ts = int(round(float(payload["ts"]) * 1000))  # 真實 ts 是 epoch 秒(float)，Deal.ts 需 epoch-ms
             account = payload["account_id"]
-            ordno = payload.get("order_id")
+            ordno = payload.get("ordno")
             broker_order_id = payload.get("seqno") or ordno
             fee_raw = payload.get("fee")
             fee = Decimal(str(fee_raw)) if fee_raw not in (None, "") else None
@@ -679,24 +723,52 @@ class ShioajiAdapter:
 
         return Fill(
             broker=self.broker, fill_id=str(fill_id), ordno=ordno, broker_order_id=broker_order_id,
-            symbol=symbol, action=action, price=price, qty=qty, fee=fee, octype=octype, ts=ts,
-            account=account, mode=self.mode, user_id=None,
+            symbol=symbol, action=action, price=price, qty=qty, fee=fee,
+            # 成交回報無 octype——"Auto" 只是滿足型別驗證的占位值，真正生效前一律會被
+            # RawInboxWorker._process_deal 用解析到的 Order.octype 覆蓋；解不到對應 Order
+            # 時整筆在覆蓋之前就已經 raise ValueError quarantine，這個占位值不會被業務邏輯讀到。
+            octype="Auto",
+            ts=ts, account=account, mode=self.mode, user_id=None,
         )
 
-    _STATUS_MAP = {
+    # 即時串流 FuturesOrderEvent 的 operation.op_type → 我方 Order.status 詞彙。
+    _OP_TYPE_STATUS_MAP = {
+        "New": "submitted", "UpdatePrice": "submitted", "UpdateQty": "submitted",
+        "Cancel": "cancelled", "Reject": "failed",
+    }
+
+    # `_reconcile_blocking` 週期性補洞時自建的扁平 payload（來自 `list_trades()` 的
+    # `OrderStatusInfo.status`，是 REST 式彙總狀態、非即時 callback 結構）沿用的舊詞彙——
+    # 與即時 callback 共用同一個 kind="order_report" 佇列/同一個 mapper，兩種來源都要能解析。
+    _TRADE_STATUS_MAP = {
         "Cancelled": "cancelled", "Failed": "failed", "PartFilled": "partfilled",
         "Filled": "filled", "PendingSubmit": "sending", "Submitted": "submitted",
     }
 
     def _map_order_report(self, payload: dict) -> OrderReport:
-        status_raw = payload.get("status")
-        ordno = payload.get("order_id")
-        broker_order_id = payload.get("seqno") or ordno
+        if "operation" in payload or "order" in payload:
+            # 即時串流 callback（真實 FuturesOrderEvent 巢狀結構）。
+            order_detail = payload.get("order") or {}
+            operation = payload.get("operation") or {}
+            # 比照既有 `_ack_fields_from_trade` 慣例：order.id → 我方 Order.ordno、
+            # order.seqno → 我方 Order.broker_order_id（我方下單時就是這樣存的，見
+            # ShioajiAdapter._ack_fields_from_trade），這裡對齊同一組 key 才能正確關聯。
+            ordno = order_detail.get("id")
+            broker_order_id = order_detail.get("seqno") or ordno
+            op_type = operation.get("op_type")
+            status = self._OP_TYPE_STATUS_MAP.get(str(op_type))
+            if status is None:
+                raise ValueError(f"未知委託回報操作型態 operation.op_type: {op_type!r}")
+        else:
+            # reconcile 週期性補洞的扁平 payload（見 `_reconcile_blocking`）。
+            ordno = payload.get("order_id")
+            broker_order_id = payload.get("seqno") or ordno
+            status_raw = payload.get("status")
+            status = self._TRADE_STATUS_MAP.get(str(status_raw))
+            if status is None:
+                raise ValueError(f"未知委託狀態: {status_raw!r}")
         if not ordno and not broker_order_id:
-            raise ValueError("order_report 缺 order_id/seqno，無法關聯委託")
-        status = self._STATUS_MAP.get(str(status_raw))
-        if status is None:
-            raise ValueError(f"未知委託狀態: {status_raw!r}")
+            raise ValueError("order_report 缺委託關聯鍵（order.id/order.seqno 或 order_id/seqno），無法關聯委託")
         return OrderReport(
             broker=self.broker, account=self.account, mode=self.mode,
             ordno=ordno, broker_order_id=broker_order_id, status=status,

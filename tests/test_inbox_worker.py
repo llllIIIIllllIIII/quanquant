@@ -104,6 +104,40 @@ def test_unresolvable_order_correlation_quarantines_not_dropped(session, engine)
         assert row.quarantine is True and row.processed is False
 
 
+def test_deal_report_octype_comes_from_resolved_order_not_mapper_payload(session, engine):
+    """成交回報（真實 FuturesDealEvent）本身沒有 octype 欄位；_process_deal 必須用解析到的
+    對應 Order 的 octype 覆蓋 mapper 回傳的任何占位值，不是照單全收 mapper 給的值
+    （見 broker/shioaji_adapter.py::_map_deal_report 的 "Auto" 占位說明）。"""
+    _seed_order(session, octype="Cover", action="Sell")  # 對應委託是平倉
+
+    def _mapper_with_wrong_octype_placeholder(payload: dict) -> Fill:
+        return Fill(
+            broker=payload["broker"], fill_id=payload["fill_id"], ordno=payload["ordno"],
+            broker_order_id=payload["broker_order_id"], symbol=payload["symbol"],
+            action=payload["action"], price=Decimal(payload["price"]), qty=int(payload["qty"]),
+            fee=Decimal(payload["fee"]), octype="Auto", ts=payload["ts"],
+            account=payload["account"], mode=payload["mode"], user_id=None,
+        )
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
+                              payload=json.dumps(_deal_payload(action="Sell")))
+        s.commit()
+
+    worker = _worker(engine, deal_mapper=_mapper_with_wrong_octype_placeholder)
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        # 沒有預先開倉的部位：若 octype 真的被覆蓋成 Cover（對應 Order 的值），Cover 分支
+        # 會因為找不到開倉部位而 quarantine；若沒被覆蓋、停留在 mapper 給的占位 "Auto"，
+        # Auto 分支會直接成功開一個新的 short 部位（不 quarantine）——用這個反差證明覆蓋真的
+        # 發生。
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True and row.processed is False
+        assert s.exec(select(BrokerPosition)).first() is None
+
+
 def test_position_mismatch_quarantines_without_partial_deal_write(session, engine):
     """Cover 缺對應開倉部位 → PositionMismatchError → quarantine，且已 stage 的 Deal 也要 rollback 掉。"""
     _seed_order(session, octype="Cover", action="Sell")

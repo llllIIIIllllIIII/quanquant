@@ -283,27 +283,77 @@ def test_callback_only_calls_commit_raw_callback_and_persists_raw_inbox(engine, 
 
     monkeypatch.setattr(shioaji_adapter_module, "commit_raw_callback", spy)
 
-    adapter._on_order_cb("FuturesDeal", {"deal_id": "D1", "action": "Buy", "octype": "New",
-                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000_000,
-                                          "account_id": "F1", "order_id": "O1"})
+    # 真實 FuturesDealEvent 欄位名稱（見 _core.pyi）：trade_id/ordno，沒有 octype/order_id。
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
 
     assert len(calls) == 1
     kind, broker, payload = calls[0]
-    assert kind == "deal_report" and broker == "shioaji" and payload["deal_id"] == "D1"
+    assert kind == "deal_report" and broker == "shioaji" and payload["trade_id"] == "D1"
     with Session(engine) as s:
         row = s.exec(select(RawInbox)).first()
         assert row is not None and row.kind == "deal_report"
-        assert json.loads(row.payload)["deal_id"] == "D1"
+        assert json.loads(row.payload)["trade_id"] == "D1"
         # 只落地 RawInbox，不直接處理業務邏輯：沒有 Order/Deal/BrokerPosition 被動到
         assert s.exec(select(Order)).first() is None
 
 
 def test_callback_order_report_uses_order_report_kind(engine):
     adapter = _adapter(engine)
-    adapter._on_order_cb("FuturesOrder", {"order_id": "O1", "status": "Cancelled", "account_id": "F1"})
+    # 真實 FuturesOrderEvent 是巢狀結構（operation/order/status/contract，見 _core.pyi）。
+    adapter._on_order_cb("FuturesOrder", {
+        "operation": {"op_type": "Cancel", "op_code": "00", "op_msg": ""},
+        "order": {"id": "O1", "seqno": "B1"}, "status": {}, "contract": {},
+    })
     with Session(engine) as s:
         row = s.exec(select(RawInbox)).first()
         assert row is not None and row.kind == "order_report"
+
+
+class _FakeMapping:
+    """比照真實 shioaji `OrderEventDict` 的最小複製品：有 keys()/__getitem__/items() 等
+    Mapping 協定方法，但不是 dict 子類、也沒有 to_dict()（見 _json_safe 的 docstring 與
+    _core.pyi 的 `OrderEventDict` 類別定義）。"""
+
+    def __init__(self, data: dict):
+        self._data = data
+
+    def keys(self):
+        return list(self._data.keys())
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self):
+        return len(self._data)
+
+
+def test_json_safe_converts_non_dict_mapping_without_to_dict():
+    """bug 1(b) 根因之一：真實 callback msg 是 mapping（有 keys()/__getitem__）但不是 dict
+    子類、無 to_dict——先前落到 {"raw": str(msg)} 整包結構遺失，改用 dict(msg)。"""
+    msg = _FakeMapping({"trade_id": "D1", "action": "Buy"})
+    result = shioaji_adapter_module.ShioajiAdapter._json_safe(msg)
+    assert result == {"trade_id": "D1", "action": "Buy"}
+    assert isinstance(result, dict) and not isinstance(result, _FakeMapping)
+
+
+def test_json_safe_recursively_converts_nested_mapping_objects():
+    """FuturesOrderEvent 是巢狀結構，operation/order/status/contract 各自也可能是同款
+    Mapping-only 物件——只轉最外層不夠，json.dumps 遇到巢狀非原生型別一樣會炸。"""
+    msg = _FakeMapping({
+        "operation": _FakeMapping({"op_type": "Cancel"}),
+        "order": _FakeMapping({"id": "O1", "seqno": "B1"}),
+    })
+    result = shioaji_adapter_module.ShioajiAdapter._json_safe(msg)
+    assert result == {"operation": {"op_type": "Cancel"}, "order": {"id": "O1", "seqno": "B1"}}
+    json.dumps(result)  # 不得拋例外——必須是保證可 JSON 序列化的原生型別
 
 
 # ---- round3 #11：connect/close/place 全部經同一個 BrokerSupervisor.run() 通道 ----
@@ -620,36 +670,235 @@ def _adapter_stub_for_mapper(*, sim_fee_per_lot=None, mode="sim"):
     )
 
 
-def test_map_deal_report_rejects_missing_deal_id():
+def test_map_deal_report_rejects_missing_trade_id():
+    """真實 FuturesDealEvent 用 trade_id（不是先前假設的 deal_id），且沒有 octype 欄位。"""
     adapter = _adapter_stub_for_mapper()
     with pytest.raises(ValueError):
-        adapter._map_deal_report({"action": "Buy", "octype": "New", "quantity": 1, "price": "1",
-                                  "ts": 1, "account_id": "F1"})  # 缺 deal_id
+        adapter._map_deal_report({"action": "Buy", "quantity": 1, "price": "1",
+                                  "ts": 1.0, "account_id": "F1"})  # 缺 trade_id
 
 
 def test_map_deal_report_fills_sim_fee_from_setting_when_missing():
     """A6：sim 模擬單成交常缺 fee，依設定 sim_fee_per_lot * qty 估算，不留 None/0。"""
     adapter = _adapter_stub_for_mapper(sim_fee_per_lot=Decimal("20"))
     fill = adapter._map_deal_report({
-        "deal_id": "D1", "action": "Buy", "octype": "New", "quantity": 3, "price": "18000",
-        "ts": 1_780_000_000_000, "account_id": "F1", "order_id": "O1",
-    })  # payload 無 "fee" 欄位
+        "trade_id": "D1", "action": "Buy", "quantity": 3, "price": "18000",
+        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
+    })  # payload 無 "fee" 欄位、無 "octype"（真實 FuturesDealEvent 沒有這個欄位）
     assert fill.fee == Decimal("60")  # 20 * 3 口
+    assert fill.ts == 1_780_000_000_000  # 秒→毫秒
 
 
 def test_map_deal_report_real_missing_fee_stays_none_no_sim_substitution():
     adapter = _adapter_stub_for_mapper(sim_fee_per_lot=Decimal("20"), mode="real")
     fill = adapter._map_deal_report({
-        "deal_id": "D1", "action": "Buy", "octype": "New", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000_000, "account_id": "F1", "order_id": "O1",
+        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
     })
     assert fill.fee is None  # real 一律取 broker 回報，缺就是缺，不用 sim 設定頂替
 
 
-def test_map_order_report_rejects_missing_ordno_and_broker_order_id():
+def test_map_deal_report_converts_epoch_seconds_ts_to_epoch_ms_for_correct_trading_day():
+    """真實 FuturesDealEvent.ts 是 epoch 秒(float)，Deal.ts/Fill.ts 需要 epoch-ms——沒有 ×1000
+    會讓 trading_day_for 算出 1970 年（epoch 秒當 ms 用，值小了 1000 倍）。"""
+    adapter = _adapter_stub_for_mapper()
+    fill = adapter._map_deal_report({
+        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
+    })
+    assert fill.ts == 1_780_000_000_000
+    trading_day = brepo.trading_day_for(fill.ts)
+    assert trading_day.startswith("2026-")  # 不是 1970 年（沒 ×1000 會算出 1970-01-21 附近）
+
+
+def test_map_deal_report_octype_is_placeholder_overridden_by_inbox_worker():
+    """成交回報沒有 octype 欄位——mapper 只能給一個滿足 Fill.__post_init__ 型別驗證的占位值
+    （"Auto"），真正生效前一律會被 RawInboxWorker._process_deal 用解析到的 Order.octype
+    覆蓋（見該檔/本檔下面的端到端契約測試）。"""
+    adapter = _adapter_stub_for_mapper()
+    fill = adapter._map_deal_report({
+        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
+    })
+    assert fill.octype == "Auto"
+
+
+def test_map_order_report_rejects_missing_ordno_and_broker_order_id_flat_reconcile_shape():
+    """_reconcile_blocking 自建的扁平 payload（order_id/seqno，非即時 callback 巢狀結構）。"""
     adapter = _adapter_stub_for_mapper()
     with pytest.raises(ValueError):
         adapter._map_order_report({"status": "Cancelled"})  # order_id/seqno 都缺
+
+
+def test_map_order_report_rejects_missing_ordno_in_nested_real_callback_shape():
+    """真實 FuturesOrderEvent 是巢狀結構——order 內沒有 id/seqno 時同樣要拒絕。"""
+    adapter = _adapter_stub_for_mapper()
+    with pytest.raises(ValueError):
+        adapter._map_order_report({"operation": {"op_type": "Cancel"}, "order": {}, "status": {}})
+
+
+def test_map_order_report_handles_reconcile_flat_shape_from_list_trades():
+    """_reconcile_blocking 自建的扁平 payload（來自 list_trades() 的 OrderStatusInfo.status，
+    非即時 callback 巢狀結構）仍須能被 _map_order_report 正確解析——兩種來源共用同一個
+    kind="order_report" 佇列與同一個 mapper。"""
+    adapter = _adapter_stub_for_mapper()
+    report = adapter._map_order_report({"order_id": "O1", "seqno": "B1", "status": "Cancelled"})
+    assert report.ordno == "O1" and report.broker_order_id == "B1" and report.status == "cancelled"
+
+
+def test_map_order_report_maps_nested_real_callback_cancel_to_cancelled():
+    """真實 FuturesOrderEvent 巢狀結構：ordno/seqno 在 order 內（比照既有 _ack_fields_from_trade
+    慣例，order.id→我方 Order.ordno、order.seqno→我方 Order.broker_order_id），操作型態在
+    operation.op_type（不是一個現成的 status 字串——見 shioaji_adapter.py 模組內說明）。"""
+    adapter = _adapter_stub_for_mapper()
+    report = adapter._map_order_report({
+        "operation": {"op_type": "Cancel", "op_code": "00", "op_msg": ""},
+        "order": {
+            "id": "O1", "seqno": "B1", "ordno": "ALT", "account": {}, "action": "Buy",
+            "price": 18000.0, "quantity": 1, "order_type": "ROD", "price_type": "LMT",
+            "market_type": "Day", "oc_type": "New", "subaccount": "", "combo": False,
+        },
+        "status": {"id": "O1", "exchange_ts": 1_780_000_000.0, "modified_price": 0.0,
+                   "cancel_quantity": 1, "order_quantity": 1, "web_id": "web"},
+        "contract": {},
+    })
+    assert report.ordno == "O1" and report.broker_order_id == "B1" and report.status == "cancelled"
+
+
+@pytest.mark.parametrize("op_type,expected_status", [
+    ("New", "submitted"), ("UpdatePrice", "submitted"), ("UpdateQty", "submitted"),
+    ("Cancel", "cancelled"), ("Reject", "failed"),
+])
+def test_map_order_report_op_type_status_table(op_type, expected_status):
+    adapter = _adapter_stub_for_mapper()
+    report = adapter._map_order_report({
+        "operation": {"op_type": op_type}, "order": {"id": "O1", "seqno": "B1"}, "status": {},
+    })
+    assert report.status == expected_status
+
+
+# ---- 以 _core.pyi 真實結構為藍本的端到端契約測試（bug 1(b)）：
+#      真實 FuturesDeal/FuturesOrder callback（非 dict、無 to_dict 的 mapping）
+#      → _json_safe → commit_raw_callback（JSON 落地）→ RawInboxWorker 解碼 → mapper
+#      → 對應到已存 Order（取得 octype）→ PositionTracker 開/平倉。 ----
+
+def test_futures_deal_event_contract_end_to_end_opens_position_using_resolved_order_octype(engine):
+    from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.db.models import BrokerPosition, Deal
+
+    adapter = _adapter(engine)
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C1", request_hash="H1", user_id=1, mode="sim", broker="shioaji",
+            account="F1", symbol="TXF", action="Buy", qty=1, price=Decimal("18000"),
+            price_type="LMT", order_type="ROD", octype="New", trading_day="2026-06-16",
+        )
+        brepo.set_order_ack(s, order.id, broker_order_id="B1", ordno="O1", status="submitted")
+        s.commit()
+
+    # 真實 FuturesDealEvent 結構（見 _core.pyi）：非 dict、無 to_dict 的 mapping，沒有 octype。
+    raw_event = _FakeMapping({
+        "trade_id": "D1", "seqno": "SEQ1", "ordno": "O1", "exchange_seq": "EX1",
+        "broker_id": "F002000", "account_id": "F1", "action": "Buy", "code": "TXF",
+        "full_code": "TXFG6", "price": 18500.0, "quantity": 1, "subaccount": "",
+        "security_type": "FUT", "delivery_month": "202607", "strike_price": 0.0,
+        "option_right": "Future", "market_type": "Day", "combo": False,
+        "ts": 1_780_000_000.0,  # epoch 秒 (float)
+    })
+    adapter._on_order_cb("FuturesDeal", raw_event)
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        deal = s.exec(select(Deal)).first()
+        assert deal is not None
+        assert deal.ts == 1_780_000_000_000  # 秒→毫秒
+        assert brepo.trading_day_for(deal.ts).startswith("2026-")  # 不是 1970 年
+
+        pos = s.exec(select(BrokerPosition)).first()
+        assert pos is not None and pos.direction == "long" and pos.total_opened_qty == 1
+
+        refreshed_order = s.exec(select(Order)).first()
+        assert refreshed_order.filled_qty == 1
+        row = s.exec(select(RawInbox)).first()
+        assert row.processed is True and row.quarantine is False
+
+
+def test_futures_deal_event_contract_unresolvable_order_quarantines_not_dropped(engine):
+    """解不到對應 Order → quarantine，不亂猜 octype（「解不到就 quarantine」的設計要求）。"""
+    from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.db.models import Deal
+
+    adapter = _adapter(engine)
+    raw_event = _FakeMapping({
+        "trade_id": "D-GHOST", "seqno": "SEQ-GHOST", "ordno": "GHOST", "exchange_seq": "EX1",
+        "broker_id": "F002000", "account_id": "F1", "action": "Buy", "code": "TXF",
+        "full_code": "TXFG6", "price": 18500.0, "quantity": 1, "subaccount": "",
+        "security_type": "FUT", "delivery_month": "202607", "strike_price": 0.0,
+        "option_right": "Future", "market_type": "Day", "combo": False,
+        "ts": 1_780_000_000.0,
+    })
+    adapter._on_order_cb("FuturesDeal", raw_event)
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    handled = worker.process_batch_once()
+    assert handled == 1  # quarantine 也算「確定處理完」
+
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True and row.processed is False
+        assert s.exec(select(Deal)).first() is None  # 沒有部分寫入
+
+
+def test_futures_order_event_contract_end_to_end_cancel_updates_order_status(engine):
+    """真實 FuturesOrderEvent 巢狀 callback（非 dict、無 to_dict 的 mapping）走完整
+    callback → RawInbox → worker → mapper 流程，operation.op_type=Cancel 應標記委託 cancelled。"""
+    from quanquant.broker.inbox_worker import RawInboxWorker
+
+    adapter = _adapter(engine)
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C1", request_hash="H1", user_id=1, mode="sim", broker="shioaji",
+            account="F1", symbol="TXF", action="Buy", qty=1, price=Decimal("18000"),
+            price_type="LMT", order_type="ROD", octype="New", trading_day="2026-06-16",
+        )
+        brepo.set_order_ack(s, order.id, broker_order_id="B1", ordno="O1", status="submitted")
+        s.commit()
+
+    raw_event = _FakeMapping({
+        "operation": _FakeMapping({"op_type": "Cancel", "op_code": "00", "op_msg": ""}),
+        "order": _FakeMapping({
+            "id": "O1", "seqno": "B1", "ordno": "ALT-ORDNO", "account": {}, "action": "Buy",
+            "price": 18000.0, "quantity": 1, "order_type": "ROD", "price_type": "LMT",
+            "market_type": "Day", "oc_type": "New", "subaccount": "", "combo": False,
+        }),
+        "status": _FakeMapping({"id": "O1", "exchange_ts": 1_780_000_000.0, "modified_price": 0.0,
+                                 "cancel_quantity": 1, "order_quantity": 1, "web_id": "web"}),
+        "contract": _FakeMapping({"security_type": "FUT", "code": "TXF", "exchange": "TAIFEX",
+                                   "delivery_month": "202607", "full_code": "TXFG6",
+                                   "delivery_date": "2026/07/15", "strike_price": 0.0,
+                                   "option_right": "Future"}),
+    })
+    adapter._on_order_cb("FuturesOrder", raw_event)
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        refreshed = s.exec(select(Order)).first()
+        assert refreshed.status == "cancelled"
 
 
 # ---- Task 8：supervisor property / health_probe（round3 #10）/ reconcile（round3 #2） ----

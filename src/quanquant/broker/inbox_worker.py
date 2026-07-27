@@ -23,7 +23,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 
 from sqlmodel import Session
 
@@ -173,6 +173,13 @@ class RawInboxWorker:
                 f"無法解析委託關聯（broker={fill.broker!r},account={fill.account!r},mode={fill.mode!r},"
                 f"ordno={fill.ordno!r},broker_order_id={fill.broker_order_id!r}），quarantine 待重建"
             )
+
+        # 真實成交回報（FuturesDealEvent）沒有 octype 欄位（見
+        # ShioajiAdapter._map_deal_report 說明）——mapper 回傳的 fill.octype 此刻只是滿足
+        # Fill.__post_init__ 型別驗證的占位值，正確值一律用上面剛解析到的對應 Order 當初下單
+        # 時存的 octype 覆蓋。解不到對應 Order 的情況已經在上面 raise ValueError quarantine
+        # 掉，不會走到這裡（「解不到就 quarantine，不亂猜」）。
+        fill = _dc_replace(fill, octype=order.octype)
 
         trading_day = brepo.trading_day_for(fill.ts)
         deal = brepo.stage_deal(
