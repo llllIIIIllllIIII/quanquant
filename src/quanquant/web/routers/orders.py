@@ -81,6 +81,18 @@ def _parse_order_price(raw: str | None, *, price_type: str | None) -> Decimal:
     return Decimal(stripped)
 
 
+def _parse_optional_update_price(raw: str | None) -> Decimal | None:
+    """bug 1（simtrade 實測回歸）：改單表單的 price 欄位留白／整個缺席（`form.get()` 回
+    `None`）一律視為「沿用既有值」（回 `None`，交給 `ShioajiAdapter.update` 的合併規則採用
+    `order.price`），不得裸呼叫 `Decimal(form.get("price"))`——`Decimal(None)` 會炸
+    `TypeError: conversion from NoneType to Decimal is not supported`。同 `_parse_order_price`
+    一致：`(raw or "").strip()` 把 None 與空字串統一處理，兩者都不會走到裸的
+    `Decimal(raw)` 呼叫；非空但格式不合法的字串仍讓 `Decimal()` 自然拋錯，交由呼叫端既有
+    的 except 顯示表單錯誤。"""
+    stripped = (raw or "").strip()
+    return Decimal(stripped) if stripped else None
+
+
 def _order_request_from_form(form, *, user_id: int) -> OrderRequest:
     """round3 #7：client_order_id 只在表單完全沒帶這個欄位時才 fallback 生新的
     （正常流程一律沿用 orders_page 首次渲染時寫進 hidden input 的那個值）。"""
@@ -288,13 +300,14 @@ async def update_order(
         raise HTTPException(status_code=404, detail="order subsystem disabled")
     form = await request.form()
     try:
-        # 同步 _parse_order_price 的空白安全處理（bug 2）：留白＝沿用既有值（None，見下方
-        # service.update 的合併規則），不強制歸零——price_type 不可經改單變更，MKT 委託的
-        # 既有 price 本來就已經是 0（下單當下由 _parse_order_price 定的），這裡留白直接沿用
-        # 既有值即可，不需要重新判斷 price_type。
-        raw_price = (form.get("price") or "").strip()
+        # 同步 _parse_order_price 的空白/None 安全處理（bug 1/2）：留白或欄位整個缺席
+        # （disabled 欄位不送出時 form.get() 回 None）＝沿用既有值（None，見下方
+        # service.update 的合併規則），不強制歸零、也不裸呼叫 Decimal(None)——price_type
+        # 不可經改單變更，MKT 委託的既有 price 本來就已經是 0（下單當下由
+        # _parse_order_price 定的），這裡留白/缺席直接沿用既有值即可，不需要重新判斷
+        # price_type。見 _parse_optional_update_price docstring。
         raw_qty = (form.get("qty") or "").strip()
-        price = Decimal(raw_price) if raw_price else None
+        price = _parse_optional_update_price(form.get("price"))
         qty = int(raw_qty) if raw_qty else None
     except (ValueError, InvalidOperation) as exc:
         return _edit_form_error(session, service, broker_order_id, str(exc))

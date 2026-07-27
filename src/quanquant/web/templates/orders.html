@@ -12,7 +12,7 @@
 
   <div class="form-error-slot"></div>
 
-  <form hx-post="/orders" hx-swap="none" x-data="{ priceType: 'LMT', orderType: 'ROD' }">
+  <form hx-post="/orders" hx-swap="none" x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
     <input type="hidden" name="client_order_id" value="{{ client_order_id }}">
     <div class="grid">
       <label>商品
@@ -27,13 +27,18 @@
     </div>
     <div class="grid">
       <label>價格
-        <!-- bug 2：MKT（市價單）不需要價格——停用時瀏覽器不會送出這個欄位，後端
-             _parse_order_price 對 MKT/空值一律視為 0（見 web/routers/orders.py）。 -->
-        <input name="price" type="text" placeholder="18000" x-bind:disabled="priceType === 'MKT'">
+        <!-- bug 1（simtrade 實測回歸）：MKT 時改用 readonly（而非 disabled）——disabled
+             欄位完全依賴瀏覽器/HTMX 排除送出的行為，這件事本身無法用 TestClient 驗證
+             （見 docs/superpowers/reviews/2026-07-25 驗收殘留：真瀏覽器 UI/HTMX 未經真
+             瀏覽器互動）；readonly 一律隨表單送出，切到 MKT 時同時把顯示/送出值自動歸零
+             （見下方 price_type 的 x-on:change），讓後端一律收得到明確的 price=0，不需要
+             再依賴「有沒有送出這個欄位」。空值/None 後端 _parse_order_price 仍有防線
+             （見 web/routers/orders.py），這裡是前端層再多一道保險。 -->
+        <input name="price" type="text" placeholder="18000" x-model="priceValue" x-bind:readonly="priceType === 'MKT'">
       </label>
       <label>價格類型
         <select name="price_type" x-model="priceType"
-                x-on:change="if (priceType === 'MKT' && orderType === 'ROD') orderType = 'IOC'">
+                x-on:change="if (priceType === 'MKT') { priceValue = '0'; if (orderType === 'ROD') orderType = 'IOC'; }">
           <option value="LMT">限價</option><option value="MKT">市價</option>
         </select>
       </label>
