@@ -12,7 +12,11 @@
 
   <div class="form-error-slot"></div>
 
-  <form hx-post="/orders" hx-swap="none" x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
+  <!-- hx-disabled-elt：送出期間停用送出鈕，杜絕「回應還沒回來前的 double-submit」——連點的
+       第二下會帶同一顆 client_order_id（成功回應才會 OOB 換鍵），撞 repository 冪等短路而靜默
+       回既有委託、不建新單，使用者感覺「沒反應」。 -->
+  <form hx-post="/orders" hx-swap="none" hx-disabled-elt="find button[type='submit']"
+        x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
     <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
     <div class="grid">
       <label>商品
@@ -66,11 +70,15 @@
     <a role="button" class="{{ 'contrast' if mode == 'sim' else '' }}" href="/orders?mode=sim">模擬</a>
   </div>
 
+  <!-- every 2s 週期輪詢：市價單成交是事後非同步落地（callback→RawInbox→RawInboxWorker 每 ~1s
+       輪詢才更新委託為 filled、建部位），place() 回 200 當下那次 refreshorders 打完時成交多半還
+       沒落地。沒有輪詢的話畫面會一直停在 submitted／空部位，直到下一次手動觸發。輪詢讓成交落地
+       後 ~2s 內自動反映（部位 div 唯讀無互動；委託列表的取消/改單按鈕重繪不影響已開的改單 modal）。 -->
   <h4>委託</h4>
-  <div hx-get="/orders/list?mode={{ mode }}" hx-trigger="load, refreshorders from:body" hx-swap="innerHTML"></div>
+  <div hx-get="/orders/list?mode={{ mode }}" hx-trigger="load, refreshorders from:body, every 2s" hx-swap="innerHTML"></div>
 
   <h4>部位</h4>
-  <div hx-get="/orders/positions" hx-trigger="load, refreshorders from:body" hx-swap="innerHTML"></div>
+  <div hx-get="/orders/positions" hx-trigger="load, refreshorders from:body, every 2s" hx-swap="innerHTML"></div>
 
   <!-- 改單 modal -->
   <dialog :open="open">

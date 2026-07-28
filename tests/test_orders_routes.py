@@ -142,6 +142,17 @@ def test_place_form_price_input_uses_readonly_not_disabled_for_mkt(order_client)
     assert "disabled" not in tag  # 不再用 disabled（會被排除在 FormData 之外）
 
 
+def test_orders_page_polls_lists_and_guards_double_submit(order_client):
+    """simtrade 實測回歸（「按了市價下單有時沒反應」）：市價單成交是事後非同步落地
+    （callback→RawInbox→RawInboxWorker），place() 回 200 當下那次 refreshorders 打完時成交
+    多半還沒到——委託/部位兩個 div 必須有週期輪詢，否則畫面停在 submitted／空部位。表單也要
+    在請求進行中停用送出鈕，杜絕連點（第二下撞 repository 冪等短路、靜默回既有委託、無反應）。"""
+    text = order_client.get("/orders").text
+    assert text.count("refreshorders from:body, every 2s") == 2  # 委託 + 部位 兩個 div 都輪詢
+    assert 'hx-get="/orders/list' in text and 'hx-get="/orders/positions"' in text
+    assert "hx-disabled-elt" in text  # 送出期間停用送出鈕（防 double-submit）
+
+
 def test_place_order_sim_sends_directly(order_client, fake_service, user):
     resp = order_client.post("/orders", data={
         "client_order_id": "C1", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "18000",
