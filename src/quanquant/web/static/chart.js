@@ -395,10 +395,13 @@
       this._renderDrawings(); // re-anchor overlays to the new timeframe grid
     },
 
-    async setSession(mode) {
+    async setSession(mode, opts = {}) {
       if (mode === this.session) return;
       this.session = mode;
-      localStorage.setItem("qq_session", mode);
+      // 只有使用者用時段下拉「明確選擇」時才持久化；分時模式的 session 覆寫是純檢視、
+      // 不持久化（傳 {persist:false}）——否則分時設的 day 會殘留在 localStorage，reload
+      // 後分時已關卻卡在非即時日盤、K 棒不再更新（本檔 line 136/792 已註明分時不持久化）。
+      if (opts.persist !== false) localStorage.setItem("qq_session", mode);
       if (!this._switchFromCacheOrLoad()) await this.loadInitial();
       this._renderDrawings(); // data grid changed → rebuild overlays cleanly
     },
@@ -952,12 +955,14 @@
       this.intradayMode = !this.intradayMode;
       if (this.intradayMode) {
         this._prevTf = this.tf; this._prevSession = this.session;
-        if (this.session !== "day") { this.session = "day"; await QQChart.setSession("day"); }
+        // 分時是純檢視、不持久化：session 覆寫傳 {persist:false}，不寫 localStorage，
+        // 避免 reload 後分時已關卻殘留 qq_session=day 卡在非即時日盤。
+        if (this.session !== "day") { this.session = "day"; await QQChart.setSession("day", { persist: false }); }
         if (this.tf !== "1m") { this.tf = "1m"; await QQChart.setTf("1m"); }
         QQChart.setIntraday(true);
       } else {
         QQChart.setIntraday(false);
-        if (this.session !== this._prevSession) { this.session = this._prevSession; await QQChart.setSession(this._prevSession); }
+        if (this.session !== this._prevSession) { this.session = this._prevSession; await QQChart.setSession(this._prevSession, { persist: false }); }
         if (this.tf !== this._prevTf) { this.tf = this._prevTf; await QQChart.setTf(this._prevTf); }
       }
     },
