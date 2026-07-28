@@ -71,6 +71,11 @@ class _FakeService:
             raise AuthorizationError("not owner")
         return [Position(symbol="TXF", direction="long", qty=1, avg_price=Decimal("18000"))]
 
+    def positions_snapshot(self, *, actor_user_id):
+        if self._deny_user == actor_user_id:
+            raise AuthorizationError("not owner")
+        return [Position(symbol="TXF", direction="long", qty=1, avg_price=Decimal("18000"))]
+
     def on_fill(self, handler):
         pass
 
@@ -324,6 +329,14 @@ def test_update_order_authorization_error_maps_to_403(order_client, fake_service
     fake_service._deny_user = user.id
     resp = order_client.put("/orders/B1", data={"qty": "2"})
     assert resp.status_code == 403
+
+
+def test_positions_snapshot_renders_for_owner(order_client, fake_service, user):
+    """positions 端點改用無鎖同步快照（positions_snapshot，離開 event loop、不搶 supervisor
+    鎖）後，owner 仍能正常取得並渲染部位。"""
+    resp = order_client.get("/orders/positions")
+    assert resp.status_code == 200
+    assert "TXF" in resp.text and "多" in resp.text  # 部位表有渲染出多單
 
 
 def test_positions_non_owner_gets_403(order_client, fake_service, user):

@@ -208,8 +208,12 @@ async def orders_page(
     })
 
 
+# 委託/部位是每 2s 輪詢的唯讀端點，一律用同步 `def`（比照 /api/candles 慣例）跑 threadpool、
+# 完全離開 event loop——否則這兩個每 2s 的同步 DB 讀會壓在單一 event loop 上，與餵 K 線的
+# 報價 SSE/tick fan-out 搶 loop，造成下單延遲與 K 線凍住（見診斷）。positions 讀 DB 快照，
+# 且**不搶 supervisor 序列化鎖**（positions_snapshot），不與每 1s 的 RawInboxWorker/place 競爭。
 @router.get("/orders/list", response_class=HTMLResponse)
-async def orders_list(
+def orders_list(
     session: Session = Depends(get_session), user: User = Depends(get_current_user),
     mode: str = Query("sim"), service=Depends(get_order_service),
 ):
@@ -219,11 +223,11 @@ async def orders_list(
 
 
 @router.get("/orders/positions", response_class=HTMLResponse)
-async def orders_positions(user: User = Depends(get_current_user), service=Depends(get_order_service)):
+def orders_positions(user: User = Depends(get_current_user), service=Depends(get_order_service)):
     if service is None:
         return HTMLResponse(render_partial("partials/position_table.html", positions=[]))
     try:
-        positions = await service.positions(actor_user_id=user.id)
+        positions = service.positions_snapshot(actor_user_id=user.id)
     except AuthorizationError:
         raise HTTPException(status_code=403, detail="not owner")
     return HTMLResponse(render_partial("partials/position_table.html", positions=positions))

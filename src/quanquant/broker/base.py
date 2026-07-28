@@ -47,4 +47,10 @@ class OrderService(Protocol):
 
     async def positions(self, *, actor_user_id: int) -> list[Position]: ...
 
+    def positions_snapshot(self, *, actor_user_id: int) -> list[Position]:
+        """輪詢/唯讀路徑用的無鎖同步部位快照：只讀 DB（committed rows，WAL 下一致快照），
+        不搶 broker 序列化鎖、可在 threadpool（同步 def 路由）跑，完全離開 event loop。
+        所有權檢查與 `positions()` 相同。"""
+        ...
+
     def on_fill(self, handler: Callable[[Fill], None]) -> None: ...

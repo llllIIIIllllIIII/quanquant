@@ -672,24 +672,32 @@ class ShioajiAdapter:
     # ---- positions（純讀 DB，不呼叫 native API——BrokerPosition 是唯一真相來源；
     #      仍經 supervisor.run 走同一通道，避免與 connect/reconnect 交錯讀到半新半舊狀態） ----
 
-    async def positions(self, *, actor_user_id: int) -> list[Position]:
-        def _do_positions() -> list[Position]:
-            with self._session_factory() as session:
-                if self._risk_guard is not None:
-                    self._risk_guard.assert_owner(actor_user_id)
-                rows = brepo.list_open_positions(
-                    session, user_id=actor_user_id, broker=self.broker, account=self.account,
-                    mode=self.mode, symbol=self.symbol,
+    def positions_snapshot(self, *, actor_user_id: int) -> list[Position]:
+        """無鎖同步部位快照（輪詢/唯讀路徑用）：只讀 BrokerPosition（committed rows，WAL 下
+        是一致快照），**不搶 supervisor 鎖**、不呼叫 native，可在 threadpool（同步 def 路由）
+        跑、完全離開 event loop。與 `positions()` 唯一差別是少了那把「避免與 connect/reconnect
+        交錯讀到半新半舊」的鎖——但這是純讀 committed 資料、reconnect 不寫 BrokerPosition，
+        故快照仍一致。所有權檢查（assert_owner）與 `positions()` 相同。"""
+        with self._session_factory() as session:
+            if self._risk_guard is not None:
+                self._risk_guard.assert_owner(actor_user_id)
+            rows = brepo.list_open_positions(
+                session, user_id=actor_user_id, broker=self.broker, account=self.account,
+                mode=self.mode, symbol=self.symbol,
+            )
+            return [
+                Position(
+                    symbol=r.symbol, direction=r.direction,
+                    qty=brepo.remaining_qty(r), avg_price=brepo.avg_entry_price(r),
                 )
-                return [
-                    Position(
-                        symbol=r.symbol, direction=r.direction,
-                        qty=brepo.remaining_qty(r), avg_price=brepo.avg_entry_price(r),
-                    )
-                    for r in rows
-                ]
+                for r in rows
+            ]
 
-        return await self._supervisor.run(_do_positions)
+    async def positions(self, *, actor_user_id: int) -> list[Position]:
+        # 保留原本「走 supervisor 序列化通道」的語意給非輪詢呼叫端；讀取邏輯與無鎖快照共用。
+        return await self._supervisor.run(
+            lambda: self.positions_snapshot(actor_user_id=actor_user_id)
+        )
 
     # ---- callback（背景執行緒）：只落地 RawInbox，不直接處理業務邏輯（round3 BLOCKER#2） ----
 

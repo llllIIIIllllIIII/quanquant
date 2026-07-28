@@ -40,6 +40,19 @@ from quanquant.web.templating import STATIC_DIR
 log = logging.getLogger(__name__)
 
 
+def _write_market_rows(rows, quote_row) -> None:
+    """同步 DB 寫入（candle upsert + 可選 Quote insert），設計成在 threadpool 執行——讓
+    event loop 在等 SQLite 寫鎖時仍能 fan-out tick / 推報價 SSE，避免「K 線與價格都停住」。
+    保留原本兩段各自的寫入語意（upsert_candles 內部自行 commit；Quote 另開 session commit）。"""
+    if rows:
+        with Session(get_engine()) as session:
+            upsert_candles(session, rows)
+    if quote_row is not None:
+        with Session(get_engine()) as session:
+            session.add(quote_row)
+            session.commit()
+
+
 async def _persist_market_data(
     poller: QuotePoller, symbol: str, *, quote_write_min_interval: float = 0.0
 ) -> None:
@@ -63,23 +76,21 @@ async def _persist_market_data(
                 continue
             snap = event.snapshot
             try:
-                rows = builder.on_snapshot(snap)  # every tick → accurate OHLCV
-                if rows:
-                    with Session(get_engine()) as session:
-                        upsert_candles(session, rows)
+                rows = builder.on_snapshot(snap)  # every tick → accurate OHLCV（CPU，留在 loop）
                 now = time.monotonic()
+                quote_row = None
                 if now - last_quote_write >= quote_write_min_interval:
                     last_quote_write = now
-                    with Session(get_engine()) as session:
-                        session.add(
-                            Quote(
-                                symbol=snap.symbol,
-                                price=snap.price,
-                                volume=snap.volume,
-                                fetched_at=snap.fetched_at.replace(tzinfo=None),
-                            )
-                        )
-                        session.commit()
+                    quote_row = Quote(
+                        symbol=snap.symbol,
+                        price=snap.price,
+                        volume=snap.volume,
+                        fetched_at=snap.fetched_at.replace(tzinfo=None),
+                    )
+                if rows or quote_row is not None:
+                    # DB 寫入丟 threadpool：SQLite 寫鎖等待不再凍住 event loop（tick fan-out /
+                    # 報價 SSE 續跑）。await 之後才取下一筆，故寫入仍依 tick 順序序列化、K 棒正確。
+                    await asyncio.to_thread(_write_market_rows, rows, quote_row)
             except Exception:
                 pass  # never let a write error stop the market-data feed
     finally:
