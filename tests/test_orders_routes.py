@@ -341,6 +341,47 @@ def test_order_table_shows_cancel_and_edit_buttons_only_for_live_open_orders(ord
     assert 'hx-delete="/orders/B-DONE"' not in text
 
 
+def test_order_table_shows_avg_fill_price_not_committed_zero_price_for_filled_mkt_order(
+    order_client, session, user
+):
+    """bug C 回歸：市價單（MKT）委託價 `orders.price` 恆為 0（委託本來就無價，這是對的），
+    真實成交價在 `deals.price`／已由 `apply_order_fill` 累加進 `orders.avg_fill_price`
+    （見 broker/repository.py）。委託列表對已成交/部分成交的委託必須顯示成交均價，不能
+    照舊顯示委託價 0（那會讓使用者誤以為成交價是 0）。未成交的委託仍應顯示委託價。"""
+    filled_order = brepo.create_order(
+        session, client_order_id="FILLED1", request_hash="H1", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("0"), price_type="MKT", order_type="IOC", octype="New",
+        trading_day="2026-07-27",
+    )
+    brepo.set_order_ack(session, filled_order.id, broker_order_id="B-FILLED", ordno="O-FILLED",
+                        status="submitted")
+    session.commit()
+    with Session(session.get_bind()) as s:
+        order = s.get(type(filled_order), filled_order.id)
+        brepo.apply_order_fill(s, order, fill_qty=1, fill_price=Decimal("43737"))
+        s.commit()
+
+    pending_order = brepo.create_order(
+        session, client_order_id="PENDING1", request_hash="H2", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("18500"), price_type="LMT", order_type="ROD", octype="New",
+        trading_day="2026-07-27",
+    )
+    brepo.set_order_ack(session, pending_order.id, broker_order_id="B-PENDING", ordno="O-PENDING",
+                        status="submitted")
+    session.commit()
+
+    text = order_client.get("/orders/list?mode=sim").text
+    assert "18500" in text  # 未成交委託仍顯示委託價
+
+    # 精準定位 FILLED1 那一列（id="order-{id}"），確認成交均價顯示出來、不是裸的委託價 0。
+    rows = re.findall(rf'<tr id="order-{filled_order.id}">.*?</tr>', text, re.DOTALL)
+    assert len(rows) == 1
+    assert "43737" in rows[0]
+    assert re.search(r"<td[^>]*>0(\.0+)?</td>", rows[0]) is None  # 不再顯示裸的委託價 0
+
+
 def test_edit_order_form_without_service_shows_disabled_message(engine, user):
     """round3 #9：改單控制的 GET 端點，service 未啟用時同樣回可讀訊息，不是 500。"""
     def _session_override():

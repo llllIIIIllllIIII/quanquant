@@ -9,7 +9,13 @@
       <td>{{ o.symbol }}</td>
       <td><span class="dir {{ 'long' if o.action == 'Buy' else 'short' }}">{{ '買' if o.action == 'Buy' else '賣' }}</span></td>
       <td class="numcell">{{ o.qty }}</td>
-      <td class="numcell">{{ o.price }}</td>
+      <td class="numcell">
+        {%- if o.status in ("filled", "partfilled") and o.avg_fill_price is not none -%}
+        {{ o.avg_fill_price }}
+        {%- else -%}
+        {{ o.price }}
+        {%- endif -%}
+      </td>
       <td>{{ o.status }}</td>
       <td class="numcell">{{ o.filled_qty }}/{{ o.qty }}</td>
       <td class="nowrap">
