@@ -27,14 +27,20 @@ from quanquant.db.models import Order, QuotaReservation, RawInbox
 
 
 class _FakeOrderHandle:
-    def __init__(self, id_, seqno):
+    def __init__(self, id_, seqno, ordno=None):
         self.id = id_
         self.seqno = seqno
+        # 實測 payload（權威）：Shioaji `OrderResult.ordno`（交易所委託書號，如 "001CB9"）
+        # 是跟 `.id`/`.seqno`（我方存的 ordno/broker_order_id 關聯鍵，如 "101CB7"）**不同**的
+        # 欄位（見 _core.pyi `OrderResult`）。預設給一個刻意不同於 id 的值，逼所有引用這個
+        # fake 的既有測試都必須通過「比對 id 而非 ordno」這關，避免悄悄退化回比對 ordno
+        # （bug A 的根因，見 ShioajiAdapter._find_trade_by_ordno）。
+        self.ordno = ordno if ordno is not None else f"ALT-{id_}"
 
 
 class _FakeTrade:
-    def __init__(self, id_, seqno):
-        self.order = _FakeOrderHandle(id_, seqno)
+    def __init__(self, id_, seqno, ordno=None):
+        self.order = _FakeOrderHandle(id_, seqno, ordno)
 
 
 class _FakeApi:
@@ -341,6 +347,21 @@ def test_update_raises_clear_error_and_releases_delta_quota_when_no_matching_tra
         rows = list(s.exec(select(QuotaReservation)))
         update_row = next(r for r in rows if r.reservation_id != "C1")
         assert update_row.state == "released"  # 確定沒生效，delta 配額立即釋放
+
+
+def test_find_trade_by_ordno_matches_order_id_not_broker_ordno_field(engine):
+    """bug A 回歸：實測 payload（權威）——`order.id`=`order.seqno`="101CB7"（我方存的
+    ordno/broker_order_id 關聯鍵），`order.ordno`="001CB9"（交易所委託書號，另一個不同
+    欄位）。`_find_trade_by_ordno` 必須比對 `trade.order.id`，若誤比對成
+    `trade.order.ordno` 就永遠 miss（找不到券商對應委託）——這裡刻意讓兩者不同，證明比對
+    的是 id 而非 ordno。"""
+    adapter = _adapter(engine)
+    trade = _FakeTrade("101CB7", "101CB7", ordno="001CB9")
+    adapter._api._live_trades["101CB7"] = trade
+
+    assert trade.order.id != trade.order.ordno  # 前提：fixture 真的模擬了兩個不同欄位
+    found = adapter._find_trade_by_ordno("101CB7")
+    assert found is trade
 
 
 def test_order_request_has_no_mode_field_structural_rejection():
@@ -944,6 +965,47 @@ def test_futures_deal_event_contract_end_to_end_opens_position_using_resolved_or
         assert refreshed_order.filled_qty == 1
         row = s.exec(select(RawInbox)).first()
         assert row.processed is True and row.quarantine is False
+
+
+def test_futures_deal_event_contract_specific_contract_code_end_to_end_shows_up_in_positions(engine):
+    """部位顯示 bug 收尾（端到端）：真實 FuturesDealEvent 的 `code` 是具體月合約代碼
+    （實測如 "TXFH6"），不是下單表單/`self.symbol` 用的通用代碼 "TXF"。完整走一輪
+    callback→RawInbox→worker→PositionTracker 後，`adapter.positions()`（也就是
+    `orders_positions` route 實際呼叫的方法）必須真的能查到這筆部位——不只是 DB 裡有資料，
+    是使用者在 /orders/positions 會實際看到的那條查詢路徑。"""
+    from quanquant.broker.inbox_worker import RawInboxWorker
+
+    adapter = _adapter(engine)
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C1", request_hash="H1", user_id=1, mode="sim", broker="shioaji",
+            account="F1", symbol="TXF", action="Buy", qty=1, price=Decimal("0"),
+            price_type="MKT", order_type="IOC", octype="New", trading_day="2026-07-27",
+        )
+        brepo.set_order_ack(s, order.id, broker_order_id="B1", ordno="O1", status="submitted")
+        s.commit()
+
+    raw_event = _FakeMapping({
+        "trade_id": "101CB7", "seqno": "101CB7", "ordno": "O1", "exchange_seq": "000001",
+        "broker_id": "F002000", "account_id": "F1", "action": "Buy", "code": "TXFH6",
+        "full_code": "TXFH6", "price": 43737.0, "quantity": 1, "subaccount": "",
+        "security_type": "FUT", "delivery_month": "202603", "strike_price": 0.0,
+        "option_right": "Future", "market_type": "Day", "combo": False,
+        "ts": 1_785_129_208.629643,
+    })
+    adapter._on_order_cb("FuturesDeal", raw_event)
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    assert worker.process_batch_once() == 1
+
+    positions = asyncio.run(adapter.positions(actor_user_id=1))
+    assert len(positions) == 1
+    assert positions[0].symbol == "TXF"
+    assert positions[0].qty == 1
+    assert positions[0].avg_price == Decimal("43737")
 
 
 def test_futures_deal_event_contract_unresolvable_order_quarantines_not_dropped(engine):
