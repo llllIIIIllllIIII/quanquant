@@ -1,0 +1,5 @@
+<!-- 下單成功後由 place_order 以 out-of-band swap 回傳：把下單面板 hidden input 換成全新的
+     client_order_id，讓下一筆委託用新的冪等鍵（否則反向/不同 payload 的下一單會被 repository.py
+     的冪等防護當成「同鍵不同 payload」擋下）。id/name 與 orders.html 的原 input 完全一致，
+     OOB 依 id 就地替換，替換後仍留在原 form 內、隨表單送出。 -->
+<input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}" hx-swap-oob="true">

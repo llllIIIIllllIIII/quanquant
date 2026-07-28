@@ -69,6 +69,16 @@ def _orders_trigger(*, close_modal: bool = False) -> HTMLResponse:
     return HTMLResponse("", headers={"HX-Trigger": events})
 
 
+def _place_success() -> HTMLResponse:
+    """下單成功：body 帶一個 out-of-band swap，把下單面板的 client_order_id hidden input
+    換成全新 UUID——client_order_id 由 orders_page 首渲染時生成一次（round3 #7，同一張表單的
+    HTTP retry 沿用同鍵才能冪等去重），但成功送出後若不換鍵，下一筆（尤其反向/不同 payload）
+    會沿用同一顆鍵、被 repository 冪等防護擋成「同鍵不同 payload」。只在**成功**路徑換鍵，
+    失敗/需確認時不換（保留 retry 冪等）。同時觸發 refreshorders 刷新委託/部位列表。"""
+    html = render_partial("partials/client_order_id_input.html", client_order_id=str(uuid.uuid4()))
+    return HTMLResponse(html, headers={"HX-Trigger": "refreshorders"})
+
+
 def _parse_order_price(raw: str | None, *, price_type: str | None) -> Decimal:
     """bug 2：MKT（市價單）不需要價格——`Decimal(form.get("price"))` 對 MKT 沒有特判，
     空字串/缺欄位（MKT 的 price 欄位停用時瀏覽器不會送出這個欄位）一律 `decimal.
@@ -249,7 +259,7 @@ async def place_order(
         return _form_error(_safe_str(exc, service))
     except OrderError as exc:
         return _form_error(_safe_str(exc, service))
-    return _orders_trigger()
+    return _place_success()
 
 
 @router.get("/orders/{broker_order_id}/edit", response_class=HTMLResponse)

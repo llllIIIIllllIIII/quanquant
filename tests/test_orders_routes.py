@@ -151,6 +151,37 @@ def test_place_order_sim_sends_directly(order_client, fake_service, user):
     assert len(fake_service.placed) == 1
 
 
+def test_place_success_rotates_client_order_id_via_oob_swap(order_client, fake_service, user):
+    """反向/下一筆委託不得重用同一顆 client_order_id（simtrade 實測回歸：市價買單成功後，
+    反向賣單沿用同鍵、payload 不同，被 repository 冪等防護擋成「已存在但 payload 不同」）。
+    下單成功後回傳的 body 必須帶一個 out-of-band swap，把下單面板 hidden input
+    （id=client-order-id-input）換成全新的 UUID，讓下一筆用新鍵。"""
+    submitted = "C-REUSE"
+    resp = order_client.post("/orders", data={
+        "client_order_id": submitted, "symbol": "TXF", "action": "Buy", "qty": "1", "price": "18000",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert 'hx-swap-oob="true"' in resp.text
+    assert 'id="client-order-id-input"' in resp.text
+    fresh = _hidden(resp.text, "client_order_id")
+    assert fresh is not None
+    assert fresh != submitted  # 成功後換了全新的鍵
+    assert re.fullmatch(r"[0-9a-f-]{36}", fresh) is not None  # 是新生成的 UUID
+
+
+def test_place_failure_keeps_same_client_order_id_for_retry_idempotency(order_client, fake_service, user):
+    """失敗路徑（此處為 LMT 留白的表單錯誤）不得輪替 client_order_id——round3 #7 的設計是
+    「同一張表單的 HTTP retry 沿用同鍵才能冪等去重」，只有**成功**才換鍵。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-KEEP", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",  # LMT 留白 → 表單錯誤
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 0
+    assert 'hx-swap-oob="true"' not in resp.text  # 失敗不換鍵
+
+
 def test_place_order_real_two_step_confirm_round_trip(order_client, fake_service, user):
     fake_service.mode = "real"
     form = {

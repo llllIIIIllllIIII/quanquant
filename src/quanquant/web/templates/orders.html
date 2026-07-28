@@ -13,7 +13,7 @@
   <div class="form-error-slot"></div>
 
   <form hx-post="/orders" hx-swap="none" x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
-    <input type="hidden" name="client_order_id" value="{{ client_order_id }}">
+    <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
     <div class="grid">
       <label>商品
         <select name="symbol">{% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
