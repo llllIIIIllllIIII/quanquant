@@ -70,15 +70,19 @@
     <a role="button" class="{{ 'contrast' if mode == 'sim' else '' }}" href="/orders?mode=sim">模擬</a>
   </div>
 
-  <!-- every 2s 週期輪詢：市價單成交是事後非同步落地（callback→RawInbox→RawInboxWorker 每 ~1s
-       輪詢才更新委託為 filled、建部位），place() 回 200 當下那次 refreshorders 打完時成交多半還
-       沒落地。沒有輪詢的話畫面會一直停在 submitted／空部位，直到下一次手動觸發。輪詢讓成交落地
-       後 ~2s 內自動反映（部位 div 唯讀無互動；委託列表的取消/改單按鈕重繪不影響已開的改單 modal）。 -->
-  <h4>委託</h4>
-  <div hx-get="/orders/list?mode={{ mode }}" hx-trigger="load, refreshorders from:body, every 2s" hx-swap="innerHTML"></div>
+  <!-- SSE 推送取代盲輪詢：委託/成交/部位有變動時，後端 /orders/stream 推一個 orders-changed
+       事件（主要由 RawInboxWorker 非同步成交落地觸發，見 broker/inbox_worker.py），瀏覽器據此
+       重抓自己 user-scoped 的委託/部位。保留 load（首載）與 refreshorders from:body（本分頁
+       下單/改單/取消當下即時刷新）；不再每 2s 盲輪詢、不再壓 event loop/supervisor 鎖。 -->
+  <div hx-ext="sse" sse-connect="/orders/stream">
+    <h4>委託</h4>
+    <div hx-get="/orders/list?mode={{ mode }}"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
 
-  <h4>部位</h4>
-  <div hx-get="/orders/positions" hx-trigger="load, refreshorders from:body, every 2s" hx-swap="innerHTML"></div>
+    <h4>部位</h4>
+    <div hx-get="/orders/positions"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+  </div>
 
   <!-- 改單 modal -->
   <dialog :open="open">

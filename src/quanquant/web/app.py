@@ -15,6 +15,7 @@ from sqlmodel import Session
 
 from quanquant.alerts.engine import run_alert_engine
 from quanquant.broker.lifecycle import run_confirm_token_cleanup, shutdown_order_subsystem
+from quanquant.broker.order_events import OrderEventHub
 from quanquant.broker.preflight import order_subsystem_preflight
 from quanquant.broker.redaction import redact_secrets
 from quanquant.broker.session_state import OrderSessionState
@@ -192,6 +193,7 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     inbox_worker = RawInboxWorker(
         session_factory=_order_session, supervisor=supervisor,
         deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+        order_events=getattr(app.state, "order_events", None),
     )
 
     try:
@@ -243,6 +245,9 @@ async def lifespan(app: FastAPI):
     source = make_source("taifex" if use_shioaji else settings.source)
     poller = QuotePoller(source, settings.symbol, settings.poll_interval_seconds)
     app.state.poller = poller
+    # 委託/成交/部位變動的 SSE ping hub：無條件建立（即使下單子系統停用，/orders/stream
+    # 端點也有 hub 可訂閱，只是永不觸發），供 RawInboxWorker 發布、/orders/stream 訂閱。
+    app.state.order_events = OrderEventHub()
 
     # Market Pulse: classify tick velocity off the un-coalesced poller stream;
     # the level is stamped onto the quote SSE, Telegram fires on entering Extreme.

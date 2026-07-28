@@ -147,15 +147,24 @@ def test_place_form_price_input_uses_readonly_not_disabled_for_mkt(order_client)
     assert "disabled" not in tag  # 不再用 disabled（會被排除在 FormData 之外）
 
 
-def test_orders_page_polls_lists_and_guards_double_submit(order_client):
-    """simtrade 實測回歸（「按了市價下單有時沒反應」）：市價單成交是事後非同步落地
-    （callback→RawInbox→RawInboxWorker），place() 回 200 當下那次 refreshorders 打完時成交
-    多半還沒到——委託/部位兩個 div 必須有週期輪詢，否則畫面停在 submitted／空部位。表單也要
-    在請求進行中停用送出鈕，杜絕連點（第二下撞 repository 冪等短路、靜默回既有委託、無反應）。"""
+def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
+    """委託/部位改用 SSE 推送（sse:orders-changed）取代每 2s 盲輪詢：頁面要有 sse-connect
+    容器、兩個 div 的 trigger 含 sse:orders-changed、且不再有 every 2s 盲輪詢（消除對 event
+    loop / supervisor 鎖的壓力）。保留 refreshorders（本分頁動作當下即時刷新）與防連點。"""
     text = order_client.get("/orders").text
-    assert text.count("refreshorders from:body, every 2s") == 2  # 委託 + 部位 兩個 div 都輪詢
+    assert 'sse-connect="/orders/stream"' in text  # SSE 連線容器
+    assert text.count("sse:orders-changed") == 2  # 委託 + 部位 兩個 div 都靠 SSE 觸發
+    assert "every 2s" not in text  # 不再盲輪詢
+    assert "refreshorders from:body" in text  # 動作當下本分頁仍即時刷新
     assert 'hx-get="/orders/list' in text and 'hx-get="/orders/positions"' in text
     assert "hx-disabled-elt" in text  # 送出期間停用送出鈕（防 double-submit）
+
+
+def test_orders_stream_without_hub_returns_empty_stream_not_500(order_client):
+    """/orders/stream：app.state.order_events 未接線（此 fixture 未設 hub）時回空 stream、
+    不 500——與 alerts_stream 同慣例，端點在無 lifespan 的測試/停用情境不壞。"""
+    resp = order_client.get("/orders/stream")
+    assert resp.status_code == 200
 
 
 def test_place_order_sim_sends_directly(order_client, fake_service, user):

@@ -24,6 +24,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace as _dc_replace
+from typing import TYPE_CHECKING
 
 from sqlmodel import Session
 
@@ -32,6 +33,9 @@ from quanquant.broker.position_tracker import PositionMismatchError, PositionTra
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill
 from quanquant.db.models import Order, RawInbox
+
+if TYPE_CHECKING:
+    from quanquant.broker.order_events import OrderEventHub
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +79,7 @@ class RawInboxWorker:
         tracker: PositionTracker | None = None,
         idle_interval: float = 1.0,
         batch_limit: int = 50,
+        order_events: "OrderEventHub | None" = None,
     ) -> None:
         self._session_factory = session_factory
         self._supervisor = supervisor
@@ -83,12 +88,17 @@ class RawInboxWorker:
         self._tracker = tracker or PositionTracker()
         self._idle_interval = idle_interval
         self._batch_limit = batch_limit
+        self._order_events = order_events
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
         while not self._stop.is_set():
             async with self._supervisor.lock:
                 handled = await asyncio.to_thread(self.process_batch_once)
+            # 有列真的落地了（成交/委託狀態變更）→ 推 SSE，瀏覽器據此重抓委託/部位（取代盲輪詢）。
+            # 發布點在 to_thread 回來後、已回到 event loop 執行緒，故可直接呼叫、不需 call_soon_threadsafe。
+            if handled and self._order_events is not None:
+                self._order_events.publish()
             if handled == 0:
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._idle_interval)

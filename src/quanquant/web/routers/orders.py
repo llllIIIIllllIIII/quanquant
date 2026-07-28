@@ -26,6 +26,7 @@ from decimal import Decimal, InvalidOperation
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse
 from sqlmodel import Session
+from sse_starlette.sse import EventSourceResponse
 
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
@@ -231,6 +232,29 @@ def orders_positions(user: User = Depends(get_current_user), service=Depends(get
     except AuthorizationError:
         raise HTTPException(status_code=403, detail="not owner")
     return HTMLResponse(render_partial("partials/position_table.html", positions=positions))
+
+
+@router.get("/orders/stream")
+async def orders_stream(request: Request, user: User = Depends(get_current_user)):
+    """SSE：委託/成交/部位有變動時推一個 `orders-changed` 事件，取代下單頁每 2s 盲輪詢。
+    主要發布者是 RawInboxWorker 的非同步成交落地（見 broker/inbox_worker.py）；動作當下的
+    刷新仍由 place/cancel/update 回應的 `refreshorders` HX-Trigger 負責。hub 未接線
+    （下單子系統停用或測試無 lifespan）時回空 stream、不 500。ping 不帶 per-user 資料，
+    瀏覽器收到後各自重抓 user-scoped 的委託/部位（本就以 user_id 過濾 + 驗所有權），無跨用戶洩漏。"""
+    hub = getattr(request.app.state, "order_events", None)
+    if hub is None:
+        return EventSourceResponse(iter(()))
+    queue = hub.subscribe()
+
+    async def event_generator():
+        try:
+            while True:
+                await queue.get()
+                yield {"event": "orders-changed", "data": "1"}
+        finally:
+            hub.unsubscribe(queue)
+
+    return EventSourceResponse(event_generator())
 
 
 @router.post("/orders", response_class=HTMLResponse)
