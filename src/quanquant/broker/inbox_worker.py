@@ -179,7 +179,15 @@ class RawInboxWorker:
         # Fill.__post_init__ 型別驗證的占位值，正確值一律用上面剛解析到的對應 Order 當初下單
         # 時存的 octype 覆蓋。解不到對應 Order 的情況已經在上面 raise ValueError quarantine
         # 掉，不會走到這裡（「解不到就 quarantine，不亂猜」）。
-        fill = _dc_replace(fill, octype=order.octype)
+        #
+        # symbol 同理覆蓋（部位顯示 bug 收尾）：真實 FuturesDealEvent 的 `code` 欄位是具體
+        # 月合約代碼（如 "TXFH6"），mapper（_map_deal_report）照原樣帶出；但 Order.symbol／
+        # ShioajiAdapter.symbol／positions() 查詢一律用通用商品代碼（如 "TXF"，見
+        # config.Settings.symbol）。若直接採用 mapper 給的具體合約代碼寫入
+        # BrokerPosition.symbol，會跟 `list_open_positions(symbol=self.symbol)` 的過濾條件
+        # 對不起來——部位明明已入帳，`positions()` 卻永遠查不到。一律以解析到的
+        # Order.symbol（通用代碼）為準，不信任 mapper 給的具體合約代碼。
+        fill = _dc_replace(fill, octype=order.octype, symbol=order.symbol)
 
         trading_day = brepo.trading_day_for(fill.ts)
         deal = brepo.stage_deal(

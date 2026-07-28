@@ -138,6 +138,38 @@ def test_deal_report_octype_comes_from_resolved_order_not_mapper_payload(session
         assert s.exec(select(BrokerPosition)).first() is None
 
 
+def test_deal_report_symbol_comes_from_resolved_order_not_specific_contract_code(session, engine):
+    """部位顯示 bug 回歸：真實 FuturesDealEvent 的 `code` 欄位是「具體月合約代碼」
+    （如 "TXFH6"），不是我方全域慣用的「通用商品代碼」（如 "TXF"，見 config.Settings.symbol/
+    ShioajiAdapter.symbol，下單表單、`positions()` 查詢一律用這個通用代碼）。若成交回報直接
+    照抄 mapper 給的 `payload["code"]` 當 BrokerPosition.symbol，會跟 `list_open_positions`
+    用 `symbol=self.symbol="TXF"` 查詢的過濾條件對不起來——部位明明已入帳，`positions()`
+    卻永遠查不到（使用者看到的現象是「部位沒顯示」）。同 octype 的既有覆蓋慣例：symbol 一律
+    以解析到的 Order.symbol（通用代碼）為準，不信任 mapper 給的具體合約代碼。"""
+    _seed_order(session, symbol="TXF")  # 下單當下存的是通用代碼
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(symbol="TXFH6")),  # 成交回報帶的是具體月合約代碼
+        )
+        s.commit()
+
+    worker = _worker(engine)
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        pos = s.exec(select(BrokerPosition)).first()
+        assert pos is not None
+        assert pos.symbol == "TXF"  # 不是 mapper 給的 "TXFH6"
+
+        # 與 ShioajiAdapter.positions() 實際查詢條件一致：symbol=self.symbol（通用代碼）。
+        found = brepo.list_open_positions(
+            s, user_id=1, broker="shioaji", account="F1", mode="sim", symbol="TXF",
+        )
+        assert len(found) == 1
+
+
 def test_position_mismatch_quarantines_without_partial_deal_write(session, engine):
     """Cover 缺對應開倉部位 → PositionMismatchError → quarantine，且已 stage 的 Deal 也要 rollback 掉。"""
     _seed_order(session, octype="Cover", action="Sell")
