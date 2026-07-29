@@ -709,8 +709,21 @@ class ShioajiAdapter:
         BLOCKER#2）。callback 內不碰部位/DB 業務邏輯，那是 RawInboxWorker 之後才做的事。
         """
         kind = "deal_report" if str(stat).endswith("Deal") else "order_report"
-        payload = self._json_safe(msg)
-        commit_raw_callback(self._session_factory, kind=kind, broker=self.broker, payload=payload)
+        try:
+            payload = self._json_safe(msg)
+            commit_raw_callback(self._session_factory, kind=kind, broker=self.broker, payload=payload)
+        except Exception:
+            # 券商回報是真錢關鍵路徑：序列化/落地失敗絕不能靜默丟單，也絕不能把例外拋回
+            # Solace/.NET callback thread（會殺掉整條回報通道）。退化保存一筆帶原始 repr 的
+            # 紀錄供 reconcile/人工補救；連退化保存都失敗才記錄後放行（DB 全掛時已無法多做）。
+            log.exception("成交/委託回報落地失敗，改以退化 payload 保存（kind=%s）", kind)
+            try:
+                commit_raw_callback(
+                    self._session_factory, kind=kind, broker=self.broker,
+                    payload={"_unparsed": True, "repr": repr(msg)},
+                )
+            except Exception:
+                log.exception("退化 payload 也落地失敗，回報恐遺失（kind=%s）", kind)
 
     @staticmethod
     def _json_safe(msg) -> dict:
@@ -744,7 +757,12 @@ class ShioajiAdapter:
                     return {k: _convert(value[k]) for k in value.keys()}
                 except Exception:
                     pass
-            return value
+            # 保底（真錢丟單防線）：走到這裡代表無法結構化轉換。JSON 原生型別原封保留，
+            # 其餘一律 str()——確保下游 json.dumps 永不炸、整包回報不會在 callback thread
+            # 因序列化失敗而遺失（datetime/Decimal/enum/未知 SDK 物件等葉節點皆轉字串）。
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            return str(value)
 
         converted = _convert(msg)
         return converted if isinstance(converted, dict) else {"raw": str(msg)}

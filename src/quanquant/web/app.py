@@ -70,6 +70,7 @@ async def _persist_market_data(
     builder = CandleBuilder(symbol)
     queue = poller.subscribe()
     last_quote_write = 0.0
+    last_write_error_log = 0.0
     try:
         while True:
             event = await queue.get()
@@ -93,7 +94,12 @@ async def _persist_market_data(
                     # 報價 SSE 續跑）。await 之後才取下一筆，故寫入仍依 tick 順序序列化、K 棒正確。
                     await asyncio.to_thread(_write_market_rows, rows, quote_row)
             except Exception:
-                pass  # never let a write error stop the market-data feed
+                # 不讓寫入錯誤停掉行情 feed（韌性），但不再靜默吞掉——節流每 30s 記一次完整
+                # traceback，否則正準 candle store 寫入失敗會全無觀測性（Tier0 C#3）。
+                now = time.monotonic()
+                if now - last_write_error_log >= 30.0:
+                    last_write_error_log = now
+                    log.exception("市場資料寫入失敗，已略過此筆（每 30s 記一次）")
     finally:
         poller.unsubscribe(queue)
 
