@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""  # alerts → Telegram (browser-only when unset)
     telegram_chat_id: str = ""
 
+    # 營運/開發告警（T0.3）：與上面 3 人共用的價格警示 chat 分離，走獨立 dev chat。
+    # token 留空 → 沿用 telegram_bot_token（同一 bot，只是送不同 chat）；chat_id 留空 →
+    # ops 告警整體 no-op（不誤入共用 chat）。事件：下單失敗/quarantine/feed 停滯/reconcile
+    # 漂移/kill switch/connect 失敗。
+    ops_telegram_bot_token: str = ""
+    ops_telegram_chat_id: str = ""
+    feed_stale_alert_seconds: float = 90.0  # 盤中報價停滯逾此秒數 → 營運告警（僅交易時段判定）
+
     # Market Pulse v0.1 — price-velocity audio + Telegram alerts.
     # Audio/cooldown/toggle live in the browser; the backend only computes the
     # Velocity Level and pushes Telegram when ENTERING the configured high level.

@@ -97,16 +97,36 @@ class _FakeApi:
         pass
 
 
-def _adapter(engine, *, mode="sim", risk_guard=None):
+def _adapter(engine, *, mode="sim", risk_guard=None, ops_alerter=None):
     a = ShioajiAdapter(
         api_key="k", secret_key="s", ca_path=None, ca_passwd=None, person_id=None,
         symbol="TXF", mode=mode, session_factory=lambda: Session(engine),
-        supervisor=BrokerSupervisor(), risk_guard=risk_guard,
+        supervisor=BrokerSupervisor(), risk_guard=risk_guard, ops_alerter=ops_alerter,
     )
     a._api = _FakeApi()  # 跳過 connect()（不做網路呼叫），直接注入假 client
     a._contract = object()
     a.account = "F1"
     return a
+
+
+class _RecordingAlerter:
+    """假 OpsAlerter：記錄各語意方法的呼叫 kwargs，供 T0.3 告警串接測試斷言。方法簽章比照
+    真實 OpsAlerter 的固定 API（place_failed/reconcile_drift/quarantine/connect_failed/
+    feed_stale），本身絕不 raise。"""
+
+    def __init__(self) -> None:
+        self.place_failed_calls: list[dict] = []
+        self.reconcile_drift_calls: list[dict] = []
+        self.connect_failed_calls: list[str] = []
+
+    def place_failed(self, **kw) -> None:
+        self.place_failed_calls.append(kw)
+
+    def reconcile_drift(self, **kw) -> None:
+        self.reconcile_drift_calls.append(kw)
+
+    def connect_failed(self, message: str) -> None:
+        self.connect_failed_calls.append(message)
 
 
 def _req(**over):
@@ -196,6 +216,136 @@ def test_classify_place_failure_boundary_cases():
     assert classify(RuntimeError("網路逾時")) == "unknown"
     assert classify(Exception("connection reset by peer")) == "unknown"
     assert classify(Exception("internal server error, code: 500")) == "unknown"  # 5xx 非明確拒絕
+
+
+# ---- T0.3 營運告警串接：place/update 失敗發 place_failed、RiskError 攔截不發、reconcile 漂移 ----
+
+def test_place_broker_rejection_alerts_place_failed_with_failed_classification(engine):
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, ops_alerter=alerter)
+
+    def _boom(contract, order):
+        raise Exception("place_order: ... code: 406, detail: Please sign ... first.")
+
+    adapter._api.place_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    assert len(alerter.place_failed_calls) == 1
+    call = alerter.place_failed_calls[0]
+    assert call["classification"] == "failed"
+    assert call["client_order_id"] == "C1" and call["symbol"] == "TXF"
+    assert call["action"] == "Buy" and call["qty"] == 1
+
+
+def test_place_unknown_failure_alerts_place_failed_with_unknown_classification(engine):
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, ops_alerter=alerter)
+
+    def _boom(contract, order):
+        raise RuntimeError("網路逾時")
+
+    adapter._api.place_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    assert len(alerter.place_failed_calls) == 1
+    assert alerter.place_failed_calls[0]["classification"] == "unknown"
+
+
+def test_place_riskerror_send_gate_does_not_alert_place_failed(engine):
+    """kill switch / send gate 攔截是預期中的風控攔截，非券商失敗——不得發 place_failed。"""
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, risk_guard=_real_guard(engine), ops_alerter=alerter)
+
+    async def _blocked_gate():
+        raise RiskError("kill switch 已啟動，拒絕送出")
+
+    adapter._send_gate = _blocked_gate
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    assert alerter.place_failed_calls == []  # 風控攔截不發告警
+
+
+def test_place_successful_send_does_not_alert(engine):
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, ops_alerter=alerter)
+    asyncio.run(adapter.place(_req(), actor_user_id=1))
+    assert alerter.place_failed_calls == []
+
+
+def test_place_alert_detail_is_redacted(engine):
+    """detail 一定要 redact：夾帶秘密的例外訊息不得原文進告警。"""
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, ops_alerter=alerter)
+
+    def _boom(contract, order):
+        raise RuntimeError("login failed with secret_key=s and api_key=k")
+
+    adapter._api.place_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.place(_req(), actor_user_id=1))
+    detail = alerter.place_failed_calls[0]["detail"]
+    assert "secret_key=s" not in detail and "api_key=k" not in detail
+
+
+def test_update_broker_rejection_alerts_place_failed_failed(engine):
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, risk_guard=_real_guard(engine), ops_alerter=alerter)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+
+    def _boom(trade, **kw):
+        raise Exception("update_order: ... code: 406, detail: rejected.")
+
+    adapter._api.update_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    reject_calls = [c for c in alerter.place_failed_calls if c["classification"] == "failed"]
+    assert len(reject_calls) == 1
+    assert reject_calls[0]["action"] == "Buy" and reject_calls[0]["qty"] == 5  # 目標口數
+
+
+def test_update_unknown_failure_alerts_place_failed_unknown(engine):
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, risk_guard=_real_guard(engine), ops_alerter=alerter)
+    ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
+
+    def _boom(trade, **kw):
+        raise RuntimeError("網路逾時")
+
+    adapter._api.update_order = _boom
+    with pytest.raises(OrderError):
+        asyncio.run(adapter.update(ack.broker_order_id, actor_user_id=1, qty=5))
+    unknown_calls = [c for c in alerter.place_failed_calls if c["classification"] == "unknown"]
+    assert len(unknown_calls) == 1
+
+
+def test_reconcile_drift_alerts_when_staged_and_stays_silent_when_empty(engine):
+    alerter = _RecordingAlerter()
+    adapter = _adapter(engine, ops_alerter=alerter)
+
+    # 空 list_trades（比照 sim）→ _reconcile_blocking 回 0 → 不發 drift。
+    adapter._api.list_trades = lambda: []
+    asyncio.run(adapter.reconcile())
+    assert alerter.reconcile_drift_calls == []
+
+    # 有新委託進展 → 回 N 且發 reconcile_drift(count=N)。
+    adapter._api.list_trades = lambda: [
+        _FakeTrade2("ORD1", "SEQ1", "Submitted", order_datetime=datetime(2026, 6, 16, 9, 0)),
+        _FakeTrade2("ORD2", "SEQ2", "Cancelled", order_datetime=datetime(2026, 6, 16, 9, 5)),
+    ]
+    asyncio.run(adapter.reconcile())
+    assert len(alerter.reconcile_drift_calls) == 1
+    assert alerter.reconcile_drift_calls[0]["count"] == 2
+
+
+def test_reconcile_blocking_returns_staged_count(engine):
+    adapter = _adapter(engine)
+    assert adapter._reconcile_blocking() == 0  # 空清單 → 0
+    adapter._api.list_trades = lambda: [
+        _FakeTrade2("ORD1", "SEQ1", "Submitted", order_datetime=datetime(2026, 6, 16, 9, 0)),
+    ]
+    assert adapter._reconcile_blocking() == 1
+    # 第二次同一批（cursor 已覆蓋）→ 無新進展 → 0
+    assert adapter._reconcile_blocking() == 0
 
 
 def test_place_persists_pending_correlation_before_native_call(engine):

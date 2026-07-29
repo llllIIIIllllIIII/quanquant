@@ -127,6 +127,7 @@ class ShioajiAdapter:
         risk_guard: "_RiskGuardLike | None" = None,
         broker: str = "shioaji",
         sim_fee_per_lot: Decimal | None = None,
+        ops_alerter=None,
     ) -> None:
         self._api_key = api_key
         self._secret_key = secret_key
@@ -146,9 +147,33 @@ class ShioajiAdapter:
         self._supervisor = supervisor
         self._risk_guard = risk_guard
         self._sim_fee_per_lot = sim_fee_per_lot  # A6：sim 成交 fee 缺值時依口數估算，不留 None/0
+        self._ops = ops_alerter  # T0.3：營運告警（fire-and-forget、絕不 raise），純疊加
         self._api = None
         self._contract = None
         self._fill_handler: Callable[[Fill], None] | None = None
+
+    # ---- T0.3 營運告警（純疊加，絕不反噬既有 fail-closed/冪等/redaction 行為） ----
+
+    def _redact(self, text: str) -> str:
+        """比照本檔既有 `_redact_secrets(str(exc), secrets=self._secrets_to_redact)` 用法，
+        統一遮蔽這個 adapter instance 認得的所有秘密值（api_key/secret_key/ca_passwd/
+        person_id）——任何可能夾帶秘密的上游例外文字進告警/日誌前必經此步。"""
+        return _redact_secrets(text, secrets=self._secrets_to_redact)
+
+    def _alert_place_failed(self, *, client_order_id, action, qty, classification, exc) -> None:
+        """把 place/update 失敗送進 OpsAlerter（`if self._ops is not None:` 保護、detail 一律
+        redact）。取值/redact 皆包 try/except 吞掉——告警絕不能反噬下單主流程（此刻多半正要
+        raise OrderError，若這裡拋例外會遮蓋掉真正的失敗）。"""
+        if self._ops is None:
+            return
+        try:
+            self._ops.place_failed(
+                client_order_id=client_order_id, symbol=self.symbol,
+                action=action, qty=qty, classification=classification,
+                detail=self._redact(str(exc)),
+            )
+        except Exception:
+            log.exception("place_failed 告警失敗（已吞，不影響下單流程）")
 
     # ---- 連線生命週期（round3 #11：connect/close 都經 supervisor.run，同一通道） ----
 
@@ -258,11 +283,17 @@ class ShioajiAdapter:
         真的發生「斷線期間券商 callback 完全沒送達」的成交缺口，需要券商提供逐筆歷史回放
         API 才能完整補齊，超出目前高階 SDK 介面下可靠實作的範圍。
         """
-        await self._supervisor.run(lambda: asyncio.to_thread(self._reconcile_blocking))
+        # supervisor.run 回傳被包協程/callable 的結果（見 broker/supervisor.py），故
+        # `_reconcile_blocking` 回傳的「本次補回筆數」能直接在這裡取得。>0 才發漂移告警：
+        # sim 下 list_trades() 空 → count 0 → 不發（見對應測試）。
+        count = await self._supervisor.run(lambda: asyncio.to_thread(self._reconcile_blocking))
+        if count and self._ops is not None:
+            self._ops.reconcile_drift(count=count, context=f"mode={self.mode} account={self.account}")
 
-    def _reconcile_blocking(self) -> None:
+    def _reconcile_blocking(self) -> int:
+        """回傳本次實際補回 RawInbox 的委託進展筆數（`len(staged)`）；兩個 early-return 回 0。"""
         if self._api is None:
-            return
+            return 0
         with self._session_factory() as session:
             cursor = brepo.get_reconcile_cursor(session, broker=self.broker, account=self.account, mode=self.mode)
 
@@ -290,7 +321,7 @@ class ShioajiAdapter:
                 newest = watermark
 
         if not staged and newest == cursor:
-            return  # 沒有新東西，連 cursor 都不動（避免每次 watchdog 週期都無意義地寫 DB）
+            return 0  # 沒有新東西，連 cursor 都不動（避免每次 watchdog 週期都無意義地寫 DB）
 
         with self._session_factory() as session:
             for payload in staged:
@@ -300,6 +331,7 @@ class ShioajiAdapter:
                 at=newest if newest is not None else _utcnow_naive(),
             )
             session.commit()
+        return len(staged)
 
     @staticmethod
     def _trade_watermark(trade) -> datetime | None:
@@ -426,6 +458,13 @@ class ShioajiAdapter:
                     else:
                         brepo.mark_order_status(fail_session, fail_order, status="unknown")
                     fail_session.commit()
+                # T0.3 告警（純疊加）：failed/unknown 兩條路都通知；RiskError（send gate/kill
+                # switch 攔截）在上面的 except RiskError 分支就已返回，不會走到這裡——那是預期
+                # 中的風控攔截、非券商失敗，不發 place_failed。
+                self._alert_place_failed(
+                    client_order_id=client_order_id, action=req.action, qty=req.qty,
+                    classification=classification, exc=exc,
+                )
                 if classification == "failed":
                     raise OrderError(
                         f"送單遭券商明確拒絕，委託標記 failed 並已釋放配額："
@@ -586,6 +625,7 @@ class ShioajiAdapter:
             elif order.user_id != actor_user_id:
                 raise AuthorizationError("非委託所有人不得改單")
             order_id, ordno, client_order_id = order.id, order.ordno, order.client_order_id
+            action = order.action  # 供 T0.3 place_failed 告警用（session 關閉後不再讀 detached order）
             price_type = order.price_type  # 改單不能改變 price_type，送出前判斷 MKT 用既有值
 
         # round3 #4/#11 收尾：這次改單「若有」保留的 delta 配額（RiskGuard.check_update 只在
@@ -634,6 +674,12 @@ class ShioajiAdapter:
                     with self._session_factory() as fail_session:
                         brepo.release_quota(fail_session, reservation_id=reservation_id)
                         fail_session.commit()
+                # T0.3 告警（純疊加）；RiskError/_TradeNotFoundError 在上面各自的 except 分支
+                # 就已返回、不會走到這裡（那兩者非券商送單失敗，不發 place_failed）。
+                self._alert_place_failed(
+                    client_order_id=client_order_id, action=action, qty=new_qty,
+                    classification="failed", exc=exc,
+                )
                 raise OrderError(
                     f"改單遭券商明確拒絕，delta 配額已釋放（委託本身狀態不變）："
                     f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
@@ -642,6 +688,10 @@ class ShioajiAdapter:
                 fail_order = fail_session.get(Order, order_id)
                 brepo.mark_order_status(fail_session, fail_order, status="unknown")
                 fail_session.commit()
+            self._alert_place_failed(
+                client_order_id=client_order_id, action=action, qty=new_qty,
+                classification="unknown", exc=exc,
+            )
             raise OrderError(
                 f"改單失敗，委託標記 unknown 待 reconcile："
                 f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"

@@ -58,6 +58,7 @@ async def run_order_watchdog(
     login_min_interval: float,
     unquarantine_after_seconds: float = 300.0,
     unknown_reconcile_grace_seconds: float = 300.0,
+    ops_alerter=None,
 ) -> None:
     backoff = interval
     last_login_monotonic = 0.0
@@ -89,6 +90,10 @@ async def run_order_watchdog(
                 message = redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", []))
                 log.warning("watchdog 重連失敗: %s", message)
                 state.mark_unhealthy(message)
+                # T0.3 告警（純疊加）：重連失敗通知，訊息已 redact（可能夾帶 login/activate_ca
+                # 的 api_key/ca_passwd/person_id）。OpsAlerter.connect_failed 自帶節流+吞錯。
+                if ops_alerter is not None:
+                    ops_alerter.connect_failed(message)
                 state.reconnect_attempts += 1
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
                 await asyncio.sleep(backoff)

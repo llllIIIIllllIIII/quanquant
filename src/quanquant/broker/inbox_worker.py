@@ -80,6 +80,7 @@ class RawInboxWorker:
         idle_interval: float = 1.0,
         batch_limit: int = 50,
         order_events: "OrderEventHub | None" = None,
+        ops_alerter=None,
     ) -> None:
         self._session_factory = session_factory
         self._supervisor = supervisor
@@ -89,6 +90,7 @@ class RawInboxWorker:
         self._idle_interval = idle_interval
         self._batch_limit = batch_limit
         self._order_events = order_events
+        self._ops = ops_alerter  # T0.3：回報進 quarantine 時發營運告警（fire-and-forget，純疊加）
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -152,8 +154,16 @@ class RawInboxWorker:
             except (ValueError, PositionMismatchError) as exc:
                 session.rollback()
                 row = session.get(RawInbox, row_id)
+                kind = row.kind if row is not None else "?"  # commit 前先取（expire_on_commit 後不再讀 detached row）
                 brepo.quarantine_raw_inbox(session, row, error=str(exc))
                 session.commit()
+                # T0.3 告警（純疊加）：quarantine 落地後才通知；取值/呼叫包 try/except 吞掉，
+                # 告警絕不能反噬處理流程（此列已成功 quarantine，DB 狀態不受告警影響）。
+                if self._ops is not None:
+                    try:
+                        self._ops.quarantine(row_id=row_id, kind=kind, error=str(exc))
+                    except Exception:
+                        log.exception("quarantine 告警失敗（已吞，不影響處理流程）")
 
     @staticmethod
     def _decode_payload(raw: str) -> dict:

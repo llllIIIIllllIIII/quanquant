@@ -49,14 +49,26 @@ def _noop_order_report_mapper(payload: dict) -> OrderReport:
     return OrderReport(**payload)
 
 
-def _worker(engine, *, deal_mapper=_ok_deal_mapper, order_report_mapper=_noop_order_report_mapper, supervisor=None):
+def _worker(engine, *, deal_mapper=_ok_deal_mapper, order_report_mapper=_noop_order_report_mapper,
+            supervisor=None, ops_alerter=None):
     return RawInboxWorker(
         session_factory=lambda: Session(engine),
         supervisor=supervisor or BrokerSupervisor(),
         deal_mapper=deal_mapper,
         order_report_mapper=order_report_mapper,
         idle_interval=0.01,
+        ops_alerter=ops_alerter,
     )
+
+
+class _RecordingAlerter:
+    """假 OpsAlerter：記錄 quarantine 呼叫 kwargs（T0.3 告警串接）；本身絕不 raise。"""
+
+    def __init__(self) -> None:
+        self.quarantine_calls: list[dict] = []
+
+    def quarantine(self, **kw) -> None:
+        self.quarantine_calls.append(kw)
 
 
 def _seed_order(session, **over):
@@ -102,6 +114,37 @@ def test_unresolvable_order_correlation_quarantines_not_dropped(session, engine)
         assert s.exec(select(Deal)).first() is None  # 沒有部分寫入
         row = s.exec(select(RawInbox)).first()
         assert row.quarantine is True and row.processed is False
+
+
+def test_quarantine_emits_ops_alert_with_row_id_kind_and_error(session, engine):
+    """T0.3：走進 quarantine 分支時通知 OpsAlerter（row_id/kind/error）。"""
+    alerter = _RecordingAlerter()
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(ordno="GHOST", broker_order_id="GHOST-B")),
+        )
+        s.commit()
+        row_id = s.exec(select(RawInbox)).first().id
+
+    worker = _worker(engine, ops_alerter=alerter)
+    worker.process_batch_once()
+    assert len(alerter.quarantine_calls) == 1
+    call = alerter.quarantine_calls[0]
+    assert call["row_id"] == row_id and call["kind"] == "deal_report"
+    assert "無法解析委託關聯" in call["error"]
+
+
+def test_normal_processing_does_not_emit_quarantine_alert(session, engine):
+    alerter = _RecordingAlerter()
+    _seed_order(session)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    worker = _worker(engine, ops_alerter=alerter)
+    worker.process_batch_once()
+    assert alerter.quarantine_calls == []  # 正常落地不發告警
 
 
 def test_deal_report_octype_comes_from_resolved_order_not_mapper_payload(session, engine):

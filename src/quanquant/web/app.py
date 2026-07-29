@@ -21,11 +21,14 @@ from quanquant.broker.redaction import redact_secrets
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.broker.watchdog import run_order_watchdog
 from quanquant.candles.builder import CandleBuilder
+from quanquant.candles.market_calendar import session_now
 from quanquant.candles.repo import prune_quotes, upsert_candles
 from quanquant.config import Settings, get_settings
 from quanquant.db.engine import get_engine, init_db
 from quanquant.db.models import Quote
+from quanquant.market_hours import CST
 from quanquant.notify import TelegramNotifier, build_notify
+from quanquant.notify.ops_alerter import build_ops_alerter
 from quanquant.poller import QuoteEvent, QuotePoller
 from quanquant.pulse.engine import PulseEngine, run_pulse_engine
 from quanquant.pulse.prefs import load_telegram_enabled
@@ -141,6 +144,31 @@ async def _prune_quotes_loop() -> None:
         await asyncio.sleep(24 * 3600)
 
 
+def _feed_stale_check(poller, ops_alerter, threshold: float, session_open_fn) -> None:
+    """單次判定（抽出以利測試，不必真跑無限 loop）：**僅在交易時段**且 poller 報價停滯逾
+    `threshold` 秒時，才發 feed_stale 告警。休市（週末/夜盤收盤後/盤間）時 `session_open_fn()`
+    回 False → 直接返回，避免每晚對著關閉的市場狂噴告警（本項驗收重點）。"""
+    if poller is None or ops_alerter is None:
+        return
+    if not session_open_fn():
+        return
+    if poller.is_stale(threshold):
+        ops_alerter.feed_stale(age_seconds=poller.seconds_since_snapshot())
+
+
+async def run_feed_watchdog(
+    poller, ops_alerter, *, threshold: float, interval: float = 30.0, session_open_fn
+) -> None:
+    """盤中報價停滯 watchdog（T0.3）：每 `interval` 秒做一次 `_feed_stale_check`。判定/告警
+    任何例外一律吞掉並記 log，不讓 watchdog 自己掛掉。"""
+    while True:
+        try:
+            _feed_stale_check(poller, ops_alerter, threshold, session_open_fn)
+        except Exception:
+            log.exception("feed watchdog 判定失敗（已吞，續跑）")
+        await asyncio.sleep(interval)
+
+
 async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) -> None:
     """Task 8 readiness gate：ORDER_MODE 拼錯（`order_subsystem_preflight` raise
     RuntimeError）只讓下單子系統停用並反映在 `/healthz`——**不**讓整個 app 起不來，行情/日誌
@@ -154,6 +182,7 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     app.state.order_service = None
     app.state.order_risk_guard = None
     app.state.order_inbox_worker = None
+    ops_alerter = getattr(app.state, "ops_alerter", None)  # T0.3：lifespan 已建好，這裡取用傳遞
 
     try:
         order_enabled, order_disabled_reason = order_subsystem_preflight(settings)
@@ -195,11 +224,13 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         person_id=settings.shioaji_person_id or None, symbol=settings.symbol,
         mode=settings.order_mode, session_factory=_order_session, supervisor=supervisor,
         risk_guard=risk_guard, sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+        ops_alerter=ops_alerter,
     )
     inbox_worker = RawInboxWorker(
         session_factory=_order_session, supervisor=supervisor,
         deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
         order_events=getattr(app.state, "order_events", None),
+        ops_alerter=ops_alerter,
     )
 
     try:
@@ -216,6 +247,10 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         )
         order_state.mark_unhealthy(message)
         log.error("下單子系統 connect 失敗（fail closed）: %s", message)
+        # T0.3 告警（純疊加）：務必用已 redact 的 message（原始 exc 可能夾帶
+        # api_key/ca_passwd/person_id），不可用原始 exc。
+        if ops_alerter is not None:
+            ops_alerter.connect_failed(message)
         return
 
     order_state.mark_ready()
@@ -255,6 +290,7 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         login_min_interval=settings.order_login_min_interval_seconds,
         unquarantine_after_seconds=settings.order_unquarantine_after_seconds,
         unknown_reconcile_grace_seconds=settings.order_unknown_reconcile_grace_seconds,
+        ops_alerter=ops_alerter,
     )))
     tasks.append(asyncio.create_task(run_confirm_token_cleanup(
         _order_session, interval=settings.order_confirm_token_cleanup_interval_seconds,
@@ -268,6 +304,11 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     notify = build_notify(settings)
     app.state.notify = notify
+
+    # T0.3 營運告警管道（獨立 dev chat，與 3 人共用的價格警示分離；未設定則整體 no-op）。
+    ops_alerter = build_ops_alerter(settings, mode=settings.order_mode)
+    ops_alerter.attach_loop(asyncio.get_running_loop())
+    app.state.ops_alerter = ops_alerter
 
     use_shioaji = bool(
         settings.source == "shioaji"
@@ -332,6 +373,13 @@ async def lifespan(app: FastAPI):
         tasks.append(asyncio.create_task(poller.run()))
 
     await _start_order_subsystem(app, settings, tasks)
+
+    # T0.3 盤中報價停滯 watchdog：session_open_fn 複用 calendar-aware 的 `session_now`
+    # （market_calendar），休市（週末/假日/夜盤收盤後/盤間）一律回 None→False，不誤噴告警。
+    tasks.append(asyncio.create_task(run_feed_watchdog(
+        poller, ops_alerter, threshold=settings.feed_stale_alert_seconds,
+        session_open_fn=lambda: session_now(datetime.now(CST)) is not None,
+    )))
 
     try:
         yield
