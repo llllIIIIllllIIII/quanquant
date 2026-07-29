@@ -78,6 +78,11 @@ class RiskGuard:
         property 當下的值，Task 8 的 admin 開關/緊急停止直接呼叫本方法即可立刻生效。"""
         self._kill_switch = value
 
+    def is_owner(self, actor_user_id: int) -> bool:
+        """非 raise 版的 owner 判定（`assert_owner` 是 raise 版）：供模板/UI 決定是否顯示
+        owner-only 控制（如 kill switch）。server 端的授權仍一律經 `assert_owner`。"""
+        return actor_user_id in self._owner_user_ids
+
     def assert_owner(self, actor_user_id: int) -> None:
         if actor_user_id not in self._owner_user_ids:
             raise AuthorizationError(f"user_id={actor_user_id} 不是 owner")

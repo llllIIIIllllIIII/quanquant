@@ -81,17 +81,38 @@ class _FakeService:
 
 
 class _FakeRiskGuard:
-    def __init__(self):
+    def __init__(self, owner_ids=None):
         self.kill_switch = False
+        # owner_ids=None → 允許所有人（既有測試預設：assert_owner 為 no-op、is_owner 恆真）；
+        # 傳集合則只有集合內的 user 是 owner（kill switch 非 owner→403 測試用）。
+        self._owner_ids = None if owner_ids is None else set(owner_ids)
+        self.set_kill_switch_calls = []
 
     def set_kill_switch(self, value):
+        self.set_kill_switch_calls.append(value)
         self.kill_switch = value
 
+    def is_owner(self, actor_user_id):
+        return self._owner_ids is None or actor_user_id in self._owner_ids
+
     def assert_owner(self, actor_user_id):
-        pass
+        if self._owner_ids is not None and actor_user_id not in self._owner_ids:
+            raise AuthorizationError("not owner")
 
     def issue_confirm_token(self, session, *, actor_user_id, payload_hash):
         return f"TOKEN-{payload_hash}"
+
+
+class _FakeOps:
+    """假 ops_alerter：只記錄 kill_switch(...) 呼叫（API 見 notify/ops_alerter.py）。"""
+
+    def __init__(self):
+        self.kill_switch_calls = []
+
+    def kill_switch(self, *, enabled, actor_user_id, open_order_count=0, detail=""):
+        self.kill_switch_calls.append(
+            {"enabled": enabled, "actor_user_id": actor_user_id, "open_order_count": open_order_count}
+        )
 
 
 @pytest.fixture
@@ -105,7 +126,12 @@ def fake_guard():
 
 
 @pytest.fixture
-def order_client(engine, user, fake_service, fake_guard):
+def fake_ops():
+    return _FakeOps()
+
+
+@pytest.fixture
+def order_client(engine, user, fake_service, fake_guard, fake_ops):
     def _session_override():
         with Session(engine) as s:
             yield s
@@ -115,6 +141,7 @@ def order_client(engine, user, fake_service, fake_guard):
     app.dependency_overrides[get_poller] = lambda: None
     app.state.order_service = fake_service
     app.state.order_risk_guard = fake_guard
+    app.state.ops_alerter = fake_ops
     c = TestClient(app)
     c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
     return c
@@ -221,6 +248,91 @@ def test_place_order_real_two_step_confirm_round_trip(order_client, fake_service
     second = order_client.post("/orders", data={**form, "confirm_token": token})
     assert second.status_code == 200
     assert len(fake_service.placed) == 1  # 帶 token 那次真的送出去了
+
+
+# ---------------------------------------------------------------------------
+# T0.3(B) kill switch runtime 開關：owner-only 端點 + 告警 + 最小 UI
+# ---------------------------------------------------------------------------
+
+def _seed_order(session, user, *, client_order_id, request_hash, status, broker_order_id, ordno):
+    brepo.set_order_ack(
+        session,
+        brepo.create_order(
+            session, client_order_id=client_order_id, request_hash=request_hash, user_id=user.id,
+            mode="sim", broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-07-27",
+        ).id,
+        broker_order_id=broker_order_id, ordno=ordno, status=status,
+    )
+
+
+def test_kill_switch_owner_turns_on_toggles_and_alerts_with_open_order_count(
+    order_client, session, fake_guard, fake_ops, user
+):
+    """owner 翻 ON：200、guard.kill_switch 變 True、ops.kill_switch 被呼叫（enabled=True、
+    帶正確 open_order_count——只算 submitted/partfilled，不算 filled）。"""
+    _seed_order(session, user, client_order_id="KOPEN", request_hash="KH1", status="submitted",
+                broker_order_id="KB-OPEN", ordno="KO")
+    _seed_order(session, user, client_order_id="KDONE", request_hash="KH2", status="filled",
+                broker_order_id="KB-DONE", ordno="KD")
+    session.commit()
+
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true"})
+    assert resp.status_code == 200
+    assert fake_guard.kill_switch is True
+    assert len(fake_ops.kill_switch_calls) == 1
+    call = fake_ops.kill_switch_calls[0]
+    assert call["enabled"] is True
+    assert call["actor_user_id"] == user.id
+    assert call["open_order_count"] == 1  # 只算未成交掛單，filled 不算
+    assert 'hx-post="/orders/kill-switch"' in resp.text  # 回傳更新後的控制片段
+
+
+def test_kill_switch_owner_turns_off(order_client, fake_guard, fake_ops, user):
+    fake_guard.kill_switch = True
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "false"})
+    assert resp.status_code == 200
+    assert fake_guard.kill_switch is False
+    assert fake_ops.kill_switch_calls[-1]["enabled"] is False
+
+
+def test_kill_switch_non_owner_gets_403_and_does_not_toggle(order_client, fake_guard, fake_ops, user):
+    """非 owner → 403、set_kill_switch 未被呼叫、狀態不變、不發告警。"""
+    fake_guard._owner_ids = set()  # 沒有任何 owner → 目前 user 不是 owner
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true"})
+    assert resp.status_code == 403
+    assert fake_guard.kill_switch is False
+    assert fake_guard.set_kill_switch_calls == []
+    assert fake_ops.kill_switch_calls == []
+
+
+def test_kill_switch_without_risk_guard_does_not_500(engine, user):
+    """risk_guard 為 None（下單子系統關）→ 優雅回應（200 停用片段），不是 500。"""
+    def _session_override():
+        with Session(engine) as s:
+            yield s
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _session_override
+    app.dependency_overrides[get_poller] = lambda: None
+    # 刻意不設 app.state.order_risk_guard → get_order_risk_guard 回 None
+    c = TestClient(app)
+    c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
+    resp = c.post("/orders/kill-switch", data={"enabled": "true"})
+    assert resp.status_code == 200
+    assert "未啟用" in resp.text
+
+
+def test_orders_page_shows_kill_switch_control_for_owner(order_client):
+    text = order_client.get("/orders").text
+    assert 'hx-post="/orders/kill-switch"' in text
+
+
+def test_orders_page_hides_kill_switch_control_for_non_owner(order_client, fake_guard):
+    fake_guard._owner_ids = set()  # user 非 owner
+    text = order_client.get("/orders").text
+    assert 'hx-post="/orders/kill-switch"' not in text
 
 
 # ---- bug 1（simtrade 實測回歸）：_parse_order_price 對 None 的確切防線單元測試 ----

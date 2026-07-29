@@ -260,6 +260,19 @@ def count_orders_today(session: Session, *, user_id: int, mode: str, trading_day
     return len(list(session.exec(stmt)))
 
 
+_OPEN_ORDER_STATUSES = ("submitted", "partfilled")
+
+
+def count_open_orders(session: Session, *, mode: str | None = None) -> int:
+    """kill switch 告警用：粗略計算「當下仍掛在券商、未成交」的委託數（submitted/partfilled，
+    與 order_table.html 判定可取消/改單的 live-open 集合一致）。全域（不分 user）、best-effort，
+    供人工決定是否手動撤單參考；`mode` 指定時只計該執行 mode（real/sim）。"""
+    stmt = select(Order).where(Order.status.in_(_OPEN_ORDER_STATUSES))
+    if mode is not None:
+        stmt = stmt.where(Order.mode == mode)
+    return len(list(session.exec(stmt)))
+
+
 def sum_qty_today(session: Session, *, user_id: int, mode: str, trading_day: str) -> int:
     stmt = select(Order).where(
         Order.user_id == user_id, Order.mode == mode, Order.trading_day == trading_day

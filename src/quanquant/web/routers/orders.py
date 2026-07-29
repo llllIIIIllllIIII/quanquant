@@ -58,6 +58,20 @@ def _mode(raw: str | None) -> str:
     return raw if raw in ("sim", "real") else "sim"
 
 
+def _parse_kill_switch_enabled(raw) -> bool:
+    """HTMX 隱藏欄位 `enabled` 送 "true"/"false"（也容忍 1/on/yes）；其餘一律視為 False。"""
+    return str(raw or "").strip().lower() in ("true", "1", "on", "yes")
+
+
+def _count_open_orders_best_effort(session: Session, service) -> int:
+    """kill switch 告警用的未成交掛單數：best-effort，計數失敗一律回 0，絕不擋住切換。"""
+    try:
+        mode = getattr(service, "mode", None) if service is not None else None
+        return brepo.count_open_orders(session, mode=mode)
+    except Exception:  # noqa: BLE001 — 計數只供告警參考，任何失敗都不得反噬切換
+        return 0
+
+
 def _form_error(message: str) -> HTMLResponse:
     html = render_partial("partials/form_error.html", message=message)
     return HTMLResponse(
@@ -199,14 +213,50 @@ async def orders_page(
     request: Request,
     user: User = Depends(get_current_user),
     service=Depends(get_order_service),
+    risk_guard=Depends(get_order_risk_guard),
     mode: str | None = Query(None),
 ):
     resolved_mode = _mode(mode or (service.mode if service is not None else None))
+    # kill switch 控制只給 owner 看（server 端切換仍一律經 assert_owner，非只靠前端隱藏）；
+    # risk_guard 可能為 None（下單子系統停用）——此時無 owner、也不顯示控制。
+    is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
+    kill_switch = risk_guard.kill_switch if risk_guard is not None else False
     return templates.TemplateResponse(request, "orders.html", {
         "active": "orders", "mode": resolved_mode,
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
-        "symbols": ["TXF"],
+        "symbols": ["TXF"], "is_owner": is_owner, "kill_switch": kill_switch,
     })
+
+
+@router.post("/orders/kill-switch", response_class=HTMLResponse)
+async def toggle_kill_switch(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    service=Depends(get_order_service),
+    risk_guard=Depends(get_order_risk_guard),
+):
+    """owner-only 全域 kill switch runtime 開關（runtime 即時生效，見 RiskGuard.set_kill_switch）。
+    翻 ON 只擋新單、不自動撤既有掛單（自動撤單危險，留給人工/T0.4）；改以告警列出當下未成交
+    掛單數，提醒人工決定。子系統停用（risk_guard 為 None）時優雅回一個停用片段，不 500。"""
+    if risk_guard is None:
+        return HTMLResponse(
+            render_partial("partials/kill_switch_control.html", kill_switch=False, disabled=True)
+        )
+    try:
+        risk_guard.assert_owner(user.id)  # 非 owner → AuthorizationError → 403（比照 positions L232-233）
+    except AuthorizationError:
+        raise HTTPException(status_code=403, detail="not owner")
+    form = await request.form()
+    enabled = _parse_kill_switch_enabled(form.get("enabled"))
+    risk_guard.set_kill_switch(enabled)  # runtime 即時生效
+    open_count = _count_open_orders_best_effort(session, service)
+    ops = getattr(request.app.state, "ops_alerter", None)
+    if ops is not None:  # 告警本身絕不能反噬切換
+        ops.kill_switch(enabled=enabled, actor_user_id=user.id, open_order_count=open_count)
+    return HTMLResponse(
+        render_partial("partials/kill_switch_control.html", kill_switch=enabled, disabled=False)
+    )
 
 
 # 委託/部位是每 2s 輪詢的唯讀端點，一律用同步 `def`（比照 /api/candles 慣例）跑 threadpool、

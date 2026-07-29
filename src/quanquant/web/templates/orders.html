@@ -10,6 +10,11 @@
   <p class="error-banner">下單子系統目前未啟用，無法送出新委託（歷史委託仍可查看）。</p>
   {% endif %}
 
+  {# owner-only 全域 kill switch 控制（server 端切換仍一律經 assert_owner，非只靠此隱藏）。 #}
+  {% if is_owner %}
+  {% include "partials/kill_switch_control.html" %}
+  {% endif %}
+
   <div class="form-error-slot"></div>
 
   <!-- hx-disabled-elt：送出期間停用送出鈕，杜絕「回應還沒回來前的 double-submit」——連點的
