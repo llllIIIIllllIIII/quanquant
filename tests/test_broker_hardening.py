@@ -87,3 +87,27 @@ def test_on_order_cb_stages_degraded_payload_when_primary_commit_fails(caplog):
         mod.commit_raw_callback = orig
 
     assert any(isinstance(p, dict) and p.get("_unparsed") for p in staged)  # 有退化保存
+
+
+# ---- T0.2：孤兒委託偵測（pending/sending + 無券商識別碼） ----
+
+def test_list_pending_orphans_finds_pending_null_ordno_but_not_acked(session, user):
+    from quanquant.broker import repository as brepo
+
+    def _mk(cid):
+        return brepo.create_order(
+            session, client_order_id=cid, request_hash=cid, user_id=user.id, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1, price=Decimal("0"),
+            price_type="MKT", order_type="IOC", octype="New", trading_day="2026-07-28",
+        )
+
+    orphan = _mk("ORPH")            # 建立後預設 pending、ordno/broker_order_id 皆 NULL = 孤兒
+    acked = _mk("ACKED")
+    brepo.set_order_ack(session, acked.id, broker_order_id="B1", ordno="O1", status="submitted")
+    session.commit()
+
+    found = brepo.list_pending_orphans_older_than(session, older_than=datetime(2099, 1, 1))
+    cids = {o.client_order_id for o in found}
+    assert "ORPH" in cids       # pending + 無券商識別碼 → 被 surface
+    assert "ACKED" not in cids  # 已拿到 ordno/broker_order_id → 不算孤兒（可被 reconcile 正常關聯）
+    assert orphan.status == "pending"

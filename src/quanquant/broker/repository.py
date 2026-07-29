@@ -282,6 +282,31 @@ def list_unknown_orders_older_than(
     return list(session.exec(stmt))
 
 
+def list_pending_orphans_older_than(
+    session: Session, *, older_than: datetime, limit: int = 200
+) -> list[Order]:
+    """T0.2 孤兒單偵測：找出卡在 pending/sending、且**從未拿到任何券商識別碼**（ordno 與
+    broker_order_id 皆 NULL）、又卡了一段時間（updated_at < older_than）的委託。
+
+    這代表 process 曾在「create_order/reserve_quota 之後、set_order_ack 落地之前」崩潰。
+    與 unknown+NULL 不同（那是 native 呼叫**拋例外**、幾乎確定沒送達），pending 孤兒是
+    native place_order() **可能已成功回傳**（券商已收單）後才崩潰——因此**不可**自動判
+    failed/釋放配額（會少算曝險→過度交易）。本函式只用來 surface 給人工/reconcile 依券商
+    真相處理；對應 QuotaReservation 仍卡 reserved，配額收尾需券商端關聯確認後才做。"""
+    stmt = (
+        select(Order)
+        .where(
+            Order.status.in_(("pending", "sending")),  # type: ignore[union-attr]
+            Order.ordno.is_(None),  # type: ignore[union-attr]
+            Order.broker_order_id.is_(None),  # type: ignore[union-attr]
+            Order.updated_at < older_than,
+        )
+        .order_by(Order.id)
+        .limit(limit)
+    )
+    return list(session.exec(stmt))
+
+
 # ---- RawInbox（durable callback spool，V3-2） ----
 
 def stage_raw_inbox(session: Session, *, kind: str, broker: str, payload: str) -> RawInbox:

@@ -223,6 +223,33 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     app.state.order_risk_guard = risk_guard
     app.state.order_inbox_worker = inbox_worker
     tasks.append(asyncio.create_task(inbox_worker.run()))
+    # T0.2：開機做一次 best-effort reconcile——原本 reconcile 只在斷線重連後才跑（watchdog），
+    # 正常開機不會補回停機期間券商端的委託/狀態變更。失敗不擋啟動（watchdog 後續仍會補）；
+    # sim 下 list_trades() 空、no-op。
+    try:
+        await adapter.reconcile()
+    except Exception as exc:
+        log.warning(
+            "開機 reconcile 失敗（不擋啟動，watchdog 後續重試）: %s",
+            redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", [])),
+        )
+    # T0.2：surface 孤兒委託（pending/sending + 無券商識別碼）——process 曾在送單落地前崩潰，
+    # 券商端**可能已收單/成交**，故不自動改狀態/釋放配額（會少算曝險→過度交易），只明顯記錄
+    # 交人工/reconcile 對照券商端後收尾。開機當下任何 pending+NULL 都是前次執行殘留的孤兒。
+    try:
+        from quanquant.broker import repository as _brepo
+        with _order_session() as _s:
+            orphans = _brepo.list_pending_orphans_older_than(
+                _s, older_than=datetime.now(timezone.utc).replace(tzinfo=None)
+            )
+        if orphans:
+            log.warning(
+                "偵測到 %d 筆孤兒委託（送單落地前崩潰，券商端可能已成交，未自動處理）：client_order_id=%s"
+                "——請對照券商端後手動收尾其保留配額",
+                len(orphans), [o.client_order_id for o in orphans],
+            )
+    except Exception:
+        log.exception("孤兒委託掃描失敗")
     tasks.append(asyncio.create_task(run_order_watchdog(
         adapter, order_state, interval=settings.order_watchdog_interval_seconds,
         login_min_interval=settings.order_login_min_interval_seconds,
