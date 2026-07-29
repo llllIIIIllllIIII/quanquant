@@ -192,7 +192,9 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         return
 
     if not order_enabled:
-        order_state.mark_unhealthy(order_disabled_reason or "下單子系統未啟用")
+        # 刻意停用（缺 key/owner/CA）：非故障，/healthz 仍算健康（200）。設定錯（上面的
+        # RuntimeError 分支）才是 mark_unhealthy → /healthz 回 503。
+        order_state.mark_disabled(order_disabled_reason or "下單子系統未啟用")
         log.info("下單子系統未啟用: %s", order_disabled_reason)
         return
 
