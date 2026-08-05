@@ -97,3 +97,16 @@ async def test_gateway_error_message_preserves_broker_code_for_classification():
     with pytest.raises(OrderError) as ei:
         await gw.place(_req())
     assert _classify_place_failure(ei.value) == "failed"
+
+
+# ---- codex round1 fix4(a)（MEDIUM）：error_kind=="timeout" 要對映成型別化的
+# AgentCommandTimeoutError（取代一般 OrderError），讓 _classify_place_failure 走既有
+# isinstance 分支穩定判 "unknown"（不必依賴訊息字串裡沒有 code: 4xx 這種巧合）。----
+
+async def test_gateway_timeout_error_kind_raises_typed_and_classified_unknown():
+    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", ok=False, error_kind="timeout",
+                                   message="agent 子程序無回應"))
+    gw = AgentNativeGateway(ch, timeout_seconds=1)
+    with pytest.raises(AgentCommandTimeoutError) as ei:
+        await gw.place(_req())
+    assert _classify_place_failure(ei.value) == "unknown"

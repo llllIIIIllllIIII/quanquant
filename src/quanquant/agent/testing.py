@@ -11,7 +11,7 @@
 import time
 from decimal import Decimal
 
-from quanquant.broker.base import TradeNotFoundError
+from quanquant.broker.base import OrderError, TradeNotFoundError
 
 
 class FakeNativeClient:
@@ -59,7 +59,13 @@ class FakeNativeClient:
             # 專供 redaction 測試：訊息內嵌憑證，驗證 child_main 送出前已 redact。
             raise RuntimeError(f"boom {self.credentials.get('api_key')}")
         if ordno not in self._orders:
-            raise TradeNotFoundError(ordno)
+            # codex round1 fix4(b)：對齊 production 契約——native.py 的 cancel()（227-233
+            # 行）對找不到對應委託 raise 一般 OrderError，TradeNotFoundError 只用在
+            # update()。這裡原本誤用 TradeNotFoundError，跟真實 SDK 行為不一致。
+            raise OrderError(
+                f"找不到券商對應委託（ordno={ordno!r}），可能已成交/已刪除/跨日，"
+                "拒絕在無法確認對應委託的情況下送出取消"
+            )
         del self._orders[ordno]
 
     def update(self, ordno: str, *, price, qty: int, price_type: str | None = None) -> None:

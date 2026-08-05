@@ -44,13 +44,18 @@ def test_connect_then_place_acks_and_persists_reports(tmp_path):
     _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
 
 
-def test_cancel_unknown_maps_trade_not_found(tmp_path):
+def test_cancel_unknown_maps_exception_like_production(tmp_path):
+    # codex round1 fix4(b)：FakeNativeClient.cancel 對未知 ordno 原本 raise
+    # TradeNotFoundError，但 production 的 native.cancel()（native.py 227-233）對同樣情況
+    # raise 一般 OrderError（TradeNotFoundError 只用在 update()）。改讓 fake 對齊 production
+    # 契約——error_kind 變成 "exception"，不再是 "trade_not_found"。
     conn, t = _start_child_thread(tmp_path)
     _rpc(conn, {"op": "connect"})
     reply = _rpc(conn, {"op": "cancel", "ordno": "NOPE"})
-    assert reply == {"ok": False, "error_kind": "trade_not_found",
-                     "message": reply["message"], "result": {"ordno": "NOPE"}}
-    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+    assert reply["ok"] is False and reply["error_kind"] == "exception"
+    assert "NOPE" in reply["message"]
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
 
 
 def test_exception_reply_is_redacted_and_loop_survives(tmp_path):

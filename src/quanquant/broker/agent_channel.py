@@ -124,6 +124,10 @@ class AgentNativeGateway:
             return ack.result or {}
         if ack.error_kind == "trade_not_found":
             raise TradeNotFoundError((ack.result or {}).get("ordno"))
+        if ack.error_kind == "timeout":
+            # codex round1 fix4(a)：型別化——讓 _classify_place_failure 走既有 isinstance
+            # 分支穩定判 "unknown"（結果不明、保留配額），不必依賴訊息字串巧合。
+            raise AgentCommandTimeoutError(ack.message or "agent 子程序無回應")
         # message 內含券商原始錯誤字串（agent 端已 redact），
         # `code: 4xx` 交給既有 _classify_place_failure 判 failed。
         raise OrderError(ack.message or f"agent 指令失敗（{ack.error_kind}）")
