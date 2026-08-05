@@ -1,6 +1,6 @@
 """ShioajiAdapter：OrderService 的 Shioaji 落地。
 
-lazy-import shioaji（比照 sources/shioaji_stream.py），一般測試/CLI import 這個模組不會
+本檔不直接碰 Shioaji SDK（Task 2 委派重構，見下方說明），一般測試/CLI 載入這個模組不會
 拉進原生 client。所有 native 呼叫（connect/close/place/cancel/update/positions）一律經
 `BrokerSupervisor.run()` 這個單一 command executor（round3 #11）——**禁止**呼叫端各自
 `async with supervisor.lock:`，否則 watchdog reconnect（Task 8）可能與 place 交錯替換
@@ -30,8 +30,16 @@ crash/等 supervisor lock 時 payload 仍會遺失）；callback 內**不**碰�
 **注意**：Shioaji SDK 的確切回呼欄位名稱（`order.id`/`order.seqno`/`status.id` 等）以
 官方文件公開語意為準，本檔用 `getattr`/`payload.get` 防禦性存取（比照
 `shioaji_stream.py::_dec` 既有慣例）；實作時若已安裝套件的 type stub 顯示不同屬性名，
-只需局部調整以下三個函式內的欄位鍵，不影響本檔其餘架構：
-`_ack_fields_from_trade` / `_map_deal_report` / `_map_order_report`。
+只需局部調整以下函式內的欄位鍵，不影響本檔其餘架構：`_map_deal_report` /
+`_map_order_report`（`ack_fields_from_trade` 已隨 native 呼叫一併搬到
+`quanquant.broker.native.ShioajiNativeClient`，本檔不再直接碰 Shioaji SDK 物件）。
+
+**Inc0 委派重構（Task 2）**：本檔所有直接碰 Shioaji SDK 的呼叫已搬到
+`quanquant.broker.native.ShioajiNativeClient`（`self._native`）——`ShioajiAdapter` 只負責
+DB/風控/冪等/告警業務邏輯，經 `self._native` 的方法送出實際 native 呼叫，本檔不再直接載入
+Shioaji SDK 套件（Task 1/2 的 import 邊界：全 broker 子系統只有 `native.py` 允許載入該套件）。
+`_api`/`_contract`/`account` 是委派 `self._native` 對應屬性的 property（相容既有測試
+`a._api = _FakeApi()` 的注入寫法）。
 """
 import asyncio
 import json
@@ -45,8 +53,9 @@ from typing import Protocol
 from sqlmodel import Session
 
 from quanquant.broker import repository as brepo
-from quanquant.broker.base import AuthorizationError, OrderError, RiskError
+from quanquant.broker.base import AuthorizationError, OrderError, RiskError, TradeNotFoundError
 from quanquant.broker.inbox_worker import OrderReport, commit_raw_callback
+from quanquant.broker.native import ShioajiNativeClient
 from quanquant.broker.redaction import redact_secrets as _redact_secrets
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill, Mode, OrderAck, OrderRequest, Position, canonical_payload_hash
@@ -91,14 +100,13 @@ def _classify_place_failure(exc: Exception) -> str:
     return "failed" if 400 <= code <= 499 else "unknown"
 
 
-class _TradeNotFoundError(OrderError):
-    """cancel/update 前刷新 + `list_trades()` 比對不到對應 `Trade`（bug 2/3 收尾）。
-
-    與其餘「送出失敗」的例外刻意分開一個型別：這種情況根本**沒有**送出任何 native
-    cancel_order/update_order 呼叫（找不到要傳的 Trade 物件，連送都送不出去），不屬於
-    `_classify_place_failure` 設計要處理的「結果不明」unknown fail-safe 範疇——`update()`
-    的例外分支需要能特判這個型別，避免被泛用的 `except Exception` 誤標委託 unknown（那
-    是給「native 呼叫本身失敗/逾時」用的語意，這裡連呼叫都沒發生）。"""
+# Task 2 委派重構：native.py 的 `update()` 找不到對應 Trade 時拋 base.py 的公開
+# `TradeNotFoundError`——這裡保留舊的模組私有名稱 `_TradeNotFoundError` 當別名，本檔下面
+# `update()` 的 `except _TradeNotFoundError:` 分支與既有測試（若有 import 這個私有名）都
+# 不必改。語意同舊 docstring：cancel/update 前刷新 + `list_trades()` 比對不到對應 `Trade`
+# （bug 2/3 收尾）——這種情況根本**沒有**送出任何 native cancel_order/update_order 呼叫，
+# 不屬於 `_classify_place_failure` 設計要處理的「結果不明」unknown fail-safe 範疇。
+_TradeNotFoundError = TradeNotFoundError
 
 
 class _RiskGuardLike(Protocol):
@@ -142,15 +150,51 @@ class ShioajiAdapter:
         self.symbol = symbol
         self.mode: Mode = mode
         self.broker = broker
-        self.account = ""
         self._session_factory = session_factory
         self._supervisor = supervisor
         self._risk_guard = risk_guard
         self._sim_fee_per_lot = sim_fee_per_lot  # A6：sim 成交 fee 缺值時依口數估算，不留 None/0
         self._ops = ops_alerter  # T0.3：營運告警（fire-and-forget、絕不 raise），純疊加
-        self._api = None
-        self._contract = None
         self._fill_handler: Callable[[Fill], None] | None = None
+        # Task 2 委派重構：所有直接碰 Shioaji SDK 的呼叫交給 native（`_api`/`_contract`/
+        # `account` 三個 property 墊片委派讀寫 native 對應屬性，見下方）；`on_raw` 落地責任
+        # 交回這個 adapter 的 `_persist_raw`（等價原本 `_on_order_cb` 直呼 commit_raw_callback
+        # 落地 RawInbox 那半段）。
+        self._native = ShioajiNativeClient(
+            api_key=api_key, secret_key=secret_key, ca_path=ca_path, ca_passwd=ca_passwd,
+            person_id=person_id, symbol=symbol, mode=mode, on_raw=self._persist_raw,
+        )
+
+    # ---- native 委派 property 墊片（相容既有測試 `a._api = _FakeApi()` 注入寫法） ----
+
+    @property
+    def _api(self):
+        return self._native.api
+
+    @_api.setter
+    def _api(self, value) -> None:
+        self._native.api = value
+
+    @property
+    def _contract(self):
+        return self._native.contract
+
+    @_contract.setter
+    def _contract(self, value) -> None:
+        self._native.contract = value
+
+    @property
+    def account(self) -> str:
+        return self._native.account
+
+    @account.setter
+    def account(self, value: str) -> None:
+        self._native.account = value
+
+    def _persist_raw(self, kind: str, payload: dict) -> None:
+        """`self._native` 的 `on_raw` callback：落地責任留在 adapter（DB/session 相依），
+        native 端零 DB 相依（見 native.py 模組頂部說明）。"""
+        commit_raw_callback(self._session_factory, kind=kind, broker=self.broker, payload=payload)
 
     # ---- T0.3 營運告警（純疊加，絕不反噬既有 fail-closed/冪等/redaction 行為） ----
 
@@ -181,40 +225,17 @@ class ShioajiAdapter:
         await self._supervisor.run(lambda: asyncio.to_thread(self._connect_blocking))
 
     def _connect_blocking(self) -> None:
-        import shioaji as sj  # lazy：一般 import 這個模組不拉原生 client（比照 shioaji_stream.py）
-
-        api = sj.Shioaji(simulation=(self.mode == "sim"))
-        api.login(self._api_key, self._secret_key, fetch_contract=True, subscribe_trade=True)
-        if self.mode == "real":
-            api.activate_ca(ca_path=self._ca_path, ca_passwd=self._ca_passwd, person_id=self._person_id)
-        api.set_order_callback(self._on_order_cb)
-        self._api = api
-        self.account = api.futopt_account.account_id
-        self._contract = self._contract_for(self.symbol)
+        # native.connect() 內部登入/CA 啟用/註冊 callback（真正註冊的是 native 自己的
+        # `_on_order_cb`，會呼叫 `self._native._on_raw`＝adapter 的 `_persist_raw`——與原本
+        # 這裡直接 `api.set_order_callback(self._on_order_cb)` 落地到同一個 commit_raw_callback
+        # 等價）全部搬到 native.py（Task 1）；adapter 端不再直接碰 Shioaji SDK。
+        self._native.connect()
 
     async def close(self) -> None:
         async def _do_close() -> None:
-            api, self._api = self._api, None
-            if api is None:
-                return
-            try:
-                await asyncio.to_thread(api.logout)
-            except Exception:
-                pass
+            await asyncio.to_thread(self._native.close)
 
         await self._supervisor.run(_do_close)
-
-    def _contract_for(self, symbol: str):
-        """比照 shioaji_stream.py::_front_contract：取最近未到期的具體月合約。"""
-        import datetime as _dt
-
-        category = getattr(self._api.Contracts.Futures, symbol)
-        today = _dt.datetime.now().strftime("%Y/%m/%d")
-        months = [c for c in category if "R" not in c.code[len(symbol):]]
-        if not months:
-            raise OrderError(f"找不到 {symbol} 的月合約")
-        active = [c for c in months if (c.delivery_date or "") >= today]
-        return min(active or months, key=lambda c: c.delivery_date or "9999/99/99")
 
     def on_fill(self, handler: Callable[[Fill], None]) -> None:
         self._fill_handler = handler  # 目前無呼叫端；保留供未來 push 通知擴充
@@ -257,15 +278,9 @@ class ShioajiAdapter:
         return await self._supervisor.run(_do_probe)
 
     def _probe_blocking(self) -> None:
-        """SDK 確切探測 API 待實機驗證，以 getattr 防禦性存取（同檔一貫慣例，見模組頂部
-        說明）：優先用 `list_accounts()`（存在即代表 session 仍能來回一次 native 呼叫）；
-        找不到時 fallback 讀 `futopt_account`（純屬性存取，至少能驗證 client 物件仍持有
-        登入後才會有的狀態，AttributeError 會被呼叫端當成探測失敗）。"""
-        probe_fn = getattr(self._api, "list_accounts", None)
-        if callable(probe_fn):
-            probe_fn()
-            return
-        _ = self._api.futopt_account
+        """實際探測邏輯已搬到 native.py `ShioajiNativeClient.probe()`（同一套 getattr 防禦性
+        存取慣例：優先 `list_accounts()`，找不到 fallback 讀 `futopt_account`）；這裡純委派。"""
+        self._native.probe()
 
     # ---- reconcile（round3 #2：重連後對帳，持久 cursor + 分辨委託/成交，不只 retry 本地 quarantine） ----
 
@@ -290,64 +305,40 @@ class ShioajiAdapter:
         if count and self._ops is not None:
             self._ops.reconcile_drift(count=count, context=f"mode={self.mode} account={self.account}")
 
-    def _reconcile_blocking(self) -> int:
-        """回傳本次實際補回 RawInbox 的委託進展筆數（`len(staged)`）；兩個 early-return 回 0。"""
-        if self._api is None:
+    def _read_reconcile_cursor(self) -> "datetime | None":
+        """Task 6/8 依賴：讀取持久 `BrokerReconcileCursor` watermark（沿用原
+        `_reconcile_blocking` 的呼叫寫法，單獨拆出供 watchdog/agent 端重用）。"""
+        with self._session_factory() as session:
+            return brepo.get_reconcile_cursor(
+                session, broker=self.broker, account=self.account, mode=self.mode
+            )
+
+    def _stage_reconcile_results(self, payloads: list[dict], newest: "datetime | None") -> int:
+        """Task 6/8 依賴：把 native 端 `trades_snapshot()` 篩出的委託進展 payload 落地
+        RawInbox + 推進 cursor（沿用原 `_reconcile_blocking` L326-333 的呼叫寫法與
+        `newest is None` 時的 `_utcnow_naive()` fallback——`payloads` 非空時一律推進 cursor，
+        不留下「有新委託進展卻沒有記錄任何 cursor」的半殘狀態，行為與重構前完全一致）。"""
+        if not payloads:
             return 0
         with self._session_factory() as session:
-            cursor = brepo.get_reconcile_cursor(session, broker=self.broker, account=self.account, mode=self.mode)
-
-        list_trades = getattr(self._api, "list_trades", None)
-        trades = list_trades() if callable(list_trades) else []
-
-        newest = cursor
-        staged: list[dict] = []
-        for trade in trades:
-            watermark = self._trade_watermark(trade)
-            if cursor is not None and watermark is not None and watermark <= cursor:
-                continue  # 已對帳過，週期補洞只補新進展
-            order = getattr(trade, "order", None)
-            status = getattr(trade, "status", None)
-            ordno = getattr(order, "id", None) if order is not None else None
-            seqno = (getattr(order, "seqno", None) if order is not None else None) or ordno
-            if not ordno and not seqno:
-                continue  # 無法關聯到任何委託，略過（不硬塞垃圾進 RawInbox）
-            status_raw = getattr(status, "status", None) if status is not None else None
-            staged.append({
-                "order_id": ordno, "seqno": seqno,
-                "status": str(status_raw) if status_raw is not None else None,
-            })
-            if watermark is not None and (newest is None or watermark > newest):
-                newest = watermark
-
-        if not staged and newest == cursor:
-            return 0  # 沒有新東西，連 cursor 都不動（避免每次 watchdog 週期都無意義地寫 DB）
-
-        with self._session_factory() as session:
-            for payload in staged:
-                brepo.stage_raw_inbox(session, kind="order_report", broker=self.broker, payload=json.dumps(payload))
+            for p in payloads:
+                brepo.stage_raw_inbox(session, kind="order_report", broker=self.broker, payload=json.dumps(p))
             brepo.upsert_reconcile_cursor(
                 session, broker=self.broker, account=self.account, mode=self.mode,
                 at=newest if newest is not None else _utcnow_naive(),
             )
             session.commit()
-        return len(staged)
+        return len(payloads)
 
-    @staticmethod
-    def _trade_watermark(trade) -> datetime | None:
-        """防禦性抽取 Trade 的時間戳（欄位名稱待實機 SDK 驗證）；抽不到就回 None（呼叫端視為
-        「無法判斷新舊」，保守地一律納入這次對帳，最多是重複補一次——下游 order_report
-        處理本身是冪等/單調的，重複補不會造成錯誤，只是白工）。"""
-        status = getattr(trade, "status", None)
-        raw = getattr(status, "order_datetime", None) if status is not None else None
-        if raw is None:
-            return None
-        if isinstance(raw, datetime):
-            return raw
-        try:
-            return datetime.fromisoformat(str(raw))
-        except (TypeError, ValueError):
-            return None
+    def _reconcile_blocking(self) -> int:
+        """回傳本次實際補回 RawInbox 的委託進展筆數。讀 SDK + watermark 過濾已搬到 native.py
+        `trades_snapshot()`（Task 1）；這裡只負責讀 cursor → 委派 native 讀取 → 落地/推進
+        cursor，三段拆開供 Task 6/8 重用（`_read_reconcile_cursor`/`_stage_reconcile_results`）。"""
+        if self._api is None:
+            return 0
+        after = self._read_reconcile_cursor()
+        payloads, newest = self._native.trades_snapshot(after)
+        return self._stage_reconcile_results(payloads, newest)
 
     def _query_order_qty_blocking(self, ordno: str) -> int | None:
         """Task 8 watchdog「quota unknown reconcile」收尾用（round3 殘留1）：查詢券商目前對
@@ -363,18 +354,10 @@ class ShioajiAdapter:
         `asyncio.Lock` 上重入，永久卡死；因此只能在「呼叫端已經持有鎖」的前提下直接呼叫。
 
         找不到這筆委託（已從 `list_trades()` 目前清單消失，例如已完全結案）回 None，
-        呼叫端視為無法判斷、不猜測。欄位名稱（`order.id`/`order.quantity`）待實機 SDK
-        驗證（同檔一貫 getattr 防禦性慣例，見模組頂部說明）。"""
-        if self._api is None:
-            return None
-        list_trades = getattr(self._api, "list_trades", None)
-        trades = list_trades() if callable(list_trades) else []
-        for trade in trades:
-            order = getattr(trade, "order", None)
-            if order is not None and getattr(order, "id", None) == ordno:
-                qty = getattr(order, "quantity", None)
-                return int(qty) if qty is not None else None
-        return None
+        呼叫端視為無法判斷、不猜測。實際查詢邏輯已搬到 native.py
+        `ShioajiNativeClient.query_order_qty()`（同檔一貫 getattr 防禦性慣例）；本函式純委派，
+        呼叫端持鎖責任不變（不得再經 `supervisor.run()`，見上方 docstring）。"""
+        return self._native.query_order_qty(ordno)
 
     # ---- send gate（V3-2，鎖內、native 呼叫前的最後線性化點） ----
 
@@ -492,23 +475,12 @@ class ShioajiAdapter:
         )
 
     def _place_blocking(self, req: OrderRequest) -> dict:
-        # 防禦（bug 2）：MKT 不需要價格，顯式送 0.0，不信任 req.price 當下的值（型別層只保證
-        # MKT 時 price>=0，不強制一定是 0）——語意清楚，也避免任何上游殘留非零值誤送給券商。
-        sendable_price = 0.0 if req.price_type == "MKT" else float(req.price)
-        native_order = self._api.Order(
-            action=req.action, price=sendable_price, quantity=req.qty,
+        # 防禦（bug 2，MKT 顯式送 0.0）與組 native Order/擷取 ack 欄位已搬到 native.py
+        # `ShioajiNativeClient.place()`（Task 1）；本函式純委派，供 `_do_place` 呼叫。
+        return self._native.place(
+            action=req.action, price=req.price, qty=req.qty,
             price_type=req.price_type, order_type=req.order_type, octype=req.octype,
-            account=self._api.futopt_account,
         )
-        trade = self._api.place_order(self._contract, native_order)
-        return self._ack_fields_from_trade(trade)
-
-    @staticmethod
-    def _ack_fields_from_trade(trade) -> dict:
-        order = getattr(trade, "order", None)
-        ordno = getattr(order, "id", None) if order else None
-        broker_order_id = (getattr(order, "seqno", None) if order else None) or ordno
-        return {"ordno": ordno, "broker_order_id": broker_order_id}
 
     @staticmethod
     def _ack_from_order(order: Order) -> OrderAck:
@@ -551,46 +523,17 @@ class ShioajiAdapter:
             session.commit()
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="cancelled")
 
-    def _refresh_and_list_trades(self) -> list:
-        """cancel/update 前的委託狀態刷新（bug 2/3）：依 `_core.pyi` 真實簽章，
-        `update_status(account=...)` 是純 side-effect 呼叫（回傳 `None`，不是 list——刷新
-        SDK 內部快取），刷新完才呼叫 `list_trades()` 取回目前的 `Trade` 物件清單。
-        `update_status`/`list_trades` 皆防禦性 `getattr`（比照本檔一貫慣例）：假
-        client／舊版 SDK 沒有這個方法時直接跳過，不影響後續清單（測試用的假 client 資料
-        本來就是即時的，不需要真的刷新）。"""
-        update_status = getattr(self._api, "update_status", None)
-        if callable(update_status):
-            update_status(getattr(self._api, "futopt_account", None))
-        list_trades = getattr(self._api, "list_trades", None)
-        return list_trades() if callable(list_trades) else []
-
     def _find_trade_by_ordno(self, ordno: str | None):
-        """cancel/update 前先刷新 + `list_trades()` 比對回真正的 `Trade` 物件（bug 2/3
-        根因收尾）：`cancel_order`/`update_order` 依 `_core.pyi` 真實簽章要收 `Trade`
-        物件（`def cancel_order(self, trade: Trade, ...)`／
-        `def update_order(self, trade: Trade, price=..., qty=..., ...)`），不是委託單號
-        字串——先前直接塞 `ordno` 字串進去，在真實 SDK 會炸
-        `argument 'trade': 'str' object is not an instance of 'Trade'`。
-
-        比對鍵沿用 `_ack_fields_from_trade`/`_reconcile_blocking` 既有慣例：我方存的
-        `ordno` ← Shioaji `OrderResult.id`（同一組欄位，兩處對得起來才能正確關聯）。找不到
-        （已成交/已刪/跨日等，`list_trades()` 目前清單裡已經沒有這筆委託）回 `None`，
-        呼叫端（`_cancel_blocking`/`_update_blocking`）視為無法判斷、拒絕盲目操作，不得
-        猜測著把字串硬塞給 native API。"""
-        for trade in self._refresh_and_list_trades():
-            order = getattr(trade, "order", None)
-            if order is not None and getattr(order, "id", None) == ordno:
-                return trade
-        return None
+        """cancel/update 前先刷新 `update_status()` + `list_trades()` 比對回真正的 `Trade`
+        物件（bug 2/3 根因收尾，邏輯已搬到 native.py `ShioajiNativeClient._find_trade_by_ordno`
+        /`_refresh_and_list_trades`——Task 1）。這裡保留同名薄委派：既有測試
+        （`test_find_trade_by_ordno_matches_order_id_not_broker_ordno_field`）直呼這個方法名。"""
+        return self._native._find_trade_by_ordno(ordno)
 
     def _cancel_blocking(self, ordno: str) -> None:
-        trade = self._find_trade_by_ordno(ordno)
-        if trade is None:
-            raise OrderError(
-                f"找不到券商對應委託（ordno={ordno!r}），可能已成交/已刪除/跨日，"
-                "拒絕在無法確認對應委託的情況下送出取消"
-            )
-        self._api.cancel_order(trade)
+        # 找 Trade + 呼叫 native cancel_order 已搬到 native.py（Task 1），找不到對應 Trade 時
+        # native 拋出的 OrderError 訊息與重構前逐字相同。
+        self._native.cancel(ordno)
 
     # ---- update ----
 
@@ -707,17 +650,10 @@ class ShioajiAdapter:
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="submitted")
 
     def _update_blocking(self, ordno: str, price, qty: int, price_type: str | None = None) -> None:
-        # bug 2/3：先刷新 + list_trades() 比對回真正的 Trade 物件——update_order 依
-        # _core.pyi 真實簽章要收 Trade（見 _find_trade_by_ordno 說明），不是 ordno 字串。
-        trade = self._find_trade_by_ordno(ordno)
-        if trade is None:
-            raise _TradeNotFoundError(
-                f"找不到券商對應委託（ordno={ordno!r}），可能已成交/已刪除/跨日，"
-                "拒絕在無法確認對應委託的情況下送出改單"
-            )
-        # 防禦（bug 2），同 _place_blocking：MKT 顯式送 0.0，不信任呼叫端算出的 price 當下的值。
-        sendable_price = 0.0 if price_type == "MKT" else float(price)
-        self._api.update_order(trade, price=sendable_price, qty=qty)
+        # 找 Trade + 呼叫 native update_order 已搬到 native.py（Task 1）；找不到對應 Trade 時
+        # native 拋出公開的 base.TradeNotFoundError——與本檔的 `_TradeNotFoundError` 別名同一個
+        # 型別，下面 `update()` 的 `except _TradeNotFoundError:` 分支繼續能特判命中。
+        self._native.update(ordno, price=price, qty=qty, price_type=price_type)
 
     # ---- positions（純讀 DB，不呼叫 native API——BrokerPosition 是唯一真相來源；
     #      仍經 supervisor.run 走同一通道，避免與 connect/reconnect 交錯讀到半新半舊狀態） ----
@@ -757,65 +693,36 @@ class ShioajiAdapter:
         `loop.call_soon_threadsafe`+`ensure_future` 排程協程晚點才 commit 的作法——那個
         作法在 loop 未就緒/排程後 crash/等 supervisor lock 時 payload 仍會遺失（round3
         BLOCKER#2）。callback 內不碰部位/DB 業務邏輯，那是 RawInboxWorker 之後才做的事。
+
+        **Task 2 委派重構的刻意例外**：native.py 也有一份等價的
+        `ShioajiNativeClient._on_order_cb`——那才是 `connect()` 時真正註冊給 Shioaji SDK
+        的 callback（見 `_connect_blocking`），本方法在正式連線路徑上**不會被呼叫**。這裡
+        刻意保留本檔自己的實作（改呼叫 `_persist_raw`，落地邏輯與 native 端等價），而不是
+        單純 `self._native._on_order_cb(stat, msg)` 委派——既有硬化測試
+        （`tests/test_broker_hardening.py::_bare_adapter`）用 `object.__new__(ShioajiAdapter)`
+        繞過 `__init__` 建構最小 adapter（不會建到 `self._native`），若改成委派 native 會在
+        該測試炸 `AttributeError`。本檔與 native 端兩份實作邏輯逐字相同，非重複維護風險。
         """
         kind = "deal_report" if str(stat).endswith("Deal") else "order_report"
         try:
             payload = self._json_safe(msg)
-            commit_raw_callback(self._session_factory, kind=kind, broker=self.broker, payload=payload)
+            self._persist_raw(kind, payload)
         except Exception:
             # 券商回報是真錢關鍵路徑：序列化/落地失敗絕不能靜默丟單，也絕不能把例外拋回
             # Solace/.NET callback thread（會殺掉整條回報通道）。退化保存一筆帶原始 repr 的
             # 紀錄供 reconcile/人工補救；連退化保存都失敗才記錄後放行（DB 全掛時已無法多做）。
             log.exception("成交/委託回報落地失敗，改以退化 payload 保存（kind=%s）", kind)
             try:
-                commit_raw_callback(
-                    self._session_factory, kind=kind, broker=self.broker,
-                    payload={"_unparsed": True, "repr": repr(msg)},
-                )
+                self._persist_raw(kind, {"_unparsed": True, "repr": repr(msg)})
             except Exception:
                 log.exception("退化 payload 也落地失敗，回報恐遺失（kind=%s）", kind)
 
     @staticmethod
     def _json_safe(msg) -> dict:
-        """把 shioaji callback 的 `msg` 轉成保證 JSON 可序列化的巢狀 dict/list（供
-        `commit_raw_callback` 的 `json.dumps` 落地）。
-
-        依 `_core.pyi` 實測確認（bug 1(b) 根因之一）：真實 callback 的 `msg` 是
-        `OrderEventDict`——有 `keys()`/`__getitem__`/`items()` 等 Mapping 協定方法，但**不是**
-        `dict` 子類、也**沒有** `to_dict()`；先前只判斷 `isinstance(dict)`/`hasattr(to_dict)`，
-        兩者都不中，直接落到 `{"raw": str(msg)}`，整包結構全部遺失。改用 `dict(msg)`（dict
-        constructor 認得任何有 `.keys()`+`__getitem__` 的 mapping）。
-
-        `FuturesOrderEvent` 是巢狀結構（`operation`/`order`/`status`/`contract` 各自可能也是
-        同款 Mapping-only 物件，不是原生 dict）——只轉最外層不夠，`json.dumps` 遇到巢狀的
-        非原生型別一樣會炸；因此這裡遞迴轉換每一層，確保回傳值全部由原生
-        dict/list/str/int/float/bool/None 組成。
-        """
-
-        def _convert(value):
-            if isinstance(value, dict):
-                return {k: _convert(v) for k, v in value.items()}
-            if isinstance(value, (list, tuple)):
-                return [_convert(v) for v in value]
-            if hasattr(value, "to_dict"):
-                try:
-                    return _convert(value.to_dict())
-                except Exception:
-                    pass
-            if hasattr(value, "keys") and hasattr(value, "__getitem__"):
-                try:
-                    return {k: _convert(value[k]) for k in value.keys()}
-                except Exception:
-                    pass
-            # 保底（真錢丟單防線）：走到這裡代表無法結構化轉換。JSON 原生型別原封保留，
-            # 其餘一律 str()——確保下游 json.dumps 永不炸、整包回報不會在 callback thread
-            # 因序列化失敗而遺失（datetime/Decimal/enum/未知 SDK 物件等葉節點皆轉字串）。
-            if value is None or isinstance(value, (str, int, float, bool)):
-                return value
-            return str(value)
-
-        converted = _convert(msg)
-        return converted if isinstance(converted, dict) else {"raw": str(msg)}
+        """轉換邏輯已搬到 native.py `ShioajiNativeClient.json_safe`（Task 1，逐字相同）；這裡
+        保留同名 staticmethod 純委派——不吃 `self`/`_native`，供既有測試直呼
+        `ShioajiAdapter._json_safe(msg)`（不建構 instance）。"""
+        return ShioajiNativeClient.json_safe(msg)
 
     # ---- Task 5 DealMapper / OrderReportMapper 實作（V3-4 嚴格驗證） ----
     #
