@@ -176,11 +176,12 @@ def test_place_form_price_input_uses_readonly_not_disabled_for_mkt(order_client)
 
 def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
     """委託/部位改用 SSE 推送（sse:orders-changed）取代每 2s 盲輪詢：頁面要有 sse-connect
-    容器、兩個 div 的 trigger 含 sse:orders-changed、且不再有 every 2s 盲輪詢（消除對 event
-    loop / supervisor 鎖的壓力）。保留 refreshorders（本分頁動作當下即時刷新）與防連點。"""
+    容器、三個 div 的 trigger 含 sse:orders-changed（agent 狀態 badge + 委託 + 部位，Task 9
+    加了第一個）、且不再有 every 2s 盲輪詢（消除對 event loop / supervisor 鎖的壓力）。保留
+    refreshorders（本分頁動作當下即時刷新）與防連點。"""
     text = order_client.get("/orders").text
     assert 'sse-connect="/orders/stream"' in text  # SSE 連線容器
-    assert text.count("sse:orders-changed") == 2  # 委託 + 部位 兩個 div 都靠 SSE 觸發
+    assert text.count("sse:orders-changed") == 3  # agent 狀態 + 委託 + 部位 三個 div 都靠 SSE 觸發
     assert "every 2s" not in text  # 不再盲輪詢
     assert "refreshorders from:body" in text  # 動作當下本分頁仍即時刷新
     assert 'hx-get="/orders/list' in text and 'hx-get="/orders/positions"' in text

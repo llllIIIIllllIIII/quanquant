@@ -1,0 +1,11 @@
+{# Task 9：orders 頁 agent 通道連線狀態 badge。inprocess 通道沒有「agent 連線」這個概念，
+   直接不輸出任何內容（外層 #agent-status-box 由 orders.html 提供，這裡只換 innerHTML）。
+   顏色慣例比照 kill_switch_control.html：只在「壞」狀態上色（#c0392b），好狀態靠 emoji 表達，
+   不建新 CSS class。 #}
+{% if channel == "agent" %}
+  {% if ready %}
+<strong>🟢 agent 已連線</strong>
+  {% else %}
+<strong style="color:#c0392b;">🔴 agent 未連線{% if reason and reason != "agent 未連線" %}（{{ reason }}）{% endif %}</strong>
+  {% endif %}
+{% endif %}

@@ -80,6 +80,10 @@
        重抓自己 user-scoped 的委託/部位。保留 load（首載）與 refreshorders from:body（本分頁
        下單/改單/取消當下即時刷新）；不再每 2s 盲輪詢、不再壓 event loop/supervisor 鎖。 -->
   <div hx-ext="sse" sse-connect="/orders/stream">
+    <div id="agent-status-box"
+         hx-get="/orders/agent-status"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+
     <h4>委託</h4>
     <div hx-get="/orders/list?mode={{ mode }}"
          hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>

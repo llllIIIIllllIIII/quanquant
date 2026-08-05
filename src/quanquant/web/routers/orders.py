@@ -32,6 +32,7 @@ from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
 from quanquant.broker.redaction import redact_secrets
 from quanquant.broker.types import OrderRequest, canonical_payload_hash
+from quanquant.config import get_settings
 from quanquant.db.models import User
 from quanquant.web.deps import get_current_user, get_session
 from quanquant.web.templating import render_partial, templates
@@ -305,6 +306,20 @@ async def orders_stream(request: Request, user: User = Depends(get_current_user)
             hub.unsubscribe(queue)
 
     return EventSourceResponse(event_generator())
+
+
+@router.get("/orders/agent-status", response_class=HTMLResponse)
+def orders_agent_status(request: Request):
+    """Task 9：agent 通道連線狀態 badge（僅 order_channel=="agent" 時顯示；inprocess 通道
+    沒有「agent 連線」這個概念，partial 直接回空字串）。SSE `orders-changed`/`refreshorders`
+    觸發時 orders.html 的 #agent-status-box 會重打這支端點刷新（見 orders.html）。"""
+    state = getattr(request.app.state, "order_session_state", None)
+    return HTMLResponse(render_partial(
+        "partials/agent_status.html",
+        channel=get_settings().order_channel,
+        ready=bool(state and state.ready),
+        reason=(state.last_error if state else None),
+    ))
 
 
 @router.post("/orders", response_class=HTMLResponse)
