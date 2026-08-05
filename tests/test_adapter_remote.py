@@ -16,6 +16,7 @@ from decimal import Decimal
 import pytest
 from sqlmodel import Session, select
 
+from quanquant.broker import repository as brepo
 from quanquant.broker.base import (
     AgentCommandTimeoutError,
     AgentUnavailableError,
@@ -174,6 +175,46 @@ async def test_kill_switch_blocks_before_gateway_called(engine):
     with pytest.raises(RiskError):
         await a.place(_req(), actor_user_id=1)
     assert gw.place_calls == []
+
+
+class _KillSwitchBlindGuard:
+    """驗收者發現：`test_kill_switch_blocks_before_gateway_called` 用的真 `RiskGuard.
+    check_place` 本身就會查 kill switch 並提早擋下——那支測試其實只驗到 check_place 這層，
+    `_send_gate()`（鎖內、native/remote gateway 呼叫前的最後線性化點，見 shioaji_adapter.py
+    `_send_gate` docstring）在 remote 路徑上從未被單獨驗證過（套套邏輯）。這個 fake guard
+    比照 tests/test_shioaji_adapter.py 的 `test_send_gate_blocks_when_kill_switch_on`
+    手法：`check_place` 完全不看 kill_switch、直接放行建單，把「擋下」的責任完全留給
+    `_send_gate()` 自己的 `self._risk_guard.kill_switch` 檢查——這樣才是 `_send_gate`
+    這道深度防禦真正被獨立驗證，而不是被上層 check_place 順便擋掉。"""
+
+    kill_switch = True
+
+    def assert_owner(self, actor_user_id):
+        pass
+
+    def check_place(self, session, req, **kw):
+        order = brepo.create_order(
+            session, client_order_id=req.client_order_id, request_hash="H",
+            user_id=kw["actor_user_id"], mode=kw["mode"], broker=kw["broker"], account=kw["account"],
+            symbol=req.symbol, action=req.action, qty=req.qty, price=req.price,
+            price_type=req.price_type, order_type=req.order_type, octype=req.octype,
+            trading_day="2026-06-16",
+        )
+        session.commit()  # 比照真正 RiskGuard.check_place：quota reserve + create_order 同一交易提交
+        return order
+
+
+async def test_send_gate_blocks_kill_switch_in_remote_path_when_check_place_blind(engine):
+    """Fix 6（順修）：remote gateway 路徑上，`_send_gate()` 自己的 kill switch 檢查要在
+    鎖內、gateway.place() 呼叫之前獨立擋下——不依賴 check_place 是否也查了 kill switch。"""
+    gw = _FakeGateway()
+    a = _adapter(engine, gw, _KillSwitchBlindGuard())
+    with pytest.raises(RiskError):
+        await a.place(_req(), actor_user_id=1)
+    assert gw.place_calls == []  # _send_gate 在 gateway.place() 之前就擋下，gateway 從未被呼叫
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "failed"  # 不留在 pending 卡死（同 V3-2 收尾原則）
 
 
 # ---- Fix Round 1（審查 Important #2）：remote cancel/update 專屬測試補齊 ----
