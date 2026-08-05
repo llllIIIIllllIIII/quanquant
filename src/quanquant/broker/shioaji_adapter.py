@@ -54,6 +54,7 @@ from sqlmodel import Session
 
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import (
+    AgentCommandTimeoutError,
     AgentUnavailableError,
     AuthorizationError,
     OrderError,
@@ -107,6 +108,12 @@ def _classify_place_failure(exc: Exception) -> str:
     """
     if isinstance(exc, AgentUnavailableError):
         return "failed"
+    # 結構性早退（非靠訊息不含 code: 4xx 的隱含保證）：AgentChannel.request 逾時/送出失敗
+    # 時會把底層例外訊息包進 AgentCommandTimeoutError（例如 f"下行送出失敗: {exc}"），若
+    # 底層訊息恰好含 `code: 4xx` 字樣，靠字串比對會被誤判成 "failed"。型別優先於字串內容，
+    # 保證 AgentCommandTimeoutError 一律 unknown（保留配額，留給 watchdog reconcile 決議）。
+    if isinstance(exc, AgentCommandTimeoutError):
+        return "unknown"
     match = _BROKER_REJECT_CODE_RE.search(str(exc))
     if match is None:
         return "unknown"
