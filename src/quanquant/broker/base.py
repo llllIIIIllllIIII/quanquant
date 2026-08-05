@@ -36,6 +36,14 @@ class AuthorizationError(Exception):
     """owner allowlist / 委託所有權驗證失敗（router 對應 403）。"""
 
 
+class AgentUnavailableError(OrderError):
+    """指令送出前 agent 即不在線——保證未送達券商，可安全判 failed。"""
+
+
+class AgentCommandTimeoutError(OrderError):
+    """指令可能已送達 agent/券商但未收到 ack——必須保守判 unknown。"""
+
+
 @runtime_checkable
 class OrderService(Protocol):
     mode: Mode  # server-side 真實 session mode；place/update 產生的 Order/Fill/Trade 一律蓋此值

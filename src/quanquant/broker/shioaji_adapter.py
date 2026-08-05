@@ -53,7 +53,13 @@ from typing import Protocol
 from sqlmodel import Session
 
 from quanquant.broker import repository as brepo
-from quanquant.broker.base import AuthorizationError, OrderError, RiskError, TradeNotFoundError
+from quanquant.broker.base import (
+    AgentUnavailableError,
+    AuthorizationError,
+    OrderError,
+    RiskError,
+    TradeNotFoundError,
+)
 from quanquant.broker.inbox_worker import OrderReport, commit_raw_callback
 from quanquant.broker.native import ShioajiNativeClient
 from quanquant.broker.redaction import redact_secrets as _redact_secrets
@@ -92,7 +98,15 @@ def _classify_place_failure(exc: Exception) -> str:
     名稱（`order.id`/`order.seqno`/`status.id` 等）同屬「待實機驗證」等級：若正式 SDK
     版本的例外訊息格式不同，只需局部調整這裡的判斷邏輯，不影響呼叫端（place/update）的
     分支結構。
+
+    **本機 broker agent 通道例外**：`AgentUnavailableError` 代表指令送出前 agent 即不在
+    線——保證這筆委託沒有離開本機、沒送到券商，因此是唯一另一個能安全判定 `"failed"`
+    的訊號（同 `code: 4xx`，可放心退配額）。`AgentCommandTimeoutError`（指令可能已送達
+    agent/券商但未收到 ack）不特別分支處理——沿用上述「辨認不出來一律 unknown」的預設
+    路徑，保守保留配額。
     """
+    if isinstance(exc, AgentUnavailableError):
+        return "failed"
     match = _BROKER_REJECT_CODE_RE.search(str(exc))
     if match is None:
         return "unknown"
