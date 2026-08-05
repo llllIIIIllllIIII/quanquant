@@ -150,12 +150,15 @@ async def _reconcile_after_login(adapter) -> None:
 
 def _count_unprocessed_raw_inbox(session_factory) -> int:
     """同步 DB 查詢（呼叫端須用 asyncio.to_thread 包起來，receive 迴圈鐵律：絕不 inline
-    await 長工作）：尚未處理、也未被隔離的 RawInbox 列數——換帳號登入前的安全檢查（codex
-    round2 fix2）。"""
+    await 長工作）：尚未處理的 RawInbox 列數——換帳號登入前的安全檢查（codex round2
+    fix2）。codex round4 修正：不再排除 quarantine==True 的列——quarantined 列仍是「未
+    處理」，run_agent_watchdog 的 _retry_quarantined 之後會自動解除隔離讓 worker 重新
+    處理；若那時帳號已切到新帳號，舊帳號的 order_report 會用新帳號的 mutable
+    adapter.account 映射，造成延遲跨帳號錯配。換帳號 guard 必須擋下所有
+    processed==False 列，不論 quarantine 與否。"""
     with session_factory() as session:
         return session.exec(
             select(func.count()).where(
                 RawInbox.processed == False,  # noqa: E712 - SQLAlchemy 表達式需字面 == 比較
-                RawInbox.quarantine == False,  # noqa: E712
             )
         ).one()

@@ -333,6 +333,32 @@ def test_login_rejected_closes_connection(ws_env, engine):
         assert len(rows) == 1
 
 
+def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
+    # codex round4（HIGH，唯一新發現）：count 查詢原本同時濾 processed==False 且
+    # quarantine==False，漏放了「被隔離但仍未處理」的列——run_agent_watchdog 的
+    # _retry_quarantined 之後會自動解除 quarantine 讓 worker 重新處理；若那時帳號已切到
+    # F2，舊 F1 的 order_report 會用 F2 的 mutable adapter.account 映射，造成延遲跨帳號
+    # 錯配。換帳號 guard 必須擋下「所有」processed==False 列，不論 quarantine 與否。
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F1")
+
+    # 一筆已被隔離、但仍未處理的 RawInbox（quarantine=True）——之後 watchdog 的
+    # _retry_quarantined 會解除隔離讓 worker 重新處理，此列在那之前仍算「未處理」。
+    with Session(engine) as s:
+        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}", quarantine=True))
+        s.commit()
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        with pytest.raises(WebSocketDisconnect):
+            ws2.receive_json()   # 連線被關閉（1008）——quarantined 列也要擋下換帳號
+
+    assert ws_env.state.order_service.account == "F1"          # 帳號未被換掉
+    assert ws_env.state.agent_channel.logged_in is False        # 未 mark_logged_in
+
+
 def test_report_before_login_not_staged_not_acked(ws_env, engine):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
