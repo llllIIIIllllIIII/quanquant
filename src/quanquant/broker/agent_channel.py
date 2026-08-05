@@ -30,6 +30,12 @@ class AgentChannel:
         # attach() 遞增這個計數，detach(generation) 只在呼叫者手上的 generation 仍是目前值
         # 時才真的生效，否則視為「舊連線的遲到清理」no-op。
         self._generation = 0
+        # codex round3 fix（TOCTOU）：舊連線的 report commit 正在 to_thread 飛行中時，
+        # 新連線的「未處理 RawInbox count 查詢 + 換帳號決策 + mark_logged_in + adapter.account
+        # 設定」必須被序列化在 commit 完成之後才判定，否則 count 查詢會看到舊 commit 尚未
+        # 落地的 0，誤放行換帳號，之後舊 report 才 commit 完成、落在新帳號狀態下。只包 DB
+        # commit 與狀態轉換這兩段，不包任何等待 cmd_ack 的路徑，不引入死鎖面。
+        self.inbox_lock = asyncio.Lock()
 
     @property
     def generation(self) -> int:

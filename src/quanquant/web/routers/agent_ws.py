@@ -68,35 +68,56 @@ async def agent_ws(websocket: WebSocket) -> None:
                 log.warning("agent 上行訊息格式不符，忽略：%s", str(data)[:200])
                 continue
             if isinstance(msg, UpLogin):
-                if adapter.account and msg.account != adapter.account:
-                    # codex round2 fix2：agent 端的 tripwire（buffer.assert_account）只擋得住
-                    # 「尚未送出」的回報列；server 已 commit RawInbox 並 ack、worker 尚未處理
-                    # 的列不受保護——這個窗口換帳號登入，worker 之後映射 order_report 用的是
-                    # mutable adapter.account（已被新帳號覆蓋），舊帳號的回報會被錯配進新
-                    # 帳號的部位/委託。查詢未處理列數，有殘留就整個忽略這次 login（不
-                    # mark_logged_in、不 mark_ready、不觸發 reconcile），agent 停在未登入態；
-                    # 沒有殘留才放行（帳號覆蓋屬正常換帳號重啟）。
-                    unprocessed = await asyncio.to_thread(
-                        _count_unprocessed_raw_inbox, session_factory
-                    )
-                    if unprocessed > 0:
-                        log.warning(
-                            "拒絕帳號切換登入：尚有 %d 筆未處理回報（原帳號 %s、新帳號 %s）",
-                            unprocessed, adapter.account, msg.account,
+                # codex round3 fix1/fix3：count 查詢＋決策＋mark_logged_in＋adapter.account
+                # 設定整段包在 inbox_lock 內——與 UpReport 分支的 commit 序列化（消 TOCTOU：
+                # 舊連線的 report commit 飛行中時，這裡的 count 查詢會等它 commit 完才跑，
+                # 不會看到「尚未落地」的 0 而誤放行換帳號）。
+                async with channel.inbox_lock:
+                    if adapter.account and msg.account != adapter.account:
+                        # codex round2 fix2：agent 端的 tripwire（buffer.assert_account）只擋
+                        # 得住「尚未送出」的回報列；server 已 commit RawInbox 並 ack、worker
+                        # 尚未處理的列不受保護——這個窗口換帳號登入，worker 之後映射
+                        # order_report 用的是 mutable adapter.account（已被新帳號覆蓋），舊
+                        # 帳號的回報會被錯配進新帳號的部位/委託。查詢未處理列數，有殘留就
+                        # 整個拒絕這次 login；沒有殘留才放行（帳號覆蓋屬正常換帳號重啟）。
+                        unprocessed = await asyncio.to_thread(
+                            _count_unprocessed_raw_inbox, session_factory
                         )
-                        continue
-                channel.mark_logged_in(msg.account)
-                adapter.account = msg.account
+                        if unprocessed > 0:
+                            # codex round3 fix1（HIGH）：只 continue 會留下半開連線——agent
+                            # 端的 pump 不等 login 確認就送 report，若 UpReport 分支沒檔會被
+                            # 拒帳號的回報照樣 commit+ack。直接關閉連線消滅半開態；agent 端
+                            # 會 backoff 重連，帳號不符會一直停在離線（UI 可見）。
+                            log.warning(
+                                "拒絕帳號切換登入，關閉連線：尚有 %d 筆未處理回報"
+                                "（原帳號 %s、新帳號 %s）",
+                                unprocessed, adapter.account, msg.account,
+                            )
+                            await websocket.close(code=1008)
+                            break
+                    channel.mark_logged_in(msg.account)
+                    adapter.account = msg.account
                 order_state.mark_ready()
                 if hub is not None:
                     hub.publish()
                 asyncio.create_task(_reconcile_after_login(adapter))
             elif isinstance(msg, UpReport):
-                await asyncio.to_thread(
-                    commit_raw_callback, session_factory,
-                    kind=msg.kind, broker="shioaji", payload=msg.payload,
-                )
-                await websocket.send_json(DownReportAck(event_id=msg.event_id).model_dump())
+                # codex round3 fix2（HIGH）：未登入（或已被更新連線取代）一律不 commit、不
+                # ack——堵住「login 被拒/尚未確認時，agent 端提早送出的 report 仍被落地」的
+                # 跨帳號錯配缺口。agent 端該列維持 unacked，之後正常登入才會補送。
+                if not channel.logged_in or channel.generation != my_generation:
+                    log.warning(
+                        "忽略未登入連線的回報（event_id=%s），不 commit 也不 ack", msg.event_id
+                    )
+                    continue
+                async with channel.inbox_lock:
+                    await asyncio.to_thread(
+                        commit_raw_callback, session_factory,
+                        kind=msg.kind, broker="shioaji", payload=msg.payload,
+                    )
+                    await websocket.send_json(
+                        DownReportAck(event_id=msg.event_id).model_dump()
+                    )
             elif isinstance(msg, UpCmdAck):
                 channel.resolve_ack(msg)
             elif isinstance(msg, UpHealth):

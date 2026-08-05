@@ -86,8 +86,10 @@ def test_login_marks_ready_sets_account_schedules_reconcile(ws_env):
 
 
 def test_report_staged_then_acked(ws_env, engine):
+    # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
         ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
                       "payload": {"trade_id": "T1"}})
         assert ws.receive_json() == {"type": "report_ack", "event_id": 7}
@@ -98,8 +100,10 @@ def test_report_staged_then_acked(ws_env, engine):
 
 def test_duplicate_report_resend_both_staged_and_acked(ws_env, engine):
     # at-least-once：staging 層允許重複列，去重由既有 Deal 層 uq_deal_fill 吸收
+    # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
         for _ in range(2):
             ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
                           "payload": {"trade_id": "T1"}})
@@ -131,8 +135,10 @@ def test_login_reconcile_not_inline_receive_loop_stays_responsive(ws_env, engine
 
 
 def test_invalid_frame_ignored_connection_survives(ws_env):
+    # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
         ws.send_json({"type": "evil"})
         ws.send_json({"type": "report", "event_id": 2, "kind": "order_report",
                       "payload": {}})
@@ -290,3 +296,90 @@ def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engi
         ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
         assert _wait(lambda: ws_env.state.order_service.account == "F2")   # 無未處理列：放行
         assert _wait(lambda: ws_env.state.order_session_state.ready)
+
+
+# ---- codex round3（HIGH，第三輪唯一殘留）：round2 fix2 的兩條實證繞過。
+#   繞過1：login 被拒（換帳號＋有未處理 RawInbox）後只 continue，socket 還開著；agent 端
+#          的 pump 不等 login 確認就送 report；UpReport 分支未檢查 channel.logged_in →
+#          被拒帳號的 report 照樣 commit+ack，之後 worker 用仍是舊帳號的 adapter.account
+#          處理 → 跨帳號錯配。
+#   繞過2（TOCTOU）：舊連線的 report commit 正在 to_thread 飛行中，新連線的未處理列 count
+#          查詢看到 0 → 放行換帳號；舊 report 之後才 commit 完成，落在新帳號狀態下。
+# 修法：login 被拒即關閉連線（不再 continue）；UpReport 分支未登入/舊 generation 一律不
+# commit 不 ack；AgentChannel.inbox_lock 序列化「report commit」與「login 的 count 查詢+
+# 決策+mark_logged_in+adapter.account 設定」。----
+
+def test_login_rejected_closes_connection(ws_env, engine):
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F1")
+
+    # 未處理列（processed=False, quarantine=False）殘留 → 觸發換帳號 guard。
+    with Session(engine) as s:
+        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}"))
+        s.commit()
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        with pytest.raises(WebSocketDisconnect):
+            ws2.receive_json()   # 連線被關閉（1008）——不再是半開態
+
+    assert ws_env.state.order_service.account == "F1"        # 帳號未被換掉
+    assert ws_env.state.agent_channel.logged_in is False      # 未 mark_logged_in
+    with Session(engine) as s:
+        rows = s.exec(select(RawInbox)).all()
+        # 繞過1：拒收後連線已關，不會再有機會讓 F2 的 report 被 commit——維持原本那 1 筆。
+        assert len(rows) == 1
+
+
+def test_report_before_login_not_staged_not_acked(ws_env, engine):
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+        ws.send_json({"type": "report", "event_id": 99, "kind": "deal_report", "payload": {}})
+        ws.send_json({"type": "health"})   # 確認迴圈仍活著（report 被忽略不代表連線掛了）
+        assert _wait(lambda: ws_env.state.agent_channel.last_heartbeat is not None)
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).all() == []   # 未登入的 report 沒有被 staged
+
+
+def test_toctou_report_commit_serializes_against_login_switch(ws_env, engine, monkeypatch):
+    import threading
+
+    import quanquant.web.routers.agent_ws as agent_ws_module
+
+    entered = threading.Event()
+    release = threading.Event()
+    original_commit = agent_ws_module.commit_raw_callback
+
+    def _blocking_commit(*args, **kwargs):
+        entered.set()
+        release.wait(timeout=5)
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(agent_ws_module, "commit_raw_callback", _blocking_commit)
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_old:
+        ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F1")
+
+        ws_old.send_json({"type": "report", "event_id": 1, "kind": "deal_report", "payload": {}})
+        assert entered.wait(timeout=2), "commit 應已進入（卡在 blocking commit 中）"
+
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_new:
+            ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+
+            # 舊 report 的 commit 仍卡住（inbox_lock 未釋放）：F2 login 的 count 查詢必須被
+            # 序列化在 commit 完成之後才判定——輪詢一段時間內帳號都不該被換成 F2。
+            assert not _wait(lambda: ws_env.state.order_service.account == "F2", timeout=0.3)
+
+            release.set()   # 放行卡住的 commit
+
+            assert ws_old.receive_json() == {"type": "report_ack", "event_id": 1}
+            # commit 完成後 RawInbox 多一筆未處理列 → F2 login 的 count 查詢看到它 → 拒絕、
+            # 連線被關（繞過2：TOCTOU 已被 inbox_lock 消除）。
+            with pytest.raises(WebSocketDisconnect):
+                ws_new.receive_json()
+
+    assert ws_env.state.order_service.account == "F1"   # F2 login 被拒，帳號未換
