@@ -104,9 +104,13 @@ def child_main(
     while True:
         op = conn.recv()
         kind = op.get("op")
+        # codex round1 fix1(a)：原樣帶回呼叫端的 rpc_id（op 沒帶就回 None）——
+        # ChildHandle._rpc 靠這個欄位辨識/丟棄逾時後才姍姍來遲的舊 reply，避免污染下一輪
+        # RPC（見 runner.py ChildHandle docstring）。
 
         if native is None:
-            conn.send({"ok": False, "error_kind": "mode_mismatch", "message": _MODE_MISMATCH_MESSAGE})
+            conn.send({"ok": False, "error_kind": "mode_mismatch",
+                       "message": _MODE_MISMATCH_MESSAGE, "rpc_id": op.get("rpc_id")})
             if kind == "shutdown":
                 break
             continue
@@ -116,12 +120,13 @@ def child_main(
         except TradeNotFoundError as exc:
             message = redact_secrets(str(exc), secrets=secrets)
             conn.send({"ok": False, "error_kind": "trade_not_found", "message": message,
-                       "result": {"ordno": exc.ordno}})
+                       "result": {"ordno": exc.ordno}, "rpc_id": op.get("rpc_id")})
             continue
         except Exception as exc:
             message = redact_secrets(str(exc), secrets=secrets)
             log.error("子程序執行 %s 失敗: %s", kind, message)
-            conn.send({"ok": False, "error_kind": "exception", "message": message})
+            conn.send({"ok": False, "error_kind": "exception", "message": message,
+                       "rpc_id": op.get("rpc_id")})
             continue
 
         if kind == "connect" and reply.get("ok"):
@@ -132,6 +137,7 @@ def child_main(
             except RuntimeError as exc:
                 reply = {"ok": False, "message": str(exc)}
 
+        reply["rpc_id"] = op.get("rpc_id")
         conn.send(reply)
         if kind == "shutdown":
             break

@@ -34,7 +34,10 @@ def _rpc(conn, msg, timeout=5):
 
 def test_connect_then_place_acks_and_persists_reports(tmp_path):
     conn, t = _start_child_thread(tmp_path)
-    assert _rpc(conn, {"op": "connect"}) == {"ok": True, "account": "F1"}
+    # codex round1 fix1(a)：reply 多帶 rpc_id 欄位（op 未帶 rpc_id 時原樣回 None）——
+    # 不再用嚴格 dict 相等，改斷言子集。
+    reply0 = _rpc(conn, {"op": "connect"})
+    assert reply0["ok"] is True and reply0["account"] == "F1"
     reply = _rpc(conn, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
                         "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
     assert reply["ok"] and reply["result"]["ordno"] == "101AA1"
@@ -73,7 +76,8 @@ def test_exception_reply_is_redacted_and_loop_survives(tmp_path):
     assert reply["ok"] is False and reply["error_kind"] == "exception"
     assert "SECRET-KEY-123" not in reply["message"]         # redact_secrets 已遮蔽
     assert "SECRET-VAL-456" not in reply["message"]
-    assert _rpc(parent_conn, {"op": "ping"}) == {"ok": True}  # 迴圈仍活著
+    # codex round1 fix1(a)：reply 多帶 rpc_id 欄位——不再用嚴格 dict 相等。
+    assert _rpc(parent_conn, {"op": "ping"})["ok"] is True  # 迴圈仍活著
     _rpc(parent_conn, {"op": "shutdown"}); t.join(timeout=5)
 
 
@@ -177,7 +181,8 @@ def test_update_op_with_price(tmp_path):
                 "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
     reply = _rpc(conn, {"op": "update", "ordno": "101AA1", "price": "21600", "qty": 2,
                         "price_type": "LMT"})
-    assert reply == {"ok": True, "result": {}}
+    # codex round1 fix1(a)：reply 多帶 rpc_id 欄位——不再用嚴格 dict 相等。
+    assert reply["ok"] is True and reply["result"] == {}
     _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
 
 
@@ -189,7 +194,8 @@ def test_update_op_price_none(tmp_path):
                 "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
     reply = _rpc(conn, {"op": "update", "ordno": "101AA1", "price": None, "qty": 3,
                         "price_type": None})
-    assert reply == {"ok": True, "result": {}}
+    # codex round1 fix1(a)：reply 多帶 rpc_id 欄位——不再用嚴格 dict 相等。
+    assert reply["ok"] is True and reply["result"] == {}
     _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
 
 
@@ -231,8 +237,9 @@ def test_reconcile_op_reply_shape(tmp_path):
     conn, t = _start_child_thread(tmp_path)
     _rpc(conn, {"op": "connect"})
     reply = _rpc(conn, {"op": "reconcile", "after": None})
-    assert reply == {"ok": True, "result": {"payloads": [], "newest": None}}
+    # codex round1 fix1(a)：reply 多帶 rpc_id 欄位——不再用嚴格 dict 相等。
+    assert reply["ok"] is True and reply["result"] == {"payloads": [], "newest": None}
     # after 帶 ISO 字串：驗 datetime.fromisoformat 解析不炸（FakeNativeClient 本身不檢查值）。
     reply2 = _rpc(conn, {"op": "reconcile", "after": "2026-08-04T09:00:00"})
-    assert reply2 == {"ok": True, "result": {"payloads": [], "newest": None}}
+    assert reply2["ok"] is True and reply2["result"] == {"payloads": [], "newest": None}
     _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)

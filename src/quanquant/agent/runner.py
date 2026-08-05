@@ -56,7 +56,19 @@ class ChildFrozenError(RuntimeError):
 
 
 class ChildHandle:
-    """SDK 子程序的擁有者：spawn(spawn ctx)、序列 RPC（threading.Lock）、ping、terminate。"""
+    """SDK 子程序的擁有者：spawn(spawn ctx)、序列 RPC（threading.Lock）、ping、terminate。
+
+    pipe 失同步防線（codex round1 fix1，BLOCKER）：危險情境是 place 逾時後，之後 child
+    才姍姍來遲把 reply 送出——若 pipe 被下一個 ping/place 重用，會把這筆遲到 reply 讀走，
+    誤把上一單的 broker id 當成這一單的結果。兩層防線：
+
+    (a) 每筆 RPC 帶遞增 `_rpc_seq` 當 rpc_id，child_main 原樣帶回；收到 reply 後比對
+        rpc_id，不符（上一輪遲到的 reply）就丟棄，在剩餘 timeout 預算內繼續等真正的回覆。
+    (b) 一旦真的逾時、或 pipe 本身壞掉（EOFError/BrokenPipeError/OSError），直接把整條
+        pipe 判死（`_poisoned=True`）並 terminate 子程序——之後任何 request()/ping() 都
+        不再嘗試碰這條已經不可信的 pipe，直接 fail；`alive` 隨之回 False，交給
+        `AgentRunner.ensure_child()` respawn 一條全新的子程序 + pipe。
+    """
 
     def __init__(self, *, credentials: dict, symbol: str, mode: str, buffer_path: str,
                  native_factory=None) -> None:
@@ -68,6 +80,8 @@ class ChildHandle:
         self._lock = threading.Lock()
         self._process: mp.process.BaseProcess | None = None
         self._conn = None
+        self._rpc_seq = 0
+        self._poisoned = False
 
     def start(self) -> str:
         ctx = mp.get_context("spawn")
@@ -80,11 +94,16 @@ class ChildHandle:
         process.start()
         self._process = process
         self._conn = parent_conn
+        self._poisoned = False   # 全新 spawn 的子程序 + pipe：重置前一輪可能留下的中毒態。
         try:
-            reply = self._rpc(self._conn, {"op": "connect"}, timeout=_CHILD_CONNECT_TIMEOUT)
+            reply = self._rpc({"op": "connect"}, timeout=_CHILD_CONNECT_TIMEOUT)
         except Exception as exc:
-            self._process.kill()
-            self._process.join(timeout=5)
+            # _rpc 逾時/pipe 異常時可能已經 poison→terminate 過（self._process 已是
+            # None）；用 None 檢查讓這裡的清理對兩種狀態都安全，不重複 kill 一個 None。
+            if self._process is not None:
+                self._process.kill()
+                self._process.join(timeout=5)
+                self._process = None
             raise RuntimeError(f"agent 子程序啟動失敗: {exc}") from exc
         if not reply.get("ok"):
             self._process.kill()
@@ -93,14 +112,51 @@ class ChildHandle:
         return reply["account"]
 
     def request(self, op: dict, *, timeout: float) -> dict:
-        return self._rpc(self._conn, op, timeout=timeout)
+        return self._rpc(op, timeout=timeout)
 
-    def _rpc(self, conn, op: dict, *, timeout: float) -> dict:
+    def _rpc(self, op: dict, *, timeout: float) -> dict:
+        if self._poisoned:
+            raise TimeoutError(
+                f"agent 子程序 pipe 已判死（前次逾時遺留遲到回覆風險），拒絕重用"
+                f"（op={op.get('op')}）"
+            )
         with self._lock:
-            conn.send(op)
-            if not conn.poll(timeout):
-                raise TimeoutError(f"agent 子程序逾時未回應（op={op.get('op')}）")
-            return conn.recv()
+            conn = self._conn
+            self._rpc_seq += 1
+            rpc_id = self._rpc_seq
+            conn.send({**op, "rpc_id": rpc_id})
+            deadline = time.monotonic() + timeout
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._poison()
+                    raise TimeoutError(f"agent 子程序逾時未回應（op={op.get('op')}）")
+                try:
+                    ready = conn.poll(remaining)
+                except (EOFError, OSError) as exc:
+                    self._poison()
+                    raise TimeoutError(
+                        f"agent 子程序 pipe 異常（op={op.get('op')}）: {exc}"
+                    ) from exc
+                if not ready:
+                    self._poison()
+                    raise TimeoutError(f"agent 子程序逾時未回應（op={op.get('op')}）")
+                try:
+                    reply = conn.recv()
+                except (EOFError, OSError) as exc:
+                    self._poison()
+                    raise TimeoutError(
+                        f"agent 子程序 pipe 異常（op={op.get('op')}）: {exc}"
+                    ) from exc
+                if reply.get("rpc_id") != rpc_id:
+                    # 上一輪逾時後才遲到的 reply：丟棄，在剩餘 timeout 預算內繼續等
+                    # 這次呼叫真正的回覆——不會被誤配給呼叫端。
+                    continue
+                return reply
+
+    def _poison(self) -> None:
+        self._poisoned = True
+        self.terminate()
 
     def ping(self, *, timeout: float) -> bool:
         try:
@@ -120,7 +176,7 @@ class ChildHandle:
 
     @property
     def alive(self) -> bool:
-        return self._process is not None and self._process.is_alive()
+        return (not self._poisoned) and self._process is not None and self._process.is_alive()
 
 
 def _to_op(msg: Any) -> dict:

@@ -158,7 +158,9 @@ def test_real_child_handle_spawn_roundtrip(tmp_path):
                         native_factory=fake_native_factory)
     assert child.start() == "F1"
     reply = child.request({"op": "ping"}, timeout=10)
-    assert reply == {"ok": True}
+    # codex round1 fix1(a)：reply 現在多帶一個 rpc_id 欄位（request() 自動附加、child_main
+    # 原樣帶回，用來擋遲到 reply 誤配下一輪 RPC）——不再用嚴格 dict 相等，改斷言子集。
+    assert reply["ok"] is True
     child.terminate()
     assert not child.alive
 
@@ -199,6 +201,139 @@ async def test_ensure_child_respawns_when_alive_but_account_lost(tmp_path):
     r.ensure_child()
     assert child.starts == 1                      # terminate 後 respawn 一次
     assert r._account == "F1"
+
+
+# ---------- codex round1 fix1（BLOCKER）：ChildHandle pipe 失同步——timeout 後遲到
+# reply 污染下一個 RPC ----------
+# 危險情境：place 逾時 → 之後 child 完成送出遲到 reply → 下一個 ping/place 把它讀走 →
+# 前一單的 broker id 寫進下一張 Order。兩層防線：(a) rpc_id 比對，不符即丟棄繼續在剩餘
+# timeout 預算內等；(b) 真的逾時（或 pipe 本身壞掉）就整條 pipe 判死 + terminate，之後
+# request()/ping() 一律直接 fail，不再碰這條不可信的 pipe，交給 ensure_child() respawn。
+
+class _FakeProcess:
+    def __init__(self, alive: bool = True):
+        self._alive = alive
+        self.killed = False
+        self.joined = False
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def kill(self) -> None:
+        self.killed = True
+        self._alive = False
+
+    def join(self, timeout=None) -> None:
+        self.joined = True
+
+
+class _FakeConn:
+    """模擬 multiprocessing.Connection：poll_results/recv_queue 依序被消耗，用來精確控制
+    「逾時」「遲到 reply」等時序，不必依賴真實 IPC 延遲。"""
+
+    def __init__(self):
+        self.sent: list[dict] = []
+        self.poll_results: list[bool] = []
+        self.recv_queue: list[dict] = []
+        self.recv_error: Exception | None = None
+        self.closed = False
+
+    def send(self, obj) -> None:
+        self.sent.append(obj)
+
+    def poll(self, timeout=None) -> bool:
+        if not self.poll_results:
+            return False
+        return self.poll_results.pop(0)
+
+    def recv(self) -> dict:
+        if self.recv_error is not None:
+            raise self.recv_error
+        return self.recv_queue.pop(0)
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _bare_child_handle(tmp_path):
+    from quanquant.agent.runner import ChildHandle
+    return ChildHandle(credentials={}, symbol="TXF", mode="sim",
+                       buffer_path=str(tmp_path / "o.db"))
+
+
+def test_timeout_poisons_pipe_and_second_request_never_touches_it(tmp_path):
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = process, conn
+
+    conn.poll_results = [False]      # 第一個 request：poll 逾時
+    with pytest.raises(TimeoutError):
+        child.request({"op": "place"}, timeout=0.01)
+
+    assert process.killed and process.joined    # 逾時即 terminate
+    assert conn.closed
+    assert child.alive is False
+
+    # 第二個 request：poisoned 態必須直接 fail，完全不碰 pipe（不再 send/poll/recv）。
+    sent_before = len(conn.sent)
+    with pytest.raises(TimeoutError):
+        child.request({"op": "ping"}, timeout=1)
+    assert len(conn.sent) == sent_before
+
+
+def test_mismatched_rpc_id_reply_is_discarded_within_timeout_budget(tmp_path):
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = process, conn
+
+    # 兩次 poll 都成功；第一次 recv 回來的是遲到的上一輪 reply（rpc_id 不符），
+    # 第二次才是這次呼叫真正的 reply（rpc_id==1，第一筆 RPC）。
+    conn.poll_results = [True, True]
+    conn.recv_queue = [
+        {"ok": True, "result": {"stale": True}, "rpc_id": 999},
+        {"ok": True, "result": {"pong": 1}, "rpc_id": 1},
+    ]
+    reply = child.request({"op": "ping"}, timeout=1)
+    assert reply["result"] == {"pong": 1}
+    assert child.alive is True           # 沒有因為「收到一則不符的 reply」就被判死
+
+
+def test_recv_error_poisons_pipe(tmp_path):
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = process, conn
+    conn.poll_results = [True]
+    conn.recv_error = EOFError("child 端已關閉")
+
+    with pytest.raises(TimeoutError):
+        child.request({"op": "ping"}, timeout=1)
+    assert child.alive is False
+    assert process.killed and conn.closed
+
+
+def test_child_handle_respawns_after_being_poisoned(tmp_path):
+    """真 spawn 一次驗證端到端：逾時判死 → alive=False → 重新 start() 成功（ensure_child
+    在 AgentRunner 那層即是靠 alive 決定要不要 respawn，這裡直測 ChildHandle 本身）。"""
+    from quanquant.agent.testing import fake_native_factory
+    from quanquant.agent.runner import ChildHandle
+    child = ChildHandle(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                        mode="sim", buffer_path=str(tmp_path / "o.db"),
+                        native_factory=fake_native_factory)
+    assert child.start() == "F1"
+    real_process = child._process
+
+    fake_conn = _FakeConn()
+    fake_conn.poll_results = [False]     # 換上假管線，確定性地模擬逾時
+    child._conn = fake_conn
+    with pytest.raises(TimeoutError):
+        child.request({"op": "ping"}, timeout=0.01)
+
+    assert child.alive is False
+    assert real_process.is_alive() is False   # 真的被 kill 了，不是只改旗標
+
+    assert child.start() == "F1"      # respawn：新的真子程序 + 新 pipe
+    assert child.alive is True
+    child.terminate()
 
 
 def test_child_handle_ping_wraps_request(tmp_path):
