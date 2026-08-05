@@ -29,7 +29,8 @@ def test_pending_orders_by_id_and_respects_limit(tmp_path):
 def test_append_from_thread_visible_to_main(tmp_path):
     buf = DurableBuffer(tmp_path / "o.db")
     t = threading.Thread(target=lambda: buf.append("deal_report", {"x": 1}))
-    t.start(); t.join()
+    t.start()
+    t.join()
     assert buf.unsent_count() == 1
 
 

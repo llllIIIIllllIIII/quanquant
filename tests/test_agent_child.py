@@ -44,7 +44,8 @@ def test_connect_then_place_acks_and_persists_reports(tmp_path):
     buf = DurableBuffer(tmp_path / "o.db")
     kinds = [r.kind for r in buf.pending()]
     assert kinds == ["order_report", "deal_report"]        # callback 已同步落地
-    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
 
 
 def test_cancel_unknown_maps_exception_like_production(tmp_path):
@@ -78,7 +79,8 @@ def test_exception_reply_is_redacted_and_loop_survives(tmp_path):
     assert "SECRET-VAL-456" not in reply["message"]
     # codex round1 fix1(a)：reply 多帶 rpc_id 欄位——不再用嚴格 dict 相等。
     assert _rpc(parent_conn, {"op": "ping"})["ok"] is True  # 迴圈仍活著
-    _rpc(parent_conn, {"op": "shutdown"}); t.join(timeout=5)
+    _rpc(parent_conn, {"op": "shutdown"})
+    t.join(timeout=5)
 
 
 # ---- codex round1 fix3（HIGH）：例外處理原本用 log.exception（帶 exc_info/traceback），
@@ -116,7 +118,8 @@ def test_child_refuses_non_sim_mode(tmp_path):
     t.start()
     reply = _rpc(parent_conn, {"op": "connect"})
     assert reply["ok"] is False and reply["error_kind"] == "mode_mismatch"
-    _rpc(parent_conn, {"op": "shutdown"}); t.join(timeout=5)
+    _rpc(parent_conn, {"op": "shutdown"})
+    t.join(timeout=5)
 
 
 def test_real_process_spawn_smoke(tmp_path):
@@ -183,7 +186,8 @@ def test_update_op_with_price(tmp_path):
                         "price_type": "LMT"})
     # codex round1 fix1(a)：reply 多帶 rpc_id 欄位——不再用嚴格 dict 相等。
     assert reply["ok"] is True and reply["result"] == {}
-    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
 
 
 def test_update_op_price_none(tmp_path):
@@ -196,7 +200,8 @@ def test_update_op_price_none(tmp_path):
                         "price_type": None})
     # codex round1 fix1(a)：reply 多帶 rpc_id 欄位——不再用嚴格 dict 相等。
     assert reply["ok"] is True and reply["result"] == {}
-    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
 
 
 # ---- codex round1 fix6（MEDIUM）：connect 成功後呼 buffer.assert_account——outbox 有
@@ -247,4 +252,5 @@ def test_reconcile_op_reply_shape(tmp_path):
     # after 帶 ISO 字串：驗 datetime.fromisoformat 解析不炸（FakeNativeClient 本身不檢查值）。
     reply2 = _rpc(conn, {"op": "reconcile", "after": "2026-08-04T09:00:00"})
     assert reply2["ok"] is True and reply2["result"] == {"payloads": [], "newest": None}
-    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)

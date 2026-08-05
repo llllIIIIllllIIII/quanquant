@@ -109,7 +109,10 @@ def live_server(engine, user, monkeypatch):
             yield s
 
     app.dependency_overrides[get_session] = _session_override
-    session_factory = lambda: Session(engine)
+
+    def session_factory():
+        return Session(engine)
+
     supervisor = BrokerSupervisor()
     guard = RiskGuard(session_factory=session_factory, secret="s",
                       owner_user_ids=frozenset({user.id}),
