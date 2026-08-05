@@ -60,7 +60,9 @@ def parse_downlink(data: dict):
 # ---------- 上行（agent → server） ----------
 class UpLogin(BaseModel):
     type: Literal["login"] = "login"
-    protocol: int = PROTOCOL_VERSION
+    # codex round1 fix5：錯版 agent 在 parse_uplink 這關就 ValidationError（端點既有
+    # invalid-frame 路徑忽略，agent 永不 ready），不必等到跑起來才發現協定不合。
+    protocol: Literal[1] = PROTOCOL_VERSION
     account: str
     mode: Literal["sim"]
 

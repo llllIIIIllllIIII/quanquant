@@ -31,3 +31,17 @@ def test_uplink_discriminates_by_type():
 def test_unknown_type_raises():
     with pytest.raises(ValidationError):
         parse_uplink({"type": "evil"})
+
+
+# ---- codex round1 fix5：login 帶協定版本，錯版直接 ValidationError（端點既有
+# invalid-frame 路徑會忽略，agent 永不 ready，避免版本不合的 agent 誤連上）----
+
+def test_uplink_login_rejects_unknown_protocol_version():
+    with pytest.raises(ValidationError):
+        parse_uplink({"type": "login", "account": "F1", "mode": "sim", "protocol": 999})
+
+
+def test_uplink_login_accepts_current_protocol_version():
+    from quanquant.broker.agent_protocol import UpLogin
+    msg = parse_uplink({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+    assert isinstance(msg, UpLogin) and msg.account == "F1"
