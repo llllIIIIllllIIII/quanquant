@@ -36,6 +36,7 @@ from quanquant.sources.registry import make_source
 from quanquant.web.deps import get_current_user
 from quanquant.web.routers import alerts, candles, dashboard, health, stats, trades
 from quanquant.web.routers import admin as admin_routes
+from quanquant.web.routers import agent_ws as agent_ws_routes
 from quanquant.web.routers import auth as auth_routes
 from quanquant.web.routers import orders as orders_routes
 from quanquant.web.routers import pulse as pulse_routes
@@ -414,6 +415,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_routes.router)    # public: /login, /logout
     app.include_router(health.router)         # public: /healthz
+    app.include_router(agent_ws_routes.router)  # public: /ws/agent（token 認證，非 cookie）
 
     protected = [Depends(get_current_user)]
     app.include_router(dashboard.router, dependencies=protected)

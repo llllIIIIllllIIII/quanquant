@@ -87,6 +87,11 @@ class Settings(BaseSettings):
     order_unknown_reconcile_grace_seconds: float = 300.0  # unknown 委託等多久才判定失敗+釋放配額
     order_confirm_token_cleanup_interval_seconds: float = 3600.0  # 過期/已消費 token 清理週期
 
+    # --- 本機 broker agent 通道（Increment 0，單一信任使用者） ---
+    order_channel: str = "inprocess"    # inprocess | agent（agent=Shioaji I/O 在使用者本機執行）
+    agent_ws_token: str = ""            # agent WS 靜態 token；空字串=agent 通道停用
+    agent_command_timeout_seconds: float = 10.0  # server 等 cmd_ack 逾時（逾時→unknown 保守）
+
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
