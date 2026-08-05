@@ -67,6 +67,9 @@ async def test_run_once_sends_login_first(tmp_path):
     await _until(lambda: len(tr.sent) >= 1)
     assert tr.sent[0]["type"] == "login"
     assert tr.sent[0]["account"] == "F1" and tr.sent[0]["mode"] == "sim"
+    # codex round2 fix1：protocol 版本必填化後，UpLogin 不再有 default——runner 必須顯式帶
+    # protocol=PROTOCOL_VERSION，否則建構就會 ValidationError。
+    assert tr.sent[0]["protocol"] == 1
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 

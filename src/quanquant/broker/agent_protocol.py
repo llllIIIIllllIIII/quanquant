@@ -62,7 +62,10 @@ class UpLogin(BaseModel):
     type: Literal["login"] = "login"
     # codex round1 fix5：錯版 agent 在 parse_uplink 這關就 ValidationError（端點既有
     # invalid-frame 路徑忽略，agent 永不 ready），不必等到跑起來才發現協定不合。
-    protocol: Literal[1] = PROTOCOL_VERSION
+    # codex round2 fix1：拿掉 default——有 default 時缺 protocol 欄位的 login 會自動補 1
+    # 通過驗證，等於版本協商可被繞過。必填後，任何呼叫端（runner.py 的 UpLogin(...)）都
+    # 必須顯式帶 protocol=PROTOCOL_VERSION，缺就是建構期 ValidationError。
+    protocol: Literal[1]
     account: str
     mode: Literal["sim"]
 

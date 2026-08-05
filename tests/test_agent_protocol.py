@@ -45,3 +45,11 @@ def test_uplink_login_accepts_current_protocol_version():
     from quanquant.broker.agent_protocol import UpLogin
     msg = parse_uplink({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
     assert isinstance(msg, UpLogin) and msg.account == "F1"
+
+
+# ---- codex round2 fix1：protocol 版本必填化——UpLogin.protocol 原本有 default=1，缺欄位
+# 的 login 會自動補齊通過驗證，等於版本協商可被繞過。改成必填後，缺欄位必須 ValidationError。
+
+def test_uplink_login_missing_protocol_field_rejected():
+    with pytest.raises(ValidationError):
+        parse_uplink({"type": "login", "account": "F1", "mode": "sim"})

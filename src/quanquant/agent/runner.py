@@ -41,8 +41,8 @@ from typing import Any
 from pydantic import ValidationError
 
 from quanquant.broker.agent_protocol import (
-    DownCancel, DownHealth, DownPlace, DownReconcile, DownReportAck, DownUpdate,
-    UpCmdAck, UpHealth, UpLogin, UpReport, parse_downlink,
+    PROTOCOL_VERSION, DownCancel, DownHealth, DownPlace, DownReconcile, DownReportAck,
+    DownUpdate, UpCmdAck, UpHealth, UpLogin, UpReport, parse_downlink,
 )
 from quanquant.agent.native_runner import child_main
 
@@ -240,7 +240,8 @@ class AgentRunner:
         tasks: list[asyncio.Task] = []
         try:
             await self._transport.send(
-                UpLogin(account=self._account, mode=self._mode).model_dump()
+                UpLogin(protocol=PROTOCOL_VERSION, account=self._account,
+                        mode=self._mode).model_dump()
             )
             tasks = [
                 asyncio.create_task(self._pump()),
