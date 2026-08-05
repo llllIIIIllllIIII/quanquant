@@ -112,6 +112,38 @@ def test_duplicate_report_resend_both_staged_and_acked(ws_env, engine):
         assert len(s.exec(select(RawInbox)).all()) == 2
 
 
+def test_report_ack_only_after_commit_success(ws_env, engine, monkeypatch, caplog):
+    # 零丟單紅線：UpReport 分支必須「RawInbox commit 成功後才回 report_ack」——commit 失敗
+    # 時，client 絕不能收到 ack（否則 agent 端會誤判該筆回報已落地而不再重送，造成靜默丟單）。
+    # 驗收者實證：把 send_json(DownReportAck) 搬到 commit_raw_callback 之前，既有 19 個
+    # 相關測試全綠也擋不住這個回歸——本測試補上這條紅線的直接覆蓋。
+    import quanquant.web.routers.agent_ws as agent_ws_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("commit boom")
+
+    monkeypatch.setattr(agent_ws_module, "commit_raw_callback", _boom)
+    caplog.set_level("ERROR", logger="quanquant.web.routers.agent_ws")
+    client = TestClient(ws_env)
+    received = []
+    try:
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+            ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+            ws.send_json({"type": "report", "event_id": 5, "kind": "deal_report", "payload": {}})
+            # 現行例外語意（Task 8 附加需求 3）：commit 失敗會讓 receive 迴圈 log.exception
+            # 後 re-raise、連線斷線——不論客端在哪個時點觀察到例外（receive_json() 當場，或
+            # with 區塊結束時背景 task join 再拋），照實接住，只驗證關鍵事實：沒有 ack。
+            received.append(ws.receive_json())
+    except Exception:
+        pass
+    assert not any(isinstance(m, dict) and m.get("type") == "report_ack" for m in received), (
+        "commit 失敗仍收到 report_ack——commit-before-ack 順序被破壞"
+    )
+    assert "agent WS 處理上行訊息失敗" in caplog.text
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).all() == []
+
+
 def test_cmd_ack_routed_to_channel(ws_env):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
