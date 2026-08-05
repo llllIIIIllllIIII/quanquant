@@ -309,10 +309,14 @@ async def orders_stream(request: Request, user: User = Depends(get_current_user)
 
 
 @router.get("/orders/agent-status", response_class=HTMLResponse)
-def orders_agent_status(request: Request):
+def orders_agent_status(request: Request, user: User = Depends(get_current_user)):
     """Task 9：agent 通道連線狀態 badge（僅 order_channel=="agent" 時顯示；inprocess 通道
     沒有「agent 連線」這個概念，partial 直接回空字串）。SSE `orders-changed`/`refreshorders`
-    觸發時 orders.html 的 #agent-status-box 會重打這支端點刷新（見 orders.html）。"""
+    觸發時 orders.html 的 #agent-status-box 會重打這支端點刷新（見 orders.html）。
+
+    修：顯式宣告 `user: User = Depends(get_current_user)`——本檔其餘端點皆已如此，router
+    層雖已掛登入保護，這裡補上只為縱深防禦＋與同檔慣例一致（此端點內容不含使用者資料，
+    unused 變數屬預期）。"""
     state = getattr(request.app.state, "order_session_state", None)
     return HTMLResponse(render_partial(
         "partials/agent_status.html",
