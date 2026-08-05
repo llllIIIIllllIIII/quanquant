@@ -11,6 +11,7 @@ from decimal import Decimal
 
 from quanquant.broker.base import OrderError, TradeNotFoundError
 from quanquant.broker.native import ShioajiNativeClient
+from quanquant.broker.shioaji_adapter import ShioajiAdapter
 
 
 class _FakeOrderHandle:
@@ -142,6 +143,64 @@ def test_on_order_cb_degrades_when_on_raw_raises_once():
     c = _client(on_raw=flaky)
     c._on_order_cb("OrderState.FuturesDeal", {"trade_id": "T1"})
     assert calls[1]["_unparsed"] is True and "repr" in calls[1]
+
+
+def _bare_adapter(persist_raw):
+    """比照 tests/test_broker_hardening.py 的 `_bare_adapter` 慣例：繞過 `__init__` 建最小
+    adapter（`_on_order_cb` 只用到 `_persist_raw`），把落地責任換成測試用的攔截函式——不碰
+    真 DB，也不需要 session_factory/engine。"""
+    adapter = object.__new__(ShioajiAdapter)
+    adapter._session_factory = lambda: None
+    adapter.broker = "shioaji"
+    adapter._persist_raw = persist_raw
+    return adapter
+
+
+def test_adapter_and_native_order_cb_stay_equivalent():
+    """回歸測試（Task 2 委派重構審查 Important #2）：native.py 的 `ShioajiNativeClient.
+    _on_order_cb` 與 shioaji_adapter.py 的 `ShioajiAdapter._on_order_cb` 是刻意保留的兩份
+    等價實作（見 shioaji_adapter.py 該方法 docstring 的說明——既有硬化測試用
+    `object.__new__` 繞過 __init__，改成委派 native 會炸 AttributeError，故兩邊各自維護一份
+    邏輯逐字相同的 callback）。這是零丟單紅線路徑，兩份漂移不會被既有測試發現：本測試把
+    同一組輸入分別餵給兩邊，攔截兩邊最終落地的 (kind, payload)，斷言完全相同。"""
+    # 案例①：正常 dict msg，兩邊應落地相同 (kind, payload)。
+    native_seen: list[tuple[str, dict]] = []
+    native_client = _client(on_raw=lambda kind, payload: native_seen.append((kind, payload)))
+    native_client._on_order_cb("OrderState.FuturesDeal", {"trade_id": "T1", "price": 100.0})
+
+    adapter_seen: list[tuple[str, dict]] = []
+    adapter = _bare_adapter(lambda kind, payload: adapter_seen.append((kind, payload)))
+    adapter._on_order_cb("OrderState.FuturesDeal", {"trade_id": "T1", "price": 100.0})
+
+    assert native_seen == adapter_seen == [("deal_report", {"trade_id": "T1", "price": 100.0})]
+
+    # 案例②：落地 handler 第一次拋例外（flaky），逼兩邊都走「退化重試」路徑——斷言退化
+    # payload 的 `_unparsed`/`repr` 鍵形狀與內容也完全一致。
+    def _make_flaky(calls: list[tuple[str, dict]]):
+        def flaky(kind, payload):
+            calls.append((kind, payload))
+            if len(calls) == 1:
+                raise RuntimeError("db down")
+
+        return flaky
+
+    native_calls: list[tuple[str, dict]] = []
+    native_client2 = _client(on_raw=_make_flaky(native_calls))
+    native_client2._on_order_cb("FuturesOrder", {"id": "O1"})
+
+    adapter_calls: list[tuple[str, dict]] = []
+    adapter2 = _bare_adapter(_make_flaky(adapter_calls))
+    adapter2._on_order_cb("FuturesOrder", {"id": "O1"})
+
+    assert len(native_calls) == len(adapter_calls) == 2
+    assert native_calls[0] == adapter_calls[0] == ("order_report", {"id": "O1"})
+
+    n_kind, n_degraded = native_calls[1]
+    a_kind, a_degraded = adapter_calls[1]
+    assert n_kind == a_kind == "order_report"
+    assert n_degraded.keys() == a_degraded.keys() == {"_unparsed", "repr"}
+    assert n_degraded["_unparsed"] is a_degraded["_unparsed"] is True
+    assert n_degraded["repr"] == a_degraded["repr"]
 
 
 def test_trades_snapshot_filters_by_watermark_and_returns_newest():
