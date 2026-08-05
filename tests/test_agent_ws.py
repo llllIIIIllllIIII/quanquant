@@ -205,6 +205,20 @@ def test_ws_closes_when_wiring_incomplete_missing_session_factory(engine, monkey
     get_settings.cache_clear()
 
 
+def test_non_ascii_token_rejected_not_crashed(ws_env):
+    # `secrets.compare_digest` 對非 ASCII str 直接 raise TypeError；Starlette 依 ASGI spec
+    # 用 latin-1 解碼 header，理論上可帶非 ASCII 字元。httpx 的 TestClient 對 str header
+    # 值本身強制 ascii-only（client 端送不出去），所以這裡直接用 latin-1 編碼過的 bytes
+    # 當 header value，繞過 client 端限制、重現「server 收到非 ASCII token」的情境。
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": "é".encode("latin-1")}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+
 def test_ws_rejects_when_token_unset_default_empty(engine, monkeypatch):
     # Task 8 附加需求 2：不設 AGENT_WS_TOKEN（預設空字串）時一律拒絕連線——驗 production
     # 預設安全（漏設 env 不會意外開放無認證下單通道）。

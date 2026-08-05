@@ -31,8 +31,13 @@ async def agent_ws(websocket: WebSocket) -> None:
     channel = getattr(state, "agent_channel", None)
     token = websocket.headers.get("x-agent-token", "")
     await websocket.accept()
+    # 修：secrets.compare_digest 對非 ASCII str 直接 raise TypeError（Starlette 的 header
+    # 依 ASGI spec 用 latin-1 解碼，理論上可出現非 ASCII 字元）；比對一律先各自 encode 成
+    # bytes 再交給 compare_digest，bytes 版本沒有這個限制，token 不符時照樣安全回 1008。
     if (channel is None or not settings.agent_ws_token
-            or not _secrets.compare_digest(token, settings.agent_ws_token)):
+            or not _secrets.compare_digest(
+                token.encode("utf-8"), settings.agent_ws_token.encode("utf-8")
+            )):
         await websocket.close(code=1008)
         return
     # 連線洩漏防呆：這三個 app.state 屬性務必在 channel.attach 之前讀完——缺任一個
