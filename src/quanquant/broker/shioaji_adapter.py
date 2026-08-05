@@ -437,11 +437,6 @@ class ShioajiAdapter:
     async def place(
         self, req: OrderRequest, *, actor_user_id: int, confirm_token: str | None = None
     ) -> OrderAck:
-        # Task 6 fail-fast：remote gateway 存在但未連線時，連 Order/配額列都不建（行為矩陣
-        # 「gateway.ready=False（place 進入時）」一列）——避免建立之後永遠等不到 ack 的
-        # pending 委託與被鎖住的配額，呼叫端應直接重試或走告警路徑，不留殘骸。
-        if self._remote_gateway is not None and not self._remote_gateway.ready:
-            raise OrderError("agent 未連線，無法下單")
         request_hash = canonical_payload_hash(
             symbol=req.symbol, action=req.action, qty=req.qty, price=req.price,
             price_type=req.price_type, order_type=req.order_type, octype=req.octype,
@@ -457,6 +452,17 @@ class ShioajiAdapter:
                     # 別人的 client_order_id+完全相同 payload 不得在授權前拿到他人 OrderAck。
                     raise AuthorizationError("client_order_id 已被其他使用者的委託佔用")
                 return self._ack_from_order(existing)  # 冪等：不重跑風控、不燒 token、不再送單
+
+            # Fix Round 1（審查 Important #1）：offline fail-fast 搬到冪等查找 miss 之後——
+            # 原本擺在函式最開頭、request_hash 計算與冪等查找之前，會讓「client 因逾時用同一
+            # client_order_id 重送、agent 恰好離線」這種情境提早短路，永遠吃不到上面的冪等
+            # shortcut（in-process 模式反而能命中回快取 ack，remote 模式卻直接拒絕，冪等
+            # 保證在跨網路後被削弱）。搬到這裡之後：existing 命中（無論 gateway 狀態）一律
+            # 走上面冪等分支；只有「查無既有列、確定要建新委託」時才檢查 gateway 是否就緒，
+            # 且仍在任何 `session.commit()` 之前，維持「連 Order/配額列都不建」的原始保證
+            # （行為矩陣「gateway.ready=False（place 進入時）」一列不變）。
+            if self._remote_gateway is not None and not self._remote_gateway.ready:
+                raise OrderError("agent 未連線，無法下單")
 
             if self._risk_guard is not None:
                 order = self._risk_guard.check_place(

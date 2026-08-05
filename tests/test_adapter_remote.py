@@ -21,6 +21,7 @@ from quanquant.broker.base import (
     AgentUnavailableError,
     OrderError,
     RiskError,
+    TradeNotFoundError,
 )
 from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter, _classify_place_failure
@@ -145,6 +146,26 @@ async def test_remote_place_offline_fails_fast_no_db_rows(engine):
         assert s.exec(select(QuotaReservation)).all() == []
 
 
+async def test_remote_place_idempotent_replay_served_while_offline(engine):
+    """Fix Round 1（審查 Important #1）：offline fail-fast 必須排在冪等查找之後——已成功
+    送出的委託，client 用同一 client_order_id 重送時（例如網路逾時重試），即使 agent 此刻
+    恰好離線，也要能命中冪等 shortcut 回快取 ack，不得被 fail-fast 攔截、也不能真的再送
+    一次單。"""
+    gw = _FakeGateway()
+    a = _adapter(engine, gw, _guard(engine))
+    req = _req(cid="c-replay")
+    first = await a.place(req, actor_user_id=1)
+    assert first.status == "submitted" and first.ordno == "101AA1"
+
+    gw.ready = False
+    replay = await a.place(req, actor_user_id=1)
+    assert replay.status == "submitted"
+    assert replay.ordno == "101AA1"
+    with Session(engine) as s:
+        assert len(s.exec(select(Order)).all()) == 1
+    assert len(gw.place_calls) == 1
+
+
 async def test_kill_switch_blocks_before_gateway_called(engine):
     gw = _FakeGateway()
     guard = _guard(engine)
@@ -153,6 +174,84 @@ async def test_kill_switch_blocks_before_gateway_called(engine):
     with pytest.raises(RiskError):
         await a.place(_req(), actor_user_id=1)
     assert gw.place_calls == []
+
+
+# ---- Fix Round 1（審查 Important #2）：remote cancel/update 專屬測試補齊 ----
+# cancel 的 `_do_cancel`、update 的 `_do_update` 實作在 Task 6 原始交付就已存在（gateway.ready
+# 檢查、TradeNotFoundError/AgentUnavailableError/AgentCommandTimeoutError 傳遞），當時只缺
+# 專屬測試覆蓋，這裡補上。
+
+
+async def _placed_order(engine, gw, guard):
+    """建立一筆已成功送出（status=submitted）的委託，供以下 cancel/update 測試操作。"""
+    a = _adapter(engine, gw, guard)
+    ack = await a.place(_req(), actor_user_id=1)
+    return a, ack
+
+
+async def test_remote_cancel_success_marks_cancelled(engine):
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    result = await a.cancel(ack.broker_order_id, actor_user_id=1)
+    assert result.status == "cancelled"
+    assert gw.cancel_calls == ["101AA1"]
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "cancelled"
+
+
+async def test_remote_cancel_offline_rejected_state_unchanged(engine):
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    gw.ready = False
+    with pytest.raises(OrderError):
+        await a.cancel(ack.broker_order_id, actor_user_id=1)
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"
+
+
+async def test_remote_cancel_trade_not_found_propagates(engine):
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    gw.raise_exc = TradeNotFoundError("101AA1")
+    with pytest.raises(OrderError):
+        await a.cancel(ack.broker_order_id, actor_user_id=1)
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"
+
+
+async def test_remote_update_timeout_marks_unknown_keeps_quota(engine):
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    gw.raise_exc = AgentCommandTimeoutError("逾時")
+    with pytest.raises(AgentCommandTimeoutError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "unknown"
+        rows = list(s.exec(select(QuotaReservation)))
+        update_row = next(r for r in rows if r.reservation_id != ack.client_order_id)
+        assert update_row.state == "reserved"  # 結果不明，watchdog reconcile 前不擅自 release
+
+
+async def test_remote_update_unavailable_releases_delta_quota(engine):
+    """讀碼結論（`update()` 的 `except Exception` 分支，見 shioaji_adapter.py ~707-747 行）：
+    update 失敗分支語意與 place 不同——`classification=="failed"`（`AgentUnavailableError`
+    正是一例）只會 release「若有」保留的 delta 配額，**不**把委託本身標成 failed；委託
+    status 維持呼叫前的既有值（這裡是 place 留下的 "submitted"），因為「改單失敗不代表
+    委託本身壞了」（同 in-process 版 test_update_releases_delta_quota_reservation_on_broker_
+    explicit_rejection / ...when_send_gate_raises_riskerror 的既有原則）。只有
+    classification=="unknown" 才會把委託標成 "unknown"（見上一個測試）。兩支分支最後都
+    re-raise 原始例外型別（不包成 OrderError），故這裡 pytest.raises 抓的是
+    AgentUnavailableError 本身。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    gw.raise_exc = AgentUnavailableError("斷線")
+    with pytest.raises(AgentUnavailableError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"  # 改單失敗不影響委託本身狀態
+        rows = list(s.exec(select(QuotaReservation)))
+        update_row = next(r for r in rows if r.reservation_id != ack.client_order_id)
+        assert update_row.state == "released"  # 明確判定失敗，立即釋放 delta 配額
 
 
 async def test_remote_reconcile_stages_payloads_and_returns_count(engine):
