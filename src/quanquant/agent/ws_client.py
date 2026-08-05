@@ -6,9 +6,8 @@
 `websockets` 套件連 server 的 `/ws/agent` 端點，header `x-agent-token` 帶認證 token
 （server 端見 `quanquant.web.routers.agent_ws`）。
 
-`websockets` 目前只是 uvicorn[standard] 的間接依賴（環境中已可 import），本 task 刻意不動
-pyproject——顯式宣告留給 Task 14。`additional_headers` 是目前安裝版本（16.x）的參數名；
-舊版 `websockets`（<14）用的是 `extra_headers`，升級/降版時需回頭確認。
+`additional_headers` 是 `websockets` 14+ 才有的參數名（舊版 <14 用 `extra_headers`）；pyproject
+已顯式宣告 `websockets>=14` 對齊此用法，不在程式碼加版本分支相容舊版。
 """
 import json
 from typing import Protocol
