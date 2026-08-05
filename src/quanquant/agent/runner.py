@@ -1,5 +1,6 @@
-"""agent 端 runner（Inc0 Task 12）：一條 WS session、上行泵（durable buffer → server）、
-下行 dispatch（server 指令 → SDK 子程序）。
+"""agent 端 runner（Inc0 Task 12/13）：一條 WS session、上行泵（durable buffer →
+server）、下行 dispatch（server 指令 → SDK 子程序）、重連 backoff、子程序凍結偵測/
+respawn。
 
 `ChildHandle` 是 SDK 子程序（`native_runner.child_main`，#203 隔離）的擁有者：spawn、
 序列 RPC（`threading.Lock` 保護 pipe，因為 `AgentRunner._receive_loop` 用
@@ -8,15 +9,23 @@
 不會同時有兩個 `_execute_command` 在跑）、ping、terminate。
 
 `AgentRunner.run_once()` 是一次完整的 WS session 生命週期：connect → 先送 `UpLogin` →
-啟動 `_pump`/`_receive_loop`/`_heartbeat` 三個 task → 任一 task 例外就全部收攏、關閉
-transport、例外原樣上拋（給呼叫者，未來 Task 13 的 `run_forever` 決定要不要重試/backoff）。
+啟動 `_pump`/`_receive_loop`/`_heartbeat`/`_child_watchdog` 四個 task → 任一 task 例外
+就全部收攏、關閉 transport、例外原樣上拋給 `run_forever`。`_child_watchdog` 定期 ping
+子程序，False/例外一律視為凍結（issue #203），raise `ChildFrozenError` 讓 session 崩出。
 
-零丟單設計：`_pump` 只讀 `buffer.pending()`（尚未 `mark_sent` 的列），送出後記一筆
-`_inflight` 時間戳（純粹防同一 session 內短時間內重複洗頻，不是持久化機制）；只有收到
-server 的 `report_ack` 才 `buffer.mark_sent()`。若這個 process 在 ack 抵達前崩潰，
-`_inflight` 隨記憶體消失，但 buffer 裡那筆事件仍是「未送達」狀態——下一個 session（新
-`AgentRunner` 實例，同一個 buffer 檔）的 `_pump` 會把它當成 pending 重新送出，天然做到
-「送出未 ack 就重啟 → 補送同一 event_id」，不需要額外的崩潰偵測邏輯。
+`run_forever()` 不斷跑 `run_once()`：`ChildFrozenError` 時 terminate 子程序，下一輪
+`ensure_child()` respawn；任何例外都依 backoff（倍增封頂 `backoff_max`）延遲重試；只要
+本輪成功送出 `login`（`_login_sent`），backoff 就重設為 `backoff_base`——server 端視角
+即 WS 斷線→重連→重新 login，觸發既有 login handler 的 reconcile（T0.2 斷線 reconcile
+免費保存，憑證全程留在父程序記憶體，不落地）。`stop()` 讓迴圈結束。
+
+零丟單設計：`_pump` 只讀 `buffer.pending()`（尚未 `mark_sent` 的列，經 `to_thread` 離開
+event loop），送出後記一筆 `_inflight` 時間戳（純粹防同一 session 內短時間內重複洗頻，
+不是持久化機制）；只有收到 server 的 `report_ack` 才 `buffer.mark_sent()`（同樣經
+`to_thread`）。若這個 process 在 ack 抵達前崩潰，`_inflight` 隨記憶體消失，但 buffer 裡
+那筆事件仍是「未送達」狀態——下一個 session（新 `AgentRunner` 實例，同一個 buffer 檔）
+的 `_pump` 會把它當成 pending 重新送出，天然做到「送出未 ack 就重啟 → 補送同一
+event_id」，不需要額外的崩潰偵測邏輯。
 """
 import asyncio
 import logging
@@ -146,14 +155,21 @@ class AgentRunner:
         self._account = ""
         self._inflight: dict[int, float] = {}
         self._stopping = False
+        self._login_sent = False  # 本輪 session 是否已成功送出 login（run_forever 決定 backoff 重設）
 
     def ensure_child(self) -> None:
-        """child 未活則 (re)start，記 self._account。"""
-        if not self._child.alive:
-            self._account = self._child.start()
+        """child 未活則 (re)start；child alive 但 self._account 遺失（接手他人已在跑的
+        child 的邊界情況）視同需要重啟。回傳後 self._account 必為非空。"""
+        if self._child.alive and self._account:
+            return
+        if self._child.alive:
+            self._child.terminate()
+        self._account = self._child.start()
 
     async def run_once(self) -> None:
-        """單一 WS session：connect→login→pump/receive/heartbeat 直到斷線/例外。"""
+        """單一 WS session：connect→login→pump/receive/heartbeat/watchdog 直到斷線/例外
+        /子程序凍結。login 送出成功即記 self._login_sent=True，供 run_forever 判斷是否
+        重設重連 backoff。"""
         self.ensure_child()
         await self._transport.connect()
         tasks: list[asyncio.Task] = []
@@ -161,10 +177,12 @@ class AgentRunner:
             await self._transport.send(
                 UpLogin(account=self._account, mode=self._mode).model_dump()
             )
+            self._login_sent = True
             tasks = [
                 asyncio.create_task(self._pump()),
                 asyncio.create_task(self._receive_loop()),
                 asyncio.create_task(self._heartbeat()),
+                asyncio.create_task(self._child_watchdog()),
             ]
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for t in done:
@@ -179,7 +197,31 @@ class AgentRunner:
             await self._transport.close()
 
     async def run_forever(self) -> None:
-        raise NotImplementedError
+        """不斷跑 run_once()：連線/子程序凍結例外時依 backoff 重試（backoff×2 封頂
+        backoff_max）；ChildFrozenError 則 terminate 子程序，下一輪 ensure_child()
+        respawn＋（run_once 內）重新登入——server 端視角即 WS 斷線→重連→重新 login，
+        觸發既有 login handler 的 reconcile（T0.2）。任何一輪成功送出 login 就代表連線
+        恢復健康，backoff 重設為 backoff_base。stop() 後迴圈結束。"""
+        backoff = self._backoff_base
+        while not self._stopping:
+            self._login_sent = False
+            try:
+                await self.run_once()
+            except ChildFrozenError:
+                log.warning("agent 子程序疑似凍結（issue #203），terminate 後下一輪 respawn")
+                self._child.terminate()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("agent WS session 異常結束，準備依 backoff 重連")
+
+            if self._login_sent:
+                backoff = self._backoff_base
+
+            if self._stopping:
+                break
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, self._backoff_max)
 
     def stop(self) -> None:
         self._stopping = True
@@ -188,7 +230,8 @@ class AgentRunner:
         while True:
             await asyncio.sleep(self._pump_interval)
             now = time.monotonic()
-            for row in self._buffer.pending(50):
+            pending = await asyncio.to_thread(self._buffer.pending, 50)
+            for row in pending:
                 sent_at = self._inflight.get(row.id)
                 if sent_at is not None and (now - sent_at) < self._resend_after:
                     continue
@@ -206,7 +249,7 @@ class AgentRunner:
                 log.warning("agent 收到不合法下行訊息，忽略：%s", str(raw)[:200])
                 continue
             if isinstance(msg, DownReportAck):
-                self._buffer.mark_sent(msg.event_id)
+                await asyncio.to_thread(self._buffer.mark_sent, msg.event_id)
                 self._inflight.pop(msg.event_id, None)
             elif isinstance(msg, DownHealth):
                 await self._transport.send(UpHealth().model_dump())
@@ -234,3 +277,20 @@ class AgentRunner:
         while True:
             await asyncio.sleep(self._heartbeat_interval)
             await self._transport.send(UpHealth().model_dump())
+
+    async def _child_watchdog(self) -> None:
+        """定期 ping SDK 子程序（#203 凍結偵測）：False 或例外（含逾時）一律視為凍結，
+        raise ChildFrozenError 讓 run_once 的 asyncio.wait(FIRST_EXCEPTION) 崩出——
+        run_forever 接手 terminate+respawn+重新登入。"""
+        while True:
+            await asyncio.sleep(self._child_ping_interval)
+            try:
+                ok = await asyncio.to_thread(
+                    self._child.ping, timeout=self._child_ping_timeout
+                )
+            except Exception as exc:
+                raise ChildFrozenError(
+                    f"agent 子程序 ping 例外，疑似凍結（issue #203）: {exc}"
+                ) from exc
+            if not ok:
+                raise ChildFrozenError("agent 子程序 ping 逾時/失敗，疑似凍結（issue #203）")

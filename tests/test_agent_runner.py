@@ -159,3 +159,56 @@ def test_real_child_handle_spawn_roundtrip(tmp_path):
     assert reply == {"ok": True}
     child.terminate()
     assert not child.alive
+
+
+# ---------- Task 13：重連 backoff + 子程序凍結偵測/respawn ----------
+
+async def test_run_forever_reconnects_after_transport_error(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    tr.fail_connects = 1                          # 第一次 connect 失敗
+    r = _runner(tr, child, buf)
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: tr.connects >= 2 and any(m["type"] == "login" for m in tr.sent))
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_child_frozen_triggers_respawn_and_relogin(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.ping_ok = False                         # 第一個 session 內就判凍結
+    r = _runner(tr, child, buf)
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: child.starts >= 2)       # respawn 過
+    child.ping_ok = True
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2)
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_ensure_child_respawns_when_alive_but_account_lost(tmp_path):
+    """接手他人 child 的邊界：child.alive 為 True 但 runner 尚無 _account →
+    視同需要重啟（terminate+start），保證 ensure_child() 返回後 _account 非空。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.alive = True                            # 模擬接手他人已在跑的 child
+    r = _runner(tr, child, buf)
+    assert r._account == ""
+    r.ensure_child()
+    assert child.starts == 1                      # terminate 後 respawn 一次
+    assert r._account == "F1"
+
+
+def test_child_handle_ping_wraps_request(tmp_path):
+    """直測 ChildHandle.ping() 包裝方法本身（Task 12 只測過底層 request）：
+    request 正常回覆 → True；request 逾時（TimeoutError）→ False。"""
+    from quanquant.agent.runner import ChildHandle
+    child = ChildHandle(credentials={}, symbol="TXF", mode="sim",
+                        buffer_path=str(tmp_path / "o.db"))
+    child.request = lambda op, *, timeout: {"ok": True}
+    assert child.ping(timeout=1) is True
+
+    def _raise_timeout(op, *, timeout):
+        raise TimeoutError("agent 子程序逾時未回應")
+    child.request = _raise_timeout
+    assert child.ping(timeout=1) is False
