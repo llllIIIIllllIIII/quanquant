@@ -9,6 +9,14 @@ class OrderError(Exception):
     """下單/改單/刪單失敗（券商拒單、連線異常、狀態不明等）。"""
 
 
+class TradeNotFoundError(OrderError):
+    """cancel/update 時在券商 list_trades 找不到對應委託（可能已終結或不存在）。"""
+
+    def __init__(self, ordno: str | None = None) -> None:
+        super().__init__(f"找不到 ordno={ordno!r} 對應的委託")
+        self.ordno = ordno
+
+
 class RiskError(Exception):
     """風控攔截（超限、非白名單、kill switch、缺/錯確認 token 等）。
 
