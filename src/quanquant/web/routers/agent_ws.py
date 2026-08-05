@@ -32,13 +32,24 @@ async def agent_ws(websocket: WebSocket) -> None:
             or not _secrets.compare_digest(token, settings.agent_ws_token)):
         await websocket.close(code=1008)
         return
+    # 連線洩漏防呆：這三個 app.state 屬性務必在 channel.attach 之前讀完——缺任一個
+    # （wiring 未完成）就直接關閉連線並 return，channel 才不會卡在 attached 態卻永遠等不到
+    # 對應的 finally 清理（之後真正的 agent 連線會被誤判成「已有連線」而被踢掉，永久連不上）。
+    try:
+        order_state = state.order_session_state
+        adapter = state.order_service
+        session_factory = state.order_session_factory
+    except AttributeError:
+        log.error(
+            "agent WS wiring 不完整（缺 order_session_state/order_service/"
+            "order_session_factory），拒絕連線"
+        )
+        await websocket.close(code=1011)
+        return
+    hub = getattr(state, "order_events", None)
     if channel.connected:
         channel.detach()   # 新連線取代殘留半開連線（agent 重啟）
     channel.attach(websocket.send_json)
-    order_state = state.order_session_state
-    hub = getattr(state, "order_events", None)
-    adapter = state.order_service
-    session_factory = state.order_session_factory
     try:
         while True:
             data = await websocket.receive_json()
@@ -66,6 +77,11 @@ async def agent_ws(websocket: WebSocket) -> None:
                 channel.note_heartbeat()
     except WebSocketDisconnect:
         pass
+    except Exception:
+        # 觀測用（不改變既有中斷語意）：非 WebSocketDisconnect 的例外原本就會讓迴圈往上炸、
+        # 帶著 finally 清理連線，這裡只加一行 log 讓「炸在哪、為什麼」不再無聲無息。
+        log.exception("agent WS 處理上行訊息失敗")
+        raise
     finally:
         channel.detach()
         order_state.mark_disabled("agent 離線")
