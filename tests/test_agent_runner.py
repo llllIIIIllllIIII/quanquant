@@ -49,12 +49,14 @@ async def _until(cond, timeout=3.0):
     await asyncio.wait_for(_poll(), timeout)
 
 
-def _runner(tr, child, buf):
-    return AgentRunner(transport=tr, buffer=buf, child=child,
-                       pump_interval=0.02, resend_after=0.5,
-                       child_command_timeout=0.5, heartbeat_interval=30,
-                       child_ping_interval=0.05, child_ping_timeout=0.1,
-                       backoff_base=0.01, backoff_max=0.05)
+def _runner(tr, child, buf, **overrides):
+    kwargs = dict(transport=tr, buffer=buf, child=child,
+                  pump_interval=0.02, resend_after=0.5,
+                  child_command_timeout=0.5, heartbeat_interval=30,
+                  child_ping_interval=0.05, child_ping_timeout=0.1,
+                  backoff_base=0.01, backoff_max=0.05)
+    kwargs.update(overrides)
+    return AgentRunner(**kwargs)
 
 
 async def test_run_once_sends_login_first(tmp_path):
@@ -212,3 +214,53 @@ def test_child_handle_ping_wraps_request(tmp_path):
         raise TimeoutError("agent 子程序逾時未回應")
     child.request = _raise_timeout
     assert child.ping(timeout=1) is False
+
+
+# ---------- Task 13 Fix Round 1：backoff 重設判準改為「session 存活時間達門檻」 ----------
+# 原本用 `_login_sent`（login 送出即 True）判準：login 在四個 session task 啟動前就送出，
+# 幾乎所有失敗模式（子程序凍結、receive/pump 例外、server 收線後立斷）都發生在 login 送出
+# 之後，導致 backoff 每輪被重設回 base、指數退避形同虛設。改用 `_backoff_history`（每輪
+# sleep 前的 backoff 值）斷言序列形狀，避免 wall-clock 間隔斷言的 flaky 風險。
+
+async def test_backoff_not_reset_on_short_lived_session(tmp_path):
+    """stable_session_seconds 設到不可能達標 → 即使 login 早就送出，反覆快速凍結的
+    session 也不該讓 backoff 重設；應持續倍增（封頂 backoff_max）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.ping_ok = False                          # 每輪 session 一啟動就被判凍結，session 短命
+    r = _runner(tr, child, buf, backoff_base=0.05, backoff_max=1.0,
+                stable_session_seconds=999.0)       # 不可能達標 → 永不重設
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: len(r._backoff_history) >= 3, timeout=5)
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    first_three = r._backoff_history[:3]
+    assert first_three[0] == pytest.approx(0.05)    # 第一輪即 backoff_base
+    assert first_three == sorted(first_three)        # 單調不減
+    assert first_three[0] < first_three[-1]           # 確實持續成長，未被重設拉回 base
+
+
+async def test_backoff_resets_after_stable_session(tmp_path):
+    """快速失敗兩輪（backoff 已長大）後，第三輪 session 存活時間跨過
+    stable_session_seconds 門檻才結束 → 下一輪的 backoff 應重設回 base 級距。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    tr.fail_connects = 2                            # 前兩輪 connect 直接失敗，session 近乎瞬間結束
+    r = _runner(tr, child, buf, backoff_base=0.05, backoff_max=1.0,
+                stable_session_seconds=0.05)
+    task = asyncio.create_task(r.run_forever())
+
+    await _until(lambda: len(r._backoff_history) >= 2)   # 前兩輪快速失敗已記錄
+    assert r._backoff_history[0] == pytest.approx(0.05)
+    assert r._backoff_history[1] == pytest.approx(0.1)
+
+    await _until(lambda: tr.connects >= 3)          # 第三輪 connect 成功，session 開始存活
+    await asyncio.sleep(0.15)                       # 撐過 stable_session_seconds(0.05) 門檻
+    child.ping_ok = False                           # 觸發第三輪 session 結束（凍結偵測）
+
+    await _until(lambda: len(r._backoff_history) >= 3)
+    assert r._backoff_history[2] == pytest.approx(0.05)   # 存活夠久 → backoff 重設回 base
+
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)

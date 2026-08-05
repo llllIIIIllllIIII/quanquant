@@ -14,10 +14,14 @@ respawn。
 子程序，False/例外一律視為凍結（issue #203），raise `ChildFrozenError` 讓 session 崩出。
 
 `run_forever()` 不斷跑 `run_once()`：`ChildFrozenError` 時 terminate 子程序，下一輪
-`ensure_child()` respawn；任何例外都依 backoff（倍增封頂 `backoff_max`）延遲重試；只要
-本輪成功送出 `login`（`_login_sent`），backoff 就重設為 `backoff_base`——server 端視角
-即 WS 斷線→重連→重新 login，觸發既有 login handler 的 reconcile（T0.2 斷線 reconcile
-免費保存，憑證全程留在父程序記憶體，不落地）。`stop()` 讓迴圈結束。
+`ensure_child()` respawn；任何例外都依 backoff（倍增封頂 `backoff_max`）延遲重試；只有
+本輪 session **存活時間達 `stable_session_seconds` 門檻**，backoff 才重設為
+`backoff_base`（Task 13 修復：原本用「login 是否已送出」判準，但 login 在四個
+session task 啟動前就送出，幾乎所有失敗模式——子程序凍結、receive/pump 例外、server
+收線後立斷——都發生在 login 送出之後，導致 backoff 形同虛設；凍結 respawn 迴圈若無退避，
+會在 Shioaji 每日 1000 次登入上限下快速燒配額）。server 端視角即 WS 斷線→重連→重新
+login，觸發既有 login handler 的 reconcile（T0.2 斷線 reconcile 免費保存，憑證全程留在
+父程序記憶體，不落地）。`stop()` 讓迴圈結束。
 
 零丟單設計：`_pump` 只讀 `buffer.pending()`（尚未 `mark_sent` 的列，經 `to_thread` 離開
 event loop），送出後記一筆 `_inflight` 時間戳（純粹防同一 session 內短時間內重複洗頻，
@@ -139,7 +143,8 @@ class AgentRunner:
                  pump_interval: float = 0.5, resend_after: float = 5.0,
                  child_command_timeout: float = 8.0, child_ping_interval: float = 10.0,
                  child_ping_timeout: float = 20.0, heartbeat_interval: float = 15.0,
-                 backoff_base: float = 1.0, backoff_max: float = 60.0) -> None:
+                 backoff_base: float = 1.0, backoff_max: float = 60.0,
+                 stable_session_seconds: float = 30.0) -> None:
         self._transport = transport
         self._buffer = buffer
         self._child = child
@@ -152,10 +157,14 @@ class AgentRunner:
         self._heartbeat_interval = heartbeat_interval
         self._backoff_base = backoff_base
         self._backoff_max = backoff_max
+        # session 存活時間達此門檻才視為「連線恢復健康」，backoff 重設回 backoff_base
+        # （Task 13 修復：不再用「login 是否已送出」判準，理由見 module docstring）。
+        self._stable_session_seconds = stable_session_seconds
         self._account = ""
         self._inflight: dict[int, float] = {}
         self._stopping = False
-        self._login_sent = False  # 本輪 session 是否已成功送出 login（run_forever 決定 backoff 重設）
+        # 每輪 sleep 前的 backoff 值，僅供測試觀察退避序列形狀，不影響邏輯。
+        self._backoff_history: list[float] = []
 
     def ensure_child(self) -> None:
         """child 未活則 (re)start；child alive 但 self._account 遺失（接手他人已在跑的
@@ -168,8 +177,8 @@ class AgentRunner:
 
     async def run_once(self) -> None:
         """單一 WS session：connect→login→pump/receive/heartbeat/watchdog 直到斷線/例外
-        /子程序凍結。login 送出成功即記 self._login_sent=True，供 run_forever 判斷是否
-        重設重連 backoff。"""
+        /子程序凍結。session 存活時間由 run_forever 用 time.monotonic() 量測，決定是否
+        重設重連 backoff（見 module docstring）。"""
         self.ensure_child()
         await self._transport.connect()
         tasks: list[asyncio.Task] = []
@@ -177,7 +186,6 @@ class AgentRunner:
             await self._transport.send(
                 UpLogin(account=self._account, mode=self._mode).model_dump()
             )
-            self._login_sent = True
             tasks = [
                 asyncio.create_task(self._pump()),
                 asyncio.create_task(self._receive_loop()),
@@ -200,11 +208,14 @@ class AgentRunner:
         """不斷跑 run_once()：連線/子程序凍結例外時依 backoff 重試（backoff×2 封頂
         backoff_max）；ChildFrozenError 則 terminate 子程序，下一輪 ensure_child()
         respawn＋（run_once 內）重新登入——server 端視角即 WS 斷線→重連→重新 login，
-        觸發既有 login handler 的 reconcile（T0.2）。任何一輪成功送出 login 就代表連線
-        恢復健康，backoff 重設為 backoff_base。stop() 後迴圈結束。"""
+        觸發既有 login handler 的 reconcile（T0.2）。backoff 重設判準是本輪 session
+        「存活時間達 stable_session_seconds」，而非「是否送出 login」（Task 13 修復：
+        login 在四個 session task 啟動前就送出，幾乎所有失敗模式都發生在 login 送出之後，
+        用它當判準會讓 backoff 每輪重設、指數退避失效——凍結 respawn 迴圈會無節制地重打
+        Shioaji 登入，燒每日 1000 次額度）。stop() 後迴圈結束。"""
         backoff = self._backoff_base
         while not self._stopping:
-            self._login_sent = False
+            session_start = time.monotonic()
             try:
                 await self.run_once()
             except ChildFrozenError:
@@ -215,8 +226,10 @@ class AgentRunner:
             except Exception:
                 log.exception("agent WS session 異常結束，準備依 backoff 重連")
 
-            if self._login_sent:
+            elapsed = time.monotonic() - session_start
+            if elapsed >= self._stable_session_seconds:
                 backoff = self._backoff_base
+            self._backoff_history.append(backoff)
 
             if self._stopping:
                 break
