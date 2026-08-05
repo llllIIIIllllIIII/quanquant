@@ -72,6 +72,30 @@ def test_exception_reply_is_redacted_and_loop_survives(tmp_path):
     _rpc(parent_conn, {"op": "shutdown"}); t.join(timeout=5)
 
 
+# ---- codex round1 fix3（HIGH）：例外處理原本用 log.exception（帶 exc_info/traceback），
+# Shioaji 例外字串可能內嵌憑證——本機 log 檔會外洩。改 log.error 帶已 redact 過的訊息、
+# 不附 exc_info。----
+
+def test_exception_log_does_not_leak_credentials(tmp_path, caplog):
+    caplog.set_level("ERROR", logger="quanquant.agent.native_runner")
+    parent_conn, child_conn = mp.Pipe()
+    t = threading.Thread(
+        target=child_main, args=(child_conn,),
+        kwargs=dict(credentials={"api_key": "SECRET-KEY-999", "secret_key": "SECRET-VAL-999"},
+                    symbol="TXF", mode="sim", buffer_path=str(tmp_path / "o.db"),
+                    native_factory=fake_native_factory),
+        daemon=True)
+    t.start()
+    _rpc(parent_conn, {"op": "connect"})
+    _rpc(parent_conn, {"op": "cancel", "ordno": "BOOM"})
+    _rpc(parent_conn, {"op": "shutdown"})
+    t.join(timeout=5)
+
+    assert "SECRET-KEY-999" not in caplog.text
+    assert "SECRET-VAL-999" not in caplog.text
+    assert "Traceback" not in caplog.text   # log.error 不帶 exc_info，不應印出 traceback
+
+
 def test_child_refuses_non_sim_mode(tmp_path):
     parent_conn, child_conn = mp.Pipe()
     t = threading.Thread(
@@ -162,6 +186,40 @@ def test_update_op_price_none(tmp_path):
                         "price_type": None})
     assert reply == {"ok": True, "result": {}}
     _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+
+
+# ---- codex round1 fix6（MEDIUM）：connect 成功後呼 buffer.assert_account——outbox 有
+# 前一帳號未送回報時，換帳號啟動要被擋下，避免回報跨帳號錯配。----
+
+def test_connect_account_switch_with_unsent_rows_fails(tmp_path):
+    # 先塞入「前一帳號 F2」的 meta + 未送列，模擬換帳號啟動（FakeNativeClient.connect
+    # 固定回 "F1"）。
+    pre = DurableBuffer(tmp_path / "o.db")
+    pre.assert_account("F2")
+    pre.append("deal_report", {"n": 1})
+
+    conn, t = _start_child_thread(tmp_path)
+    reply = _rpc(conn, {"op": "connect"})
+    assert reply["ok"] is False
+    assert "F2" in reply["message"] and "F1" in reply["message"]
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
+
+
+def test_connect_same_account_restart_ok_even_with_unsent_rows(tmp_path):
+    conn, t = _start_child_thread(tmp_path)
+    reply = _rpc(conn, {"op": "connect"})
+    assert reply["ok"] is True and reply["account"] == "F1"
+    _rpc(conn, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
+                "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})  # 留未送列
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
+
+    conn2, t2 = _start_child_thread(tmp_path)   # 模擬同帳號重啟（同一 buffer 檔）
+    reply2 = _rpc(conn2, {"op": "connect"})
+    assert reply2["ok"] is True and reply2["account"] == "F1"
+    _rpc(conn2, {"op": "shutdown"})
+    t2.join(timeout=5)
 
 
 def test_reconcile_op_reply_shape(tmp_path):

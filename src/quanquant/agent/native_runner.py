@@ -120,9 +120,17 @@ def child_main(
             continue
         except Exception as exc:
             message = redact_secrets(str(exc), secrets=secrets)
-            log.exception("子程序 op 失敗（op=%s）", kind)
+            log.error("子程序執行 %s 失敗: %s", kind, message)
             conn.send({"ok": False, "error_kind": "exception", "message": message})
             continue
+
+        if kind == "connect" and reply.get("ok"):
+            # 帳號切換 tripwire（codex round1 fix6）：outbox 有前一帳號未送回報時，拒絕
+            # 以不同帳號啟動——避免這個 buffer 檔接下來收到的回報被錯配進新帳號的 session。
+            try:
+                buffer.assert_account(reply["account"])
+            except RuntimeError as exc:
+                reply = {"ok": False, "message": str(exc)}
 
         conn.send(reply)
         if kind == "shutdown":
