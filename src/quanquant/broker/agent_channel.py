@@ -25,6 +25,15 @@ class AgentChannel:
         self.logged_in = False
         self.account = ""
         self.last_heartbeat: float | None = None
+        # codex round1 fix2：雙連線 generation——新連線取代舊連線後，舊 WS handler 較晚才
+        # 跑到自己的 finally 時，若無條件 detach()，會把新連線也拆掉、誤標 offline。每次
+        # attach() 遞增這個計數，detach(generation) 只在呼叫者手上的 generation 仍是目前值
+        # 時才真的生效，否則視為「舊連線的遲到清理」no-op。
+        self._generation = 0
+
+    @property
+    def generation(self) -> int:
+        return self._generation
 
     @property
     def connected(self) -> bool:
@@ -34,10 +43,14 @@ class AgentChannel:
     def ready(self) -> bool:
         return self._send is not None and self.logged_in
 
-    def attach(self, send_json: Callable[[dict], Awaitable[None]]) -> None:
+    def attach(self, send_json: Callable[[dict], Awaitable[None]]) -> int:
+        self._generation += 1
         self._send = send_json
+        return self._generation
 
-    def detach(self) -> None:
+    def detach(self, generation: int | None = None) -> None:
+        if generation is not None and generation != self._generation:
+            return  # 舊連線的遲到 detach：已被新連線取代，不動目前狀態。
         self._send = None
         self.logged_in = False
         pending, self._pending = self._pending, {}

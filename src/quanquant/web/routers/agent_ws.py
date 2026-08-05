@@ -48,11 +48,17 @@ async def agent_ws(websocket: WebSocket) -> None:
         return
     hub = getattr(state, "order_events", None)
     if channel.connected:
-        channel.detach()   # 新連線取代殘留半開連線（agent 重啟）
-    channel.attach(websocket.send_json)
+        channel.detach()   # 新連線取代殘留半開連線（agent 重啟；無條件，不帶 generation）
+    my_generation = channel.attach(websocket.send_json)
     try:
         while True:
             data = await websocket.receive_json()
+            if channel.generation != my_generation:
+                # 這條連線已被更新的連線取代（generation 已前進）——舊連線收到的訊息一律
+                # 靜默忽略，不再處理／不再改動 channel 狀態，讓迴圈自然落到 finally 退場。
+                log.info("agent WS 舊連線（generation=%s）已被新連線取代，忽略後續訊息並退場",
+                         my_generation)
+                break
             try:
                 msg = parse_uplink(data)
             except ValidationError:
@@ -83,11 +89,15 @@ async def agent_ws(websocket: WebSocket) -> None:
         log.exception("agent WS 處理上行訊息失敗")
         raise
     finally:
-        channel.detach()
-        order_state.mark_disabled("agent 離線")
-        if hub is not None:
-            hub.publish()
-        log.warning("agent WS 連線中斷，下單暫停（等待 agent 重連）")
+        # 只有這條連線仍是目前這一代（沒被更新的連線取代）時，detach 才真的生效——
+        # 也只有真的生效才標 offline/publish，避免舊連線的遲到 finally 誤傷新連線。
+        was_current = channel.generation == my_generation
+        channel.detach(my_generation)
+        if was_current:
+            order_state.mark_disabled("agent 離線")
+            if hub is not None:
+                hub.publish()
+            log.warning("agent WS 連線中斷，下單暫停（等待 agent 重連）")
 
 
 async def _reconcile_after_login(adapter) -> None:

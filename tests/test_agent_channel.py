@@ -53,6 +53,68 @@ async def test_detach_fails_pending_with_timeout_error():
         await task
 
 
+# ---- codex round1 fix2（HIGH）：雙連線 generation——新連線取代舊連線後，舊 handler
+# 較晚才跑到的 finally 不該把新連線拆掉、誤標 offline。----
+
+def test_attach_returns_increasing_generation():
+    ch = AgentChannel()
+    gen1 = ch.attach(_Sink())
+    assert gen1 == ch.generation
+    gen2 = ch.attach(_Sink())
+    assert gen2 == ch.generation
+    assert gen2 != gen1
+
+
+def test_detach_with_stale_generation_is_noop():
+    ch = AgentChannel()
+    gen1 = ch.attach(_Sink())
+    ch.mark_logged_in("F1")
+    gen2 = ch.attach(_Sink())          # 新連線取代舊連線
+    ch.mark_logged_in("F2")
+
+    ch.detach(gen1)                    # 舊 handler 較晚才跑到 finally
+
+    assert ch.connected is True        # 新連線未被拆掉
+    assert ch.logged_in is True
+    assert ch.account == "F2"
+    assert ch.generation == gen2
+
+
+def test_detach_with_current_generation_detaches():
+    ch = AgentChannel()
+    gen = ch.attach(_Sink())
+    ch.mark_logged_in("F1")
+
+    ch.detach(gen)
+
+    assert ch.connected is False
+    assert ch.logged_in is False
+
+
+def test_detach_without_generation_arg_is_unconditional():
+    # 既有呼叫慣例（新連線一開始無條件拆掉殘留半開連線）仍要維持。
+    ch = AgentChannel()
+    ch.attach(_Sink())
+    ch.mark_logged_in("F1")
+    ch.detach()
+    assert ch.connected is False
+
+
+async def test_detach_stale_generation_does_not_fail_new_connections_pending():
+    ch = AgentChannel()
+    gen1 = ch.attach(_Sink())
+    ch.mark_logged_in("F1")
+    gen2 = ch.attach(_Sink())
+    ch.mark_logged_in("F2")
+    fut = asyncio.get_running_loop().create_future()
+    ch._pending["c-new"] = fut
+
+    ch.detach(gen1)                    # 舊連線的 detach 不該波及新連線掛著的 pending
+
+    assert not fut.done()
+    assert ch.generation == gen2
+
+
 class _StubChannel(AgentChannel):
     """request 直接回 canned ack / raise，測 gateway 對映。"""
     def __init__(self, ack=None, exc=None):

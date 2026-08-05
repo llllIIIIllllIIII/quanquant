@@ -190,6 +190,50 @@ def test_ws_rejects_when_token_unset_default_empty(engine, monkeypatch):
     get_settings.cache_clear()
 
 
+# ---- codex round1 fix2（HIGH）：新連線 attach 後，舊連線較晚才跑到的 finally 不該把
+# 新連線拆掉、誤標 offline；舊連線收到的訊息也不該再改動 channel 狀態。----
+
+def test_stale_connection_message_ignored_after_superseded(ws_env):
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_old:
+        ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F1")
+
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_new:
+            ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+            assert _wait(lambda: ws_env.state.order_service.account == "F2")
+
+            # 舊連線的 socket 仍開著；重送一次 login（F1）——若舊 handler 沒被 generation
+            # 擋下，會被當成合法上行訊息處理，把 account 改回 F1，蓋掉新連線剛登入的 F2。
+            ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+            time.sleep(0.1)
+
+            assert ws_env.state.order_service.account == "F2"     # 未被舊連線的訊息改回去
+            assert ws_env.state.agent_channel.account == "F2"
+
+
+def test_stale_connection_finally_does_not_disable_new_connection(ws_env):
+    client = TestClient(ws_env)
+    old_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"})
+    ws_old = old_cm.__enter__()
+    ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+    assert _wait(lambda: ws_env.state.order_service.account == "F1")
+
+    new_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"})
+    ws_new = new_cm.__enter__()
+    try:
+        ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F2")
+
+        old_cm.__exit__(None, None, None)   # 手動關閉舊連線（觸發它的 finally），新連線仍開著
+
+        assert _wait(lambda: ws_env.state.agent_channel.connected is True)
+        assert ws_env.state.order_session_state.disabled is False
+        assert ws_env.state.agent_channel.account == "F2"
+    finally:
+        new_cm.__exit__(None, None, None)
+
+
 def test_receive_loop_unexpected_exception_logged_and_reraised(ws_env, monkeypatch, caplog):
     # Task 8 附加需求 3：非 WebSocketDisconnect 的例外要 log.exception 後 re-raise（觀測用，
     # 不改變既有中斷語意——finally 仍會跑，連線仍會斷）。
