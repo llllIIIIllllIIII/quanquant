@@ -13,7 +13,10 @@ class TradeNotFoundError(OrderError):
     """cancel/update 時在券商 list_trades 找不到對應委託（可能已終結或不存在）。"""
 
     def __init__(self, ordno: str | None = None) -> None:
-        super().__init__(f"找不到 ordno={ordno!r} 對應的委託")
+        super().__init__(
+            f"找不到券商對應委託（ordno={ordno!r}），可能已成交/已刪除/跨日，"
+            "拒絕在無法確認對應委託的情況下送出改單"
+        )
         self.ordno = ordno
 
 
