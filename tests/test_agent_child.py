@@ -213,6 +213,11 @@ def test_connect_account_switch_with_unsent_rows_fails(tmp_path):
     reply = _rpc(conn, {"op": "connect"})
     assert reply["ok"] is False
     assert "F2" in reply["message"] and "F1" in reply["message"]
+    # codex round2 fix4(a)：reply 帶可辨識標記 error_kind="account_mismatch"——runner.py
+    # 的 ChildHandle.start() 靠這個欄位判斷要 raise FatalAgentError（停止重試，防止
+    # run_forever 的 backoff 迴圈每輪都真的重打一次 Shioaji 登入、燒配額），而不是把它當
+    # 一般連線失敗無限重試。
+    assert reply["error_kind"] == "account_mismatch"
     _rpc(conn, {"op": "shutdown"})
     t.join(timeout=5)
 

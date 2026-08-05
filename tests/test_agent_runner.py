@@ -461,3 +461,47 @@ def test_lock_rechecks_poisoned_before_touching_conn(tmp_path):
     t.join(timeout=2)
     assert isinstance(results.get("exc"), TimeoutError)
     assert conn.sent == []       # 從未碰過 conn
+
+
+# ---------- codex round2 fix4：帳號不符 → fatal 停止，不進 run_forever 的無限 backoff
+# 重試迴圈（每輪重試都是一次真的券商登入，會燒 Shioaji 每日 1000 次配額）----------
+
+async def test_run_forever_does_not_retry_on_fatal_agent_error(tmp_path):
+    from quanquant.agent.runner import FatalAgentError
+
+    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
+
+    class _FatalChild(_FakeChild):
+        def start(self):
+            self.starts += 1
+            raise FatalAgentError(
+                "agent 帳號不符（outbox 屬於 F1，此次以 F2 登入），拒絕啟動"
+            )
+
+    child = _FatalChild()
+    r = _runner(tr, child, buf)
+    with pytest.raises(FatalAgentError):
+        await r.run_forever()
+    assert child.starts == 1     # 不重試
+
+
+def test_child_handle_start_raises_fatal_agent_error_on_account_mismatch(tmp_path):
+    """真 spawn 端到端：outbox 已綁定 F2 且有未送列，fake native 固定回帳號 F1 →
+    native_runner 的 connect 分支 assert_account 失敗、reply 帶 error_kind=account_mismatch
+    → ChildHandle.start() 必須 terminate 子程序後 raise FatalAgentError（而非泛用
+    RuntimeError），讓 run_forever 的例外鏈能攔截、停止重試。"""
+    from quanquant.agent.runner import ChildHandle, FatalAgentError
+    from quanquant.agent.testing import fake_native_factory
+
+    buffer_path = tmp_path / "o.db"
+    pre = DurableBuffer(buffer_path)
+    pre.assert_account("F2")
+    pre.append("deal_report", {"n": 1})
+
+    child = ChildHandle(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                        mode="sim", buffer_path=str(buffer_path),
+                        native_factory=fake_native_factory)
+    with pytest.raises(FatalAgentError) as exc_info:
+        child.start()
+    assert "F1" in str(exc_info.value) and "F2" in str(exc_info.value)
+    assert child.alive is False

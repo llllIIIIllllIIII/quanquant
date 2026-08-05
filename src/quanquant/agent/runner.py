@@ -55,6 +55,15 @@ class ChildFrozenError(RuntimeError):
     """SDK 子程序無回應（疑似 issue #203 凍結），需 respawn。"""
 
 
+class FatalAgentError(RuntimeError):
+    """不可重試的致命錯誤（codex round2 fix4）：帳號與 outbox 綁定的帳號不符。
+
+    `assert_account` 原本要等 broker login **成功**才失敗，若把它當一般連線失敗處理，
+    `run_forever` 會照 backoff 無限重試——每一輪都是一次真的 Shioaji 登入，會燒掉
+    person_id 每日 1000 次登入配額。這個例外讓 `run_forever` 的例外鏈識別出「重試也沒用，
+    需要人工介入」，直接停止（不 respawn、不 backoff），把例外原樣往外拋給 main。"""
+
+
 class ChildHandle:
     """SDK 子程序的擁有者：spawn(spawn ctx)、序列 RPC（threading.Lock）、ping、terminate。
 
@@ -106,8 +115,17 @@ class ChildHandle:
                 self._process = None
             raise RuntimeError(f"agent 子程序啟動失敗: {exc}") from exc
         if not reply.get("ok"):
-            self._process.kill()
-            self._process.join(timeout=5)
+            self.terminate()
+            if reply.get("error_kind") == "account_mismatch":
+                # codex round2 fix4：帳號與 outbox 綁定的帳號不符——這不是暫時性連線問題，
+                # 重試也沒用。raise FatalAgentError（而非 RuntimeError）讓 run_forever 的
+                # 例外鏈識別出「不可重試」，直接停止，不落入 backoff 無限重連（每輪都真的
+                # 燒一次 Shioaji 登入配額）。訊息帶處置指引，交給操作者人工介入。
+                raise FatalAgentError(
+                    f"agent 帳號不符，拒絕啟動（{reply.get('message')}）——請清空這個 outbox"
+                    f"（{self._buffer_path}）改用原帳號重啟，或改用原帳號登入；若確認要放棄"
+                    "舊帳號未送達的回報，需人工確認後手動刪除 buffer 檔再重啟。"
+                )
             raise RuntimeError(f"agent 子程序 connect 失敗: {reply}")
         return reply["account"]
 
@@ -293,6 +311,13 @@ class AgentRunner:
             session_start = time.monotonic()
             try:
                 await self.run_once()
+            except FatalAgentError:
+                # codex round2 fix4：帳號不符等不可重試錯誤——絕不能落入下面的 backoff
+                # 重連迴圈（每輪都是一次真的 Shioaji 登入，會燒每日 1000 次配額）。停止
+                # 迴圈，例外原樣往外拋給呼叫端（main.py）處理。
+                log.error("agent 遇到不可重試的致命錯誤，停止（不重試）")
+                self.stop()
+                raise
             except ChildFrozenError:
                 log.warning("agent 子程序疑似凍結（issue #203），terminate 後下一輪 respawn")
                 self._child.terminate()

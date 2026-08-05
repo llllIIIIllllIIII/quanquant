@@ -135,7 +135,11 @@ def child_main(
             try:
                 buffer.assert_account(reply["account"])
             except RuntimeError as exc:
-                reply = {"ok": False, "message": str(exc)}
+                # codex round2 fix4(a)：reply 帶可辨識標記 error_kind="account_mismatch"
+                # （pipe 內部 reply，非 UpCmdAck，不受 protocol Literal 限制）——runner.py 的
+                # ChildHandle.start() 靠這個欄位判斷要 raise FatalAgentError（停止重試），
+                # 而不是把它當一般連線失敗、任由 run_forever 無限 backoff 重打券商登入。
+                reply = {"ok": False, "error_kind": "account_mismatch", "message": str(exc)}
 
         reply["rpc_id"] = op.get("rpc_id")
         conn.send(reply)

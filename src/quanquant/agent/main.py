@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import getpass
 import os
+import sys
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -27,7 +28,7 @@ def main() -> None:
     secret_key = os.environ.get("QQ_AGENT_SECRET_KEY") or getpass.getpass("Shioaji Secret Key: ")
 
     from quanquant.agent.buffer import DurableBuffer
-    from quanquant.agent.runner import AgentRunner, ChildHandle
+    from quanquant.agent.runner import AgentRunner, ChildHandle, FatalAgentError
     from quanquant.agent.ws_client import WebsocketsTransport
 
     runner = AgentRunner(
@@ -42,3 +43,8 @@ def main() -> None:
         asyncio.run(runner.run_forever())
     except KeyboardInterrupt:
         print("agent 結束")
+    except FatalAgentError as exc:
+        # codex round2 fix4(d)：帳號不符等不可重試錯誤——不能讓 run_forever 悶頭重試燒
+        # 券商登入配額，這裡接住後印出處置指引並以非零碼結束，讓操作者/監控知道要人工介入。
+        print(f"agent 停止（不可重試錯誤，需人工介入）: {exc}")
+        sys.exit(2)
