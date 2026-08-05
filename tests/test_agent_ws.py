@@ -254,3 +254,39 @@ def test_receive_loop_unexpected_exception_logged_and_reraised(ws_env, monkeypat
             ws.receive_json()
     assert "agent WS 處理上行訊息失敗" in caplog.text
     assert _wait(lambda: ws_env.state.order_session_state.disabled)
+
+
+# ---- codex round2 fix2：server 端擋「未處理 RawInbox + 換帳號」視窗——agent 端的
+# tripwire（buffer.assert_account）只擋得住「尚未送出」的列；server 已經 commit RawInbox
+# 並 ack、worker 尚未處理的列不受保護。此時若換帳號登入，worker 之後映射 order_report 用
+# 的是 mutable adapter.account（已被新帳號覆蓋），舊帳號的回報會被錯配。----
+
+def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env, engine):
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F1")
+        assert _wait(lambda: ws_env.state.order_session_state.ready)
+
+    # server 已 commit 但 worker 尚未處理的一筆 RawInbox（processed=False, quarantine=False）。
+    with Session(engine) as s:
+        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}"))
+        s.commit()
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        time.sleep(0.2)   # 給 server 足夠時間處理（若未擋下，account 會被改成 F2）
+        assert ws_env.state.order_service.account == "F1"          # 沒被換掉
+        assert ws_env.state.order_session_state.ready is False     # 這次 login 未生效
+
+
+def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engine):
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F1")
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        assert _wait(lambda: ws_env.state.order_service.account == "F2")   # 無未處理列：放行
+        assert _wait(lambda: ws_env.state.order_session_state.ready)

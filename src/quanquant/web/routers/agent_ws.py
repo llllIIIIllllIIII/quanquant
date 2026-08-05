@@ -10,12 +10,15 @@ import secrets as _secrets
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
+from sqlalchemy import func
+from sqlmodel import select
 
 from quanquant.broker.agent_protocol import (
     DownReportAck, UpCmdAck, UpHealth, UpLogin, UpReport, parse_uplink,
 )
 from quanquant.broker.inbox_worker import commit_raw_callback
 from quanquant.config import get_settings
+from quanquant.db.models import RawInbox
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -65,6 +68,23 @@ async def agent_ws(websocket: WebSocket) -> None:
                 log.warning("agent 上行訊息格式不符，忽略：%s", str(data)[:200])
                 continue
             if isinstance(msg, UpLogin):
+                if adapter.account and msg.account != adapter.account:
+                    # codex round2 fix2：agent 端的 tripwire（buffer.assert_account）只擋得住
+                    # 「尚未送出」的回報列；server 已 commit RawInbox 並 ack、worker 尚未處理
+                    # 的列不受保護——這個窗口換帳號登入，worker 之後映射 order_report 用的是
+                    # mutable adapter.account（已被新帳號覆蓋），舊帳號的回報會被錯配進新
+                    # 帳號的部位/委託。查詢未處理列數，有殘留就整個忽略這次 login（不
+                    # mark_logged_in、不 mark_ready、不觸發 reconcile），agent 停在未登入態；
+                    # 沒有殘留才放行（帳號覆蓋屬正常換帳號重啟）。
+                    unprocessed = await asyncio.to_thread(
+                        _count_unprocessed_raw_inbox, session_factory
+                    )
+                    if unprocessed > 0:
+                        log.warning(
+                            "拒絕帳號切換登入：尚有 %d 筆未處理回報（原帳號 %s、新帳號 %s）",
+                            unprocessed, adapter.account, msg.account,
+                        )
+                        continue
                 channel.mark_logged_in(msg.account)
                 adapter.account = msg.account
                 order_state.mark_ready()
@@ -105,3 +125,16 @@ async def _reconcile_after_login(adapter) -> None:
         await adapter.reconcile()
     except Exception:
         log.exception("agent 登入後 reconcile 失敗（best-effort，不影響連線）")
+
+
+def _count_unprocessed_raw_inbox(session_factory) -> int:
+    """同步 DB 查詢（呼叫端須用 asyncio.to_thread 包起來，receive 迴圈鐵律：絕不 inline
+    await 長工作）：尚未處理、也未被隔離的 RawInbox 列數——換帳號登入前的安全檢查（codex
+    round2 fix2）。"""
+    with session_factory() as session:
+        return session.exec(
+            select(func.count()).where(
+                RawInbox.processed == False,  # noqa: E712 - SQLAlchemy 表達式需字面 == 比較
+                RawInbox.quarantine == False,  # noqa: E712
+            )
+        ).one()
