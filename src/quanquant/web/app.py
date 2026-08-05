@@ -170,6 +170,107 @@ async def run_feed_watchdog(
         await asyncio.sleep(interval)
 
 
+async def _scan_orphan_orders_once(session_factory, ops_alerter) -> None:
+    """T0.2：surface 孤兒委託（pending/sending + 無券商識別碼）——process 曾在送單落地前崩潰，
+    券商端**可能已收單/成交**，故不自動改狀態/釋放配額（會少算曝險→過度交易），只明顯記錄
+    交人工/reconcile 對照券商端後收尾。開機當下任何 pending+NULL 都是前次執行殘留的孤兒。
+
+    in-process／agent 兩種通道共用（Task 8）：in-process 在 connect 成功後原位呼叫；
+    agent 分支沒有 native connect 時機，改在 wiring 完成時排一次同樣的 one-shot task。
+    """
+    try:
+        from quanquant.broker import repository as _brepo
+        with session_factory() as _s:
+            orphans = _brepo.list_pending_orphans_older_than(
+                _s, older_than=datetime.now(timezone.utc).replace(tzinfo=None)
+            )
+        if orphans:
+            log.warning(
+                "偵測到 %d 筆孤兒委託（送單落地前崩潰，券商端可能已成交，未自動處理）：client_order_id=%s"
+                "——請對照券商端後手動收尾其保留配額",
+                len(orphans), [o.client_order_id for o in orphans],
+            )
+    except Exception:
+        log.exception("孤兒委託掃描失敗")
+
+
+async def _start_agent_channel_subsystem(
+    app: FastAPI, settings: Settings, tasks: list, order_state: OrderSessionState, ops_alerter,
+) -> None:
+    """ORDER_CHANNEL=agent 分支（Task 8）：Shioaji I/O 交給使用者本機 broker agent，經
+    `/ws/agent` 上下行；server 端仍是唯一決策者（風控/冪等/配額全在這裡，未變）。
+
+    Increment 0 硬限制：僅支援 `ORDER_MODE=sim`（agent 端目前只做模擬撮合，real 走 CA 簽署
+    尚未實作）；未設定 `AGENT_WS_TOKEN`／owner id 皆是刻意停用（非故障，/healthz 仍 200）。
+    """
+    from decimal import Decimal
+
+    from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
+    from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
+    from quanquant.broker.shioaji_adapter import ShioajiAdapter
+    from quanquant.broker.supervisor import BrokerSupervisor
+    from quanquant.broker.watchdog import run_agent_watchdog
+
+    if settings.order_mode != "sim":
+        order_state.mark_unhealthy("agent 通道 Increment 0 僅支援 ORDER_MODE=sim")
+        return
+    if not settings.agent_ws_token:
+        order_state.mark_disabled("未設定 AGENT_WS_TOKEN，agent 通道停用")
+        return
+    owner_ids = parse_owner_ids(settings.order_owner_user_ids)
+    if not owner_ids:
+        order_state.mark_disabled("order_owner_user_ids 未設定，下單子系統未啟用")
+        return
+
+    supervisor = BrokerSupervisor()
+
+    def _order_session() -> Session:
+        return Session(get_engine())
+
+    risk_guard = RiskGuard(
+        session_factory=_order_session,
+        secret=settings.session_secret or "dev-only-insecure",
+        owner_user_ids=owner_ids,
+        symbol_whitelist=parse_whitelist(settings.order_symbol_whitelist),
+        max_qty_per_order=settings.order_max_qty_per_order,
+        max_qty_per_day=settings.order_max_qty_per_day,
+        max_orders_per_day=settings.order_max_orders_per_day,
+        confirm_token_ttl_seconds=settings.order_confirm_token_ttl_seconds,
+        kill_switch_initial=settings.order_kill_switch_initial,
+    )
+    channel = AgentChannel()
+    gateway = AgentNativeGateway(channel,
+                                 timeout_seconds=settings.agent_command_timeout_seconds)
+    adapter = ShioajiAdapter(
+        api_key="", secret_key="", ca_path=None, ca_passwd=None, person_id=None,
+        symbol=settings.symbol, mode="sim", session_factory=_order_session,
+        supervisor=supervisor, risk_guard=risk_guard,
+        sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+        ops_alerter=ops_alerter, remote_gateway=gateway,
+    )
+    inbox_worker = RawInboxWorker(
+        session_factory=_order_session, supervisor=supervisor,
+        deal_mapper=adapter._map_deal_report,
+        order_report_mapper=adapter._map_order_report,
+        order_events=getattr(app.state, "order_events", None),
+        ops_alerter=ops_alerter,
+    )
+    app.state.agent_channel = channel
+    app.state.order_service = adapter
+    app.state.order_risk_guard = risk_guard
+    app.state.order_inbox_worker = inbox_worker
+    app.state.order_session_factory = _order_session
+    order_state.mark_disabled("agent 未連線")     # 等 agent 上線；/healthz 200
+    tasks.append(asyncio.create_task(inbox_worker.run()))
+    tasks.append(asyncio.create_task(run_agent_watchdog(
+        adapter, unquarantine_after_seconds=settings.order_unquarantine_after_seconds)))
+    # T0.2：agent 分支沒有 native connect 時機可以掛「connect 成功後跑一次」，故在 wiring
+    # 完成時直接排一次 one-shot 孤兒掃描（可視性，不影響啟動）。
+    tasks.append(asyncio.create_task(_scan_orphan_orders_once(_order_session, ops_alerter)))
+    log.info("agent 通道下單子系統已配線，等待本機 broker agent 連線")
+
+
 async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) -> None:
     """Task 8 readiness gate：ORDER_MODE 拼錯（`order_subsystem_preflight` raise
     RuntimeError）只讓下單子系統停用並反映在 `/healthz`——**不**讓整個 app 起不來，行情/日誌
@@ -184,6 +285,13 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     app.state.order_risk_guard = None
     app.state.order_inbox_worker = None
     ops_alerter = getattr(app.state, "ops_alerter", None)  # T0.3：lifespan 已建好，這裡取用傳遞
+
+    if settings.order_channel not in ("inprocess", "agent"):
+        order_state.mark_unhealthy(f"ORDER_CHANNEL 設定錯誤: {settings.order_channel!r}")
+        return
+    if settings.order_channel == "agent":
+        await _start_agent_channel_subsystem(app, settings, tasks, order_state, ops_alerter)
+        return
 
     try:
         order_enabled, order_disabled_reason = order_subsystem_preflight(settings)
@@ -271,23 +379,8 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
             "開機 reconcile 失敗（不擋啟動，watchdog 後續重試）: %s",
             redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", [])),
         )
-    # T0.2：surface 孤兒委託（pending/sending + 無券商識別碼）——process 曾在送單落地前崩潰，
-    # 券商端**可能已收單/成交**，故不自動改狀態/釋放配額（會少算曝險→過度交易），只明顯記錄
-    # 交人工/reconcile 對照券商端後收尾。開機當下任何 pending+NULL 都是前次執行殘留的孤兒。
-    try:
-        from quanquant.broker import repository as _brepo
-        with _order_session() as _s:
-            orphans = _brepo.list_pending_orphans_older_than(
-                _s, older_than=datetime.now(timezone.utc).replace(tzinfo=None)
-            )
-        if orphans:
-            log.warning(
-                "偵測到 %d 筆孤兒委託（送單落地前崩潰，券商端可能已成交，未自動處理）：client_order_id=%s"
-                "——請對照券商端後手動收尾其保留配額",
-                len(orphans), [o.client_order_id for o in orphans],
-            )
-    except Exception:
-        log.exception("孤兒委託掃描失敗")
+    # T0.2：surface 孤兒委託（Task 8 抽成模組級 helper，agent 分支共用）。
+    await _scan_orphan_orders_once(_order_session, ops_alerter)
     tasks.append(asyncio.create_task(run_order_watchdog(
         adapter, order_state, interval=settings.order_watchdog_interval_seconds,
         login_min_interval=settings.order_login_min_interval_seconds,

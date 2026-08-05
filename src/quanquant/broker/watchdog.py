@@ -121,6 +121,24 @@ async def run_order_watchdog(
                 )
 
 
+async def run_agent_watchdog(adapter, *, unquarantine_after_seconds: float) -> None:
+    """agent 通道模式的精簡 watchdog：只做 DB-only 背景工作。
+
+    連線/重連/健康是 agent 端與 WS 端點的責任；`_reconcile_unknown_quota`
+    需要 native 查詢，Increment 0 在 agent 模式停用（保守後果：unknown 委託的
+    配額維持保留、不會超賣），Increment 1 以下行 query_qty 指令補回。
+    supervisor.lock 在 agent 模式背後沒有 native → 即決策 5 的「獨立 server 鎖」。
+    """
+    while True:
+        await asyncio.sleep(unquarantine_after_seconds)
+        try:
+            await _retry_quarantined(adapter, unquarantine_after_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("agent watchdog：retry_quarantined 失敗")
+
+
 async def _retry_quarantined(adapter, older_than_seconds: float) -> None:
     async with adapter.supervisor.lock:
         await asyncio.to_thread(_retry_quarantined_blocking, adapter, older_than_seconds)
