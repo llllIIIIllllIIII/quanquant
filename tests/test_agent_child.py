@@ -136,3 +136,40 @@ def test_fake_native_client_reports_are_mapper_compatible():
 
     fill = adapter._map_deal_report(deal_payload)                    # 不 raise
     assert fill.ordno == "101AA1" and fill.qty == 1 and fill.action == "Buy"
+
+
+# ---- Task 11 審查遺留（Task 12 依賴這三個契約）：update/reconcile op 的正式回歸測試 ----
+
+
+def test_update_op_with_price(tmp_path):
+    conn, t = _start_child_thread(tmp_path)
+    _rpc(conn, {"op": "connect"})
+    _rpc(conn, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
+                "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
+    reply = _rpc(conn, {"op": "update", "ordno": "101AA1", "price": "21600", "qty": 2,
+                        "price_type": "LMT"})
+    assert reply == {"ok": True, "result": {}}
+    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+
+
+def test_update_op_price_none(tmp_path):
+    # price=None 透傳路徑（例如只改 qty 不改價）：FakeNativeClient.update 對 None 不 raise。
+    conn, t = _start_child_thread(tmp_path)
+    _rpc(conn, {"op": "connect"})
+    _rpc(conn, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
+                "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
+    reply = _rpc(conn, {"op": "update", "ordno": "101AA1", "price": None, "qty": 3,
+                        "price_type": None})
+    assert reply == {"ok": True, "result": {}}
+    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)
+
+
+def test_reconcile_op_reply_shape(tmp_path):
+    conn, t = _start_child_thread(tmp_path)
+    _rpc(conn, {"op": "connect"})
+    reply = _rpc(conn, {"op": "reconcile", "after": None})
+    assert reply == {"ok": True, "result": {"payloads": [], "newest": None}}
+    # after 帶 ISO 字串：驗 datetime.fromisoformat 解析不炸（FakeNativeClient 本身不檢查值）。
+    reply2 = _rpc(conn, {"op": "reconcile", "after": "2026-08-04T09:00:00"})
+    assert reply2 == {"ok": True, "result": {"payloads": [], "newest": None}}
+    _rpc(conn, {"op": "shutdown"}); t.join(timeout=5)

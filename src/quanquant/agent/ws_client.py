@@ -1,0 +1,48 @@
+"""agent → server 的 WS 傳輸層（Inc0 Task 12）：純 I/O，不含協定語意——訊息形狀由
+`quanquant.broker.agent_protocol` 定義、由 `runner.py` 組裝/解析。
+
+`Transport` 是 runner 依賴的最小介面（結構型別，`AgentRunner` 建構時注入），測試用
+`_FakeTransport` 替身即可，不需真的連網。`WebsocketsTransport` 是唯一的正式實作，用
+`websockets` 套件連 server 的 `/ws/agent` 端點，header `x-agent-token` 帶認證 token
+（server 端見 `quanquant.web.routers.agent_ws`）。
+
+`websockets` 目前只是 uvicorn[standard] 的間接依賴（環境中已可 import），本 task 刻意不動
+pyproject——顯式宣告留給 Task 14。`additional_headers` 是目前安裝版本（16.x）的參數名；
+舊版 `websockets`（<14）用的是 `extra_headers`，升級/降版時需回頭確認。
+"""
+import json
+from typing import Protocol
+
+import websockets
+
+
+class Transport(Protocol):
+    async def connect(self) -> None: ...
+    async def send(self, msg: dict) -> None: ...
+    async def receive(self) -> dict: ...
+    async def close(self) -> None: ...
+
+
+class WebsocketsTransport:
+    """websockets 套件實作；header x-agent-token 帶 token。"""
+
+    def __init__(self, url: str, *, token: str) -> None:
+        self._url = url
+        self._token = token
+        self._ws = None
+
+    async def connect(self) -> None:
+        self._ws = await websockets.connect(
+            self._url, additional_headers={"x-agent-token": self._token},
+        )
+
+    async def send(self, msg: dict) -> None:
+        await self._ws.send(json.dumps(msg))
+
+    async def receive(self) -> dict:
+        data = await self._ws.recv()
+        return json.loads(data)
+
+    async def close(self) -> None:
+        if self._ws is not None:
+            await self._ws.close()

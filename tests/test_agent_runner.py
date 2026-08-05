@@ -1,0 +1,161 @@
+import asyncio
+import pytest
+from quanquant.agent.buffer import DurableBuffer
+from quanquant.agent.runner import AgentRunner
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.sent, self.incoming, self.connects = [], asyncio.Queue(), 0
+        self.fail_connects = 0                    # 前 N 次 connect 丟例外（Task 13 用）
+    async def connect(self):
+        self.connects += 1
+        if self.connects <= self.fail_connects:
+            raise ConnectionError("連不上")
+    async def send(self, msg):
+        self.sent.append(msg)
+    async def receive(self):
+        return await self.incoming.get()
+    async def close(self):
+        pass
+    def reports(self):
+        return [m for m in self.sent if m["type"] == "report"]
+
+
+class _FakeChild:
+    def __init__(self):
+        self.ops, self.starts, self.alive = [], 0, False
+        self.ping_ok = True
+        self.request_exc = None
+    def start(self):
+        self.starts += 1
+        self.alive = True
+        return "F1"
+    def request(self, op, *, timeout):
+        self.ops.append(op)
+        if self.request_exc:
+            raise self.request_exc
+        return {"ok": True, "result": {"ordno": "101AA1", "broker_order_id": "101AA1"}}
+    def ping(self, *, timeout):
+        return self.ping_ok
+    def terminate(self):
+        self.alive = False
+
+
+async def _until(cond, timeout=3.0):
+    async def _poll():
+        while not cond():
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(_poll(), timeout)
+
+
+def _runner(tr, child, buf):
+    return AgentRunner(transport=tr, buffer=buf, child=child,
+                       pump_interval=0.02, resend_after=0.5,
+                       child_command_timeout=0.5, heartbeat_interval=30,
+                       child_ping_interval=0.05, child_ping_timeout=0.1,
+                       backoff_base=0.01, backoff_max=0.05)
+
+
+async def test_run_once_sends_login_first(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.sent) >= 1)
+    assert tr.sent[0]["type"] == "login"
+    assert tr.sent[0]["account"] == "F1" and tr.sent[0]["mode"] == "sim"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pump_sends_pending_and_marks_sent_on_ack(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    ids = [buf.append("deal_report", {"n": i}) for i in range(2)]
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.reports()) >= 2)
+    assert [m["event_id"] for m in tr.reports()[:2]] == ids
+    for eid in ids:
+        tr.incoming.put_nowait({"type": "report_ack", "event_id": eid})
+    await _until(lambda: buf.unsent_count() == 0)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pump_resends_when_no_ack(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    eid = buf.append("deal_report", {"n": 1})
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len([m for m in tr.reports() if m["event_id"] == eid]) >= 2,
+                 timeout=5)                       # resend_after=0.5 後重送
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_crash_before_ack_resent_by_next_session(tmp_path):
+    """零丟單核心測試：送出未 ack 就崩潰 → 重啟後補送。"""
+    tr1, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    eid = buf.append("deal_report", {"n": 1})
+    r1 = _runner(tr1, child, buf)
+    r1.ensure_child()
+    t1 = asyncio.create_task(r1.run_once())
+    await _until(lambda: len(tr1.reports()) >= 1)
+    t1.cancel()                                   # 模擬 agent 崩潰（未收 ack）
+    await asyncio.gather(t1, return_exceptions=True)
+    tr2 = _FakeTransport()
+    r2 = _runner(tr2, child, DurableBuffer(tmp_path / "o.db"))
+    r2.ensure_child()
+    t2 = asyncio.create_task(r2.run_once())
+    await _until(lambda: any(m["event_id"] == eid for m in tr2.reports()))
+    t2.cancel()
+    await asyncio.gather(t2, return_exceptions=True)
+
+
+async def test_downlink_place_dispatched_to_child_and_acked(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "place", "cmd_id": "c1", "mode": "sim",
+                            "native": {"action": "Buy", "price": "0", "qty": 1,
+                                       "price_type": "MKT", "order_type": "IOC",
+                                       "octype": "Auto"}})
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack = next(m for m in tr.sent if m.get("type") == "cmd_ack")
+    assert ack["cmd_id"] == "c1" and ack["ok"] and ack["result"]["ordno"] == "101AA1"
+    assert child.ops[0]["op"] == "place" and child.ops[0]["price"] == "0"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_child_timeout_yields_error_ack(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request_exc = TimeoutError()
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c2", "mode": "sim",
+                            "ordno": "101AA1"})
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack = next(m for m in tr.sent if m.get("type") == "cmd_ack")
+    assert ack["ok"] is False and ack["error_kind"] == "timeout"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+def test_real_child_handle_spawn_roundtrip(tmp_path):
+    """ChildHandle 對真 spawn 子程序的 smoke（fake native factory）。"""
+    from quanquant.agent.runner import ChildHandle
+    from quanquant.agent.testing import fake_native_factory
+    child = ChildHandle(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                        mode="sim", buffer_path=str(tmp_path / "o.db"),
+                        native_factory=fake_native_factory)
+    assert child.start() == "F1"
+    reply = child.request({"op": "ping"}, timeout=10)
+    assert reply == {"ok": True}
+    child.terminate()
+    assert not child.alive
