@@ -140,6 +140,22 @@ class _RiskGuardLike(Protocol):
     def check_update(self, session: Session, order: Order, **kw) -> None: ...
 
 
+class _NativeGatewayLike(Protocol):
+    """Task 5 `AgentNativeGateway` 的結構型別（避免對 agent_channel 模組的 import-time
+    相依，同 `_RiskGuardLike` 鬆耦合寫法）。三段切：adapter 只認得這個介面，不知道背後是
+    in-process native 還是跨網路 WS 通道；`ready=False` 時代表 agent 未連線，呼叫端一律
+    fail-fast，不得誤送。"""
+
+    @property
+    def ready(self) -> bool: ...
+    async def place(self, req: OrderRequest) -> dict: ...
+    async def cancel(self, ordno: str) -> None: ...
+    async def update(
+        self, ordno: str, *, price, qty: int, price_type: str | None = None
+    ) -> None: ...
+    async def trades_snapshot(self, after): ...
+
+
 class ShioajiAdapter:
     def __init__(
         self,
@@ -157,6 +173,7 @@ class ShioajiAdapter:
         broker: str = "shioaji",
         sim_fee_per_lot: Decimal | None = None,
         ops_alerter=None,
+        remote_gateway: "_NativeGatewayLike | None" = None,
     ) -> None:
         self._api_key = api_key
         self._secret_key = secret_key
@@ -176,6 +193,10 @@ class ShioajiAdapter:
         self._risk_guard = risk_guard
         self._sim_fee_per_lot = sim_fee_per_lot  # A6：sim 成交 fee 缺值時依口數估算，不留 None/0
         self._ops = ops_alerter  # T0.3：營運告警（fire-and-forget、絕不 raise），純疊加
+        # Task 6：三段切——None 時維持 in-process 行為零變化（原路徑）；非 None 時所有
+        # native 呼叫（place/cancel/update/reconcile 的 trades_snapshot）改經這個 gateway
+        # 下行，DB 決策/寫回/風控/冪等仍留在 adapter（server 端）不變。
+        self._remote_gateway = remote_gateway
         self._fill_handler: Callable[[Fill], None] | None = None
         # Task 2 委派重構：所有直接碰 Shioaji SDK 的呼叫交給 native（`_api`/`_contract`/
         # `account` 三個 property 墊片委派讀寫 native 對應屬性，見下方）；`on_raw` 落地責任
@@ -320,11 +341,26 @@ class ShioajiAdapter:
         API 才能完整補齊，超出目前高階 SDK 介面下可靠實作的範圍。
         """
         # supervisor.run 回傳被包協程/callable 的結果（見 broker/supervisor.py），故
-        # `_reconcile_blocking` 回傳的「本次補回筆數」能直接在這裡取得。>0 才發漂移告警：
-        # sim 下 list_trades() 空 → count 0 → 不發（見對應測試）。
-        count = await self._supervisor.run(lambda: asyncio.to_thread(self._reconcile_blocking))
+        # `_reconcile_inner` 回傳的「本次補回筆數」能直接在這裡取得。>0 才發漂移告警：
+        # sim 下 list_trades() 空 → count 0 → 不發（見對應測試）。count>0 的 ops 告警邏輯
+        # 在 remote/in-process 兩條路徑下完全不動（Task 6：只有 `_reconcile_inner` 內部
+        # 依 `self._remote_gateway` 分流讀取來源，這裡不知道、也不必知道走哪條）。
+        count = await self._supervisor.run(lambda: self._reconcile_inner())
         if count and self._ops is not None:
             self._ops.reconcile_drift(count=count, context=f"mode={self.mode} account={self.account}")
+
+    async def _reconcile_inner(self) -> int:
+        """Task 6：remote 模式下改讀 gateway 而非本機 native——鎖 semantics 不變（仍全程在
+        `supervisor.run` 包住的 lambda 內執行，見上方 `reconcile()`）。gateway 未連線時視同
+        本次無新進展（回 0，不 raise）：對帳是背景維護動作，watchdog 週期性重跑即可，不需要
+        像 place 那樣 fail-fast 拒絕呼叫端。"""
+        if self._remote_gateway is None:
+            return await asyncio.to_thread(self._reconcile_blocking)
+        if not self._remote_gateway.ready:
+            return 0
+        after = await asyncio.to_thread(self._read_reconcile_cursor)
+        payloads, newest = await self._remote_gateway.trades_snapshot(after)
+        return await asyncio.to_thread(self._stage_reconcile_results, payloads, newest)
 
     def _read_reconcile_cursor(self) -> "datetime | None":
         """Task 6/8 依賴：讀取持久 `BrokerReconcileCursor` watermark（沿用原
@@ -383,7 +419,15 @@ class ShioajiAdapter:
     # ---- send gate（V3-2，鎖內、native 呼叫前的最後線性化點） ----
 
     async def _send_gate(self) -> None:
-        if self._api is None:
+        if self._remote_gateway is not None:
+            # Task 6：remote 模式下「session 是否就緒」的問法變成「gateway 是否連線」——
+            # 未連線視同 AgentUnavailableError（保證這筆委託沒有離開本機/送達券商，
+            # `_classify_place_failure` 會判 failed 並安全退配額），語意對齊 native 模式
+            # `_api is None` 那支「下單 session 尚未就緒」的 fail-fast，但用 agent 自己的
+            # 例外型別，讓呼叫端的失敗分類邏輯自然落到既有 failed 分支，不必額外特判。
+            if not self._remote_gateway.ready:
+                raise AgentUnavailableError("agent 未連線或未登入")
+        elif self._api is None:
             raise OrderError("下單 session 尚未就緒")
         if self._risk_guard is not None and self._risk_guard.kill_switch:
             raise RiskError("kill switch 已啟動，拒絕送出")
@@ -393,6 +437,11 @@ class ShioajiAdapter:
     async def place(
         self, req: OrderRequest, *, actor_user_id: int, confirm_token: str | None = None
     ) -> OrderAck:
+        # Task 6 fail-fast：remote gateway 存在但未連線時，連 Order/配額列都不建（行為矩陣
+        # 「gateway.ready=False（place 進入時）」一列）——避免建立之後永遠等不到 ack 的
+        # pending 委託與被鎖住的配額，呼叫端應直接重試或走告警路徑，不留殘骸。
+        if self._remote_gateway is not None and not self._remote_gateway.ready:
+            raise OrderError("agent 未連線，無法下單")
         request_hash = canonical_payload_hash(
             symbol=req.symbol, action=req.action, qty=req.qty, price=req.price,
             price_type=req.price_type, order_type=req.order_type, octype=req.octype,
@@ -432,6 +481,8 @@ class ShioajiAdapter:
         async def _do_place():
             try:
                 await self._send_gate()
+                if self._remote_gateway is not None:
+                    return await self._remote_gateway.place(req)
                 return await asyncio.to_thread(self._place_blocking, req)
             except RiskError:
                 # send gate 擋下（如 kill switch）：確定沒送出，直接標 failed，不留在
@@ -469,6 +520,15 @@ class ShioajiAdapter:
                     client_order_id=client_order_id, action=req.action, qty=req.qty,
                     classification=classification, exc=exc,
                 )
+                if isinstance(exc, (AgentUnavailableError, AgentCommandTimeoutError)):
+                    # Task 6：remote gateway 專屬例外——DB 決策（上面 failed+release /
+                    # unknown 兩支）已完成，這裡比照上方 `except RiskError: ... raise` 的
+                    # 既有慣例，原樣 re-raise 保留型別，讓呼叫端（watchdog/路由）能用
+                    # isinstance 分辨「agent 未連線」vs「逾時未 ack」兩種不同的重試/告警
+                    # 策略，不強塞進通用 OrderError 訊息裡。in-process 原生失敗（無論是否
+                    # 本身已是 OrderError，如 native 找不到月合約）維持包成新 OrderError 的
+                    # 既有行為，不受這裡影響。
+                    raise
                 if classification == "failed":
                     raise OrderError(
                         f"送單遭券商明確拒絕，委託標記 failed 並已釋放配額："
@@ -531,7 +591,15 @@ class ShioajiAdapter:
             order_id, ordno, client_order_id = order.id, order.ordno, order.client_order_id
 
         async def _do_cancel() -> None:
-            # kill switch 不擋取消單（spec 明文：取消單仍允許），仍檢查 session 就緒
+            # kill switch 不擋取消單（spec 明文：取消單仍允許），仍檢查 session/gateway 就緒
+            # （Task 6：remote 模式下用 gateway.ready 取代 `_api is None`，同 `_send_gate`
+            # 的 remote/in-process 分流方式，但取消單本身不經過 `_classify_place_failure`/
+            # release_quota 那條路——這裡刻意用 OrderError 而非 AgentUnavailableError）。
+            if self._remote_gateway is not None:
+                if not self._remote_gateway.ready:
+                    raise OrderError("agent 未連線")
+                await self._remote_gateway.cancel(ordno)
+                return
             if self._api is None:
                 raise OrderError("下單 session 尚未就緒")
             await asyncio.to_thread(self._cancel_blocking, ordno)
@@ -602,6 +670,11 @@ class ShioajiAdapter:
 
         async def _do_update() -> None:
             await self._send_gate()
+            if self._remote_gateway is not None:
+                await self._remote_gateway.update(
+                    ordno, price=new_price, qty=new_qty, price_type=price_type
+                )
+                return
             await asyncio.to_thread(self._update_blocking, ordno, new_price, new_qty, price_type)
 
         try:
@@ -644,6 +717,10 @@ class ShioajiAdapter:
                     client_order_id=client_order_id, action=action, qty=new_qty,
                     classification="failed", exc=exc,
                 )
+                if isinstance(exc, (AgentUnavailableError, AgentCommandTimeoutError)):
+                    # Task 6：同 place 分支，保留 remote gateway 專屬例外型別（見上方
+                    # `_do_place` 的等價註解），不強塞進通用 OrderError 訊息裡。
+                    raise
                 raise OrderError(
                     f"改單遭券商明確拒絕，delta 配額已釋放（委託本身狀態不變）："
                     f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
@@ -656,6 +733,8 @@ class ShioajiAdapter:
                 client_order_id=client_order_id, action=action, qty=new_qty,
                 classification="unknown", exc=exc,
             )
+            if isinstance(exc, (AgentUnavailableError, AgentCommandTimeoutError)):
+                raise
             raise OrderError(
                 f"改單失敗，委託標記 unknown 待 reconcile："
                 f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
