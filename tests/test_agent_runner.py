@@ -1,4 +1,6 @@
 import asyncio
+import threading
+import time
 import pytest
 from quanquant.agent.buffer import DurableBuffer
 from quanquant.agent.runner import AgentRunner
@@ -239,9 +241,12 @@ class _FakeConn:
         self.poll_results: list[bool] = []
         self.recv_queue: list[dict] = []
         self.recv_error: Exception | None = None
+        self.send_error: Exception | None = None
         self.closed = False
 
     def send(self, obj) -> None:
+        if self.send_error is not None:
+            raise self.send_error
         self.sent.append(obj)
 
     def poll(self, timeout=None) -> bool:
@@ -402,3 +407,57 @@ async def test_backoff_resets_after_stable_session(tmp_path):
     r.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+# ---------- codex round2 fix3：ChildHandle send 側 poison + lock 內重檢 ----------
+# (a) conn.send() 本身也可能炸（BrokenPipeError/EOFError/OSError）——原本只有 poll/recv
+# 包了 try/except，send 炸掉會讓例外原樣往外洩，_poisoned 也不會被設起來。
+# (b) poisoned 檢查原本只在取得 lock「之前」做一次——併發等待者若在前一個 RPC 於鎖內
+# poison 之後才拿到鎖，會繼續往下碰一條已經不可信的 conn。改成鎖內再檢一次。
+
+def test_send_error_poisons_pipe_and_second_request_never_touches_conn(tmp_path):
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = process, conn
+    conn.send_error = BrokenPipeError("child 端已死")
+
+    with pytest.raises(TimeoutError):
+        child.request({"op": "place"}, timeout=1)
+
+    assert process.killed and process.joined      # send 炸掉也要 terminate
+    assert conn.closed
+    assert child.alive is False
+
+    sent_before = len(conn.sent)
+    with pytest.raises(TimeoutError):
+        child.request({"op": "ping"}, timeout=1)
+    assert len(conn.sent) == sent_before           # poisoned 態：完全不再碰 conn
+
+
+def test_lock_rechecks_poisoned_before_touching_conn(tmp_path):
+    """模擬併發：第二個等待者已通過鎖外的 poisoned 檢查（當時尚未 poison）、卡在等
+    lock；第一個 RPC 在鎖內完成並把 pipe 判死後放鎖——第二個等待者拿到鎖後必須在動
+    conn 之前重新檢查一次 poisoned，直接 fail，不送 conn.send()。"""
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = process, conn
+
+    child._lock.acquire()
+    results: dict[str, Exception] = {}
+    try:
+        def _second():
+            try:
+                child.request({"op": "ping"}, timeout=1)
+            except TimeoutError as exc:
+                results["exc"] = exc
+
+        t = threading.Thread(target=_second)
+        t.start()
+        time.sleep(0.1)          # 讓第二個等待者跑過鎖外檢查、卡在 lock.acquire()
+        child._poisoned = True   # 模擬第一個 RPC 已在鎖內判死
+    finally:
+        child._lock.release()
+
+    t.join(timeout=2)
+    assert isinstance(results.get("exc"), TimeoutError)
+    assert conn.sent == []       # 從未碰過 conn

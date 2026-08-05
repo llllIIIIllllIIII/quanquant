@@ -121,10 +121,28 @@ class ChildHandle:
                 f"（op={op.get('op')}）"
             )
         with self._lock:
+            # codex round2 fix3(b)：鎖外剛才通過的 poisoned 檢查可能已經過期——若這則
+            # request 卡在等鎖的期間，前一個持鎖的 RPC 在鎖內把 pipe 判死了，這裡拿到鎖後
+            # 必須重新檢查一次，才能在真的碰 conn（send/poll/recv）之前攔下，不讓併發等待者
+            # 誤用一條已經不可信的 pipe。
+            if self._poisoned:
+                raise TimeoutError(
+                    f"agent 子程序 pipe 已判死（前次逾時遺留遲到回覆風險），拒絕重用"
+                    f"（op={op.get('op')}）"
+                )
             conn = self._conn
             self._rpc_seq += 1
             rpc_id = self._rpc_seq
-            conn.send({**op, "rpc_id": rpc_id})
+            try:
+                conn.send({**op, "rpc_id": rpc_id})
+            except (BrokenPipeError, EOFError, OSError) as exc:
+                # codex round2 fix3(a)：send() 本身也可能炸——原本只有 poll/recv 包了
+                # try/except，send 失敗會讓例外原樣往外洩、_poisoned 卻沒被設起來，之後的
+                # request 還會繼續嘗試碰這條已經壞掉的 pipe。
+                self._poison()
+                raise TimeoutError(
+                    f"agent 子程序 pipe 異常（op={op.get('op')}）: {exc}"
+                ) from exc
             deadline = time.monotonic() + timeout
             while True:
                 remaining = deadline - time.monotonic()
