@@ -81,16 +81,44 @@ class _FakeService:
 
 
 class _FakeRiskGuard:
+    """D3 兩層 kill switch：`global_on`（全站總閘）+ `per_user`（個人急停，key=user_id）。
+    `kill_switch` 屬性保留（唯讀，等於 global_on）只為兼容舊稱呼；正確的判定入口是
+    `blocked(user_id)`，route/adapter 一律經它查詢。"""
+
     def __init__(self, owner_ids=None):
-        self.kill_switch = False
+        self.global_on = False
+        self.per_user: dict[int, bool] = {}
+        self.global_actor = None
         # owner_ids=None → 允許所有人（既有測試預設：assert_owner 為 no-op、is_owner 恆真）；
         # 傳集合則只有集合內的 user 是 owner（kill switch 非 owner→403 測試用）。
         self._owner_ids = None if owner_ids is None else set(owner_ids)
         self.set_kill_switch_calls = []
 
-    def set_kill_switch(self, value):
-        self.set_kill_switch_calls.append(value)
-        self.kill_switch = value
+    @property
+    def kill_switch(self) -> bool:
+        return self.global_on
+
+    def set_kill_switch(self, value, *, scope, actor_user_id):
+        self.assert_owner(actor_user_id)
+        self.set_kill_switch_calls.append((value, scope, actor_user_id))
+        if scope == "self":
+            self.per_user[actor_user_id] = value
+        elif scope == "global":
+            self.global_on = value
+            self.global_actor = actor_user_id
+        else:
+            raise ValueError(f"未知的 kill switch scope: {scope!r}")
+
+    def blocked(self, user_id) -> bool:
+        return self.global_on or self.per_user.get(user_id, False)
+
+    def kill_switch_view(self, user_id) -> dict:
+        return {
+            "global_on": self.global_on,
+            "self_on": self.per_user.get(user_id, False),
+            "blocked": self.blocked(user_id),
+            "global_actor": self.global_actor,
+        }
 
     def is_owner(self, actor_user_id):
         return self._owner_ids is None or actor_user_id in self._owner_ids
@@ -109,9 +137,10 @@ class _FakeOps:
     def __init__(self):
         self.kill_switch_calls = []
 
-    def kill_switch(self, *, enabled, actor_user_id, open_order_count=0, detail=""):
+    def kill_switch(self, *, enabled, actor_user_id, scope="global", open_order_count=0, detail=""):
         self.kill_switch_calls.append(
-            {"enabled": enabled, "actor_user_id": actor_user_id, "open_order_count": open_order_count}
+            {"enabled": enabled, "actor_user_id": actor_user_id, "scope": scope,
+             "open_order_count": open_order_count}
         )
 
 
@@ -271,39 +300,59 @@ def _seed_order(session, user, *, client_order_id, request_hash, status, broker_
 def test_kill_switch_owner_turns_on_toggles_and_alerts_with_open_order_count(
     order_client, session, fake_guard, fake_ops, user
 ):
-    """owner 翻 ON：200、guard.kill_switch 變 True、ops.kill_switch 被呼叫（enabled=True、
-    帶正確 open_order_count——只算 submitted/partfilled，不算 filled）。"""
+    """owner 翻 ON（scope=global）：200、guard.global_on 變 True、ops.kill_switch 被呼叫
+    （enabled=True、scope=global、帶正確 open_order_count——只算 submitted/partfilled，
+    不算 filled）。"""
     _seed_order(session, user, client_order_id="KOPEN", request_hash="KH1", status="submitted",
                 broker_order_id="KB-OPEN", ordno="KO")
     _seed_order(session, user, client_order_id="KDONE", request_hash="KH2", status="filled",
                 broker_order_id="KB-DONE", ordno="KD")
     session.commit()
 
-    resp = order_client.post("/orders/kill-switch", data={"enabled": "true"})
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "global"})
     assert resp.status_code == 200
-    assert fake_guard.kill_switch is True
+    assert fake_guard.global_on is True
     assert len(fake_ops.kill_switch_calls) == 1
     call = fake_ops.kill_switch_calls[0]
     assert call["enabled"] is True
     assert call["actor_user_id"] == user.id
+    assert call["scope"] == "global"
     assert call["open_order_count"] == 1  # 只算未成交掛單，filled 不算
     assert 'hx-post="/orders/kill-switch"' in resp.text  # 回傳更新後的控制片段
 
 
 def test_kill_switch_owner_turns_off(order_client, fake_guard, fake_ops, user):
-    fake_guard.kill_switch = True
-    resp = order_client.post("/orders/kill-switch", data={"enabled": "false"})
+    fake_guard.global_on = True
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "false", "scope": "global"})
     assert resp.status_code == 200
-    assert fake_guard.kill_switch is False
+    assert fake_guard.global_on is False
     assert fake_ops.kill_switch_calls[-1]["enabled"] is False
 
 
 def test_kill_switch_non_owner_gets_403_and_does_not_toggle(order_client, fake_guard, fake_ops, user):
     """非 owner → 403、set_kill_switch 未被呼叫、狀態不變、不發告警。"""
     fake_guard._owner_ids = set()  # 沒有任何 owner → 目前 user 不是 owner
-    resp = order_client.post("/orders/kill-switch", data={"enabled": "true"})
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "global"})
     assert resp.status_code == 403
-    assert fake_guard.kill_switch is False
+    assert fake_guard.global_on is False
+    assert fake_guard.set_kill_switch_calls == []
+    assert fake_ops.kill_switch_calls == []
+
+
+def test_kill_switch_scope_self_only_toggles_actor_own_switch(order_client, fake_guard, fake_ops, user):
+    """scope=self：只改 actor 自己的 per_user 開關，全站總閘不受影響（route 端無目標 user
+    參數，server 天然無法替他人翻閘）。"""
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "self"})
+    assert resp.status_code == 200
+    assert fake_guard.per_user.get(user.id) is True
+    assert fake_guard.global_on is False
+    call = fake_ops.kill_switch_calls[-1]
+    assert call["scope"] == "self" and call["actor_user_id"] == user.id
+
+
+def test_kill_switch_invalid_scope_rejected(order_client, fake_guard, fake_ops):
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "bogus"})
+    assert resp.status_code == 400
     assert fake_guard.set_kill_switch_calls == []
     assert fake_ops.kill_switch_calls == []
 

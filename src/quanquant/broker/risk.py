@@ -45,6 +45,24 @@ def _now_naive_utc() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+class KillSwitchState:
+    """D3 拍板形：兩層 kill switch——per-user 開關 + 保留的全站總閘。純 in-memory（隨 process
+    重啟重置，沿用舊版單一 bool 的重啟語意；未拍板要求跨重啟持久化）。
+
+    `blocked(uid) = global_on OR per_user.get(uid, False)`——這是本次設計 D3 段拍板的語意
+    鐵律：全站總閘一開，所有人（含未在 per_user 出現過的 owner）一律被擋；per_user 只在
+    該 uid 自己顯式翻開時才擋，其餘 uid 不受影響。`global_actor` 純供 UI 顯示「最後翻閘者」
+    （per-user 開關的翻閘者結構上必然是該 uid 自己，不需要另外記錄）。"""
+
+    def __init__(self, *, global_on: bool = False) -> None:
+        self.global_on = global_on
+        self.per_user: dict[int, bool] = {}
+        self.global_actor: int | None = None
+
+    def blocked(self, user_id: int) -> bool:
+        return self.global_on or self.per_user.get(user_id, False)
+
+
 class RiskGuard:
     def __init__(
         self,
@@ -67,16 +85,40 @@ class RiskGuard:
         self._max_qty_per_day = max_qty_per_day
         self._max_orders_per_day = max_orders_per_day
         self._confirm_token_ttl_seconds = confirm_token_ttl_seconds
-        self._kill_switch = kill_switch_initial
+        self._kill_switch_state = KillSwitchState(global_on=kill_switch_initial)
 
-    @property
-    def kill_switch(self) -> bool:
-        return self._kill_switch
+    def blocked(self, user_id: int) -> bool:
+        """D3 兩層判定入口：`check_place`/`check_update`（本檔）與 `ShioajiAdapter._send_gate`
+        （送單前鎖內最後一道防線）都改查這個，不再讀單一 bool。"""
+        return self._kill_switch_state.blocked(user_id)
 
-    def set_kill_switch(self, value: bool) -> None:
-        """即時可切（非啟動快照）：緊貼送單前的 ShioajiAdapter._send_gate 讀的就是這個
-        property 當下的值，Task 8 的 admin 開關/緊急停止直接呼叫本方法即可立刻生效。"""
-        self._kill_switch = value
+    def set_kill_switch(self, value: bool, *, scope: str, actor_user_id: int) -> None:
+        """即時可切（非啟動快照）：緊貼送單前的 ShioajiAdapter._send_gate 讀的就是
+        `blocked()` 當下的值，翻閘立刻生效。
+
+        `scope='self'`：只翻 actor 自己的個人急停——本方法結構上沒有目標 user 參數，
+        server 端天然無法替他人翻閘。`scope='global'`：翻全站總閘，沿用 Tier0 語意，
+        任一 owner 皆可翻（火警拉桿原則），記下最後翻閘者供 UI 顯示。兩種 scope 都要求
+        actor 是 owner（`assert_owner`），非 owner 一律 AuthorizationError。"""
+        self.assert_owner(actor_user_id)
+        if scope == "self":
+            self._kill_switch_state.per_user[actor_user_id] = value
+        elif scope == "global":
+            self._kill_switch_state.global_on = value
+            self._kill_switch_state.global_actor = actor_user_id
+        else:
+            raise ValueError(f"未知的 kill switch scope: {scope!r}（僅接受 'self'/'global'）")
+
+    def kill_switch_view(self, user_id: int) -> dict:
+        """供 orders_page/toggle route 渲染兩顆開關用的唯讀快照：
+        `{global_on, self_on, blocked, global_actor}`。"""
+        state = self._kill_switch_state
+        return {
+            "global_on": state.global_on,
+            "self_on": state.per_user.get(user_id, False),
+            "blocked": state.blocked(user_id),
+            "global_actor": state.global_actor,
+        }
 
     def is_owner(self, actor_user_id: int) -> bool:
         """非 raise 版的 owner 判定（`assert_owner` 是 raise 版）：供模板/UI 決定是否顯示
@@ -129,7 +171,7 @@ class RiskGuard:
         trading_day = brepo.trading_day_for(int(_now_naive_utc().timestamp() * 1000))
         try:
             self.assert_owner(actor_user_id)
-            if self.kill_switch:
+            if self.blocked(actor_user_id):
                 raise RiskError("kill switch 已啟動")
             if req.symbol not in self._symbol_whitelist:
                 raise RiskError(f"{req.symbol} 不在白名單")
@@ -193,7 +235,7 @@ class RiskGuard:
                     raise RiskError(f"price 必須 > 0，收到 {new_price}")
                 if order.price_type != "LMT" and new_price < 0:
                     raise RiskError(f"price 不可為負，收到 {new_price}")
-            if self.kill_switch:
+            if self.blocked(actor_user_id):
                 raise RiskError("kill switch 已啟動")
             if order.symbol not in self._symbol_whitelist:
                 raise RiskError(f"{order.symbol} 不在白名單")

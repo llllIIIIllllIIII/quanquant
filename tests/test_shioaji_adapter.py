@@ -256,7 +256,7 @@ def test_place_riskerror_send_gate_does_not_alert_place_failed(engine):
     alerter = _RecordingAlerter()
     adapter = _adapter(engine, risk_guard=_real_guard(engine), ops_alerter=alerter)
 
-    async def _blocked_gate():
+    async def _blocked_gate(user_id):
         raise RiskError("kill switch 已啟動，拒絕送出")
 
     adapter._send_gate = _blocked_gate
@@ -533,6 +533,9 @@ def test_send_gate_blocks_when_kill_switch_on():
         def assert_owner(self, actor_user_id):
             pass
 
+        def blocked(self, user_id):
+            return True
+
         def check_place(self, session, req, **kw):
             order = brepo.create_order(
                 session, client_order_id=req.client_order_id, request_hash="H",
@@ -556,6 +559,49 @@ def test_send_gate_blocks_when_kill_switch_on():
     with Session(eng) as s:
         order = s.exec(select(Order)).first()
         assert order.status == "failed"  # 不留在 pending 卡死（V3-2 收尾）
+
+
+# ---- D3：兩層 kill switch（per-user + 全站總閘）在 adapter/_send_gate 層的等價驗收 ----
+
+def test_send_gate_self_kill_switch_blocks_only_actor_not_other_owner(engine):
+    """A 開自己的急停 → A 的 place 被 _send_gate 擋下、native 從未被呼叫；B（另一個 owner）
+    的 place 完全不受影響（S#40 D3 核心情境，經真正 RiskGuard + ShioajiAdapter 全鏈路）。"""
+    guard = _real_guard(engine, owner_user_ids=frozenset({1, 2}))
+    adapter = _adapter(engine, risk_guard=guard)
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(client_order_id="C-A", user_id=1), actor_user_id=1))
+    assert len(adapter._api.placed) == 0
+
+    ack = asyncio.run(adapter.place(_req(client_order_id="C-B", user_id=2), actor_user_id=2))
+    assert ack.status == "submitted"
+    assert len(adapter._api.placed) == 1
+
+
+def test_send_gate_global_kill_switch_blocks_every_owner(engine):
+    guard = _real_guard(engine, owner_user_ids=frozenset({1, 2}))
+    adapter = _adapter(engine, risk_guard=guard)
+    guard.set_kill_switch(True, scope="global", actor_user_id=2)  # 任一 owner 翻的閘也擋別人
+
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(client_order_id="C-A", user_id=1), actor_user_id=1))
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(client_order_id="C-B", user_id=2), actor_user_id=2))
+    assert len(adapter._api.placed) == 0
+
+
+def test_cancel_not_blocked_by_either_kill_switch_layer(engine):
+    """取消單不受兩層開關影響（spec 明文、沿用既有語意）：全站總閘與 per-user 急停都開著，
+    取消既有委託仍必須成功。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(), actor_user_id=1))
+    guard.set_kill_switch(True, scope="global", actor_user_id=1)
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+
+    ack2 = asyncio.run(adapter.cancel(ack.broker_order_id, actor_user_id=1))
+    assert ack2.status == "cancelled"
 
 
 # ---- callback：只落地 RawInbox（round3 BLOCKER#2） ----
@@ -744,7 +790,7 @@ def test_place_releases_quota_reservation_when_send_gate_raises_riskerror(engine
     guard = _real_guard(engine)
     adapter = _adapter(engine, risk_guard=guard)
 
-    async def _blocked_gate():
+    async def _blocked_gate(user_id):
         raise RiskError("kill switch 已啟動，拒絕送出")
 
     adapter._send_gate = _blocked_gate
@@ -817,7 +863,7 @@ def test_update_releases_delta_quota_reservation_when_send_gate_raises_riskerror
     adapter = _adapter(engine, risk_guard=guard)
     ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
 
-    async def _blocked_gate():
+    async def _blocked_gate(user_id):
         raise RiskError("kill switch 已啟動，拒絕送出")
 
     adapter._send_gate = _blocked_gate

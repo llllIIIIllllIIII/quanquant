@@ -101,6 +101,21 @@ def test_kill_switch_wrapper_surfaces_open_orders_when_enabling():
     assert "kill switch 啟動" in fake.texts[0] and "3 筆未成交掛單" in fake.texts[0]
 
 
+def test_kill_switch_wrapper_records_scope_self_vs_global():
+    """D3：兩層 kill switch 的翻閘告警要能分辨 scope（個人急停 vs 全站總閘），供人工稽核。"""
+    fake_global = _FakeNotifier(configured=True)
+    alerter_global = OpsAlerter(fake_global)
+    _drain(alerter_global, lambda: alerter_global.kill_switch(
+        enabled=True, actor_user_id=7, scope="global", open_order_count=0))
+    assert "全站" in fake_global.texts[0]
+
+    fake_self = _FakeNotifier(configured=True)
+    alerter_self = OpsAlerter(fake_self)
+    _drain(alerter_self, lambda: alerter_self.kill_switch(
+        enabled=True, actor_user_id=7, scope="self", open_order_count=0))
+    assert "個人" in fake_self.texts[0]
+
+
 def test_build_ops_alerter_token_fallback_and_configured_gate():
     # ops token 空 → 沿用 telegram_bot_token；chat_id 有值 → configured
     s = SimpleNamespace(ops_telegram_bot_token="", telegram_bot_token="MAINTOK",

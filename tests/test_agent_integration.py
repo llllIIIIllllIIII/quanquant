@@ -210,8 +210,8 @@ async def test_skeleton_roundtrip_and_kill_switch(live_server, engine, user, tmp
 
             assert "agent 已連線" in (await client.get("/orders/agent-status")).text
 
-            # kill switch：ON 後新單被擋、child 未收到新 place
-            await client.post("/orders/kill-switch", data={"enabled": "true"})
+            # kill switch：ON 後新單被擋、child 未收到新 place（D3：全站總閘 scope=global）
+            await client.post("/orders/kill-switch", data={"enabled": "true", "scope": "global"})
             n_ops = len(child.ops)
             r = await client.post("/orders", data={
                 "client_order_id": "e2e-2", "symbol": "TXF", "action": "Buy",

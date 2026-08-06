@@ -1,21 +1,47 @@
-<div id="kill-switch-control"
-     style="margin:0 0 1rem;padding:.6rem .9rem;border-radius:6px;border:1px solid {{ '#c0392b' if kill_switch else 'var(--pico-muted-border-color,#ccc)' }};{% if kill_switch %}background:rgba(192,57,43,.12);{% endif %}">
+<div id="kill-switch-control" style="margin:0 0 1rem;display:flex;flex-direction:column;gap:.6rem;">
   {% if disabled|default(false) %}
-  <span class="muted">⚪ Kill switch 無法使用（下單子系統未啟用）</span>
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid var(--pico-muted-border-color,#ccc);">
+    <span class="muted">⚪ Kill switch 無法使用（下單子系統未啟用）</span>
+  </div>
   {% else %}
-  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
-    <strong style="{% if kill_switch %}color:#c0392b;{% endif %}">
-      {% if kill_switch %}🔴 Kill switch 已啟動 — 拒絕所有新單{% else %}🟢 下單正常{% endif %}
-    </strong>
-    <!-- 一鍵切到相反狀態；swap 自身（outerHTML）。翻 ON 只擋新單、不自動撤既有掛單。 -->
-    <form hx-post="/orders/kill-switch" hx-target="#kill-switch-control" hx-swap="outerHTML" style="margin:0;">
-      <input type="hidden" name="enabled" value="{{ 'false' if kill_switch else 'true' }}">
-      {% if kill_switch %}
-      <button type="submit" class="secondary" style="margin:0;">解除（恢復下單）</button>
-      {% else %}
-      <button type="submit" class="contrast" style="margin:0;">啟動 Kill switch（拒絕新單）</button>
-      {% endif %}
-    </form>
+  <!-- 我的急停：只影響操作者自己（scope=self，server 端強制，非前端隱藏）。 -->
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid {{ '#c0392b' if kill_switch.self_on else 'var(--pico-muted-border-color,#ccc)' }};{% if kill_switch.self_on %}background:rgba(192,57,43,.12);{% endif %}">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+      <strong style="{% if kill_switch.self_on %}color:#c0392b;{% endif %}">
+        {% if kill_switch.self_on %}🔴 我的急停已啟動 — 拒絕我的新單{% else %}🟢 我的下單正常{% endif %}
+      </strong>
+      <!-- 一鍵切到相反狀態；swap 整個外層容器（outerHTML），兩顆開關一起重繪。 -->
+      <form hx-post="/orders/kill-switch" hx-target="#kill-switch-control" hx-swap="outerHTML" style="margin:0;">
+        <input type="hidden" name="scope" value="self">
+        <input type="hidden" name="enabled" value="{{ 'false' if kill_switch.self_on else 'true' }}">
+        {% if kill_switch.self_on %}
+        <button type="submit" class="secondary" style="margin:0;">解除我的急停</button>
+        {% else %}
+        <button type="submit" class="contrast" style="margin:0;">啟動我的急停</button>
+        {% endif %}
+      </form>
+    </div>
+  </div>
+
+  <!-- 全站急停：沿用 Tier0 語意，任一 owner 可翻（火警拉桿原則），影響所有人。 -->
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid {{ '#c0392b' if kill_switch.global_on else 'var(--pico-muted-border-color,#ccc)' }};{% if kill_switch.global_on %}background:rgba(192,57,43,.12);{% endif %}">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+      <strong style="{% if kill_switch.global_on %}color:#c0392b;{% endif %}">
+        {% if kill_switch.global_on %}🔴 全站急停已啟動 — 拒絕所有人新單{% else %}🟢 全站下單正常{% endif %}
+      </strong>
+      <form hx-post="/orders/kill-switch" hx-target="#kill-switch-control" hx-swap="outerHTML" style="margin:0;">
+        <input type="hidden" name="scope" value="global">
+        <input type="hidden" name="enabled" value="{{ 'false' if kill_switch.global_on else 'true' }}">
+        {% if kill_switch.global_on %}
+        <button type="submit" class="secondary" style="margin:0;">解除全站急停</button>
+        {% else %}
+        <button type="submit" class="contrast" style="margin:0;">啟動全站急停（拒絕所有人新單）</button>
+        {% endif %}
+      </form>
+    </div>
+    {% if kill_switch.global_actor %}
+    <div class="muted" style="font-size:.85em;margin-top:.3rem;">最後翻閘者：user #{{ kill_switch.global_actor }}</div>
+    {% endif %}
   </div>
   {% endif %}
 </div>

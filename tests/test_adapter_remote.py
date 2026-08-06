@@ -170,11 +170,30 @@ async def test_remote_place_idempotent_replay_served_while_offline(engine):
 async def test_kill_switch_blocks_before_gateway_called(engine):
     gw = _FakeGateway()
     guard = _guard(engine)
-    guard.set_kill_switch(True)
+    guard.set_kill_switch(True, scope="global", actor_user_id=1)
     a = _adapter(engine, gw, guard)
     with pytest.raises(RiskError):
         await a.place(_req(), actor_user_id=1)
     assert gw.place_calls == []
+
+
+async def test_remote_kill_switch_self_scope_blocks_only_actor_not_other_owner(engine):
+    """D3 S#40：remote 路徑（多 agent slot 情境）下兩層 kill switch 一樣成立——A 開自己的
+    急停只擋 A，B 的下單經 gateway 正常送出。"""
+    gw = _FakeGateway()
+    guard = RiskGuard(session_factory=lambda: Session(engine), secret="s",
+                      owner_user_ids=frozenset({1, 2}), symbol_whitelist=frozenset({"TXF"}),
+                      max_qty_per_order=5, max_qty_per_day=20, max_orders_per_day=20)
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+    a = _adapter(engine, gw, guard)
+
+    with pytest.raises(RiskError):
+        await a.place(_req(cid="c-a"), actor_user_id=1)
+    assert gw.place_calls == []
+
+    ack = await a.place(_req(cid="c-b"), actor_user_id=2)
+    assert ack.status == "submitted"
+    assert len(gw.place_calls) == 1
 
 
 class _KillSwitchBlindGuard:
@@ -183,14 +202,17 @@ class _KillSwitchBlindGuard:
     `_send_gate()`（鎖內、native/remote gateway 呼叫前的最後線性化點，見 shioaji_adapter.py
     `_send_gate` docstring）在 remote 路徑上從未被單獨驗證過（套套邏輯）。這個 fake guard
     比照 tests/test_shioaji_adapter.py 的 `test_send_gate_blocks_when_kill_switch_on`
-    手法：`check_place` 完全不看 kill_switch、直接放行建單，把「擋下」的責任完全留給
-    `_send_gate()` 自己的 `self._risk_guard.kill_switch` 檢查——這樣才是 `_send_gate`
+    手法：`check_place` 完全不看 kill switch、直接放行建單，把「擋下」的責任完全留給
+    `_send_gate()` 自己的 `self._risk_guard.blocked(user_id)` 檢查——這樣才是 `_send_gate`
     這道深度防禦真正被獨立驗證，而不是被上層 check_place 順便擋掉。"""
 
     kill_switch = True
 
     def assert_owner(self, actor_user_id):
         pass
+
+    def blocked(self, user_id):
+        return True
 
     def check_place(self, session, req, **kw):
         order = brepo.create_order(

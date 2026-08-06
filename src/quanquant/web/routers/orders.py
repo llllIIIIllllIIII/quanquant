@@ -64,6 +64,17 @@ def _parse_kill_switch_enabled(raw) -> bool:
     return str(raw or "").strip().lower() in ("true", "1", "on", "yes")
 
 
+def _parse_kill_switch_scope(raw) -> str | None:
+    """D3：兩層 kill switch 的 `scope` 隱藏欄位——只接受 'self'/'global'，其餘（含缺席）
+    一律回 None，呼叫端映射成 400（不像 `enabled` 那樣寬鬆容錯：翻錯層級的風控開關後果
+    比表單格式錯誤嚴重，寧可拒絕也不要用預設值猜測使用者的意圖）。"""
+    value = str(raw or "").strip().lower()
+    return value if value in ("self", "global") else None
+
+
+_DISABLED_KILL_SWITCH_VIEW = {"global_on": False, "self_on": False, "blocked": False, "global_actor": None}
+
+
 def _count_open_orders_best_effort(session: Session, service) -> int:
     """kill switch 告警用的未成交掛單數：best-effort，計數失敗一律回 0，絕不擋住切換。"""
     try:
@@ -221,7 +232,7 @@ async def orders_page(
     # kill switch 控制只給 owner 看（server 端切換仍一律經 assert_owner，非只靠前端隱藏）；
     # risk_guard 可能為 None（下單子系統停用）——此時無 owner、也不顯示控制。
     is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
-    kill_switch = risk_guard.kill_switch if risk_guard is not None else False
+    kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
     return templates.TemplateResponse(request, "orders.html", {
         "active": "orders", "mode": resolved_mode,
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
@@ -237,12 +248,17 @@ async def toggle_kill_switch(
     service=Depends(get_order_service),
     risk_guard=Depends(get_order_risk_guard),
 ):
-    """owner-only 全域 kill switch runtime 開關（runtime 即時生效，見 RiskGuard.set_kill_switch）。
-    翻 ON 只擋新單、不自動撤既有掛單（自動撤單危險，留給人工/T0.4）；改以告警列出當下未成交
-    掛單數，提醒人工決定。子系統停用（risk_guard 為 None）時優雅回一個停用片段，不 500。"""
+    """owner-only kill switch runtime 開關（runtime 即時生效，見 RiskGuard.set_kill_switch）。
+    D3 拍板形：兩層——`scope='self'` 只翻 actor 自己的個人急停（本端點結構上沒有目標 user
+    參數，server 端天然無法替他人翻閘）；`scope='global'` 翻全站總閘（沿用 Tier0 語意，
+    任一 owner 可翻，火警拉桿原則）。翻 ON 只擋新單、不自動撤既有掛單（自動撤單危險，留給
+    人工/T0.4）；改以告警列出當下未成交掛單數，提醒人工決定。子系統停用（risk_guard 為
+    None）時優雅回一個停用片段，不 500。"""
     if risk_guard is None:
         return HTMLResponse(
-            render_partial("partials/kill_switch_control.html", kill_switch=False, disabled=True)
+            render_partial(
+                "partials/kill_switch_control.html", kill_switch=_DISABLED_KILL_SWITCH_VIEW, disabled=True
+            )
         )
     try:
         risk_guard.assert_owner(user.id)  # 非 owner → AuthorizationError → 403（比照 positions L232-233）
@@ -250,13 +266,19 @@ async def toggle_kill_switch(
         raise HTTPException(status_code=403, detail="not owner")
     form = await request.form()
     enabled = _parse_kill_switch_enabled(form.get("enabled"))
-    risk_guard.set_kill_switch(enabled)  # runtime 即時生效
+    scope = _parse_kill_switch_scope(form.get("scope"))
+    if scope is None:
+        raise HTTPException(status_code=400, detail="invalid scope（僅接受 self/global）")
+    risk_guard.set_kill_switch(enabled, scope=scope, actor_user_id=user.id)  # runtime 即時生效
     open_count = _count_open_orders_best_effort(session, service)
     ops = getattr(request.app.state, "ops_alerter", None)
     if ops is not None:  # 告警本身絕不能反噬切換
-        ops.kill_switch(enabled=enabled, actor_user_id=user.id, open_order_count=open_count)
+        ops.kill_switch(enabled=enabled, actor_user_id=user.id, scope=scope, open_order_count=open_count)
     return HTMLResponse(
-        render_partial("partials/kill_switch_control.html", kill_switch=enabled, disabled=False)
+        render_partial(
+            "partials/kill_switch_control.html",
+            kill_switch=risk_guard.kill_switch_view(user.id), disabled=False,
+        )
     )
 
 

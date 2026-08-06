@@ -131,11 +131,14 @@ _TradeNotFoundError = TradeNotFoundError
 
 
 class _RiskGuardLike(Protocol):
-    """Task 7 RiskGuard 的結構型別（避免對 Task 7 模組的 import-time 相依）。"""
+    """Task 7 RiskGuard 的結構型別（避免對 Task 7 模組的 import-time 相依）。
 
-    kill_switch: bool
+    D3（Inc1 兩層 kill switch）：`kill_switch: bool` 單一旗標改成 `blocked(user_id)`——
+    `_send_gate` 與 `check_place`/`check_update` 都改查這個，判定 = 全站總閘 OR 該
+    user 自己的個人急停。"""
 
     def assert_owner(self, actor_user_id: int) -> None: ...
+    def blocked(self, user_id: int) -> bool: ...
     def check_place(self, session: Session, req: OrderRequest, **kw) -> Order: ...
     def check_update(self, session: Session, order: Order, **kw) -> None: ...
 
@@ -418,7 +421,10 @@ class ShioajiAdapter:
 
     # ---- send gate（V3-2，鎖內、native 呼叫前的最後線性化點） ----
 
-    async def _send_gate(self) -> None:
+    async def _send_gate(self, user_id: int) -> None:
+        """D3：`user_id` 是這筆指令的 actor（呼叫端一律傳 place/update 當下的
+        `actor_user_id`，adapter 綁定的 owner 身分不再是唯一判準）——kill switch 判定
+        改查 `blocked(user_id)` = 全站總閘 OR 該 user 自己的個人急停。"""
         if self._remote_gateway is not None:
             # Task 6：remote 模式下「session 是否就緒」的問法變成「gateway 是否連線」——
             # 未連線視同 AgentUnavailableError（保證這筆委託沒有離開本機/送達券商，
@@ -429,7 +435,7 @@ class ShioajiAdapter:
                 raise AgentUnavailableError("agent 未連線或未登入")
         elif self._api is None:
             raise OrderError("下單 session 尚未就緒")
-        if self._risk_guard is not None and self._risk_guard.kill_switch:
+        if self._risk_guard is not None and self._risk_guard.blocked(user_id):
             raise RiskError("kill switch 已啟動，拒絕送出")
 
     # ---- place ----
@@ -486,7 +492,7 @@ class ShioajiAdapter:
 
         async def _do_place():
             try:
-                await self._send_gate()
+                await self._send_gate(actor_user_id)
                 if self._remote_gateway is not None:
                     return await self._remote_gateway.place(req)
                 return await asyncio.to_thread(self._place_blocking, req)
@@ -675,7 +681,7 @@ class ShioajiAdapter:
         )
 
         async def _do_update() -> None:
-            await self._send_gate()
+            await self._send_gate(actor_user_id)
             if self._remote_gateway is not None:
                 await self._remote_gateway.update(
                     ordno, price=new_price, qty=new_qty, price_type=price_type
