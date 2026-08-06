@@ -19,6 +19,7 @@ from quanquant.broker import repository as brepo
 from quanquant.broker import shioaji_adapter as shioaji_adapter_module
 from quanquant.broker import watchdog as watchdog_module
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
+from quanquant.broker.inbox_worker import RawInboxDeadLetterError
 from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
@@ -611,9 +612,9 @@ def test_callback_only_calls_commit_raw_callback_and_persists_raw_inbox(engine, 
     calls = []
     original = shioaji_adapter_module.commit_raw_callback
 
-    def spy(session_factory, *, kind, broker, payload):
+    def spy(session_factory, *, kind, broker, payload, **kw):
         calls.append((kind, broker, payload))
-        return original(session_factory, kind=kind, broker=broker, payload=payload)
+        return original(session_factory, kind=kind, broker=broker, payload=payload, **kw)
 
     monkeypatch.setattr(shioaji_adapter_module, "commit_raw_callback", spy)
 
@@ -631,6 +632,38 @@ def test_callback_only_calls_commit_raw_callback_and_persists_raw_inbox(engine, 
         assert json.loads(row.payload)["trade_id"] == "D1"
         # 只落地 RawInbox，不直接處理業務邏輯：沒有 Order/Deal/BrokerPosition 被動到
         assert s.exec(select(Order)).first() is None
+
+
+def test_callback_stamps_account_mode_and_leaves_user_id_none_in_process(engine):
+    """Inc1 D5：in-process `_persist_raw` → `(user_id=None, account=self.account,
+    mode=self.mode)`——這是三個 scoped staging 呼叫端之一（R1-6）。"""
+    adapter = _adapter(engine)  # account="F1", mode="sim"
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.account == "F1" and row.mode == "sim" and row.user_id is None
+
+
+def test_callback_stamps_agent_user_id_when_adapter_constructed_with_one(engine):
+    """前瞻性驗證（Task 7 依賴）：`agent_user_id` 建構參數必須一路傳進落地的 RawInbox 列——
+    目前沒有任何呼叫端會傳非 None 值（單一共享 channel、in-process 零變更），但介面必須先接好，
+    Task 7 per-slot adapter 才能直接生效而不必再動這段程式碼。"""
+    adapter = ShioajiAdapter(
+        api_key="k", secret_key="s", ca_path=None, ca_passwd=None, person_id=None,
+        symbol="TXF", mode="sim", session_factory=lambda: Session(engine),
+        supervisor=BrokerSupervisor(), agent_user_id=42,
+    )
+    adapter._api = object()
+    adapter._contract = object()
+    adapter.account = "F1"
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.user_id == 42
 
 
 def test_callback_order_report_uses_order_report_kind(engine):
@@ -1111,6 +1144,103 @@ def test_map_order_report_op_type_status_table(op_type, expected_status):
     assert report.status == expected_status
 
 
+# ---- Inc1 D5/S3：mapper 改吃列上蓋章 account，不再讀 self.account ----
+
+def test_map_order_report_returns_passed_account_not_self_account():
+    """S3 拆除：即使 self.account 當下是別的值，report.account 必須是呼叫端傳入的
+    （row 上蓋章的）account，不是 adapter 目前的 self.account。"""
+    adapter = _adapter_stub_for_mapper()
+    adapter.account = "F1"  # adapter 目前的（可能已被換帳號覆寫的）self.account
+    report = adapter._map_order_report(
+        {"order_id": "O1", "seqno": "B1", "status": "Cancelled"}, account="F2",
+    )
+    assert report.account == "F2"  # 不是 self.account="F1"
+
+
+def test_map_order_report_account_defaults_to_none_when_not_passed():
+    """未傳 account（既有直接呼叫端）不回退讀 self.account——維持明確的「未知蓋章」語意。"""
+    adapter = _adapter_stub_for_mapper()
+    adapter.account = "F1"
+    report = adapter._map_order_report({"order_id": "O1", "seqno": "B1", "status": "Cancelled"})
+    assert report.account is None
+
+
+def test_map_deal_report_payload_account_mismatch_raises_payload_mismatch_dead_letter():
+    """R1-5：deal_report payload 自帶的 account_id 與列蓋章 account 矛盾 → fail closed，
+    RawInboxDeadLetterError(reason="payload_mismatch")，不是可重試的 ValueError。"""
+    adapter = _adapter_stub_for_mapper()
+    with pytest.raises(RawInboxDeadLetterError) as exc_info:
+        adapter._map_deal_report(
+            {"trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+             "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1"},
+            account="F1",
+        )
+    assert exc_info.value.reason == "payload_mismatch"
+
+
+def test_map_deal_report_account_none_skips_mismatch_check_backward_compat():
+    """row.account 為 None（未蓋章的舊資料/直接呼叫）時跳過驗證，維持既有位元級行為
+    （同 R2-2 的 user_id NULL 放行原則）。"""
+    adapter = _adapter_stub_for_mapper()
+    fill = adapter._map_deal_report({
+        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+        "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1",
+    })  # account 未帶 → 預設 None，不驗證
+    assert fill.account == "F9"
+
+
+def test_map_deal_report_matching_account_passes_through():
+    adapter = _adapter_stub_for_mapper()
+    fill = adapter._map_deal_report(
+        {"trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+         "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1"},
+        account="F1",
+    )
+    assert fill.account == "F1"
+
+
+def test_map_order_report_uses_row_account_not_current_self_account_after_switch(engine):
+    """S3 拆除的端到端回歸（S#14/I7）：委託在帳號 F1 底下建立並補送舊事件，即使 adapter 之後
+    已經換到帳號 F2（模擬使用者換帳號重連，`self.account` 已被覆寫），這筆補送的舊事件仍須
+    正確歸屬 F1——若 mapper 誤用當下的 self.account="F2" 查詢，會解不到委託而 quarantine。"""
+    from quanquant.broker.inbox_worker import RawInboxWorker
+
+    adapter = _adapter(engine)  # account="F1"
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C1", request_hash="H1", user_id=1, mode="sim", broker="shioaji",
+            account="F1", symbol="TXF", action="Buy", qty=1, price=Decimal("18000"),
+            price_type="LMT", order_type="ROD", octype="New", trading_day="2026-06-16",
+        )
+        brepo.set_order_ack(s, order.id, broker_order_id="B1", ordno="O1", status="submitted")
+        s.commit()
+
+    # 舊帳號（F1）的委託回報，此刻正確落地並蓋章 account="F1"（模擬 in-process _persist_raw
+    # 在事件產生當下的蓋章時機）。
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="order_report", broker="shioaji",
+            payload=json.dumps({"order_id": "O1", "seqno": "B1", "status": "Cancelled"}),
+            account="F1", mode="sim",
+        )
+        s.commit()
+
+    adapter.account = "F2"  # 換帳號：self.account 現在已經是 F2
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        refreshed = s.exec(select(Order)).first()
+        assert refreshed.status == "cancelled"  # 用列蓋章 F1 正確解析，沒有因為換帳號而失聯
+        row = s.exec(select(RawInbox)).first()
+        assert row.processed is True and row.quarantine is False
+
+
 # ---- 以 _core.pyi 真實結構為藍本的端到端契約測試（bug 1(b)）：
 #      真實 FuturesDeal/FuturesOrder callback（非 dict、無 to_dict 的 mapping）
 #      → _json_safe → commit_raw_callback（JSON 落地）→ RawInboxWorker 解碼 → mapper
@@ -1385,3 +1515,51 @@ def test_reconcile_noop_when_api_none_does_not_raise(engine):
     asyncio.run(adapter.reconcile())  # 不應拋例外（尚未連線時 watchdog 也可能呼叫到）
     with Session(engine) as s:
         assert list(s.exec(select(RawInbox))) == []
+
+
+# ---- Inc1 D5（R1-6）：reconcile 落列改走 stage_scoped_raw_inbox（唯一 scoped staging API），
+#      蓋章 account/mode/user_id，且與 cursor 推進同一交易 ----
+
+def test_reconcile_stages_rows_with_account_mode_scope_stamped(engine):
+    adapter = _adapter(engine)  # account="F1", mode="sim"
+    adapter._api.list_trades = lambda: [
+        _FakeTrade2("ORD1", "SEQ1", "Submitted", order_datetime=datetime(2026, 6, 16, 9, 0))
+    ]
+    asyncio.run(adapter.reconcile())
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.account == "F1" and row.mode == "sim"
+        # 目前仍是單一共享 channel/adapter（Task 7 才建 per-slot adapter），agent_user_id 未
+        # 被任何呼叫端設定，行為與 in-process 完全一致——user_id 恆 None。
+        assert row.user_id is None
+
+
+def test_reconcile_stage_and_cursor_advance_are_same_transaction_rolls_back_together(engine, monkeypatch):
+    """R1-6/S#18：reconcile 落列與 cursor 推進必須同一交易——中途任何一筆失敗（模擬 DB 短暫
+    故障），已落地的列與 cursor 推進都要一起回滾，不留下「列已落地但 cursor 沒推進」或反過來
+    的半殘狀態。"""
+    adapter = _adapter(engine)
+    calls = {"n": 0}
+    original = shioaji_adapter_module.stage_scoped_raw_inbox
+
+    def _boom_on_second(session, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("模擬中途 DB 短暫故障")
+        return original(session, **kw)
+
+    monkeypatch.setattr(shioaji_adapter_module, "stage_scoped_raw_inbox", _boom_on_second)
+
+    with pytest.raises(RuntimeError):
+        adapter._stage_reconcile_results(
+            [
+                {"order_id": "O1", "seqno": "B1", "status": "Cancelled"},
+                {"order_id": "O2", "seqno": "B2", "status": "Cancelled"},
+            ],
+            datetime(2026, 6, 16, 9, 0),
+        )
+
+    with Session(engine) as s:
+        assert list(s.exec(select(RawInbox))) == []  # 第一筆也被回滾，沒有半殘留
+        cursor = brepo.get_reconcile_cursor(s, broker="shioaji", account="F1", mode="sim")
+        assert cursor is None  # cursor 沒推進

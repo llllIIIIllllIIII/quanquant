@@ -14,6 +14,7 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from quanquant.broker import repository as brepo
 from quanquant.db.models import (
+    AgentAccountBinding,
     BrokerPosition,
     ConfirmToken,
     Deal,
@@ -198,6 +199,84 @@ def test_unquarantine_stale_raw_inbox_reopens_old_rows(session):
     refreshed = session.get(RawInbox, row.id)
     assert refreshed.quarantine is False and refreshed.error is None
     assert [r.id for r in brepo.list_unprocessed_raw_inbox(session)] == [row.id]
+
+
+# ---- RawInbox quarantine 分級（Inc1 D5/R2-6） ----
+
+def test_quarantine_raw_inbox_default_reason_association_pending_stays_unprocessed(session):
+    """既有呼叫端（不帶 reason）維持 reason="association_pending"、processed 仍是 False——
+    可重試，不退出換帳號 guard 的 unprocessed 計數。"""
+    row = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}')
+    session.commit()
+    brepo.quarantine_raw_inbox(session, row, error="暫時解不到委託")
+    session.commit()
+    refreshed = session.get(RawInbox, row.id)
+    assert refreshed.quarantine_reason == "association_pending"
+    assert refreshed.processed is False
+    assert refreshed.processed_at is None
+
+
+@pytest.mark.parametrize("reason", ["scope_violation", "payload_mismatch", "user_mismatch"])
+def test_quarantine_raw_inbox_dead_letter_reason_marks_processed_true(session, reason):
+    """R2-6：三個永久 dead-letter reason 必須連同 processed=True（＋processed_at）一起落地——
+    這是唯一的方式讓這列退出換帳號 guard 的 unprocessed 計數（那個計數只看 processed，不管
+    quarantine，見 `agent_ws._count_unprocessed_raw_inbox`）。"""
+    row = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}')
+    session.commit()
+    brepo.quarantine_raw_inbox(session, row, error="fail closed", reason=reason)
+    session.commit()
+    refreshed = session.get(RawInbox, row.id)
+    assert refreshed.quarantine is True
+    assert refreshed.processed is True
+    assert refreshed.processed_at is not None
+    assert refreshed.quarantine_reason == reason
+
+
+@pytest.mark.parametrize("reason", ["scope_violation", "payload_mismatch", "user_mismatch"])
+def test_unquarantine_stale_raw_inbox_never_releases_dead_letter_rows(session, reason):
+    """R2-6：dead-letter 列永不進 unquarantine 重試迴圈——否則會把已經 fail-closed 判定的列
+    重新丟回處理管線，製造無限重試/告警洪水。"""
+    row = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}')
+    session.commit()
+    row.received_at = dt.datetime(2020, 1, 1)
+    session.add(row)
+    brepo.quarantine_raw_inbox(session, row, error="fail closed", reason=reason)
+    session.commit()
+
+    released = brepo.unquarantine_stale_raw_inbox(session, older_than=dt.datetime(2025, 1, 1))
+    session.commit()
+    assert released == 0
+    refreshed = session.get(RawInbox, row.id)
+    assert refreshed.quarantine is True and refreshed.quarantine_reason == reason
+
+
+def test_unquarantine_stale_raw_inbox_still_releases_null_reason_legacy_rows(session):
+    """既有列（部署本功能前就已 quarantine、`quarantine_reason` 恆 NULL）保守視為可重試，
+    不因新增分級而退化（向後相容——不確定就不要判死刑，同模組一貫的零丟單哲學）。"""
+    row = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}')
+    session.commit()
+    row.received_at = dt.datetime(2020, 1, 1)
+    row.quarantine = True
+    row.error = "legacy quarantine（reason 未蓋章）"
+    session.add(row)
+    session.commit()
+
+    released = brepo.unquarantine_stale_raw_inbox(session, older_than=dt.datetime(2025, 1, 1))
+    session.commit()
+    assert released == 1
+
+
+# ---- agent_account_bindings 查詢（Inc1 D5/D10，Task 6 才建立寫入邏輯） ----
+
+def test_find_account_binding_returns_none_when_unbound(session):
+    assert brepo.find_account_binding(session, broker="shioaji", account="F1") is None
+
+
+def test_find_account_binding_returns_bound_row(session):
+    session.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=7))
+    session.commit()
+    binding = brepo.find_account_binding(session, broker="shioaji", account="F1")
+    assert binding is not None and binding.user_id == 7
 
 
 # ---- Deal ----

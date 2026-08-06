@@ -11,7 +11,7 @@ from quanquant.auth.agent_tokens import issue_token
 from quanquant.broker.agent_channel import AgentChannel
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.config import get_settings
-from quanquant.db.models import AgentToken, RawInbox
+from quanquant.db.models import AgentAccountBinding, AgentToken, RawInbox
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_session
 
@@ -166,6 +166,44 @@ def test_report_ack_only_after_commit_success(ws_env, engine, monkeypatch, caplo
     assert "agent WS 處理上行訊息失敗" in caplog.text
     with Session(engine) as s:
         assert s.exec(select(RawInbox)).all() == []
+
+
+def test_report_scope_violation_still_commits_then_acks_and_dead_letters(ws_env, engine):
+    """R1-5/S#17：UpReport 帶的 account 已綁定給別的 user → scope_violation 永久
+    dead-letter，但仍照常 commit-then-ack（I1/I4）——不擋連線、不讓 agent 誤判需要重送。"""
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        s.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=owner_id + 1))  # 綁給別人
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
+                      "account": "F1", "mode": "sim", "payload": {"trade_id": "T1"}})
+        assert ws.receive_json() == {"type": "report_ack", "event_id": 7}  # 仍然 ack
+
+    with Session(engine) as s:
+        rows = s.exec(select(RawInbox)).all()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.quarantine is True and row.processed is True
+        assert row.quarantine_reason == "scope_violation"
+        assert row.user_id == owner_id  # 蓋章成連線認證的 user，不是綁定表指向的那個人
+
+
+def test_report_no_binding_yet_stages_normally_not_blocked(ws_env, engine):
+    """R1-5：查無 binding 列＝尚未綁定（Task 6 才建立寫入邏輯）→ 先放行，正常落地不誤擋。"""
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "report", "event_id": 8, "kind": "deal_report",
+                      "account": "F1", "mode": "sim", "payload": {"trade_id": "T1"}})
+        assert ws.receive_json() == {"type": "report_ack", "event_id": 8}
+
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is False and row.processed is False
 
 
 def test_cmd_ack_routed_to_channel(ws_env):

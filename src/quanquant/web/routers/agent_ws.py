@@ -138,9 +138,16 @@ async def agent_ws(websocket: WebSocket) -> None:
                     )
                     continue
                 async with channel.inbox_lock:
+                    # Inc1 D5：蓋章 user_id=連線認證身分、account/mode=envelope 帶的值（agent
+                    # 端在落 outbox 當下就蓋章，換帳號/重連/重送都不改變歸屬，見 UpReport 定義）。
+                    # scope 驗證（R1-5：account 是否屬於這個 user 的 binding）與 dead-letter
+                    # 分級全部在 commit_raw_callback → stage_scoped_raw_inbox 內完成，違規列仍
+                    # 照常落地＋commit-then-ack（I1/I4），不在這裡另外攔截。
                     await asyncio.to_thread(
                         commit_raw_callback, session_factory,
                         kind=msg.kind, broker="shioaji", payload=msg.payload,
+                        user_id=agent_user_id, account=msg.account, mode=msg.mode,
+                        ops_alerter=getattr(state, "ops_alerter", None),
                     )
                     await websocket.send_json(
                         DownReportAck(event_id=msg.event_id).model_dump()

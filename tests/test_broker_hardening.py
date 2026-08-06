@@ -38,11 +38,25 @@ def test_json_safe_preserves_nested_mapping_and_primitives():
     assert safe == {"a": {"b": [1, 2.0, "x", True, None]}}
 
 
+class _FakeNative:
+    """`ShioajiAdapter.account` 是委派 `self._native.account` 的 property——`_bare_adapter`
+    繞過 `__init__`（沒有真正的 `self._native`），給一個最小替身讓那個 property 讀寫不炸。"""
+
+    account = "F1"
+
+
 def _bare_adapter(session_factory):
-    """繞過 __init__ 建最小 adapter：_on_order_cb 只用到 _session_factory / broker / _json_safe。"""
+    """繞過 __init__ 建最小 adapter：`_on_order_cb`→`_persist_raw` 用到
+    `_session_factory`/`broker`/`_json_safe`；Inc1 D5 之後 `_persist_raw` 額外蓋章
+    `_agent_user_id`/`account`/`mode`/`_ops`（見 `ShioajiAdapter._persist_raw`），這裡一併補
+    最小值，不影響本檔測試焦點（落地失敗時的退化保存/不拋例外）。"""
     adapter = object.__new__(ShioajiAdapter)
     adapter._session_factory = session_factory
     adapter.broker = "shioaji"
+    adapter._agent_user_id = None
+    adapter._native = _FakeNative()
+    adapter.mode = "sim"
+    adapter._ops = None
     return adapter
 
 
@@ -74,7 +88,7 @@ def test_on_order_cb_stages_degraded_payload_when_primary_commit_fails(caplog):
     import quanquant.broker.shioaji_adapter as mod
     orig = mod.commit_raw_callback
 
-    def _spy(session_factory, *, kind, broker, payload):
+    def _spy(session_factory, *, kind, broker, payload, **kw):
         staged.append(payload)
         session_factory()  # 第一次 raise（主路徑），第二次成功（退化保存）
 

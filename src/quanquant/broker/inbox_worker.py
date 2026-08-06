@@ -10,7 +10,13 @@
 
 例外分類（重要）：
   - ValueError / PositionMismatchError：業務邏輯性失敗（payload 不合法、委託關聯解不到、
-    Cover 缺對應開倉部位、Auto 歧義）→ rollback 該列的交易 → 單獨 quarantine，不留部分寫入。
+    Cover 缺對應開倉部位、Auto 歧義）→ rollback 該列的交易 → 單獨 quarantine
+    （reason="association_pending"，可重試），不留部分寫入。
+  - RawInboxDeadLetterError（Inc1 D5/R2-6）：scope/payload/user 蓋章驗證失敗——**確定**這列
+    永遠不會因為重試而變成合法（帳號冒用/回報與蓋章帳號矛盾/委託歸屬不符本人），不是暫時性
+    問題 → rollback 該列的交易 → quarantine 且 reason 為 `scope_violation`/`payload_mismatch`/
+    `user_mismatch` 三者之一 → 永久 dead-letter（`quarantine_raw_inbox` 內部一併把
+    processed=True，退出換帳號 guard 的 unprocessed 計數與 unquarantine 重試迴圈）。
   - 其餘任何例外：視為 transient（DB 短暫故障等）→ 該列保持 processed=False、quarantine=False，
     不判死刑，留給下一輪 batch 自然重試——這是「零丟單」的關鍵：與其在不確定時猜測，
     不如什麼都不做，讓下次重試決定。
@@ -45,26 +51,117 @@ class OrderReport:
     """委託回報（FuturesOrder callback）；範圍窄於 Fill，只用來更新 Order.status。"""
 
     broker: str
-    account: str
+    # Inc1 D5/S3：account 改吃列上蓋章值，直接呼叫（未帶 scope 的既有單元測試/舊路徑）時
+    # 可能是 None——型別放寬以反映這個合法的執行期狀態（`_resolve_order_report_order` 傳給
+    # `find_order_by_ordno`/`find_order_by_broker_id` 時 None 會被當成一般查詢條件，不會炸）。
+    account: str | None
     mode: str
     ordno: str | None
     broker_order_id: str | None
     status: str
 
 
-DealMapper = Callable[[dict], Fill]
-OrderReportMapper = Callable[[dict], OrderReport]
+DealMapper = Callable[..., Fill]  # (payload, *, account=...) -> Fill（Inc1 D5/S3：帳號改吃列上蓋章）
+OrderReportMapper = Callable[..., OrderReport]  # (payload, *, account=...) -> OrderReport（同上）
+
+
+class RawInboxDeadLetterError(Exception):
+    """Inc1 D5/R2-6：代表這列 raw_inbox 應該**永久** dead-letter，不進 `association_pending`
+    的 unquarantine 重試迴圈——reason 必須是 `repository.DEAD_LETTER_QUARANTINE_REASONS`
+    三者之一（`scope_violation`/`payload_mismatch`/`user_mismatch`）。"""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def _validate_report_scope(session: Session, *, user_id: int, broker: str, account: str) -> bool:
+    """D5 逐訊息 scope 驗證（codex R1-5）：查 `agent_account_bindings` 是否已有該
+    `(broker,account)` 的綁定列——有列且指向別的 user → False（scope_violation）；查無列＝
+    這個帳號尚未綁定任何人（Task 6 才建立寫入/backfill 邏輯，本 task 只讀）→ 先放行（True）。
+    `user_id`/`account` 皆為 None 的呼叫端（in-process）不會走到這個函式，見
+    `stage_scoped_raw_inbox` 的呼叫 guard。"""
+    binding = brepo.find_account_binding(session, broker=broker, account=account)
+    if binding is None:
+        return True
+    return binding.user_id == user_id
+
+
+def stage_scoped_raw_inbox(
+    session: Session,
+    *,
+    kind: str,
+    broker: str,
+    payload: str,
+    user_id: int | None,
+    account: str | None,
+    mode: str | None,
+    ops_alerter=None,
+) -> RawInbox:
+    """Inc1 D5（R1-6）：**唯一** scoped staging 邏輯——供 `commit_raw_callback`（單筆事件、
+    自己開 session 並立即 commit）與 reconcile 批次落列（`ShioajiAdapter._stage_reconcile_results`，
+    需要與 cursor 推進包在同一交易，因此自己管理 session/commit）共用同一份驗證＋落地邏輯，
+    不重複實作兩份。呼叫端負責 session 生命週期／commit，本函式只 add/flush。
+
+    逐訊息 scope 驗證（codex R1-5）：只在 `user_id`/`account` 皆非 None 時才查
+    `agent_account_bindings`（in-process 呼叫端一律傳 `user_id=None`，不會觸發這個檢查，
+    行為與現行完全一致）——違規時仍然把這列**落地**（不是丟棄，保留稽核證據），並在同一次
+    `add/flush` 內直接標成 `quarantine=True, quarantine_reason="scope_violation"`（經
+    `repository.quarantine_raw_inbox` 一併把 `processed=True`，永久 dead-letter），commit
+    後仍會照常送 DownReportAck（I1/I4：commit-then-ack 不因為驗證失敗而破例），並嘗試發一次
+    OpsAlerter 告警（`ops_alerter` 為 None 時跳過；呼叫失敗吞掉，絕不反噬落地流程）。"""
+    if user_id is not None and account is not None and not _validate_report_scope(
+        session, user_id=user_id, broker=broker, account=account
+    ):
+        row = brepo.stage_raw_inbox(
+            session, kind=kind, broker=broker, payload=payload,
+            user_id=user_id, account=account, mode=mode,
+        )
+        error = f"帳號 {account!r} 不屬於 user_id={user_id} 的綁定（scope_violation，fail closed）"
+        brepo.quarantine_raw_inbox(session, row, error=error, reason="scope_violation")
+        if ops_alerter is not None:
+            try:
+                ops_alerter.quarantine(row_id=row.id, kind=kind, error=error)
+            except Exception:
+                log.exception("scope_violation quarantine 告警失敗（已吞，不影響落地流程）")
+        return row
+    return brepo.stage_raw_inbox(
+        session, kind=kind, broker=broker, payload=payload,
+        user_id=user_id, account=account, mode=mode,
+    )
 
 
 def commit_raw_callback(
-    session_factory: Callable[[], Session], *, kind: str, broker: str, payload: dict
+    session_factory: Callable[[], Session],
+    *,
+    kind: str,
+    broker: str,
+    payload: dict,
+    user_id: int | None,
+    account: str | None,
+    mode: str | None,
+    ops_alerter=None,
 ) -> None:
     """callback thread（或排程協程）呼叫的同步落地函式（round3 BLOCKER#2）：用獨立 Session
-    把 raw payload 落地到 RawInbox 並立即 commit——**返回前保證落地**。呼叫端（Task 6 的
-    ShioajiAdapter callback）只需呼叫這一個函式就完成 durable 保證，不可只排程協程而不等
-    commit 完成就返回。"""
+    把 raw payload 落地到 RawInbox 並立即 commit——**返回前保證落地**。呼叫端（ShioajiAdapter
+    callback／agent_ws UpReport handler）只需呼叫這一個函式就完成 durable 保證，不可只排程
+    協程而不等 commit 完成就返回。
+
+    Inc1 D5（R1-6）：三個呼叫端全部**必須**明確帶 scope（沒有預設值，強迫呼叫端表態，不會有
+    「忘記蓋章」的呼叫路徑）：
+      - in-process `ShioajiAdapter._persist_raw` → `(user_id=None, account=self.account,
+        mode=self.mode)`（in-process 的 user 歸屬本就由 ordno 匹配 Order 決定，不變）。
+      - `agent_ws` UpReport handler → `(user_id=<連線認證 user_id>, account=msg.account,
+        mode=msg.mode)`。
+      - remote reconcile 落列（`ShioajiAdapter._stage_reconcile_results`）改走
+        `stage_scoped_raw_inbox`（不是本函式——那裡需要與 cursor 推進同一交易，見該函式
+        docstring），語意仍是同一套驗證邏輯。
+    """
     with session_factory() as session:
-        brepo.stage_raw_inbox(session, kind=kind, broker=broker, payload=json.dumps(payload))
+        stage_scoped_raw_inbox(
+            session, kind=kind, broker=broker, payload=json.dumps(payload),
+            user_id=user_id, account=account, mode=mode, ops_alerter=ops_alerter,
+        )
         session.commit()
 
 
@@ -151,11 +248,15 @@ class RawInboxWorker:
                     self._process_order_report(session, row, payload)
                 else:
                     raise ValueError(f"未知 raw_inbox.kind: {row.kind!r}")
-            except (ValueError, PositionMismatchError) as exc:
+            except (RawInboxDeadLetterError, ValueError, PositionMismatchError) as exc:
                 session.rollback()
                 row = session.get(RawInbox, row_id)
                 kind = row.kind if row is not None else "?"  # commit 前先取（expire_on_commit 後不再讀 detached row）
-                brepo.quarantine_raw_inbox(session, row, error=str(exc))
+                # R2-6：RawInboxDeadLetterError 攜帶明確 reason（scope_violation/payload_mismatch/
+                # user_mismatch，永久 dead-letter）；既有 ValueError/PositionMismatchError 一律維持
+                # 原本語意，reason="association_pending"（可重試，quarantine_raw_inbox 預設值）。
+                reason = exc.reason if isinstance(exc, RawInboxDeadLetterError) else "association_pending"
+                brepo.quarantine_raw_inbox(session, row, error=str(exc), reason=reason)
                 session.commit()
                 # T0.3 告警（純疊加）：quarantine 落地後才通知；取值/呼叫包 try/except 吞掉，
                 # 告警絕不能反噬處理流程（此列已成功 quarantine，DB 狀態不受告警影響）。
@@ -176,7 +277,12 @@ class RawInboxWorker:
         return payload
 
     def _process_deal(self, session: Session, row: RawInbox, payload: dict) -> None:
-        fill = self._deal_mapper(payload)  # 不合法 → mapper 內部 raise ValueError（Task 6 嚴格驗證）
+        # Inc1 D5/S3：mapper 一律以列上蓋章的 account 為權威（不信任 payload 自帶值可能是
+        # 冒用/矛盾）；payload.account_id 與 row.account 不符時，mapper 內部 raise
+        # RawInboxDeadLetterError(reason="payload_mismatch")——只在 row.account 非 None 時檢查
+        # （row.account 為 None 的舊列/未蓋章列跳過，保持既有位元級行為，同 R2-2 的 user_id
+        # NULL 放行原則）。payload 本身不合法（缺欄位/型別錯）→ mapper 內部 raise ValueError（既有行為）。
+        fill = self._deal_mapper(payload, account=row.account)
 
         order = None
         if fill.ordno:
@@ -192,6 +298,14 @@ class RawInboxWorker:
             raise ValueError(
                 f"無法解析委託關聯（broker={fill.broker!r},account={fill.account!r},mode={fill.mode!r},"
                 f"ordno={fill.ordno!r},broker_order_id={fill.broker_order_id!r}），quarantine 待重建"
+            )
+        # R2-2：只在 row.user_id 非 None（agent 模式蓋章列）才強制比對——in-process 的 NULL 列
+        # 沿用現行「委託歸屬完全由 ordno/broker_order_id 複合鍵解析決定」行為，位元級不變。
+        if row.user_id is not None and order.user_id != row.user_id:
+            raise RawInboxDeadLetterError(
+                "user_mismatch",
+                f"deal_report 解析到的委託 user_id={order.user_id} 與列蓋章 user_id={row.user_id} "
+                f"不符（fill_id={fill.fill_id!r}），fail closed",
             )
 
         # 真實成交回報（FuturesDealEvent）沒有 octype 欄位（見
@@ -239,11 +353,21 @@ class RawInboxWorker:
         session.commit()
 
     def _process_order_report(self, session: Session, row: RawInbox, payload: dict) -> None:
-        report = self._order_report_mapper(payload)
+        # Inc1 D5/S3 拆除：mapper 改吃列上蓋章的 account，不再讀 adapter.account（那是 mutable
+        # 單例，多 agent 會互相污染帳號對映）——見 ShioajiAdapter._map_order_report。
+        report = self._order_report_mapper(payload, account=row.account)
         order = self._resolve_order_report_order(session, report)
         if order is None:
             raise ValueError(
                 f"委託回報無法解析關聯（ordno={report.ordno!r}, broker_order_id={report.broker_order_id!r}）"
+            )
+        # R2-2：同 _process_deal，只在 row.user_id 非 None 才強制比對；NULL 列（in-process）
+        # 位元級行為不變。
+        if row.user_id is not None and order.user_id != row.user_id:
+            raise RawInboxDeadLetterError(
+                "user_mismatch",
+                f"order_report 解析到的委託 user_id={order.user_id} 與列蓋章 user_id={row.user_id} "
+                f"不符（ordno={report.ordno!r}），fail closed",
             )
         brepo.mark_order_status(session, order, status=report.status)
         brepo.mark_raw_inbox_processed(session, row)

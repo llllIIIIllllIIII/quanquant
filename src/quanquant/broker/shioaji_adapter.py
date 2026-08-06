@@ -61,7 +61,12 @@ from quanquant.broker.base import (
     RiskError,
     TradeNotFoundError,
 )
-from quanquant.broker.inbox_worker import OrderReport, commit_raw_callback
+from quanquant.broker.inbox_worker import (
+    OrderReport,
+    RawInboxDeadLetterError,
+    commit_raw_callback,
+    stage_scoped_raw_inbox,
+)
 from quanquant.broker.native import ShioajiNativeClient
 from quanquant.broker.redaction import redact_secrets as _redact_secrets
 from quanquant.broker.supervisor import BrokerSupervisor
@@ -177,7 +182,15 @@ class ShioajiAdapter:
         sim_fee_per_lot: Decimal | None = None,
         ops_alerter=None,
         remote_gateway: "_NativeGatewayLike | None" = None,
+        agent_user_id: int | None = None,
     ) -> None:
+        # Inc1 D5：這個 adapter instance「屬於誰」——in-process 與目前仍是單一共享 channel 的
+        # agent 模式一律不傳（None），callback/reconcile 落地的 RawInbox 蓋章 user_id=None，
+        # 行為與現行完全一致。Task 7 建 per-user `UserAgentSlot` 後，每個 slot 建構自己的
+        # adapter 時會傳 `agent_user_id=slot.user_id`，這個屬性才會真的生效——本 task 只負責
+        # 把這個 scope 一路傳進 commit_raw_callback/stage_scoped_raw_inbox，不改變任何現行呼叫端
+        # 的實際行為。
+        self._agent_user_id = agent_user_id
         self._api_key = api_key
         self._secret_key = secret_key
         self._ca_path = ca_path
@@ -238,8 +251,17 @@ class ShioajiAdapter:
 
     def _persist_raw(self, kind: str, payload: dict) -> None:
         """`self._native` 的 `on_raw` callback：落地責任留在 adapter（DB/session 相依），
-        native 端零 DB 相依（見 native.py 模組頂部說明）。"""
-        commit_raw_callback(self._session_factory, kind=kind, broker=self.broker, payload=payload)
+        native 端零 DB 相依（見 native.py 模組頂部說明）。
+
+        Inc1 D5：在落地當下蓋章 `account=self.account, mode=self.mode`（事件產生瞬間的
+        immutable snapshot，S3 拆除的另一半——mapper 之後讀的是這個蓋章值，不是處理當下可能
+        已經被換帳號覆寫過的 `self.account`）；`user_id=self._agent_user_id`——in-process 與
+        目前仍未拆分的 agent 單例模式一律是 None，行為與現行完全一致。"""
+        commit_raw_callback(
+            self._session_factory, kind=kind, broker=self.broker, payload=payload,
+            user_id=self._agent_user_id, account=self.account, mode=self.mode,
+            ops_alerter=self._ops,
+        )
 
     # ---- T0.3 營運告警（純疊加，絕不反噬既有 fail-closed/冪等/redaction 行為） ----
 
@@ -377,12 +399,24 @@ class ShioajiAdapter:
         """Task 6/8 依賴：把 native 端 `trades_snapshot()` 篩出的委託進展 payload 落地
         RawInbox + 推進 cursor（沿用原 `_reconcile_blocking` L326-333 的呼叫寫法與
         `newest is None` 時的 `_utcnow_naive()` fallback——`payloads` 非空時一律推進 cursor，
-        不留下「有新委託進展卻沒有記錄任何 cursor」的半殘狀態，行為與重構前完全一致）。"""
+        不留下「有新委託進展卻沒有記錄任何 cursor」的半殘狀態，行為與重構前完全一致）。
+
+        Inc1 D5（R1-6）：改走 `stage_scoped_raw_inbox`（唯一 scoped staging 邏輯，不是直接呼叫
+        `repository.stage_raw_inbox`），每筆 payload 都蓋章 `user_id=self._agent_user_id`（目前
+        單例模式下恆為 None，Task 7 per-slot adapter 才會帶真正的 user_id）、
+        `account=self.account`、`mode=self.mode`；整批落列與 cursor 推進**必須同一交易**——
+        中途任何一筆失敗（例如 DB 短暫故障）都要讓已落地的列與 cursor 推進一起回滾，不留下
+        「列已落地但 cursor 沒推進」或反過來的半殘狀態（同一個 `with ... as session:` 區塊、
+        直到最後才 `session.commit()` 一次，中途 raise 就整段不 commit，見呼叫端測試 S#18）。"""
         if not payloads:
             return 0
         with self._session_factory() as session:
             for p in payloads:
-                brepo.stage_raw_inbox(session, kind="order_report", broker=self.broker, payload=json.dumps(p))
+                stage_scoped_raw_inbox(
+                    session, kind="order_report", broker=self.broker, payload=json.dumps(p),
+                    user_id=self._agent_user_id, account=self.account, mode=self.mode,
+                    ops_alerter=self._ops,
+                )
             brepo.upsert_reconcile_cursor(
                 session, broker=self.broker, account=self.account, mode=self.mode,
                 at=newest if newest is not None else _utcnow_naive(),
@@ -857,7 +891,12 @@ class ShioajiAdapter:
     #     PartFilled 狀態一律由成交回報（deal_report）驅動的 `PositionTracker.apply_fill`→
     #     `brepo.apply_order_fill` 更新，不經這個 mapper。
 
-    def _map_deal_report(self, payload: dict) -> Fill:
+    def _map_deal_report(self, payload: dict, *, account: str | None = None) -> Fill:
+        """`account` 是 RawInbox 列上蓋章的值（Inc1 D5，呼叫端見
+        `RawInboxWorker._process_deal`）——只在非 None 時才驗證 `payload["account_id"]` 與它
+        相符（R1-5 payload_mismatch），None（列上未蓋章的舊資料/未帶 scope 的直接呼叫）時跳過
+        驗證，維持既有位元級行為（同 R2-2 的 user_id NULL 放行原則，不因為新增檢查而讓歷史/
+        測試路徑退化）。"""
         try:
             fill_id = payload["trade_id"]
             if not fill_id:
@@ -866,7 +905,7 @@ class ShioajiAdapter:
             qty = int(payload["quantity"])
             price = Decimal(str(payload["price"]))
             ts = int(round(float(payload["ts"]) * 1000))  # 真實 ts 是 epoch 秒(float)，Deal.ts 需 epoch-ms
-            account = payload["account_id"]
+            payload_account = payload["account_id"]
             ordno = payload.get("ordno")
             broker_order_id = payload.get("seqno") or ordno
             fee_raw = payload.get("fee")
@@ -874,6 +913,17 @@ class ShioajiAdapter:
             symbol = payload.get("code") or self.symbol
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ValueError(f"deal_report payload 缺值或格式不合法: {exc}") from exc
+
+        if account is not None and payload_account != account:
+            # R1-5：deal_report payload 自帶的 account_id 與這列 raw_inbox 事件產生當下蓋章的
+            # account 矛盾——可能是帳號冒用或上游資料損壞，一律 fail closed 且**不重試**
+            # （mapper 一律以列 scope 為權威，不信任 payload 自帶值）。
+            raise RawInboxDeadLetterError(
+                "payload_mismatch",
+                f"deal_report payload.account_id={payload_account!r} 與列上蓋章 "
+                f"account={account!r} 不符，fail closed",
+            )
+        account = payload_account
 
         if fee is None and self.mode == "sim" and self._sim_fee_per_lot is not None:
             # A6：sim 模擬單成交 fee 常缺值/零，依設定的「每口」估算，按 qty 分批累計時自然正確
@@ -906,7 +956,12 @@ class ShioajiAdapter:
         "Filled": "filled", "PendingSubmit": "sending", "Submitted": "submitted",
     }
 
-    def _map_order_report(self, payload: dict) -> OrderReport:
+    def _map_order_report(self, payload: dict, *, account: str | None = None) -> OrderReport:
+        """`account`（Inc1 D5/S3 拆除）是 RawInbox 列上蓋章的值（呼叫端見
+        `RawInboxWorker._process_order_report`）——**不**回退讀 `self.account`：那是 mutable
+        單例，事件產生後若帳號被換掉，處理當下讀到的會是新帳號，錯誤地覆蓋掉舊事件真正的
+        歸屬（S3 要拆的縫）。直接呼叫（未傳 `account`，例如既有單元測試）維持 `None`，不強迫
+        補齊。"""
         if "operation" in payload or "order" in payload:
             # 即時串流 callback（真實 FuturesOrderEvent 巢狀結構）。
             order_detail = payload.get("order") or {}
@@ -931,7 +986,7 @@ class ShioajiAdapter:
         if not ordno and not broker_order_id:
             raise ValueError("order_report 缺委託關聯鍵（order.id/order.seqno 或 order_id/seqno），無法關聯委託")
         return OrderReport(
-            broker=self.broker, account=self.account, mode=self.mode,
+            broker=self.broker, account=account, mode=self.mode,
             ordno=ordno, broker_order_id=broker_order_id, status=status,
         )
 

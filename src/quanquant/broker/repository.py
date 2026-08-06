@@ -30,6 +30,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from quanquant.db.models import (
+    AgentAccountBinding,
     BrokerPosition,
     BrokerReconcileCursor,
     ConfirmToken,
@@ -320,13 +321,35 @@ def list_pending_orphans_older_than(
     return list(session.exec(stmt))
 
 
-# ---- RawInbox（durable callback spool，V3-2） ----
+# ---- RawInbox（durable callback spool，V3-2；Inc1 D5：per-user scope 蓋章） ----
 
-def stage_raw_inbox(session: Session, *, kind: str, broker: str, payload: str) -> RawInbox:
-    row = RawInbox(kind=kind, broker=broker, payload=payload)
+def stage_raw_inbox(
+    session: Session,
+    *,
+    kind: str,
+    broker: str,
+    payload: str,
+    user_id: int | None = None,
+    account: str | None = None,
+    mode: str | None = None,
+) -> RawInbox:
+    """Inc1 D5：`user_id`/`account`/`mode` 皆為上行來源在事件產生當下蓋章的 immutable scope
+    （見 `inbox_worker.stage_scoped_raw_inbox`/`commit_raw_callback`——唯一 scoped staging API，
+    本函式是它們共用的底層 insert）。預設全 None 以相容既有直接呼叫端（測試／尚未蓋章的呼叫
+    路徑），語意等同「未蓋章的舊列」，不強制呼叫端一定要指定。"""
+    row = RawInbox(kind=kind, broker=broker, payload=payload, user_id=user_id, account=account, mode=mode)
     session.add(row)
     session.flush()
     return row
+
+
+def find_account_binding(session: Session, *, broker: str, account: str) -> AgentAccountBinding | None:
+    """D10/D5：查 `(broker,account)` 目前綁定的 user（Task 6 才建立寫入/backfill 邏輯，本 task
+    只讀）。查無列＝該帳號尚未綁定任何人。"""
+    stmt = select(AgentAccountBinding).where(
+        AgentAccountBinding.broker == broker, AgentAccountBinding.account == account,
+    )
+    return session.exec(stmt).first()
 
 
 def list_unprocessed_raw_inbox(session: Session, *, limit: int = 200) -> list[RawInbox]:
@@ -346,9 +369,26 @@ def mark_raw_inbox_processed(session: Session, row: RawInbox) -> None:
     session.flush()
 
 
-def quarantine_raw_inbox(session: Session, row: RawInbox, *, error: str) -> None:
+# R2-6：三個永久 dead-letter reason——association_pending（預設，可重試）以外的都不進
+# unquarantine/重試迴圈，退出所有 unprocessed 計數與換帳號 guard（見 quarantine_raw_inbox）。
+DEAD_LETTER_QUARANTINE_REASONS = frozenset({"scope_violation", "payload_mismatch", "user_mismatch"})
+
+
+def quarantine_raw_inbox(
+    session: Session, row: RawInbox, *, error: str, reason: str = "association_pending"
+) -> None:
+    """R2-6 quarantine 分級：`reason="association_pending"`（預設，既有 ValueError/
+    PositionMismatchError 路徑）代表可重試——watchdog `unquarantine_stale_raw_inbox` 之後會
+    給它機會；`reason` 為 `DEAD_LETTER_QUARANTINE_REASONS` 三者之一時是**永久** dead-letter——
+    連同 `quarantine=True` 一併把 `processed=True`（＋`processed_at`）落地，讓這列同時退出
+    `unquarantine_stale_raw_inbox` 的重試迴圈與換帳號 guard 的 unprocessed 計數（那個計數只看
+    `processed==False`，不看 `quarantine`），但保留列本身（`error`/`reason`）供稽核，不是丟棄。"""
     row.quarantine = True
     row.error = error
+    row.quarantine_reason = reason
+    if reason in DEAD_LETTER_QUARANTINE_REASONS:
+        row.processed = True
+        row.processed_at = _utcnow()
     session.add(row)
     session.flush()
 
@@ -356,10 +396,22 @@ def quarantine_raw_inbox(session: Session, row: RawInbox, *, error: str) -> None
 def unquarantine_stale_raw_inbox(session: Session, *, older_than: datetime, limit: int = 200) -> int:
     """把 quarantine 超過 older_than 的列解除隔離，回到一般佇列重新嘗試一次
     （Task 8 watchdog 以較慢週期呼叫——給「當時解不到委託關聯」的列一個補救機會，
-    不會無限重試：解除後若原因仍不變會再次被 quarantine，只是白工，不會誤判成功）。"""
+    不會無限重試：解除後若原因仍不變會再次被 quarantine，只是白工，不會誤判成功）。
+
+    R2-6：只解除 `quarantine_reason` 為 `NULL`（既有列／尚未蓋章 reason 的舊資料，保守視為可
+    重試）或 `'association_pending'` 的列——`DEAD_LETTER_QUARANTINE_REASONS` 三者是永久
+    dead-letter，永不進這個重試迴圈（否則會把已經 fail-closed 判定的列重新丟回處理管線，
+    製造無限重試/告警洪水）。"""
     stmt = (
         select(RawInbox)
-        .where(RawInbox.quarantine.is_(True), RawInbox.received_at < older_than)  # type: ignore[union-attr]
+        .where(
+            RawInbox.quarantine.is_(True),  # type: ignore[union-attr]
+            RawInbox.received_at < older_than,
+            or_(
+                RawInbox.quarantine_reason.is_(None),  # type: ignore[union-attr]
+                RawInbox.quarantine_reason == "association_pending",
+            ),
+        )
         .order_by(RawInbox.id)
         .limit(limit)
     )
@@ -367,6 +419,7 @@ def unquarantine_stale_raw_inbox(session: Session, *, older_than: datetime, limi
     for row in rows:
         row.quarantine = False
         row.error = None
+        row.quarantine_reason = None
         session.add(row)
     session.flush()
     return len(rows)

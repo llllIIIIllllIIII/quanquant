@@ -9,10 +9,15 @@ from decimal import Decimal
 from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
-from quanquant.broker.inbox_worker import OrderReport, RawInboxWorker, commit_raw_callback
+from quanquant.broker.inbox_worker import (
+    OrderReport,
+    RawInboxDeadLetterError,
+    RawInboxWorker,
+    commit_raw_callback,
+)
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill
-from quanquant.db.models import BrokerPosition, Deal, Order, RawInbox
+from quanquant.db.models import AgentAccountBinding, BrokerPosition, Deal, Order, RawInbox
 
 
 def _order_kwargs(**over):
@@ -35,7 +40,10 @@ def _deal_payload(**over):
     return base
 
 
-def _ok_deal_mapper(payload: dict) -> Fill:
+def _ok_deal_mapper(payload: dict, *, account: str | None = None) -> Fill:
+    # Inc1 D5：`_process_deal` 現在一律呼叫 `mapper(payload, account=row.account)`——這些既有
+    # 測試都直接用 `stage_raw_inbox` 落列、不帶 account（row.account 恆為 None），`account`
+    # 收下但不使用，維持既有位元級行為（同 R2-2 的 NULL 放行原則）。
     return Fill(
         broker=payload["broker"], fill_id=payload["fill_id"], ordno=payload["ordno"],
         broker_order_id=payload["broker_order_id"], symbol=payload["symbol"], action=payload["action"],
@@ -45,7 +53,7 @@ def _ok_deal_mapper(payload: dict) -> Fill:
     )
 
 
-def _noop_order_report_mapper(payload: dict) -> OrderReport:
+def _noop_order_report_mapper(payload: dict, *, account: str | None = None) -> OrderReport:
     return OrderReport(**payload)
 
 
@@ -153,7 +161,7 @@ def test_deal_report_octype_comes_from_resolved_order_not_mapper_payload(session
     （見 broker/shioaji_adapter.py::_map_deal_report 的 "Auto" 占位說明）。"""
     _seed_order(session, octype="Cover", action="Sell")  # 對應委託是平倉
 
-    def _mapper_with_wrong_octype_placeholder(payload: dict) -> Fill:
+    def _mapper_with_wrong_octype_placeholder(payload: dict, *, account: str | None = None) -> Fill:
         return Fill(
             broker=payload["broker"], fill_id=payload["fill_id"], ordno=payload["ordno"],
             broker_order_id=payload["broker_order_id"], symbol=payload["symbol"],
@@ -233,6 +241,181 @@ def test_position_mismatch_quarantines_without_partial_deal_write(session, engin
         assert row.quarantine is True
 
 
+# ---- Inc1 D5/R2-6：quarantine 分級（scope_violation/payload_mismatch/user_mismatch 永久
+#      dead-letter；association_pending 才可重試）＋唯一 scoped staging API ----
+
+def test_dead_letter_error_from_mapper_marks_permanent_quarantine_with_reason(session, engine):
+    """R2-6：mapper 拋 RawInboxDeadLetterError（如 payload_mismatch）必須標
+    processed=True＋quarantine=True＋對應 reason——不是既有 ValueError 的
+    association_pending（可重試）語意。"""
+    def _mismatch_mapper(payload: dict, *, account=None) -> Fill:
+        raise RawInboxDeadLetterError("payload_mismatch", "payload.account_id 與列蓋章不符")
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    worker = _worker(engine, deal_mapper=_mismatch_mapper)
+    handled = worker.process_batch_once()
+    assert handled == 1  # dead-letter 也算「確定處理完」
+
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True
+        assert row.processed is True  # R2-6：永久 dead-letter，退出換帳號 guard 的 unprocessed 計數
+        assert row.quarantine_reason == "payload_mismatch"
+        assert s.exec(select(Deal)).first() is None  # 沒有部分寫入
+
+
+def test_dead_letter_rows_are_never_retried_by_unquarantine_stale(session, engine):
+    """R2-6：association_pending 才進 unquarantine 重試迴圈；dead-letter 永不被解除。"""
+    def _mismatch_mapper(payload: dict, *, account=None) -> Fill:
+        raise RawInboxDeadLetterError("payload_mismatch", "payload.account_id 與列蓋章不符")
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+    worker = _worker(engine, deal_mapper=_mismatch_mapper)
+    worker.process_batch_once()
+
+    import datetime as dt
+    with Session(engine) as s:
+        released = brepo.unquarantine_stale_raw_inbox(
+            s, older_than=dt.datetime.now(dt.timezone.utc).replace(tzinfo=None) + dt.timedelta(seconds=1)
+        )
+        assert released == 0
+        s.commit()
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True and row.processed is True
+
+
+def test_deal_report_user_mismatch_dead_letters_no_partial_write(session, engine):
+    """R2-2：row.user_id 非 None（agent 模式蓋章列）且與解析到的 Order.user_id 不符 →
+    user_mismatch 永久 dead-letter，不留部分寫入（Deal/BrokerPosition 都不得被寫入）。"""
+    _seed_order(session)  # user_id=1（_order_kwargs 預設）
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()), user_id=999,
+        )
+        s.commit()
+
+    worker = _worker(engine)
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True and row.processed is True
+        assert row.quarantine_reason == "user_mismatch"
+        assert s.exec(select(Deal)).first() is None
+        assert s.exec(select(BrokerPosition)).first() is None
+
+
+def test_order_report_user_mismatch_dead_letters_status_untouched(session, engine):
+    _seed_order(session)  # user_id=1
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+                broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+            )),
+            user_id=999,
+        )
+        s.commit()
+    worker = _worker(engine)
+    handled = worker.process_batch_once()
+    assert handled == 1
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True and row.processed is True
+        assert row.quarantine_reason == "user_mismatch"
+        order = s.exec(select(Order)).first()
+        assert order.status == "submitted"  # 沒被亂改
+
+
+def test_commit_raw_callback_no_binding_yet_permits_staging(engine):
+    """R1-5：查無 `agent_account_bindings` 列＝該帳號尚未綁定任何人（Task 6 才建立寫入/
+    backfill 邏輯）→ 先放行，不誤擋。"""
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=2, account="F1", mode="sim",
+    )
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row is not None
+        assert row.quarantine is False and row.processed is False
+        assert row.user_id == 2 and row.account == "F1" and row.mode == "sim"
+
+
+def test_commit_raw_callback_binding_match_permits_staging(engine):
+    with Session(engine) as s:
+        s.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=2))
+        s.commit()
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=2, account="F1", mode="sim",
+    )
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is False
+
+
+def test_commit_raw_callback_binding_mismatch_dead_letters_scope_violation(engine):
+    """R1-5：偽造 scope——UpReport 帶的 account 已綁定給別的 user → scope_violation 永久
+    dead-letter，仍然落地（保留稽核證據，不是丟棄）。"""
+    with Session(engine) as s:
+        s.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=1))
+        s.commit()
+
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=2, account="F1", mode="sim",  # user 2 冒用綁定給 user 1 的帳號
+    )
+
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row is not None
+        assert row.quarantine is True and row.processed is True
+        assert row.quarantine_reason == "scope_violation"
+        assert row.user_id == 2 and row.account == "F1"  # 蓋章仍是連線認證的 user，供稽核
+
+
+def test_commit_raw_callback_in_process_user_id_none_never_checks_binding(engine):
+    """in-process 呼叫端一律 user_id=None——即使綁定表存在矛盾列，也不觸發 scope 檢查
+    （in-process 零變更，這個檢查只在 user_id 非 None 時才跑）。"""
+    with Session(engine) as s:
+        s.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=999))
+        s.commit()
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=None, account="F1", mode="sim",
+    )
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is False and row.user_id is None
+
+
+def test_commit_raw_callback_scope_violation_alerts_ops_once(engine):
+    class _Recording:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def quarantine(self, **kw) -> None:
+            self.calls.append(kw)
+
+    with Session(engine) as s:
+        s.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=1))
+        s.commit()
+
+    alerter = _Recording()
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=2, account="F1", mode="sim", ops_alerter=alerter,
+    )
+    assert len(alerter.calls) == 1
+    assert alerter.calls[0]["kind"] == "deal_report"
+
+
 def test_unexpected_exception_leaves_row_pending_not_quarantined_zero_loss(session, engine):
     """V3-2 核心回歸：非預期例外（非 ValueError/PositionMismatchError）不得 quarantine，
     必須留 processed=False 讓下一輪重試——這就是『重啟後 raw-inbox 仍在，最終恰一次 effect』。"""
@@ -242,11 +425,11 @@ def test_unexpected_exception_leaves_row_pending_not_quarantined_zero_loss(sessi
 
     calls = {"n": 0}
 
-    def _flaky_mapper(payload: dict) -> Fill:
+    def _flaky_mapper(payload: dict, *, account: str | None = None) -> Fill:
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("模擬暫時性故障（非業務邏輯錯誤）")
-        return _ok_deal_mapper(payload)
+        return _ok_deal_mapper(payload, account=account)
 
     worker = _worker(engine, deal_mapper=_flaky_mapper)
     _seed_order(session)
@@ -402,7 +585,10 @@ def test_commit_raw_callback_lands_durably_before_returning(engine):
     committed DB 狀態（獨立 Session、真正 commit，不是排程一個協程晚點才寫）——即使呼叫端
     之後 crash、從未啟動任何 worker，raw payload 也已經安全落地，不會遺失。"""
     payload = _deal_payload()
-    commit_raw_callback(lambda: Session(engine), kind="deal_report", broker="shioaji", payload=payload)
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload=payload,
+        user_id=None, account=None, mode=None,
+    )
 
     with Session(engine) as s:
         row = s.exec(select(RawInbox)).first()
