@@ -28,6 +28,7 @@ from fastapi.responses import HTMLResponse
 from sqlmodel import Session
 from sse_starlette.sse import EventSourceResponse
 
+from quanquant.auth import agent_tokens as agent_token_service
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
 from quanquant.broker.redaction import redact_secrets
@@ -223,21 +224,51 @@ def _edit_form_error(session: Session, service, broker_order_id: str, message: s
 @router.get("/orders", response_class=HTMLResponse)
 async def orders_page(
     request: Request,
+    session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
     service=Depends(get_order_service),
     risk_guard=Depends(get_order_risk_guard),
     mode: str | None = Query(None),
 ):
     resolved_mode = _mode(mode or (service.mode if service is not None else None))
-    # kill switch 控制只給 owner 看（server 端切換仍一律經 assert_owner，非只靠前端隱藏）；
-    # risk_guard 可能為 None（下單子系統停用）——此時無 owner、也不顯示控制。
+    # kill switch／agent token 管理段只給 owner 看（server 端切換/簽發仍一律經
+    # assert_owner，非只靠前端隱藏）；risk_guard 可能為 None（下單子系統停用）——此時無
+    # owner、也不顯示控制。
     is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
     kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
+    token_row = agent_token_service.get_active_token(session, user_id=user.id) if is_owner else None
     return templates.TemplateResponse(request, "orders.html", {
         "active": "orders", "mode": resolved_mode,
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
         "symbols": ["TXF"], "is_owner": is_owner, "kill_switch": kill_switch,
+        "token_row": token_row, "raw_token": None,
     })
+
+
+@router.post("/orders/agent-token", response_class=HTMLResponse)
+async def issue_agent_token(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    risk_guard=Depends(get_order_risk_guard),
+):
+    """owner-only：簽發／rotation agent WS token（D2）。明文只在這次回應顯示一次——DB
+    只存 hash，離開這個回應後無法再取得明文，只能重新產生（rotation，舊枚立即作廢）。
+    子系統停用（risk_guard 為 None）時優雅回一個停用片段（比照 kill switch），不 500——
+    按鈕正常情況下只在 is_owner 時才會渲染，這裡是防呆（如子系統在使用者開著頁面時被關）。"""
+    if risk_guard is None:
+        return HTMLResponse(render_partial(
+            "partials/agent_token_control.html", token_row=None, raw_token=None, disabled=True,
+        ))
+    try:
+        risk_guard.assert_owner(user.id)  # 非 owner → AuthorizationError → 403（比照 kill switch）
+    except AuthorizationError:
+        raise HTTPException(status_code=403, detail="not owner")
+    ttl_days = get_settings().agent_token_ttl_days
+    raw = agent_token_service.issue_token(session, user_id=user.id, ttl_days=ttl_days)
+    token_row = agent_token_service.get_active_token(session, user_id=user.id)
+    return HTMLResponse(render_partial(
+        "partials/agent_token_control.html", token_row=token_row, raw_token=raw,
+    ))
 
 
 @router.post("/orders/kill-switch", response_class=HTMLResponse)

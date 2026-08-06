@@ -11,7 +11,7 @@ from quanquant.web.deps import get_poller, get_session
 
 
 def _settings(**kw):
-    base = dict(order_channel="agent", order_mode="sim", agent_ws_token="tok",
+    base = dict(order_channel="agent", order_mode="sim",
                 order_owner_user_ids="1", session_secret="s")
     base.update(kw)
     return Settings(**base)
@@ -54,9 +54,13 @@ async def test_agent_mode_requires_sim(engine, monkeypatch):
     assert "僅支援" in (state.last_error or "") and tasks == []
 
 
-async def test_agent_mode_without_token_disabled(engine, monkeypatch):
-    _, state, tasks = await _run(_settings(agent_ws_token=""), engine, monkeypatch)
-    assert state.disabled and tasks == []                   # 刻意停用 → /healthz 200
+# D2：`agent_ws_token`（站台層級靜態密鑰）已整個移除，原
+# `test_agent_mode_without_token_disabled`（測「未設定 AGENT_WS_TOKEN → 通道停用」）連同
+# 這個機制一起消失——沒有站台層級的靜態密鑰可以「未設定」了，改成 per-user DB opaque
+# token（見 `auth/agent_tokens.py`），token 存在與否是每個 user 自己的事，不再是
+# channel 啟動與否的閘門。等價的「無效/缺席 token 一律拒絕連線」安全性保證改由
+# `tests/test_agent_ws.py::test_ws_rejects_when_token_header_missing_or_empty` 與
+# `test_bad_token_closed` 在 WS 握手層驗證（比啟動閘門更貼近真正的防線位置）。
 
 
 async def test_agent_mode_without_owner_disabled(engine, monkeypatch):

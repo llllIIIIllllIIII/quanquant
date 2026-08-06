@@ -16,7 +16,7 @@ from decimal import Decimal
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker import repository as brepo
@@ -25,6 +25,7 @@ from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import OrderAck, Position
+from quanquant.db.models import AgentToken
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_poller, get_session
 from quanquant.web.routers.orders import _parse_optional_update_price, _parse_order_price
@@ -383,6 +384,83 @@ def test_orders_page_hides_kill_switch_control_for_non_owner(order_client, fake_
     fake_guard._owner_ids = set()  # user 非 owner
     text = order_client.get("/orders").text
     assert 'hx-post="/orders/kill-switch"' not in text
+
+
+# ---------------------------------------------------------------------------
+# D2：POST /orders/agent-token（owner-only 簽發/rotation）＋ orders 頁 token 管理段
+# ---------------------------------------------------------------------------
+
+def test_agent_token_owner_can_issue_and_sees_plaintext_once(order_client, session, user):
+    resp = order_client.post("/orders/agent-token")
+    assert resp.status_code == 200
+    assert "<code" in resp.text  # 明文有渲染出來
+    assert "尚未產生" not in resp.text
+    row = session.exec(select(AgentToken).where(AgentToken.user_id == user.id)).one()
+    assert row.revoked_at is None
+    assert str(row.expires_at) in resp.text  # UI 顯示 expires_at
+
+
+def test_agent_token_rotation_revokes_previous_row_and_shows_new_plaintext(order_client, session, user):
+    first = order_client.post("/orders/agent-token")
+    first_plaintext = re.search(r"<code[^>]*>([^<]+)</code>", first.text).group(1)
+
+    second = order_client.post("/orders/agent-token")
+    second_plaintext = re.search(r"<code[^>]*>([^<]+)</code>", second.text).group(1)
+
+    assert first_plaintext != second_plaintext
+    rows = session.exec(
+        select(AgentToken).where(AgentToken.user_id == user.id).order_by(AgentToken.created_at)
+    ).all()
+    assert len(rows) == 2
+    assert rows[0].revoked_at is not None      # 舊枚被 rotation 作廢
+    assert rows[1].revoked_at is None          # 新枚仍有效
+
+
+def test_agent_token_non_owner_gets_403_and_does_not_issue(order_client, fake_guard, session, user):
+    fake_guard._owner_ids = set()  # 沒有任何 owner → 目前 user 不是 owner
+    resp = order_client.post("/orders/agent-token")
+    assert resp.status_code == 403
+    assert session.exec(select(AgentToken).where(AgentToken.user_id == user.id)).first() is None
+
+
+def test_agent_token_without_risk_guard_does_not_500(engine, user):
+    """risk_guard 為 None（下單子系統關）→ 優雅回應（200 停用片段），不是 500（比照 kill switch）。"""
+    def _session_override():
+        with Session(engine) as s:
+            yield s
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _session_override
+    app.dependency_overrides[get_poller] = lambda: None
+    # 刻意不設 app.state.order_risk_guard → get_order_risk_guard 回 None
+    c = TestClient(app)
+    c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
+    resp = c.post("/orders/agent-token")
+    assert resp.status_code == 200
+    assert "未啟用" in resp.text
+
+
+def test_orders_page_shows_agent_token_control_for_owner(order_client):
+    text = order_client.get("/orders").text
+    assert 'hx-post="/orders/agent-token"' in text
+    assert "尚未產生 agent token" in text  # 尚未簽發過
+
+
+def test_orders_page_hides_agent_token_control_for_non_owner(order_client, fake_guard):
+    fake_guard._owner_ids = set()  # user 非 owner
+    text = order_client.get("/orders").text
+    assert 'hx-post="/orders/agent-token"' not in text
+
+
+def test_orders_page_reload_does_not_leak_plaintext_after_issue(order_client):
+    """簽發當下的回應才看得到明文；重新整理 /orders 頁只看得到 expires_at/last_used_at，
+    看不到明文（DB 本就只存 hash，route 只在簽發那次回應塞 raw_token）。"""
+    issue_resp = order_client.post("/orders/agent-token")
+    plaintext = re.search(r"<code[^>]*>([^<]+)</code>", issue_resp.text).group(1)
+
+    reload_text = order_client.get("/orders").text
+    assert plaintext not in reload_text
+    assert "尚未使用" in reload_text  # 剛簽發、還沒被 WS 握手用過
 
 
 # ---- bug 1（simtrade 實測回歸）：_parse_order_price 對 None 的確切防線單元測試 ----

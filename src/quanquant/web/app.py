@@ -201,7 +201,9 @@ async def _start_agent_channel_subsystem(
     `/ws/agent` 上下行；server 端仍是唯一決策者（風控/冪等/配額全在這裡，未變）。
 
     Increment 0 硬限制：僅支援 `ORDER_MODE=sim`（agent 端目前只做模擬撮合，real 走 CA 簽署
-    尚未實作）；未設定 `AGENT_WS_TOKEN`／owner id 皆是刻意停用（非故障，/healthz 仍 200）。
+    尚未實作）；未設定 owner id 是刻意停用（非故障，/healthz 仍 200）。D2：agent WS 連線
+    驗證改為 per-user DB opaque token（`auth/agent_tokens.py`），不再有站台層級的靜態密鑰
+    需要在這裡檢查——沒 owner id 就沒有人能被判定為 owner，故仍需 owner id 檢查。
     """
     from decimal import Decimal
 
@@ -214,9 +216,6 @@ async def _start_agent_channel_subsystem(
 
     if settings.order_mode != "sim":
         order_state.mark_unhealthy("agent 通道 Increment 0 僅支援 ORDER_MODE=sim")
-        return
-    if not settings.agent_ws_token:
-        order_state.mark_disabled("未設定 AGENT_WS_TOKEN，agent 通道停用")
         return
     owner_ids = parse_owner_ids(settings.order_owner_user_ids)
     if not owner_ids:

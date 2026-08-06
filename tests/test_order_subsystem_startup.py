@@ -107,7 +107,7 @@ def test_order_channel_agent_dispatches_before_inprocess_preflight(monkeypatch):
     app = FastAPI()
     tasks: list = []
     asyncio.run(_start_order_subsystem(
-        app, _settings(order_channel="agent", agent_ws_token="tok"), tasks,
+        app, _settings(order_channel="agent"), tasks,
     ))
 
     from quanquant.broker.agent_channel import AgentChannel

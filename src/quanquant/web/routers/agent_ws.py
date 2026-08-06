@@ -3,57 +3,79 @@
 鐵律：本 receive 迴圈絕不取得 supervisor.lock、絕不 inline await 長工作
 （login 觸發的 reconcile 一律 create_task）——否則 receive 迴圈等 reconcile、
 reconcile 等 cmd_ack、cmd_ack 需要 receive 迴圈 → 死鎖。
+
+D2：連線驗證改為 per-user DB opaque token（`auth/agent_tokens.py`），取代 Inc0 全站共用的
+`AGENT_WS_TOKEN` 靜態密鑰。握手拿到的 `user_id` 本 task 先只當作 owner 授權判定用（單一
+`agent_channel`／單 slot 架構不變，Task 7 才會把它接上 per-user registry）。
 """
 import asyncio
 import logging
-import secrets as _secrets
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
 from sqlalchemy import func
 from sqlmodel import select
 
+from quanquant.auth.agent_tokens import validate_token
 from quanquant.broker.agent_protocol import (
     DownReportAck, UpCmdAck, UpHealth, UpLogin, UpReport, parse_uplink,
 )
 from quanquant.broker.inbox_worker import commit_raw_callback
-from quanquant.config import get_settings
-from quanquant.db.models import RawInbox
+from quanquant.db.models import RawInbox, User
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _authenticate(session_factory, risk_guard, raw_token: str) -> int | None:
+    """同步 DB 工作（呼叫端須用 `asyncio.to_thread` 包起來，receive 迴圈鐵律：絕不 inline
+    await 長工作——這裡是握手階段、尚未進入 receive 迴圈，但仍離開 event loop 以免擋住其他
+    連線）：`x-agent-token` → `validate_token`（sha256 查表，過期/撤銷回 None）→ 載 User
+    驗 `is_active` → `RiskGuard.is_owner` 白名單。任一步失敗回 None（呼叫端一律 close(1008)，
+    不區分是 token 無效／帳號停用／非 owner——避免對外洩漏驗證失敗在哪一步）。"""
+    with session_factory() as session:
+        token_row = validate_token(session, raw=raw_token)
+        if token_row is None:
+            return None
+        user = session.get(User, token_row.user_id)
+        if user is None or not user.is_active:
+            return None
+        if risk_guard is None or not risk_guard.is_owner(user.id):
+            return None
+        return user.id
+
+
 @router.websocket("/ws/agent")
 async def agent_ws(websocket: WebSocket) -> None:
-    settings = get_settings()
     state = websocket.app.state
     channel = getattr(state, "agent_channel", None)
-    token = websocket.headers.get("x-agent-token", "")
+    raw_token = websocket.headers.get("x-agent-token", "")
     await websocket.accept()
-    # 修：secrets.compare_digest 對非 ASCII str 直接 raise TypeError（Starlette 的 header
-    # 依 ASGI spec 用 latin-1 解碼，理論上可出現非 ASCII 字元）；比對一律先各自 encode 成
-    # bytes 再交給 compare_digest，bytes 版本沒有這個限制，token 不符時照樣安全回 1008。
-    if (channel is None or not settings.agent_ws_token
-            or not _secrets.compare_digest(
-                token.encode("utf-8"), settings.agent_ws_token.encode("utf-8")
-            )):
+    if channel is None:
         await websocket.close(code=1008)
         return
-    # 連線洩漏防呆：這三個 app.state 屬性務必在 channel.attach 之前讀完——缺任一個
+    # 連線洩漏防呆：這幾個 app.state 屬性務必在 channel.attach 之前讀完——缺任一個
     # （wiring 未完成）就直接關閉連線並 return，channel 才不會卡在 attached 態卻永遠等不到
     # 對應的 finally 清理（之後真正的 agent 連線會被誤判成「已有連線」而被踢掉，永久連不上）。
+    # order_risk_guard 也在這裡一併讀出——token 驗證的 owner 判定需要它，缺席同樣視為
+    # wiring 不完整（1011），而非驗證失敗（1008）。
     try:
         order_state = state.order_session_state
         adapter = state.order_service
         session_factory = state.order_session_factory
+        risk_guard = state.order_risk_guard
     except AttributeError:
         log.error(
             "agent WS wiring 不完整（缺 order_session_state/order_service/"
-            "order_session_factory），拒絕連線"
+            "order_session_factory/order_risk_guard），拒絕連線"
         )
         await websocket.close(code=1011)
         return
+    agent_user_id = await asyncio.to_thread(_authenticate, session_factory, risk_guard, raw_token)
+    if agent_user_id is None:
+        await websocket.close(code=1008)
+        return
+    log.info("agent WS 通過驗證，user_id=%s（Task 7 前仍沿用單一共享 channel）", agent_user_id)
     hub = getattr(state, "order_events", None)
     if channel.connected:
         channel.detach()   # 新連線取代殘留半開連線（agent 重啟；無條件，不帶 generation）

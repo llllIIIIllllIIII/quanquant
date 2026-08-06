@@ -1,0 +1,25 @@
+<div id="agent-token-control" style="margin:0 0 1rem;display:flex;flex-direction:column;gap:.6rem;">
+  <strong>Agent Token</strong>
+  {% if disabled|default(false) %}
+  <div class="muted" style="font-size:.85em;">Agent token 管理無法使用（下單子系統未啟用）</div>
+  {% else %}
+  {% if raw_token %}
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid #c0392b;background:rgba(192,57,43,.08);">
+    <div class="muted" style="font-size:.85em;margin-bottom:.3rem;">明文只顯示這一次，請立即複製；離開此頁後無法再次查看，只能重新產生（原 token 立即作廢）：</div>
+    <code style="word-break:break-all;">{{ raw_token }}</code>
+  </div>
+  {% endif %}
+  {% if token_row %}
+  <div class="muted" style="font-size:.85em;">
+    到期時間：{{ token_row.expires_at }}　最後使用：{{ token_row.last_used_at or '尚未使用' }}
+  </div>
+  {% else %}
+  <div class="muted" style="font-size:.85em;">尚未產生 agent token。</div>
+  {% endif %}
+  <form hx-post="/orders/agent-token" hx-target="#agent-token-control" hx-swap="outerHTML" style="margin:0;">
+    <button type="submit" class="{{ 'secondary' if token_row else 'contrast' }}" style="margin:0;">
+      {{ '重新產生（原 token 立即作廢）' if token_row else '產生 Agent Token' }}
+    </button>
+  </form>
+  {% endif %}
+</div>

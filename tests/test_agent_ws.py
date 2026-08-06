@@ -1,12 +1,17 @@
+import datetime as dt
 import time
+from datetime import timedelta
+
 import pytest
 from sqlmodel import Session, select
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+from quanquant.auth import service as auth_service
+from quanquant.auth.agent_tokens import issue_token
 from quanquant.broker.agent_channel import AgentChannel
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.config import get_settings
-from quanquant.db.models import RawInbox
+from quanquant.db.models import AgentToken, RawInbox
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_session
 
@@ -38,6 +43,15 @@ class _SpyChannel(AgentChannel):
         super().resolve_ack(ack)
 
 
+class _FakeRiskGuard:
+    """D2 測試替身：只需要 `is_owner`（WS 握手唯一用到的介面），不拉進完整
+    `RiskGuard`（session_factory/secret/quota 等與本檔測試焦點無關）。"""
+    def __init__(self, owner_ids):
+        self._owner_ids = set(owner_ids)
+    def is_owner(self, user_id):
+        return user_id in self._owner_ids
+
+
 def _wait(cond, timeout=2.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -49,7 +63,9 @@ def _wait(cond, timeout=2.0):
 
 @pytest.fixture
 def ws_env(engine, monkeypatch):
-    monkeypatch.setenv("AGENT_WS_TOKEN", "tok")
+    # D2：連線驗證改為 per-user DB opaque token——不再需要 AGENT_WS_TOKEN 這個站台層級
+    # 靜態密鑰；改為先建一個 owner 使用者、幫它簽發一枚真的 agent token，WS 測試一律帶
+    # 這枚 token（`ws_env.state.agent_test_token`）連線。
     get_settings.cache_clear()
     app = create_app()
 
@@ -58,11 +74,18 @@ def ws_env(engine, monkeypatch):
             yield s
 
     app.dependency_overrides[get_session] = _session_override
+    with Session(engine) as s:
+        owner = auth_service.create_user(s, "agent-owner", "pw", role="admin")
+        owner_id = owner.id  # 讀出來存純值——owner 本身在 with 區塊結束後就會 detach
+        token = issue_token(s, user_id=owner_id, ttl_days=30)
     app.state.agent_channel = _SpyChannel()
     app.state.order_session_state = OrderSessionState()
     app.state.order_events = _FakeHub()
     app.state.order_service = _FakeAdapter()
     app.state.order_session_factory = lambda: Session(engine)
+    app.state.order_risk_guard = _FakeRiskGuard({owner_id})
+    app.state.agent_test_token = token
+    app.state.agent_test_owner_id = owner_id
     yield app
     get_settings.cache_clear()
 
@@ -76,7 +99,7 @@ def test_bad_token_closed(ws_env):
 
 def test_login_marks_ready_sets_account_schedules_reconcile(ws_env):
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_session_state.ready)
         assert ws_env.state.order_service.account == "F1"
@@ -88,7 +111,7 @@ def test_login_marks_ready_sets_account_schedules_reconcile(ws_env):
 def test_report_staged_then_acked(ws_env, engine):
     # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
                       "account": "F1", "mode": "sim", "payload": {"trade_id": "T1"}})
@@ -102,7 +125,7 @@ def test_duplicate_report_resend_both_staged_and_acked(ws_env, engine):
     # at-least-once：staging 層允許重複列，去重由既有 Deal 層 uq_deal_fill 吸收
     # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         for _ in range(2):
             ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
@@ -127,7 +150,7 @@ def test_report_ack_only_after_commit_success(ws_env, engine, monkeypatch, caplo
     client = TestClient(ws_env)
     received = []
     try:
-        with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
             ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
             ws.send_json({"type": "report", "event_id": 5, "kind": "deal_report",
                          "account": "F1", "mode": "sim", "payload": {}})
@@ -147,7 +170,7 @@ def test_report_ack_only_after_commit_success(ws_env, engine, monkeypatch, caplo
 
 def test_cmd_ack_routed_to_channel(ws_env):
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "cmd_ack", "cmd_id": "c9", "event_id": 1, "ok": True,
                      "result": {}})
         assert _wait(lambda: len(ws_env.state.agent_channel.acks) == 1)
@@ -159,7 +182,7 @@ def test_login_reconcile_not_inline_receive_loop_stays_responsive(ws_env, engine
     adapter = ws_env.state.order_service
     adapter.block = asyncio.Event()   # reconcile 永久卡住
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         ws.send_json({"type": "report", "event_id": 1, "kind": "order_report",
                       "account": "F1", "mode": "sim", "payload": {"k": 1}})
@@ -171,7 +194,7 @@ def test_login_reconcile_not_inline_receive_loop_stays_responsive(ws_env, engine
 def test_invalid_frame_ignored_connection_survives(ws_env):
     # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         ws.send_json({"type": "evil"})
         ws.send_json({"type": "report", "event_id": 2, "kind": "order_report",
@@ -180,9 +203,13 @@ def test_invalid_frame_ignored_connection_survives(ws_env):
 
 
 def test_ws_closes_when_wiring_incomplete_missing_session_factory(engine, monkeypatch):
-    # Task 8 附加需求 1：channel.attach 前務必讀完 order_session_state/order_service/
-    # order_session_factory——缺任一個就拒絕連線，channel 不能卡在 attached 態洩漏。
-    monkeypatch.setenv("AGENT_WS_TOKEN", "tok")
+    # Task 8 附加需求 1（D2 更新：wiring 完整性檢查現在也涵蓋 order_risk_guard，因為 token
+    # 驗證的 owner 判定需要它——但這裡缺的是更早讀取的 order_session_factory，所以不論
+    # risk_guard 有沒有設都一樣落在這個分支）：channel.attach 前務必讀完
+    # order_session_state/order_service/order_session_factory/order_risk_guard——缺任一個
+    # 就拒絕連線，channel 不能卡在 attached 態洩漏。token 驗證本身依賴 session_factory，
+    # 缺席時連驗證都做不了，所以 wiring 檢查必須先於 token 驗證——這裡帶什麼 token 字串
+    # 都不影響結果（1011 而非 1008）。
     get_settings.cache_clear()
     app = create_app()
 
@@ -199,7 +226,7 @@ def test_ws_closes_when_wiring_incomplete_missing_session_factory(engine, monkey
     # 故意不設定 app.state.order_session_factory —— 模擬 wiring 未完成
 
     client = TestClient(app)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "irrelevant"}) as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
             ws.receive_json()
     assert exc_info.value.code == 1011
@@ -207,11 +234,43 @@ def test_ws_closes_when_wiring_incomplete_missing_session_factory(engine, monkey
     get_settings.cache_clear()
 
 
+def test_ws_closes_when_wiring_incomplete_missing_risk_guard(engine):
+    # D2 新增：order_risk_guard 是 owner 判定的必要依賴，缺席同樣算 wiring 不完整（1011），
+    # 不是「驗證失敗」（1008）——即使帶的是合法 token 也一樣，因為根本沒有東西可以判斷
+    # is_owner。
+    get_settings.cache_clear()
+    app = create_app()
+
+    def _session_override():
+        with Session(engine) as s:
+            yield s
+
+    app.dependency_overrides[get_session] = _session_override
+    channel = AgentChannel()
+    app.state.agent_channel = channel
+    app.state.order_session_state = OrderSessionState()
+    app.state.order_events = _FakeHub()
+    app.state.order_service = _FakeAdapter()
+    app.state.order_session_factory = lambda: Session(engine)
+    # 故意不設定 app.state.order_risk_guard —— 模擬 wiring 未完成
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "irrelevant"}) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1011
+    assert not channel.connected
+    get_settings.cache_clear()
+
+
 def test_non_ascii_token_rejected_not_crashed(ws_env):
-    # `secrets.compare_digest` 對非 ASCII str 直接 raise TypeError；Starlette 依 ASGI spec
-    # 用 latin-1 解碼 header，理論上可帶非 ASCII 字元。httpx 的 TestClient 對 str header
-    # 值本身強制 ascii-only（client 端送不出去），所以這裡直接用 latin-1 編碼過的 bytes
-    # 當 header value，繞過 client 端限制、重現「server 收到非 ASCII token」的情境。
+    # D2 更新：舊機制的 `secrets.compare_digest` 對非 ASCII str 直接 raise TypeError；新機制
+    # 改成 DB hash 查表（`raw.encode("utf-8")` 餵給 hashlib，對任何 Unicode 字串都合法），
+    # 不再有那個崩潰疑慮——本測試改驗證「規則仍然安全」：Starlette 依 ASGI spec 用 latin-1
+    # 解碼 header，理論上可帶非 ASCII 字元；httpx 的 TestClient 對 str header 值本身強制
+    # ascii-only（client 端送不出去），所以這裡直接用 latin-1 編碼過的 bytes 當 header
+    # value，繞過 client 端限制、重現「server 收到非 ASCII token」的情境——查無此 hash，
+    # 照樣安全回 1008，不崩潰。
     client = TestClient(ws_env)
     with client.websocket_connect(
         "/ws/agent", headers={"x-agent-token": "é".encode("latin-1")}
@@ -221,27 +280,16 @@ def test_non_ascii_token_rejected_not_crashed(ws_env):
     assert exc_info.value.code == 1008
 
 
-def test_ws_rejects_when_token_unset_default_empty(engine, monkeypatch):
-    # Task 8 附加需求 2：不設 AGENT_WS_TOKEN（預設空字串）時一律拒絕連線——驗 production
-    # 預設安全（漏設 env 不會意外開放無認證下單通道）。
-    monkeypatch.delenv("AGENT_WS_TOKEN", raising=False)
-    get_settings.cache_clear()
-    app = create_app()
-
-    def _session_override():
-        with Session(engine) as s:
-            yield s
-
-    app.dependency_overrides[get_session] = _session_override
-    app.state.agent_channel = AgentChannel()
-    app.state.order_session_state = OrderSessionState()
-
-    client = TestClient(app)
+def test_ws_rejects_when_token_header_missing_or_empty(ws_env):
+    # D2 改寫（原「不設 AGENT_WS_TOKEN 預設空字串」測試已隨該設定移除失去意義）：沒有
+    # x-agent-token header（或空字串）時 raw_token 落地成空字串，`validate_token` 對空字串
+    # 直接回 None——驗 production 預設安全（漏帶 header 不會意外放行），即使其餘 wiring
+    # 完整、有真正 owner 的合法 token 存在也一樣拒絕。
+    client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ""}) as ws:
         with pytest.raises(WebSocketDisconnect) as exc_info:
             ws.receive_json()
     assert exc_info.value.code == 1008
-    get_settings.cache_clear()
 
 
 # ---- codex round1 fix2（HIGH）：新連線 attach 後，舊連線較晚才跑到的 finally 不該把
@@ -249,11 +297,11 @@ def test_ws_rejects_when_token_unset_default_empty(engine, monkeypatch):
 
 def test_stale_connection_message_ignored_after_superseded(ws_env):
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_old:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws_old:
         ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
-        with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_new:
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws_new:
             ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
             assert _wait(lambda: ws_env.state.order_service.account == "F2")
 
@@ -268,12 +316,12 @@ def test_stale_connection_message_ignored_after_superseded(ws_env):
 
 def test_stale_connection_finally_does_not_disable_new_connection(ws_env):
     client = TestClient(ws_env)
-    old_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"})
+    old_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token})
     ws_old = old_cm.__enter__()
     ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
     assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
-    new_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"})
+    new_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token})
     ws_new = new_cm.__enter__()
     try:
         ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
@@ -303,7 +351,7 @@ def test_receive_loop_unexpected_exception_logged_and_reraised(ws_env, monkeypat
     # `with` 區塊結束（背景 task join）時於前景重新拋出——這正是「re-raise、不吞例外」要
     # 驗的行為，只是在這個測試工具下顯現的位置是 context manager 出口而非 receive_json()。
     with pytest.raises(RuntimeError, match="boom"):
-        with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
             ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
             ws.receive_json()
     assert "agent WS 處理上行訊息失敗" in caplog.text
@@ -317,7 +365,7 @@ def test_receive_loop_unexpected_exception_logged_and_reraised(ws_env, monkeypat
 
 def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env, engine):
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
         assert _wait(lambda: ws_env.state.order_session_state.ready)
@@ -327,7 +375,7 @@ def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env
         s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}"))
         s.commit()
 
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
         ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         time.sleep(0.2)   # 給 server 足夠時間處理（若未擋下，account 會被改成 F2）
         assert ws_env.state.order_service.account == "F1"          # 沒被換掉
@@ -336,11 +384,11 @@ def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env
 
 def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engine):
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
         ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F2")   # 無未處理列：放行
         assert _wait(lambda: ws_env.state.order_session_state.ready)
@@ -359,7 +407,7 @@ def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engi
 
 def test_login_rejected_closes_connection(ws_env, engine):
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
@@ -368,7 +416,7 @@ def test_login_rejected_closes_connection(ws_env, engine):
         s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}"))
         s.commit()
 
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
         ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         with pytest.raises(WebSocketDisconnect):
             ws2.receive_json()   # 連線被關閉（1008）——不再是半開態
@@ -388,7 +436,7 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
     # F2，舊 F1 的 order_report 會用 F2 的 mutable adapter.account 映射，造成延遲跨帳號
     # 錯配。換帳號 guard 必須擋下「所有」processed==False 列，不論 quarantine 與否。
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
@@ -398,7 +446,7 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
         s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}", quarantine=True))
         s.commit()
 
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
         ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         with pytest.raises(WebSocketDisconnect):
             ws2.receive_json()   # 連線被關閉（1008）——quarantined 列也要擋下換帳號
@@ -409,7 +457,7 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
 
 def test_report_before_login_not_staged_not_acked(ws_env, engine):
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "report", "event_id": 99, "kind": "deal_report",
                      "account": "F1", "mode": "sim", "payload": {}})
         ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
@@ -436,7 +484,7 @@ def test_toctou_report_commit_serializes_against_login_switch(ws_env, engine, mo
     monkeypatch.setattr(agent_ws_module, "commit_raw_callback", _blocking_commit)
 
     client = TestClient(ws_env)
-    with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_old:
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws_old:
         ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
@@ -444,7 +492,7 @@ def test_toctou_report_commit_serializes_against_login_switch(ws_env, engine, mo
                          "account": "F1", "mode": "sim", "payload": {}})
         assert entered.wait(timeout=2), "commit 應已進入（卡在 blocking commit 中）"
 
-        with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_new:
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws_new:
             ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
 
             # 舊 report 的 commit 仍卡住（inbox_lock 未釋放）：F2 login 的 count 查詢必須被
@@ -460,3 +508,134 @@ def test_toctou_report_commit_serializes_against_login_switch(ws_env, engine, mo
                 ws_new.receive_json()
 
     assert ws_env.state.order_service.account == "F1"   # F2 login 被拒，帳號未換
+
+
+# ---- D2（Task 4）：per-user agent token 簽發/驗證＋WS 換發（S#11） ----
+# 這一段直接對照設計文件 D2 的握手流程：`x-agent-token` → validate_token（sha256 查表，
+# 過期/撤銷回 None）→ 載 User 驗 is_active → RiskGuard.is_owner → 得 user_id。任一步失敗
+# close(1008)。issue_token/validate_token 本身的單元測試在 tests/test_agent_tokens.py；
+# 這裡驗證的是「這條鏈在 WS 握手上真的被接起來」。
+
+def test_issued_token_handshake_succeeds_and_updates_last_used_at(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        before = s.exec(select(AgentToken).where(AgentToken.user_id == owner_id)).one()
+        assert before.last_used_at is None
+
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: ws_env.state.order_session_state.ready)
+
+    with Session(engine) as s:
+        after = s.exec(select(AgentToken).where(AgentToken.user_id == owner_id)).one()
+        assert after.last_used_at is not None
+
+
+def test_expired_token_closed(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        row = s.exec(select(AgentToken).where(AgentToken.user_id == owner_id)).one()
+        row.expires_at = dt.datetime.utcnow() - timedelta(seconds=1)
+        s.add(row)
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+
+def test_revoked_token_closed(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        row = s.exec(select(AgentToken).where(AgentToken.user_id == owner_id)).one()
+        row.revoked_at = dt.datetime.utcnow()
+        s.add(row)
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+
+def test_rotation_invalidates_old_token_new_token_still_works(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
+    old_token = ws_env.state.agent_test_token
+    with Session(engine) as s:
+        new_token = issue_token(s, user_id=owner_id, ttl_days=30)
+    assert new_token != old_token
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": old_token}) as ws_old:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws_old.receive_json()
+    assert exc_info.value.code == 1008
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": new_token}) as ws_new:
+        ws_new.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: ws_env.state.order_session_state.ready)
+
+
+def test_same_user_only_one_valid_token_after_rotation(ws_env, engine):
+    # 與 test_agent_tokens.py 的 DB 層測試互補：這裡從 WS 握手的角度直接證明「同一時刻
+    # 只有最新那一枚能連得上」——rotation 前後各連一次，只有最後簽發的那枚成功。
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        raw2 = issue_token(s, user_id=owner_id, ttl_days=30)
+    with Session(engine) as s:
+        raw3 = issue_token(s, user_id=owner_id, ttl_days=30)
+
+    client = TestClient(ws_env)
+    for stale in (ws_env.state.agent_test_token, raw2):
+        with client.websocket_connect("/ws/agent", headers={"x-agent-token": stale}) as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+        assert exc_info.value.code == 1008
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": raw3}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: ws_env.state.order_session_state.ready)
+
+
+def test_non_owner_valid_token_rejected(ws_env, engine):
+    # 有效、未過期、未撤銷的 token，但持有者不在 owner 白名單——D2 握手鐵律：任一步失敗
+    # （含非 owner）一律 close(1008)，不得放行。
+    with Session(engine) as s:
+        non_owner = auth_service.create_user(s, "not-owner", "pw", role="user")
+        raw = issue_token(s, user_id=non_owner.id, ttl_days=30)
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": raw}) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+
+def test_inactive_owner_valid_token_rejected(ws_env, engine):
+    # is_active=False（帳號被停用）：即使 token 本身仍有效、使用者仍在 owner 白名單，
+    # 也必須拒絕——帳號停用要立即生效，不能靠 token 過期慢慢收斂。
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        from quanquant.db.models import User
+        user_row = s.get(User, owner_id)
+        user_row.is_active = False
+        s.add(user_row)
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
