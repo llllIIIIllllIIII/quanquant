@@ -236,6 +236,17 @@ class RawInbox(SQLModel, table=True):
     error: str | None = None
     processed_at: datetime | None = None
 
+    # ---- Inc1 多人 scope（Task 1，D5：S1/S2/S3 一次解）----
+    # 皆 nullable：既有列／舊 DB 經 _MIGRATIONS ALTER 補上時為 NULL；in-process 模式的
+    # user_id 恆為 NULL（in-process 的 user 歸屬本就由 ordno 匹配 Order 決定，不變）。
+    user_id: int | None = Field(default=None, index=True)   # agent 模式：連線認證身分蓋章
+    account: str | None = None                               # 上行 envelope 蓋章（immutable，D5）
+    mode: str | None = None                                  # 上行 envelope 蓋章
+    quarantine_reason: str | None = None                     # "association_pending"（可重試，
+                                                               # watchdog/late-ack 可解）｜
+                                                               # "scope_violation"/"payload_mismatch"/
+                                                               # "user_mismatch"（永久 dead-letter，R2-6）
+
 
 class Order(SQLModel, table=True):
     """一張委託單（下單面板／委託列表資料來源）。client_order_id 為下單前伺服器產生的冪等鍵；
@@ -483,3 +494,119 @@ class BrokerReconcileCursor(SQLModel, table=True):
     mode: str = Field(index=True)
     last_reconciled_at: datetime  # naive UTC watermark：只補這個時間點之後有新進展的委託
     updated_at: datetime = Field(default_factory=_utcnow)
+
+
+# ---- 本機 broker agent Inc1（多人 simtrade）（Task 1）----
+#
+# 三張新表，走 SQLModel.metadata.create_all 自動建（見上方 Task 3 段落註解，同一套機制）；
+# raw_inbox 的四個新 scope 欄位改走 db/migrate.py 的 ensure_columns（既有表補欄）。
+
+
+class AgentToken(SQLModel, table=True):
+    """本機 broker agent 的 WS 連線憑證（D2）：明文 token（`secrets.token_urlsafe(32)`）
+    只在簽發當下顯示一次，DB 只存 `token_hash`（sha256），可即時單獨撤銷、TTL 可長
+    （涵蓋無人值守重連，預設 30 天，見設定 `agent_token_ttl_days`）。每 user 同時只有一枚
+    有效 token——簽發新枚即 revoke 舊枚（rotation 語意最簡）。握手：連線帶 `x-agent-token`
+    → sha256 → 查表（未過期、未撤銷）→ 綁 `user_id`（見 spec D2 握手流程）。"""
+
+    __tablename__ = "agent_tokens"
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True)
+    token_hash: str = Field(unique=True, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime
+    revoked_at: datetime | None = None
+    last_used_at: datetime | None = None
+
+
+class AgentCommand(SQLModel, table=True):
+    """G1 command ledger（server 端 authoritative 列，D4）：place/cancel/update 三種 mutating
+    指令送前持久化（與該指令的 DB 決策段同一交易），下行後由 agent 端 ack／逾時／
+    unknown-resolver 收斂。**終結模型是兩維（codex R2-1/R3-1/R4-4）**：
+
+    - `transport_acked_at`：transport 維——agent 是否已回覆過這筆指令（不代表業務結果）。
+    - `outcome`（'ok'|'error'|'unknown'）＋`resolved_via`（'ack'|'query_qty'|'report'|'manual'）
+      ＋`resolved_at`：業務維。**resolved 唯一由 `resolved_at IS NOT NULL` 定義**——一般情況
+      outcome=ok/error 時同交易 resolved；cancel 允許 `outcome='unknown'` 且已 resolved
+      （via='report'）＝「回報已終結曝險、指令本身效果不可知」的誠實紀錄；其餘 unknown
+      （含 timeout 剛落地）皆未 resolved，交由 unknown-resolver 或人工收斂。
+
+    `broker`/`account`/`mode`（scope）與 `reservation_id` 於指令**建立當下凍結**（取自該 user
+    當下綁定帳號，codex R1-2）；agent 執行前逐訊息核對 scope，不符回 `scope_mismatch`。
+    `reservation_id` 讓收尾保護（D8 watchdog）能機械判定「這筆指令關聯哪筆配額保留」。
+
+    **update 單飛（R5-2/R6-1）**：`uq_agent_cmd_update_singleflight` partial unique index——
+    同一非空 `client_order_id`、`kind='update'`、`resolved_at IS NULL` 的列同時只能有一筆，
+    鍵取 `Order.client_order_id`（全域唯一、非 nullable 的 ordno，見 `models.py` Order 定義）
+    以免 nullable 欄位在兩方言下 unique index 皆容許多筆 NULL、互斥失效。
+
+    **狀態組合 CHECK（R4-5）**：resolved 必須帶 `resolved_via`；`resolved_via='ack'` 必須帶
+    `transport_acked_at`（其餘 resolved_via 如 query_qty/report/manual 不要求，因為那些是
+    「agent 從未回過這筆特定指令、由旁路收斂」的情境）。"""
+
+    __tablename__ = "agent_commands"
+    __table_args__ = (
+        CheckConstraint(
+            "resolved_at IS NULL OR resolved_via IS NOT NULL",
+            name="ck_agent_commands_resolved_requires_via",
+        ),
+        CheckConstraint(
+            "resolved_via != 'ack' OR transport_acked_at IS NOT NULL",
+            name="ck_agent_commands_ack_requires_transport_ack",
+        ),
+        Index(
+            "uq_agent_cmd_update_singleflight",
+            "client_order_id",
+            unique=True,
+            sqlite_where=text("kind = 'update' AND resolved_at IS NULL"),
+            postgresql_where=text("kind = 'update' AND resolved_at IS NULL"),
+        ),
+    )
+
+    cmd_id: str = Field(primary_key=True)                    # uuid4 hex
+    user_id: int = Field(index=True)
+    kind: str                                                 # "place" | "cancel" | "update"
+    broker: str                                               # scope 凍結（建立當下寫死，codex R1-2）
+    account: str
+    mode: str
+
+    client_order_id: str | None = None                        # place/update 關聯的冪等鍵
+    ordno: str | None = None                                  # cancel/update 關聯的委託流水
+    reservation_id: str | None = None                         # 關聯配額保留（D8 收尾保護判定用）
+
+    payload: str                                               # JSON TEXT（下行指令內容）
+    created_at: datetime = Field(default_factory=_utcnow)
+    sent_at: datetime | None = None
+
+    transport_acked_at: datetime | None = None                # transport 維：agent 已回覆
+    outcome: str | None = None                                # "ok" | "error" | "unknown"
+    resolved_via: str | None = None                            # "ack" | "query_qty" | "report" | "manual"
+    resolved_at: datetime | None = None                        # 業務維唯一判準（R4-4）
+
+    timeout_observed_at: datetime | None = None                # route 逾時時 CAS 寫入（非終態）
+    result: str | None = None                                  # ack/收斂時的結果詳情
+    expires_at: datetime                                       # created_at + agent_command_expiry_seconds
+
+
+class AgentAccountBinding(SQLModel, table=True):
+    """帳號↔使用者的唯一綁定（D10，新發現：多人才出現的洞）——先綁先贏。問題：回報→委託
+    匹配鍵 `(broker,account,mode,ordno)` 不含 user；若 user A 與 user B 先後綁同一個永豐帳號，
+    B 的回報會匹配到 A 的委託列，跨 user 資料互染。UNIQUE(broker,account) **不分 mode**
+    （codex R2-7）：I9 語意＝帳號整體屬一人，避免「同 user 的 sim/real 兩列撞 PK」與 mode 欄
+    語意含糊；Inc1 只會有 sim 登入，但綁定與檢查涵蓋全部 mode。UpLogin 時 upsert——該 account
+    已綁其他 user → 拒登；同 user 重複綁定 no-op。解綁走人工 DB/後續 admin UI。
+
+    這是 D5 蓋章之外必要的第二道防線：蓋章解決「列是誰的」，本表的唯一性解決
+    「帳號只能是一個人的」。"""
+
+    __tablename__ = "agent_account_bindings"
+    __table_args__ = (
+        UniqueConstraint("broker", "account", name="uq_agent_account_bindings_broker_account"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    broker: str
+    account: str
+    user_id: int = Field(index=True)
+    bound_at: datetime = Field(default_factory=_utcnow)

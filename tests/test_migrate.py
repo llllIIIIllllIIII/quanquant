@@ -145,3 +145,31 @@ def test_source_check_constraint_rejects_explicit_null_after_migration(tmp_path)
     with pytest.raises(IntegrityError):
         with eng.begin() as conn:
             conn.execute(text("INSERT INTO trades (id, symbol, source) VALUES (1, 'TXF', NULL)"))
+
+
+def _old_raw_inbox_engine(tmp_path):
+    """Inc1（D5）之前的 raw_inbox：無 user_id/account/mode/quarantine_reason 四欄。"""
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_raw_inbox.db'}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE raw_inbox (id INTEGER PRIMARY KEY, kind TEXT, broker TEXT, payload TEXT)"
+        ))
+    return eng
+
+
+def test_adds_scope_columns_to_raw_inbox(tmp_path):
+    """D5：raw_inbox 補 user_id/account/mode（S1/S2/S3 scope 蓋章）＋ quarantine_reason（R2-6 分級）。"""
+    eng = _old_raw_inbox_engine(tmp_path)
+    ensure_columns(eng)
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("raw_inbox")}
+    assert {"user_id", "account", "mode", "quarantine_reason"} <= cols
+
+
+def test_raw_inbox_scope_columns_migration_idempotent(tmp_path):
+    eng = _old_raw_inbox_engine(tmp_path)
+    ensure_columns(eng)
+    ensure_columns(eng)  # 第二次不得 raise
+    insp = inspect(eng)
+    cols = {c["name"] for c in insp.get_columns("raw_inbox")}
+    assert {"user_id", "account", "mode", "quarantine_reason"} <= cols

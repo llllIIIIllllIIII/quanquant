@@ -19,6 +19,11 @@ _MIGRATIONS = [
     ("users", "theme", "VARCHAR"),
     ("trades", "mode", "VARCHAR DEFAULT 'real' CHECK (mode IS NOT NULL AND mode IN ('sim','real'))"),
     ("trades", "source", "VARCHAR DEFAULT 'manual' CHECK (source IS NOT NULL AND source IN ('manual','shioaji'))"),
+    # Inc1（多人 simtrade，D5）：raw_inbox scope 蓋章欄，皆 nullable（既有列補上後為 NULL）。
+    ("raw_inbox", "user_id", "INTEGER"),
+    ("raw_inbox", "account", "VARCHAR"),
+    ("raw_inbox", "mode", "VARCHAR"),
+    ("raw_inbox", "quarantine_reason", "VARCHAR"),
 ]
 
 
