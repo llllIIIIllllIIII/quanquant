@@ -60,6 +60,65 @@ def test_bind_account_other_user_already_bound_returns_false(session):
     assert row.user_id == 1  # 綁定沒被 B 搶走
 
 
+def _patch_find_account_binding_miss_once(monkeypatch):
+    """讓 `find_account_binding` 的第一次呼叫刻意回 None（模擬 race window：check 當下看不到
+    剛 commit 的對手綁定），第二次起改用真實實現。用來把 `bind_account` 逼進
+    「INSERT 撞真實 DB UNIQUE 約束 → IntegrityError → rollback → 重查」分支——INSERT 本身
+    撞的是 SQLite 的 `uq_agent_account_bindings_broker_account`，不是 mock 出來的。回傳呼叫
+    次數的 counter dict，供測試斷言真的走了兩次（確認不是早退路徑）。"""
+    calls = {"n": 0}
+    real_find = brepo.find_account_binding
+
+    def fake_find(sess, *, broker, account):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_find(sess, broker=broker, account=account)
+
+    monkeypatch.setattr(brepo, "find_account_binding", fake_find)
+    return calls
+
+
+def test_bind_account_race_recovery_after_integrity_error_other_user_wins(session, monkeypatch):
+    # Important finding 修復：race-recovery 分支（L459-469 的 except IntegrityError）過去從未
+    # 被執行——三個既有 test_bind_account_* 都走 early-return 路徑。這裡真的預插一筆別人的
+    # binding 並 commit，再讓初次 check 因 race window 看不到它，逼 bind_account 真的 INSERT
+    # 撞上 SQLite 的 UNIQUE(broker,account) 約束，驗證 except 分支：①不炸；②回傳 False；
+    # ③DB 裡仍只有對手那一筆，我方沒有殘留任何半途寫入。
+    session.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=2))
+    session.commit()
+
+    calls = _patch_find_account_binding_miss_once(monkeypatch)
+
+    result = brepo.bind_account(session, broker="shioaji", account="F1", user_id=1)
+
+    assert calls["n"] == 2  # 確認真的走了「初查 miss → 撞約束 → 重查」兩次呼叫，不是早退
+    assert result is False  # 他人已綁，呼叫端應拒登
+    session.commit()
+    rows = session.exec(select(AgentAccountBinding)).all()
+    assert len(rows) == 1
+    assert rows[0].user_id == 2  # 對手的綁定原封不動，我方沒寫入任何東西
+
+
+def test_bind_account_race_recovery_after_integrity_error_same_user_is_noop(session, monkeypatch):
+    # 同 user race 變體：撞到的是自己剛 commit 的那一筆（例如同一 user 兩條連線幾乎同時
+    # 重連）——重查後發現 owner 正是自己，回傳 True（no-op），不誤判成別人已綁而拒登，
+    # DB 也不會多出重複列。
+    session.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=1))
+    session.commit()
+
+    calls = _patch_find_account_binding_miss_once(monkeypatch)
+
+    result = brepo.bind_account(session, broker="shioaji", account="F1", user_id=1)
+
+    assert calls["n"] == 2
+    assert result is True
+    session.commit()
+    rows = session.exec(select(AgentAccountBinding)).all()
+    assert len(rows) == 1  # 沒有重複插入
+    assert rows[0].user_id == 1
+
+
 # ---- backfill_account_bindings ----
 
 def test_backfill_merges_multi_mode_same_user_into_one_binding(engine):

@@ -490,8 +490,13 @@ def backfill_account_bindings(session_factory) -> None:
 
     Fail closed（R1-8）：任一 `(broker,account)` 歷史上同時屬於多個 user，或既有綁定列與
     Order 歷史 owner 不符（如人工誤改 DB），一律 raise `BackfillConflictError`、**整批不寫入
-    任何一列**——先掃完全部衝突才動筆，不會出現「部分帳號已寫入、衝突的那個沒寫」的半途
-    狀態，呼叫端據此讓整個 agent 子系統拒啟，不能隨機挑一個 user 覆蓋既有 ownership。
+    任何一列**。實作上分兩層：跨 user 的 Order 歷史衝突在迴圈開始前**預掃**一次性抓出（見
+    下方 `conflicts` 計算）；既有綁定列與 Order 歷史 owner 不符則是在逐 `(broker,account)`
+    寫入迴圈中才發現（`elif existing.user_id != owner_user_id`）。兩者都只 `session.add`、
+    不逐筆 commit——真正落地靠迴圈結束後**單一次** `session.commit()`，衝突中途 raise 時
+    尚未 commit 的 add 都隨例外傳播、session 生命週期結束而失效，不會有「部分帳號已寫入、
+    衝突的那個沒寫」的半途狀態，呼叫端據此讓整個 agent 子系統拒啟，不能隨機挑一個 user
+    覆蓋既有 ownership。
 
     冪等：已有正確綁定的 `(broker,account)` 重跑無副作用（no-op）；只在缺列時補寫。"""
     with session_factory() as session:
