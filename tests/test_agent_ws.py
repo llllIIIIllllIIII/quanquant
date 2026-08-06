@@ -1,6 +1,7 @@
 import datetime as dt
 import time
 from datetime import timedelta
+from decimal import Decimal
 
 import pytest
 from sqlmodel import Session, select
@@ -11,7 +12,7 @@ from quanquant.auth.agent_tokens import issue_token
 from quanquant.broker.agent_channel import AgentChannel
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.config import get_settings
-from quanquant.db.models import AgentAccountBinding, AgentToken, RawInbox
+from quanquant.db.models import AgentAccountBinding, AgentCommand, AgentToken, Order, RawInbox
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_session
 
@@ -169,8 +170,14 @@ def test_report_ack_only_after_commit_success(ws_env, engine, monkeypatch, caplo
 
 
 def test_report_scope_violation_still_commits_then_acks_and_dead_letters(ws_env, engine):
-    """R1-5/S#17：UpReport 帶的 account 已綁定給別的 user → scope_violation 永久
-    dead-letter，但仍照常 commit-then-ack（I1/I4）——不擋連線、不讓 agent 誤判需要重送。"""
+    """R1-5/S#17（Task 5 原始情境，Task 6 收口後更新）：UpReport 帶的 account 已綁定給別的
+    user——這個情境在 Task 6 之後已經在**登入當下**就被 `bind_account`（D10 guard 第①步）
+    擋下（見 `test_login_rejected_when_account_already_bound_to_other_user`），連線根本走不
+    到能送出 report 的地步，UpReport 層級的 scope_violation dead-letter 分支在正常 WS 流程
+    下已不可達。該分支本身（`_validate_report_scope`／`stage_scoped_raw_inbox`）仍由
+    `test_inbox_worker.py::test_commit_raw_callback_binding_mismatch_dead_letters_scope_violation`
+    直接呼叫 `commit_raw_callback` 獨立覆蓋（繞過 WS/login，不受這裡影響）。這裡改成驗證
+    Task 6 收口後的實際行為：登入本身就被拒絕、連線關閉，完全沒有機會送出/落地任何 report。"""
     owner_id = ws_env.state.agent_test_owner_id
     with Session(engine) as s:
         s.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=owner_id + 1))  # 綁給別人
@@ -179,21 +186,20 @@ def test_report_scope_violation_still_commits_then_acks_and_dead_letters(ws_env,
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
-        ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
-                      "account": "F1", "mode": "sim", "payload": {"trade_id": "T1"}})
-        assert ws.receive_json() == {"type": "report_ack", "event_id": 7}  # 仍然 ack
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
 
     with Session(engine) as s:
-        rows = s.exec(select(RawInbox)).all()
-        assert len(rows) == 1
-        row = rows[0]
-        assert row.quarantine is True and row.processed is True
-        assert row.quarantine_reason == "scope_violation"
-        assert row.user_id == owner_id  # 蓋章成連線認證的 user，不是綁定表指向的那個人
+        assert s.exec(select(RawInbox)).all() == []  # 沒有機會送出 report，什麼都沒落地
 
 
-def test_report_no_binding_yet_stages_normally_not_blocked(ws_env, engine):
-    """R1-5：查無 binding 列＝尚未綁定（Task 6 才建立寫入邏輯）→ 先放行，正常落地不誤擋。"""
+def test_report_after_login_binding_created_matches_same_user_not_blocked(ws_env, engine):
+    """Task 6 收口：UpLogin 現在會先 `bind_account`——這裡的 login 本身就會建立
+    (shioaji,F1)→owner 的綁定列，之後同一 user 送 report 自然命中「binding 存在且相符」
+    分支，正常落地不誤擋（R1-5 的 fail-open「查無 binding」分支則獨立由
+    `test_inbox_worker.py::test_commit_raw_callback_no_binding_yet_permits_staging` 直接呼叫
+    `commit_raw_callback` 覆蓋，不經過 WS/login，因此不受「登入必綁」影響）。"""
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
@@ -402,6 +408,7 @@ def test_receive_loop_unexpected_exception_logged_and_reraised(ws_env, monkeypat
 # 的是 mutable adapter.account（已被新帳號覆蓋），舊帳號的回報會被錯配。----
 
 def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
@@ -409,8 +416,9 @@ def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env
         assert _wait(lambda: ws_env.state.order_session_state.ready)
 
     # server 已 commit 但 worker 尚未處理的一筆 RawInbox（processed=False, quarantine=False）。
+    # Task 6：guard 改成 per-user 化，蓋章這個 owner 名下、account=F1（舊帳號）才會命中。
     with Session(engine) as s:
-        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}"))
+        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}", user_id=owner_id, account="F1"))
         s.commit()
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
@@ -444,14 +452,15 @@ def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engi
 # 決策+mark_logged_in+adapter.account 設定」。----
 
 def test_login_rejected_closes_connection(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
-    # 未處理列（processed=False, quarantine=False）殘留 → 觸發換帳號 guard。
+    # 未處理列（processed=False, quarantine=False）殘留，蓋章這個 owner／舊帳號 F1 → 觸發換帳號 guard。
     with Session(engine) as s:
-        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}"))
+        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}", user_id=owner_id, account="F1"))
         s.commit()
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
@@ -473,15 +482,18 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
     # _retry_quarantined 之後會自動解除 quarantine 讓 worker 重新處理；若那時帳號已切到
     # F2，舊 F1 的 order_report 會用 F2 的 mutable adapter.account 映射，造成延遲跨帳號
     # 錯配。換帳號 guard 必須擋下「所有」processed==False 列，不論 quarantine 與否。
+    owner_id = ws_env.state.agent_test_owner_id
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
-    # 一筆已被隔離、但仍未處理的 RawInbox（quarantine=True）——之後 watchdog 的
-    # _retry_quarantined 會解除隔離讓 worker 重新處理，此列在那之前仍算「未處理」。
+    # 一筆已被隔離、但仍未處理的 RawInbox（quarantine=True，蓋章這個 owner／舊帳號 F1）——
+    # 之後 watchdog 的 _retry_quarantined 會解除隔離讓 worker 重新處理，此列在那之前仍算
+    # 「未處理」。
     with Session(engine) as s:
-        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}", quarantine=True))
+        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}", quarantine=True,
+                        user_id=owner_id, account="F1"))
         s.commit()
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
@@ -491,6 +503,122 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
 
     assert ws_env.state.order_service.account == "F1"          # 帳號未被換掉
     assert ws_env.state.agent_channel.logged_in is False        # 未 mark_logged_in
+
+
+# ---- Task 6：UpLogin guard v2（D10/R1-2/R1-8）——四步接受順序 ----
+
+def test_login_rejected_when_account_already_bound_to_other_user(ws_env, engine):
+    # S#10：B 綁 A 已綁的帳號 → 拒登、連線關閉，binding 維持給 A，不被 B 搶走。
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        s.add(AgentAccountBinding(broker="shioaji", account="F1", user_id=owner_id + 1))  # 綁給別人（A）
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+    assert ws_env.state.order_session_state.ready is False
+
+    with Session(engine) as s:
+        rows = s.exec(select(AgentAccountBinding).where(AgentAccountBinding.account == "F1")).all()
+        assert len(rows) == 1 and rows[0].user_id == owner_id + 1
+
+
+def test_login_allowed_reconnect_same_account_even_with_own_unprocessed_rows_for_that_account(ws_env, engine):
+    # S#9：同帳號重連不擋——即使這個 user 名下有這個帳號自己的未處理殘留（正常在途處理中，
+    # 不是換帳號風險：count_unprocessed_for_login 只計 account 不同或 NULL 的列）。
+    owner_id = ws_env.state.agent_test_owner_id
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: ws_env.state.order_session_state.ready)
+
+    with Session(engine) as s:
+        s.add(RawInbox(kind="deal_report", broker="shioaji", payload="{}", user_id=owner_id, account="F1"))
+        s.commit()
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
+        ws2.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: ws_env.state.order_session_state.ready)   # 沒被擋
+
+
+def test_login_rejected_when_historical_order_belongs_to_other_user_even_without_binding_row(ws_env, engine):
+    # S#20（R1-8）：binding 表沒有這個帳號的列（模擬 backfill 未跑到／落後），但 Order 歷史
+    # 已經有別人的委託——第二道防線（account_owned_by_other_user_in_orders）仍要擋，且不得
+    # 留下錯誤的 binding 殘影（bind_account 那步可能先成功，後面步驟擋下就該 rollback）。
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        s.add(Order(
+            client_order_id="C1", request_hash="H1", user_id=owner_id + 1, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-06-16",
+        ))
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+    with Session(engine) as s:
+        assert s.exec(select(AgentAccountBinding)).all() == []  # 沒有留下錯誤綁定
+
+
+def test_login_blocked_by_other_account_unresolved_place_command(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        s.add(AgentCommand(
+            cmd_id="cmd-1", user_id=owner_id, kind="place", broker="shioaji", account="F1", mode="sim",
+            payload="{}", expires_at=dt.datetime(2099, 1, 1),
+        ))
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+    assert ws_env.state.order_session_state.ready is False
+
+
+def test_login_blocked_by_other_account_unresolved_update_command(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        s.add(AgentCommand(
+            cmd_id="cmd-1", user_id=owner_id, kind="update", broker="shioaji", account="F1", mode="sim",
+            payload="{}", expires_at=dt.datetime(2099, 1, 1),
+        ))
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+
+def test_login_not_blocked_by_other_account_unresolved_cancel_command(ws_env, engine):
+    # R3-1 #29：cancel 不是新增曝險，不擋換帳號 guard——只有 place/update 才算。
+    owner_id = ws_env.state.agent_test_owner_id
+    with Session(engine) as s:
+        s.add(AgentCommand(
+            cmd_id="cmd-1", user_id=owner_id, kind="cancel", broker="shioaji", account="F1", mode="sim",
+            payload="{}", expires_at=dt.datetime(2099, 1, 1),
+        ))
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: ws_env.state.order_session_state.ready)
 
 
 def test_report_before_login_not_staged_not_acked(ws_env, engine):

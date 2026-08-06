@@ -334,8 +334,11 @@ def test_order_report_user_mismatch_dead_letters_status_untouched(session, engin
 
 
 def test_commit_raw_callback_no_binding_yet_permits_staging(engine):
-    """R1-5：查無 `agent_account_bindings` 列＝該帳號尚未綁定任何人（Task 6 才建立寫入/
-    backfill 邏輯）→ 先放行，不誤擋。"""
+    """R1-5：查無 `agent_account_bindings` 列 → 先放行，不誤擋（fail-open 預設）。Task 6
+    落地後，正常 WS 流程下 UpLogin 必先 `bind_account` 才會放行登入——已登入連線送出的
+    UpReport 理論上不會再命中這個分支（見 `inbox_worker._validate_report_scope` 的收口
+    說明）。這裡直接呼叫 `commit_raw_callback` 繞過 WS/login，單獨驗證這個 fail-open 預設
+    本身仍然正確（防禦性退路，涵蓋舊資料庫/未跑 backfill 等情境）。"""
     commit_raw_callback(
         lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
         user_id=2, account="F1", mode="sim",

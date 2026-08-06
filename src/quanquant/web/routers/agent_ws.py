@@ -7,21 +7,23 @@ reconcile 等 cmd_ack、cmd_ack 需要 receive 迴圈 → 死鎖。
 D2：連線驗證改為 per-user DB opaque token（`auth/agent_tokens.py`），取代 Inc0 全站共用的
 `AGENT_WS_TOKEN` 靜態密鑰。握手拿到的 `user_id` 本 task 先只當作 owner 授權判定用（單一
 `agent_channel`／單 slot 架構不變，Task 7 才會把它接上 per-user registry）。
+
+Task 6：UpLogin 分支改為 D10/R1-2/R1-8 的四步接受順序（見 `_check_uplogin`）——先綁先贏的
+帳號綁定、歷史 Order ownership 雙查、per-user 換帳號 guard、他帳號未 resolved 曝險指令 guard。
 """
 import asyncio
 import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import ValidationError
-from sqlalchemy import func
-from sqlmodel import select
 
 from quanquant.auth.agent_tokens import validate_token
+from quanquant.broker import repository as brepo
 from quanquant.broker.agent_protocol import (
     DownReportAck, UpCmdAck, UpHealth, UpLogin, UpReport, parse_uplink,
 )
 from quanquant.broker.inbox_worker import commit_raw_callback
-from quanquant.db.models import RawInbox, User
+from quanquant.db.models import User
 
 log = logging.getLogger(__name__)
 router = APIRouter()
@@ -95,33 +97,24 @@ async def agent_ws(websocket: WebSocket) -> None:
                 log.warning("agent 上行訊息格式不符，忽略：%s", str(data)[:200])
                 continue
             if isinstance(msg, UpLogin):
-                # codex round3 fix1/fix3：count 查詢＋決策＋mark_logged_in＋adapter.account
-                # 設定整段包在 inbox_lock 內——與 UpReport 分支的 commit 序列化（消 TOCTOU：
-                # 舊連線的 report commit 飛行中時，這裡的 count 查詢會等它 commit 完才跑，
-                # 不會看到「尚未落地」的 0 而誤放行換帳號）。
+                # Task 6（D10/R1-2/R1-8）UpLogin guard v2：四步接受順序全部包在 inbox_lock
+                # 內、與 UpReport 分支的 commit 序列化（承襲 codex round3 fix1/fix3 的理由——
+                # 消 TOCTOU：舊連線的 report commit 飛行中時，這裡的檢查會等它 commit 完才
+                # 跑，不會看到「尚未落地」的殘留而誤放行）。全過才 mark_logged_in／設定
+                # adapter.account；任一步被拒，`_check_uplogin` 內已 rollback 掉可能的
+                # binding 寫入，直接關閉連線（不留半開態——同 codex round3 fix1，agent 端會
+                # backoff 重連，帳號不符會一直停在離線，UI 可見）。
                 async with channel.inbox_lock:
-                    if adapter.account and msg.account != adapter.account:
-                        # codex round2 fix2：agent 端的 tripwire（buffer.assert_account）只擋
-                        # 得住「尚未送出」的回報列；server 已 commit RawInbox 並 ack、worker
-                        # 尚未處理的列不受保護——這個窗口換帳號登入，worker 之後映射
-                        # order_report 用的是 mutable adapter.account（已被新帳號覆蓋），舊
-                        # 帳號的回報會被錯配進新帳號的部位/委託。查詢未處理列數，有殘留就
-                        # 整個拒絕這次 login；沒有殘留才放行（帳號覆蓋屬正常換帳號重啟）。
-                        unprocessed = await asyncio.to_thread(
-                            _count_unprocessed_raw_inbox, session_factory
+                    reject_reason = await asyncio.to_thread(
+                        _check_uplogin, session_factory, user_id=agent_user_id, account=msg.account
+                    )
+                    if reject_reason is not None:
+                        log.warning(
+                            "拒絕登入，關閉連線（user_id=%s，帳號=%s）：%s",
+                            agent_user_id, msg.account, reject_reason,
                         )
-                        if unprocessed > 0:
-                            # codex round3 fix1（HIGH）：只 continue 會留下半開連線——agent
-                            # 端的 pump 不等 login 確認就送 report，若 UpReport 分支沒檔會被
-                            # 拒帳號的回報照樣 commit+ack。直接關閉連線消滅半開態；agent 端
-                            # 會 backoff 重連，帳號不符會一直停在離線（UI 可見）。
-                            log.warning(
-                                "拒絕帳號切換登入，關閉連線：尚有 %d 筆未處理回報"
-                                "（原帳號 %s、新帳號 %s）",
-                                unprocessed, adapter.account, msg.account,
-                            )
-                            await websocket.close(code=1008)
-                            break
+                        await websocket.close(code=1008)
+                        break
                     channel.mark_logged_in(msg.account)
                     adapter.account = msg.account
                 order_state.mark_ready()
@@ -182,17 +175,43 @@ async def _reconcile_after_login(adapter) -> None:
         log.exception("agent 登入後 reconcile 失敗（best-effort，不影響連線）")
 
 
-def _count_unprocessed_raw_inbox(session_factory) -> int:
-    """同步 DB 查詢（呼叫端須用 asyncio.to_thread 包起來，receive 迴圈鐵律：絕不 inline
-    await 長工作）：尚未處理的 RawInbox 列數——換帳號登入前的安全檢查（codex round2
-    fix2）。codex round4 修正：不再排除 quarantine==True 的列——quarantined 列仍是「未
-    處理」，run_agent_watchdog 的 _retry_quarantined 之後會自動解除隔離讓 worker 重新
-    處理；若那時帳號已切到新帳號，舊帳號的 order_report 會用新帳號的 mutable
-    adapter.account 映射，造成延遲跨帳號錯配。換帳號 guard 必須擋下所有
-    processed==False 列，不論 quarantine 與否。"""
+def _check_uplogin(session_factory, *, user_id: int, account: str) -> str | None:
+    """同步 DB 工作（呼叫端須用 asyncio.to_thread 包起來，receive 迴圈鐵律：絕不 inline
+    await 長工作）：Task 6 UpLogin 四步接受順序（spec D10/R1-2/R1-8）：
+      ①`bind_account` 先綁先贏——帳號已綁定別的 user → 拒登。
+      ②`account_owned_by_other_user_in_orders` 歷史 Order ownership 雙查（R1-8：backfill
+        理論上已讓①攔下這種情況，這裡是不信任新表的第二道防線）。
+      ③`count_unprocessed_for_login`（S2 per-user 化，取代舊版全域
+        `_count_unprocessed_raw_inbox`）：這個 user 名下還有未處理、且 account 不同於這次
+        登入帳號（或未蓋章 NULL）的 RawInbox 殘留 → 拒登（codex round2 fix2 的原始理由：
+        worker 晚一步映射會用到已被新帳號覆蓋的 mutable adapter.account，造成跨帳號錯配；
+        round4 修正沿用：quarantined 但未 processed 的列仍要擋，因為 watchdog 之後會解除
+        隔離重新處理）。
+      ④`has_unresolved_risky_commands_other_account`（R1-2）：這個 user 在別的帳號還有未
+        resolved 的曝險指令（place/update；cancel 不算曝險，不擋）→ 拒登，要求先用原帳號
+        連線收斂。
+
+    四步與①的寫入包在同一個 session/交易內——全過才 `session.commit()`（binding 才真正
+    落地）；任一步失敗立即 `session.rollback()` 並回傳中文拒絕原因（呼叫端據此 log 並
+    close(1008)）——即使①這次剛好是新綁定成功、後面步驟才擋下，也不會留下錯誤的綁定
+    殘影。回傳 `None` 代表全部通過。
+    """
     with session_factory() as session:
-        return session.exec(
-            select(func.count()).where(
-                RawInbox.processed == False,  # noqa: E712 - SQLAlchemy 表達式需字面 == 比較
-            )
-        ).one()
+        if not brepo.bind_account(session, broker="shioaji", account=account, user_id=user_id):
+            session.rollback()
+            return "此帳號已綁定其他使用者"
+        if brepo.account_owned_by_other_user_in_orders(
+            session, broker="shioaji", account=account, user_id=user_id
+        ):
+            session.rollback()
+            return "此帳號歷史委託屬於其他使用者，請聯絡管理員"
+        if brepo.count_unprocessed_for_login(session, user_id=user_id, account=account) > 0:
+            session.rollback()
+            return "尚有未處理的其他帳號回報殘留，請稍候或先用原帳號連線收斂"
+        if brepo.has_unresolved_risky_commands_other_account(
+            session, user_id=user_id, account=account
+        ):
+            session.rollback()
+            return "原帳號尚有未收斂的下單/改單指令，請先用原帳號連線收斂"
+        session.commit()
+        return None

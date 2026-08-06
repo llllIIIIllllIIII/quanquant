@@ -31,6 +31,7 @@ from sqlmodel import Session, select
 
 from quanquant.db.models import (
     AgentAccountBinding,
+    AgentCommand,
     BrokerPosition,
     BrokerReconcileCursor,
     ConfirmToken,
@@ -423,6 +424,138 @@ def unquarantine_stale_raw_inbox(session: Session, *, older_than: datetime, limi
         session.add(row)
     session.flush()
     return len(rows)
+
+
+# ---- AgentAccountBinding（D10：帳號↔使用者唯一綁定；Task 6：寫入/backfill/UpLogin guard v2）----
+#
+# I9 不變式：一個 (broker,account) 至多屬於一個 user（不分 mode，codex R2-7——Inc1 只會有
+# sim 登入，但綁定與檢查涵蓋全部 mode，避免「同 user 的 sim/real 兩列撞 PK」與 mode 欄語意
+# 含糊）。`find_account_binding`（見上方 RawInbox 段）是既有唯讀查詢（Task 5，供
+# `inbox_worker._validate_report_scope` 用）；以下補上寫入（`bind_account`/
+# `backfill_account_bindings`）與 UpLogin 專用 guard 查詢（`count_unprocessed_for_login`/
+# `has_unresolved_risky_commands_other_account`），供 `agent_ws._check_uplogin`（Task 6）使用。
+
+
+class BackfillConflictError(Exception):
+    """D10/R1-8/R2-7：backfill 掃到同一 `(broker,account)` 歷史上同時屬於多個 user（或既有
+    綁定列與 Order 歷史 owner 不符）——不能讓「先綁先贏」隨機挑一個覆蓋既有 ownership，必須
+    人工裁決。呼叫端（`web/app.py` agent 分支啟動）收到此例外應讓下單子系統整體拒啟
+    （fail closed），不可吞掉或忽略。"""
+
+
+def bind_account(session: Session, *, broker: str, account: str, user_id: int) -> bool:
+    """D10：UpLogin 用的先綁先贏寫入。查無列 → 建新綁定，回 True；已綁同一 user → no-op，
+    回 True（冪等，允許同帳號重連/重試）；已綁別的 user → 回 False（呼叫端據此拒登，不動
+    這一列）。
+
+    本函式只 flush，不 commit（見本檔頂部交易邊界政策）——是否真正落地由呼叫端的交易決定
+    （Task 6：`agent_ws._check_uplogin` 把這個 flush 跟後面幾步 guard 查詢包在同一個交易，
+    全過才 commit；任一步被擋，呼叫端 rollback，這裡的寫入不會留下殘影）。round3 B5 慣例：
+    撞唯一鍵時 rollback 後以該唯一鍵重新查詢，確認命中的正是這個鍵才決定 True/False；其餘
+    IntegrityError 不吞、往上拋。"""
+    existing = find_account_binding(session, broker=broker, account=account)
+    if existing is not None:
+        return existing.user_id == user_id
+    binding = AgentAccountBinding(broker=broker, account=account, user_id=user_id)
+    session.add(binding)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        existing = find_account_binding(session, broker=broker, account=account)
+        if existing is not None:
+            return existing.user_id == user_id
+        raise
+    return True
+
+
+def account_owned_by_other_user_in_orders(
+    session: Session, *, broker: str, account: str, user_id: int
+) -> bool:
+    """D10/R1-8：UpLogin 第二道防線——不只信 `agent_account_bindings` 新表，直接核對 `Order`
+    歷史紀錄：這個 `(broker,account)` 是否存在別的 user 建立過的委託（掃全部 mode）。
+    True → 呼叫端應拒登。正常情況下這個分支不該獨立命中（backfill 已在啟動時把歷史
+    ownership 灌進綁定表，`bind_account` 那一步就會先擋下）；這裡是「不能只信新表」的
+    belt-and-suspenders，涵蓋 backfill 未執行/資料落後等異常情境。"""
+    stmt = select(Order.id).where(
+        Order.broker == broker, Order.account == account, Order.user_id != user_id,
+    ).limit(1)
+    return session.exec(stmt).first() is not None
+
+
+def backfill_account_bindings(session_factory) -> None:
+    """D10/R1-8/R2-7：agent 模式啟動時呼叫（`web/app.py` `_start_agent_channel_subsystem`）。
+    掃描既有 `Order`（distinct `(broker,account)` → 該帳號歷史上出現過的所有 user_id，
+    **合併全部 mode**——R2-7 綁定不分 mode）灌進 `agent_account_bindings`。
+
+    Fail closed（R1-8）：任一 `(broker,account)` 歷史上同時屬於多個 user，或既有綁定列與
+    Order 歷史 owner 不符（如人工誤改 DB），一律 raise `BackfillConflictError`、**整批不寫入
+    任何一列**——先掃完全部衝突才動筆，不會出現「部分帳號已寫入、衝突的那個沒寫」的半途
+    狀態，呼叫端據此讓整個 agent 子系統拒啟，不能隨機挑一個 user 覆蓋既有 ownership。
+
+    冪等：已有正確綁定的 `(broker,account)` 重跑無副作用（no-op）；只在缺列時補寫。"""
+    with session_factory() as session:
+        rows = session.exec(sa_select(Order.broker, Order.account, Order.user_id).distinct()).all()
+        owners: dict[tuple[str, str], set[int]] = {}
+        for broker, account, uid in rows:
+            owners.setdefault((broker, account), set()).add(uid)
+
+        conflicts = {key: uids for key, uids in owners.items() if len(uids) > 1}
+        if conflicts:
+            detail = "; ".join(
+                f"{broker}/{account}→users={sorted(uids)}"
+                for (broker, account), uids in sorted(conflicts.items())
+            )
+            raise BackfillConflictError(
+                f"帳號綁定 backfill 偵測到跨 user 歷史 ownership 衝突，fail closed：{detail}"
+            )
+
+        for (broker, account), uids in owners.items():
+            (owner_user_id,) = uids
+            existing = find_account_binding(session, broker=broker, account=account)
+            if existing is None:
+                session.add(AgentAccountBinding(broker=broker, account=account, user_id=owner_user_id))
+            elif existing.user_id != owner_user_id:
+                raise BackfillConflictError(
+                    f"{broker}/{account} 既有綁定 user_id={existing.user_id} 與 Order 歷史 "
+                    f"owner user_id={owner_user_id} 不符，fail closed"
+                )
+        session.commit()
+
+
+def count_unprocessed_for_login(session: Session, *, user_id: int, account: str) -> int:
+    """Task 6（S2 per-user 化，取代舊版全域 `agent_ws._count_unprocessed_raw_inbox`）：這個
+    user 名下未處理（`processed==False`，不論 quarantine——同 codex round4 修正，dead-letter
+    已在 `quarantine_raw_inbox` 內把 processed 設 True，天然被排除，不需要另外濾 quarantine）
+    的 `RawInbox` 中，`account` 與這次登入帳號不同、或未蓋章（NULL）的列數。>0 代表這個 user
+    還有可能被之後 worker 用「已被新帳號覆蓋的 mutable adapter.account」錯配處理的殘留，
+    UpLogin 應拒登（codex round2 fix2 的原始理由，Task 6 改成 per-user scope）。同帳號重連
+    的殘留（account 與這次登入帳號相同）不計入——那是正常在途處理，不是換帳號風險。"""
+    stmt = select(func.count()).where(
+        RawInbox.processed == False,  # noqa: E712 - SQLAlchemy 表達式需字面 == 比較
+        RawInbox.user_id == user_id,
+        or_(RawInbox.account != account, RawInbox.account.is_(None)),
+    )
+    return session.exec(stmt).one()
+
+
+_RISKY_COMMAND_KINDS = ("place", "update")
+
+
+def has_unresolved_risky_commands_other_account(
+    session: Session, *, user_id: int, account: str
+) -> bool:
+    """R1-2：這個 user 在別的帳號（`account` 不等於這次登入帳號）是否還有未 resolved
+    （`resolved_at IS NULL`）的曝險指令——只算 `place`/`update`（cancel 不是新增曝險，讓
+    cancel 收斂不擋換帳號，R3-1 #29）。True → UpLogin 應拒登，要求先用原帳號連線收斂
+    （或走人工終結程序）。"""
+    stmt = select(AgentCommand.cmd_id).where(
+        AgentCommand.user_id == user_id,
+        AgentCommand.account != account,
+        AgentCommand.kind.in_(_RISKY_COMMAND_KINDS),
+        AgentCommand.resolved_at.is_(None),
+    ).limit(1)
+    return session.exec(stmt).first() is not None
 
 
 # ---- Deal（fill 去重帳本） ----

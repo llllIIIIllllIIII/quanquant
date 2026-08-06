@@ -77,10 +77,19 @@ class RawInboxDeadLetterError(Exception):
 
 def _validate_report_scope(session: Session, *, user_id: int, broker: str, account: str) -> bool:
     """D5 逐訊息 scope 驗證（codex R1-5）：查 `agent_account_bindings` 是否已有該
-    `(broker,account)` 的綁定列——有列且指向別的 user → False（scope_violation）；查無列＝
-    這個帳號尚未綁定任何人（Task 6 才建立寫入/backfill 邏輯，本 task 只讀）→ 先放行（True）。
-    `user_id`/`account` 皆為 None 的呼叫端（in-process）不會走到這個函式，見
-    `stage_scoped_raw_inbox` 的呼叫 guard。"""
+    `(broker,account)` 的綁定列——有列且指向別的 user → False（scope_violation）；查無列 →
+    先放行（True）。
+
+    Task 6 收口說明：`agent_ws` 的 UpLogin 現在會在 `mark_logged_in` 之前呼叫
+    `repository.bind_account`（先綁先贏，見 `agent_ws._check_uplogin`）——**登入必綁**，故
+    走這條路徑（已登入連線送出的 UpReport）理論上不應該再查到 `binding is None`。這裡仍刻意
+    保留「查無放行」而非改成 fail closed：涵蓋（a）尚未跑過 Task 6 backfill 的舊資料庫／環境、
+    （b）理論上的競態或人工介入清掉綁定列——這些情況若改成 fail closed，會把合法回報誤判成
+    違規、永久 dead-letter 掉，代價比維持 fail-open 更差。獨立回歸覆蓋見
+    `test_inbox_worker.py::test_commit_raw_callback_no_binding_yet_permits_staging`（直接呼叫
+    `commit_raw_callback`，不經過 WS/login，因此不受「登入必綁」影響）。`user_id`/`account`
+    皆為 None 的呼叫端（in-process）不會走到這個函式，見 `stage_scoped_raw_inbox` 的呼叫
+    guard。"""
     binding = brepo.find_account_binding(session, broker=broker, account=account)
     if binding is None:
         return True

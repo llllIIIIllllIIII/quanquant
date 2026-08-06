@@ -220,7 +220,8 @@ def test_quarantine_raw_inbox_default_reason_association_pending_stays_unprocess
 def test_quarantine_raw_inbox_dead_letter_reason_marks_processed_true(session, reason):
     """R2-6：三個永久 dead-letter reason 必須連同 processed=True（＋processed_at）一起落地——
     這是唯一的方式讓這列退出換帳號 guard 的 unprocessed 計數（那個計數只看 processed，不管
-    quarantine，見 `agent_ws._count_unprocessed_raw_inbox`）。"""
+    quarantine，見 `repository.count_unprocessed_for_login`，Task 6 取代舊版
+    `agent_ws._count_unprocessed_raw_inbox`）。"""
     row = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}')
     session.commit()
     brepo.quarantine_raw_inbox(session, row, error="fail closed", reason=reason)

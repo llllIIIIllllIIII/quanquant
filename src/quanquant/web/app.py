@@ -204,11 +204,16 @@ async def _start_agent_channel_subsystem(
     尚未實作）；未設定 owner id 是刻意停用（非故障，/healthz 仍 200）。D2：agent WS 連線
     驗證改為 per-user DB opaque token（`auth/agent_tokens.py`），不再有站台層級的靜態密鑰
     需要在這裡檢查——沒 owner id 就沒有人能被判定為 owner，故仍需 owner id 檢查。
+
+    Task 6（D10）：wiring 前先呼叫 `backfill_account_bindings`——用既有 `Order` 歷史灌
+    `agent_account_bindings` 初始資料；衝突（同帳號歷史上屬於多個 user）→ 子系統拒啟
+    （fail closed，見下方呼叫處註解）。
     """
     from decimal import Decimal
 
     from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
     from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.broker.repository import BackfillConflictError, backfill_account_bindings
     from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
     from quanquant.broker.shioaji_adapter import ShioajiAdapter
     from quanquant.broker.supervisor import BrokerSupervisor
@@ -226,6 +231,18 @@ async def _start_agent_channel_subsystem(
 
     def _order_session() -> Session:
         return Session(get_engine())
+
+    try:
+        backfill_account_bindings(_order_session)
+    except BackfillConflictError as exc:
+        # D10/R1-8：既有 Order 歷史 ownership 衝突——不能讓「先綁先贏」隨機覆蓋，這是真的
+        # 資料衝突需要人工裁決，但不是「app 起不來」等級的故障（比照既有 preflight 軟停用
+        # vs 拒啟語意）：order_state 標 disabled（不是 mark_unhealthy）＋記明確錯誤，讓下單
+        # 子系統拒啟（fail closed，不繼續往下 wiring channel/adapter/inbox_worker），其餘
+        # 子系統（行情/日誌/一般路由）仍正常啟動，/healthz 仍可回 200，不崩整站。
+        order_state.mark_disabled(f"帳號綁定 backfill 衝突，agent 下單子系統拒啟: {exc}")
+        log.error("agent 通道帳號綁定 backfill 衝突，子系統拒啟（app 其餘功能正常）: %s", exc)
+        return
 
     risk_guard = RiskGuard(
         session_factory=_order_session,

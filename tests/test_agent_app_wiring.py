@@ -68,6 +68,38 @@ async def test_agent_mode_without_owner_disabled(engine, monkeypatch):
     assert state.disabled and "order_owner_user_ids" in (state.last_error or "")
 
 
+async def test_agent_mode_backfill_conflict_fail_closed_disabled_not_wired(engine, monkeypatch):
+    # Task 6（D10/R1-8/R2-7）：既有 Order 歷史 ownership 衝突（同帳號跨 user）→ backfill 讓
+    # 這個子系統拒啟——order_state 標 disabled（不是 mark_unhealthy，比照既有 preflight 軟
+    # 停用語意，/healthz 仍可回 200，不崩整站，屬於「需要人工裁決」而非「app 起不來」）；
+    # 且不得繼續往下 wiring channel/adapter/inbox_worker（拒啟＝真的沒有 wiring，不是半套）。
+    from decimal import Decimal
+
+    from quanquant.db.models import Order
+
+    with Session(engine) as s:
+        s.add(Order(
+            client_order_id="C1", request_hash="H1", user_id=1, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-06-16",
+        ))
+        s.add(Order(
+            client_order_id="C2", request_hash="H1", user_id=2, mode="real",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-06-16",
+        ))
+        s.commit()
+
+    app, state, tasks = await _run(_settings(), engine, monkeypatch)
+    assert state.disabled is True and state.ready is False
+    assert "backfill" in (state.last_error or "") and "衝突" in (state.last_error or "")
+    assert getattr(app.state, "agent_channel", None) is None      # 沒有繼續 wiring
+    assert getattr(app.state, "order_service", None) is None
+    assert tasks == []
+
+
 async def test_agent_mode_happy_path_wires_state(engine, monkeypatch):
     app, state, tasks = await _run(_settings(), engine, monkeypatch)
     from quanquant.broker.agent_channel import AgentChannel
