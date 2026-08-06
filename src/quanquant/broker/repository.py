@@ -353,13 +353,17 @@ def find_account_binding(session: Session, *, broker: str, account: str) -> Agen
     return session.exec(stmt).first()
 
 
-def list_unprocessed_raw_inbox(session: Session, *, limit: int = 200) -> list[RawInbox]:
-    stmt = (
-        select(RawInbox)
-        .where(RawInbox.processed.is_(False), RawInbox.quarantine.is_(False))  # type: ignore[union-attr]
-        .order_by(RawInbox.id)
-        .limit(limit)
-    )
+def list_unprocessed_raw_inbox(
+    session: Session, *, limit: int = 200, user_id: int | None = None
+) -> list[RawInbox]:
+    """Inc1 D6/D9：`user_id=None`（預設）＝不加篩選，與既有 in-process 單一 worker 行為
+    位元級一致；agent 模式 per-slot `RawInboxWorker` 傳自己的 `slot.user_id` 精確篩
+    `RawInbox.user_id == user_id`（不是 `IS NULL OR =`）——歷史未蓋章的 NULL 列因此永遠不會
+    被 agent per-slot worker 撿走，只由 in-process worker（不帶 `user_id`）處理，見 D5。"""
+    conditions = [RawInbox.processed.is_(False), RawInbox.quarantine.is_(False)]  # type: ignore[union-attr]
+    if user_id is not None:
+        conditions.append(RawInbox.user_id == user_id)
+    stmt = select(RawInbox).where(*conditions).order_by(RawInbox.id).limit(limit)
     return list(session.exec(stmt))
 
 
@@ -394,7 +398,9 @@ def quarantine_raw_inbox(
     session.flush()
 
 
-def unquarantine_stale_raw_inbox(session: Session, *, older_than: datetime, limit: int = 200) -> int:
+def unquarantine_stale_raw_inbox(
+    session: Session, *, older_than: datetime, limit: int = 200, user_id: int | None = None
+) -> int:
     """把 quarantine 超過 older_than 的列解除隔離，回到一般佇列重新嘗試一次
     （Task 8 watchdog 以較慢週期呼叫——給「當時解不到委託關聯」的列一個補救機會，
     不會無限重試：解除後若原因仍不變會再次被 quarantine，只是白工，不會誤判成功）。
@@ -402,20 +408,23 @@ def unquarantine_stale_raw_inbox(session: Session, *, older_than: datetime, limi
     R2-6：只解除 `quarantine_reason` 為 `NULL`（既有列／尚未蓋章 reason 的舊資料，保守視為可
     重試）或 `'association_pending'` 的列——`DEAD_LETTER_QUARANTINE_REASONS` 三者是永久
     dead-letter，永不進這個重試迴圈（否則會把已經 fail-closed 判定的列重新丟回處理管線，
-    製造無限重試/告警洪水）。"""
-    stmt = (
-        select(RawInbox)
-        .where(
-            RawInbox.quarantine.is_(True),  # type: ignore[union-attr]
-            RawInbox.received_at < older_than,
-            or_(
-                RawInbox.quarantine_reason.is_(None),  # type: ignore[union-attr]
-                RawInbox.quarantine_reason == "association_pending",
-            ),
-        )
-        .order_by(RawInbox.id)
-        .limit(limit)
-    )
+    製造無限重試/告警洪水）。
+
+    Inc1 D6：`user_id=None`（預設）＝不篩，與既有 in-process 單一 watchdog 行為位元級一致；
+    agent 模式 per-slot watchdog 傳自己的 `slot.user_id`——`RawInbox.user_id == user_id` 精確
+    比對（NULL 列不會被任何 user_id 值命中，天然把未蓋章的歷史殘留留給人工／in-process 處理，
+    不會被某個 agent slot 誤認領，同 `list_unprocessed_raw_inbox` 的篩選原則）。"""
+    conditions = [
+        RawInbox.quarantine.is_(True),  # type: ignore[union-attr]
+        RawInbox.received_at < older_than,
+        or_(
+            RawInbox.quarantine_reason.is_(None),  # type: ignore[union-attr]
+            RawInbox.quarantine_reason == "association_pending",
+        ),
+    ]
+    if user_id is not None:
+        conditions.append(RawInbox.user_id == user_id)
+    stmt = select(RawInbox).where(*conditions).order_by(RawInbox.id).limit(limit)
     rows = list(session.exec(stmt))
     for row in rows:
         row.quarantine = False

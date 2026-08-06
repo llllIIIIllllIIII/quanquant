@@ -5,11 +5,17 @@
 reconcile 等 cmd_ack、cmd_ack 需要 receive 迴圈 → 死鎖。
 
 D2：連線驗證改為 per-user DB opaque token（`auth/agent_tokens.py`），取代 Inc0 全站共用的
-`AGENT_WS_TOKEN` 靜態密鑰。握手拿到的 `user_id` 本 task 先只當作 owner 授權判定用（單一
-`agent_channel`／單 slot 架構不變，Task 7 才會把它接上 per-user registry）。
+`AGENT_WS_TOKEN` 靜態密鑰。
 
 Task 6：UpLogin 分支改為 D10/R1-2/R1-8 的四步接受順序（見 `_check_uplogin`）——先綁先贏的
 帳號綁定、歷史 Order ownership 雙查、per-user 換帳號 guard、他帳號未 resolved 曝險指令 guard。
+
+Task 7（D1）：握手拿到的 `user_id` 用來向 `app.state.agent_registry` 換這個 user 專屬的
+`UserAgentSlot`——`channel`/`adapter`/`order_state` 三者全部改從 slot 讀（不再是單一全域
+`app.state.agent_channel`/`order_service`/`order_session_state`），Inc0 的 generation
+detach/attach 機制沿用不變、只是變成 per-slot（同 user 第二條連線踢舊、不同 user 互不影響，
+各自的 `channel.inbox_lock` 也是各自的，不會彼此排隊）。`order_session_factory`/
+`order_risk_guard` 仍是全站唯一（token 驗證的前置依賴，發生在還不知道 user_id 之前）。
 """
 import asyncio
 import logging
@@ -50,26 +56,23 @@ def _authenticate(session_factory, risk_guard, raw_token: str) -> int | None:
 @router.websocket("/ws/agent")
 async def agent_ws(websocket: WebSocket) -> None:
     state = websocket.app.state
-    channel = getattr(state, "agent_channel", None)
     raw_token = websocket.headers.get("x-agent-token", "")
     await websocket.accept()
-    if channel is None:
-        await websocket.close(code=1008)
-        return
     # 連線洩漏防呆：這幾個 app.state 屬性務必在 channel.attach 之前讀完——缺任一個
     # （wiring 未完成）就直接關閉連線並 return，channel 才不會卡在 attached 態卻永遠等不到
     # 對應的 finally 清理（之後真正的 agent 連線會被誤判成「已有連線」而被踢掉，永久連不上）。
     # order_risk_guard 也在這裡一併讀出——token 驗證的 owner 判定需要它，缺席同樣視為
-    # wiring 不完整（1011），而非驗證失敗（1008）。
+    # wiring 不完整（1011），而非驗證失敗（1008）。Task 7：per-user 的 channel/adapter/
+    # order_state 要等驗證拿到 user_id 之後才能從 agent_registry 查到對應 slot，不屬於這裡
+    # 的前置檢查範圍——這裡只檢查「握手本身能不能跑」的三個全站依賴。
     try:
-        order_state = state.order_session_state
-        adapter = state.order_service
+        registry = state.agent_registry
         session_factory = state.order_session_factory
         risk_guard = state.order_risk_guard
     except AttributeError:
         log.error(
-            "agent WS wiring 不完整（缺 order_session_state/order_service/"
-            "order_session_factory/order_risk_guard），拒絕連線"
+            "agent WS wiring 不完整（缺 agent_registry/order_session_factory/"
+            "order_risk_guard），拒絕連線"
         )
         await websocket.close(code=1011)
         return
@@ -77,7 +80,21 @@ async def agent_ws(websocket: WebSocket) -> None:
     if agent_user_id is None:
         await websocket.close(code=1008)
         return
-    log.info("agent WS 通過驗證，user_id=%s（Task 7 前仍沿用單一共享 channel）", agent_user_id)
+    slot = registry.get(agent_user_id)
+    if slot is None:
+        # 防禦性：D1 eager 建置後，通過驗證（含 is_owner 白名單）的 user 理論上必定有 slot——
+        # 查無代表 owner 名單與 registry 建置時不同步（如設定改了但沒重啟），視為 wiring 不
+        # 一致，1011（不是 1008：token 本身是有效的，問題不在驗證）。
+        log.error(
+            "agent WS：user_id=%s 通過驗證但 registry 查無對應 slot（wiring 不一致），拒絕連線",
+            agent_user_id,
+        )
+        await websocket.close(code=1011)
+        return
+    channel = slot.channel
+    adapter = slot.adapter
+    order_state = slot.session_state
+    log.info("agent WS 通過驗證並取得 slot，user_id=%s", agent_user_id)
     hub = getattr(state, "order_events", None)
     if channel.connected:
         channel.detach()   # 新連線取代殘留半開連線（agent 重啟；無條件，不帶 generation）
@@ -165,7 +182,8 @@ async def agent_ws(websocket: WebSocket) -> None:
             order_state.mark_disabled("agent 離線")
             if hub is not None:
                 hub.publish()
-            log.warning("agent WS 連線中斷，下單暫停（等待 agent 重連）")
+            log.warning("agent WS 連線中斷，user_id=%s 下單暫停（等待該使用者 agent 重連）",
+                       agent_user_id)
 
 
 async def _reconcile_after_login(adapter) -> None:

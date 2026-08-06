@@ -35,7 +35,7 @@ from quanquant.broker.redaction import redact_secrets
 from quanquant.broker.types import OrderRequest, canonical_payload_hash
 from quanquant.config import get_settings
 from quanquant.db.models import User
-from quanquant.web.deps import get_current_user, get_session
+from quanquant.web.deps import get_agent_slot, get_current_user, get_order_service, get_session
 from quanquant.web.templating import render_partial, templates
 
 router = APIRouter()
@@ -46,10 +46,6 @@ def _safe_str(exc: Exception, service) -> str:
     adapter 內部已對已知分支 redact，這裡是回顯給瀏覽器前的最後一道防線）。`service` 就是
     `ShioajiAdapter` instance，經 `secrets_to_redact` property 取得同一份秘密清單。"""
     return redact_secrets(str(exc), secrets=getattr(service, "secrets_to_redact", []))
-
-
-def get_order_service(request: Request):
-    return getattr(request.app.state, "order_service", None)
 
 
 def get_order_risk_guard(request: Request):
@@ -362,15 +358,21 @@ async def orders_stream(request: Request, user: User = Depends(get_current_user)
 
 
 @router.get("/orders/agent-status", response_class=HTMLResponse)
-def orders_agent_status(request: Request, user: User = Depends(get_current_user)):
+def orders_agent_status(
+    request: Request, user: User = Depends(get_current_user), slot=Depends(get_agent_slot),
+):
     """Task 9：agent 通道連線狀態 badge（僅 order_channel=="agent" 時顯示；inprocess 通道
     沒有「agent 連線」這個概念，partial 直接回空字串）。SSE `orders-changed`/`refreshorders`
     觸發時 orders.html 的 #agent-status-box 會重打這支端點刷新（見 orders.html）。
 
-    修：顯式宣告 `user: User = Depends(get_current_user)`——本檔其餘端點皆已如此，router
-    層雖已掛登入保護，這裡補上只為縱深防禦＋與同檔慣例一致（此端點內容不含使用者資料，
-    unused 變數屬預期）。"""
-    state = getattr(request.app.state, "order_session_state", None)
+    Task 7（D9）：per-user 化——`agent_registry` 已 wiring 時改讀**自己**這個 slot 的
+    `session_state`（每個 user 只看得到自己的 agent 連線狀態，不是全站共用一份）；registry
+    不存在（in-process 模式／agent 模式尚未成功 wiring）時 fallback 回舊的全站
+    `order_session_state`，與 Task 7 之前完全零改動的既有路徑（見 `get_agent_slot`）。"""
+    if getattr(request.app.state, "agent_registry", None) is not None:
+        state = slot.session_state if slot is not None else None
+    else:
+        state = getattr(request.app.state, "order_session_state", None)
     return HTMLResponse(render_partial(
         "partials/agent_status.html",
         channel=get_settings().order_channel,

@@ -197,8 +197,8 @@ async def _scan_orphan_orders_once(session_factory, ops_alerter) -> None:
 async def _start_agent_channel_subsystem(
     app: FastAPI, settings: Settings, tasks: list, order_state: OrderSessionState, ops_alerter,
 ) -> None:
-    """ORDER_CHANNEL=agent 分支（Task 8）：Shioaji I/O 交給使用者本機 broker agent，經
-    `/ws/agent` 上下行；server 端仍是唯一決策者（風控/冪等/配額全在這裡，未變）。
+    """ORDER_CHANNEL=agent 分支：Shioaji I/O 交給使用者本機 broker agent，經 `/ws/agent`
+    上下行；server 端仍是唯一決策者（風控/冪等/配額全在這裡，未變）。
 
     Increment 0 硬限制：僅支援 `ORDER_MODE=sim`（agent 端目前只做模擬撮合，real 走 CA 簽署
     尚未實作）；未設定 owner id 是刻意停用（非故障，/healthz 仍 200）。D2：agent WS 連線
@@ -208,11 +208,25 @@ async def _start_agent_channel_subsystem(
     Task 6（D10）：wiring 前先呼叫 `backfill_account_bindings`——用既有 `Order` 歷史灌
     `agent_account_bindings` 初始資料；衝突（同帳號歷史上屬於多個 user）→ 子系統拒啟
     （fail closed，見下方呼叫處註解）。
+
+    Task 7（D1/D9）：Inc0 的單一全域 `AgentChannel`/`ShioajiAdapter`/`OrderSessionState`
+    拆成 per-owner 的 `UserAgentSlot`——`app.state.agent_registry` 取代
+    `app.state.agent_channel`；`RiskGuard` 仍是單一共享實例（D3：kill switch 的 per-user
+    狀態只是它內部一個 `dict`，不需要拆實例）；每個 slot 各自一份
+    `BrokerSupervisor`/`AgentChannel`/`AgentNativeGateway`/`ShioajiAdapter`/
+    `OrderSessionState`/`RawInboxWorker`/agent watchdog——跨 user 完全無共享可變 runtime
+    狀態（I8：A 的 offline/quarantine/慢 reconcile 不影響 B）。healthz 語意改變（D9）：
+    這裡的 `order_state`（全站唯一，`app.state.order_session_state`）現在只代表「wiring
+    有沒有完成」，不再跟著任何一個使用者的連線狀態切換 ready/disabled——wiring 一旦成功就
+    `mark_ready()`，個別 slot 的連線狀態改進 `slot.session_state`（只餵 UI／
+    `orders_agent_status`，不再進 /healthz 判定，見 web/routers/health.py 不需要因此改動）。
     """
     from decimal import Decimal
 
     from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
+    from quanquant.broker.agent_registry import AgentRegistry, UserAgentSlot
     from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.broker.lifecycle import run_confirm_token_cleanup
     from quanquant.broker.repository import BackfillConflictError, backfill_account_bindings
     from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
     from quanquant.broker.shioaji_adapter import ShioajiAdapter
@@ -227,8 +241,6 @@ async def _start_agent_channel_subsystem(
         order_state.mark_disabled("order_owner_user_ids 未設定，下單子系統未啟用")
         return
 
-    supervisor = BrokerSupervisor()
-
     def _order_session() -> Session:
         return Session(get_engine())
 
@@ -238,12 +250,15 @@ async def _start_agent_channel_subsystem(
         # D10/R1-8：既有 Order 歷史 ownership 衝突——不能讓「先綁先贏」隨機覆蓋，這是真的
         # 資料衝突需要人工裁決，但不是「app 起不來」等級的故障（比照既有 preflight 軟停用
         # vs 拒啟語意）：order_state 標 disabled（不是 mark_unhealthy）＋記明確錯誤，讓下單
-        # 子系統拒啟（fail closed，不繼續往下 wiring channel/adapter/inbox_worker），其餘
+        # 子系統拒啟（fail closed，不繼續往下 wiring registry/slot），其餘
         # 子系統（行情/日誌/一般路由）仍正常啟動，/healthz 仍可回 200，不崩整站。
         order_state.mark_disabled(f"帳號綁定 backfill 衝突，agent 下單子系統拒啟: {exc}")
         log.error("agent 通道帳號綁定 backfill 衝突，子系統拒啟（app 其餘功能正常）: %s", exc)
         return
 
+    # D3：RiskGuard 單一共享實例——kill switch/quota/confirm token 全站一份（per-user 只有
+    # KillSwitchState.per_user 這個 dict 帶 per-user 概念，見 risk.py），所有 slot 的
+    # adapter 共用同一個 instance。
     risk_guard = RiskGuard(
         session_factory=_order_session,
         secret=settings.session_secret or "dev-only-insecure",
@@ -255,36 +270,61 @@ async def _start_agent_channel_subsystem(
         confirm_token_ttl_seconds=settings.order_confirm_token_ttl_seconds,
         kill_switch_initial=settings.order_kill_switch_initial,
     )
-    channel = AgentChannel()
-    gateway = AgentNativeGateway(channel,
-                                 timeout_seconds=settings.agent_command_timeout_seconds)
-    adapter = ShioajiAdapter(
-        api_key="", secret_key="", ca_path=None, ca_passwd=None, person_id=None,
-        symbol=settings.symbol, mode="sim", session_factory=_order_session,
-        supervisor=supervisor, risk_guard=risk_guard,
-        sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
-        ops_alerter=ops_alerter, remote_gateway=gateway,
-    )
-    inbox_worker = RawInboxWorker(
-        session_factory=_order_session, supervisor=supervisor,
-        deal_mapper=adapter._map_deal_report,
-        order_report_mapper=adapter._map_order_report,
-        order_events=getattr(app.state, "order_events", None),
-        ops_alerter=ops_alerter,
-    )
-    app.state.agent_channel = channel
-    app.state.order_service = adapter
+
+    registry = AgentRegistry()
+    inbox_workers: list[RawInboxWorker] = []
+    for uid in sorted(owner_ids):
+        slot_supervisor = BrokerSupervisor()
+        channel = AgentChannel()
+        gateway = AgentNativeGateway(channel,
+                                     timeout_seconds=settings.agent_command_timeout_seconds)
+        adapter = ShioajiAdapter(
+            api_key="", secret_key="", ca_path=None, ca_passwd=None, person_id=None,
+            symbol=settings.symbol, mode="sim", session_factory=_order_session,
+            supervisor=slot_supervisor, risk_guard=risk_guard,
+            sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+            ops_alerter=ops_alerter, remote_gateway=gateway,
+        )
+        session_state = OrderSessionState()
+        session_state.mark_disabled("agent 未連線")     # 等這個 user 的 agent 上線
+        slot_inbox_worker = RawInboxWorker(
+            session_factory=_order_session, supervisor=slot_supervisor,
+            deal_mapper=adapter._map_deal_report,
+            order_report_mapper=adapter._map_order_report,
+            order_events=getattr(app.state, "order_events", None),
+            ops_alerter=ops_alerter, user_id=uid,   # D6：批次查詢 WHERE user_id = uid
+        )
+        slot = UserAgentSlot(
+            user_id=uid, channel=channel, gateway=gateway, adapter=adapter,
+            session_state=session_state, supervisor=slot_supervisor, tasks=[],
+        )
+        slot.tasks.append(asyncio.create_task(slot_inbox_worker.run()))
+        slot.tasks.append(asyncio.create_task(run_agent_watchdog(
+            adapter, user_id=uid,
+            unquarantine_after_seconds=settings.order_unquarantine_after_seconds,
+        )))
+        registry.add(slot)
+        inbox_workers.append(slot_inbox_worker)
+        tasks.extend(slot.tasks)
+
+    app.state.agent_registry = registry
+    app.state.agent_inbox_workers = inbox_workers   # 供 lifespan shutdown 逐 slot drain（Task 7）
     app.state.order_risk_guard = risk_guard
-    app.state.order_inbox_worker = inbox_worker
     app.state.order_session_factory = _order_session
-    order_state.mark_disabled("agent 未連線")     # 等 agent 上線；/healthz 200
-    tasks.append(asyncio.create_task(inbox_worker.run()))
-    tasks.append(asyncio.create_task(run_agent_watchdog(
-        adapter, unquarantine_after_seconds=settings.order_unquarantine_after_seconds)))
-    # T0.2：agent 分支沒有 native connect 時機可以掛「connect 成功後跑一次」，故在 wiring
-    # 完成時直接排一次 one-shot 孤兒掃描（可視性，不影響啟動）。
+    # D9：healthz 語意——子系統 wiring 完成即 ready（200）；個別 slot 的連線狀態不再進這裡，
+    # 只反映在 slot.session_state（UI／orders_agent_status）。
+    order_state.mark_ready()
+    # D6：confirm-token 清理是純 DB 全域工作（不分 user），agent 模式 Inc0 漏掉了一個，
+    # 這裡補一個全域 task（in-process 分支本來就有，見 `_start_order_subsystem` 對應行）。
+    tasks.append(asyncio.create_task(run_confirm_token_cleanup(
+        _order_session, interval=settings.order_confirm_token_cleanup_interval_seconds,
+    )))
+    # T0.2：孤兒委託掃描本就是全站一次性、跨所有 owner 的 Order 可視性動作，不需要按 slot
+    # 各跑一次；agent 分支沒有 native connect 時機可以掛「connect 成功後跑一次」，故在
+    # wiring 完成時直接排一次 one-shot 掃描。
     tasks.append(asyncio.create_task(_scan_orphan_orders_once(_order_session, ops_alerter)))
-    log.info("agent 通道下單子系統已配線，等待本機 broker agent 連線")
+    log.info("agent 通道下單子系統已配線（%d 位 owner，各自獨立 slot），等待各自的本機 broker "
+             "agent 連線", len(owner_ids))
 
 
 async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) -> None:
@@ -503,6 +543,12 @@ async def lifespan(app: FastAPI):
         order_ok = await shutdown_order_subsystem(
             order_service=getattr(app.state, "order_service", None),
             inbox_worker=getattr(app.state, "order_inbox_worker", None),
+            # Task 7：agent 模式改用 registry——沒有單一 order_service/inbox_worker 可關，
+            # 逐 slot 各自 close()/drain（見 shutdown_order_subsystem 的 registry/
+            # inbox_workers 參數）。兩組互斥（in-process 用前兩個 kwarg，agent 用這兩個），
+            # 但同時傳兩組彼此不影響。
+            registry=getattr(app.state, "agent_registry", None),
+            inbox_workers=getattr(app.state, "agent_inbox_workers", None),
             state=getattr(app.state, "order_session_state", None),
             timeout=5.0,
         )

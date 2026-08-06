@@ -72,7 +72,7 @@ async def test_agent_mode_backfill_conflict_fail_closed_disabled_not_wired(engin
     # Task 6（D10/R1-8/R2-7）：既有 Order 歷史 ownership 衝突（同帳號跨 user）→ backfill 讓
     # 這個子系統拒啟——order_state 標 disabled（不是 mark_unhealthy，比照既有 preflight 軟
     # 停用語意，/healthz 仍可回 200，不崩整站，屬於「需要人工裁決」而非「app 起不來」）；
-    # 且不得繼續往下 wiring channel/adapter/inbox_worker（拒啟＝真的沒有 wiring，不是半套）。
+    # 且不得繼續往下 wiring registry/slot（拒啟＝真的沒有 wiring，不是半套）。
     from decimal import Decimal
 
     from quanquant.db.models import Order
@@ -95,7 +95,7 @@ async def test_agent_mode_backfill_conflict_fail_closed_disabled_not_wired(engin
     app, state, tasks = await _run(_settings(), engine, monkeypatch)
     assert state.disabled is True and state.ready is False
     assert "backfill" in (state.last_error or "") and "衝突" in (state.last_error or "")
-    assert getattr(app.state, "agent_channel", None) is None      # 沒有繼續 wiring
+    assert getattr(app.state, "agent_registry", None) is None      # 沒有繼續 wiring
     assert getattr(app.state, "order_service", None) is None
     assert tasks == []
 
@@ -103,13 +103,21 @@ async def test_agent_mode_backfill_conflict_fail_closed_disabled_not_wired(engin
 async def test_agent_mode_happy_path_wires_state(engine, monkeypatch):
     app, state, tasks = await _run(_settings(), engine, monkeypatch)
     from quanquant.broker.agent_channel import AgentChannel
+    from quanquant.broker.agent_registry import AgentRegistry
     from quanquant.broker.shioaji_adapter import ShioajiAdapter
-    assert isinstance(app.state.agent_channel, AgentChannel)
-    assert isinstance(app.state.order_service, ShioajiAdapter)
+    assert isinstance(app.state.agent_registry, AgentRegistry)
+    slot = app.state.agent_registry.get(1)     # order_owner_user_ids 預設 "1"
+    assert slot is not None and slot.user_id == 1
+    assert isinstance(slot.channel, AgentChannel)
+    assert isinstance(slot.adapter, ShioajiAdapter)
     assert app.state.order_risk_guard is not None
     assert callable(app.state.order_session_factory)
-    assert state.disabled and "agent 未連線" in (state.last_error or "")
-    assert len(tasks) >= 2                                  # inbox worker + agent watchdog
+    assert slot.session_state.disabled and "agent 未連線" in (slot.session_state.last_error or "")
+    # D9：healthz 語意——wiring 完成即 ready，不等任何 slot 連線（個別 slot 仍是 disabled，
+    # 上面那行已驗證）。
+    assert state.ready is True
+    assert len(slot.tasks) >= 2                             # 這個 slot 自己的 inbox worker + watchdog
+    assert len(tasks) >= 4                                  # +全域 confirm-token 清理 +孤兒掃描
 
 
 # ---------------------------------------------------------------------------

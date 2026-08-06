@@ -121,36 +121,41 @@ async def run_order_watchdog(
                 )
 
 
-async def run_agent_watchdog(adapter, *, unquarantine_after_seconds: float) -> None:
-    """agent 通道模式的精簡 watchdog：只做 DB-only 背景工作。
+async def run_agent_watchdog(adapter, *, user_id: int, unquarantine_after_seconds: float) -> None:
+    """agent 通道模式的精簡 watchdog：只做 DB-only 背景工作。Inc1 D6/D9：per-slot 跑一份
+    （lifespan 對每個 owner 各起一個 task），`user_id` 是這個 slot 的 owner——
+    quarantine 解除嚴格 scope 到這個 user（`unquarantine_stale_raw_inbox` 的
+    `RawInbox.user_id == user_id` 精確比對＋既有 reason=association_pending 篩選，見
+    repository.py），不會誤解除/誤重試其他 user 的殘留，跨 user 完全互不影響（I8）。
 
     連線/重連/健康是 agent 端與 WS 端點的責任；`_reconcile_unknown_quota`
     需要 native 查詢，Increment 0 在 agent 模式停用（保守後果：unknown 委託的
-    配額維持保留、不會超賣），Increment 1 以下行 query_qty 指令補回。
-    supervisor.lock 在 agent 模式背後沒有 native → 即決策 5 的「獨立 server 鎖」。
+    配額維持保留、不會超賣），Increment 1 以下行 query_qty 指令補回（Task 11）。
+    supervisor.lock 在 agent 模式背後沒有 native → 即決策 5 的「獨立 server 鎖」，且
+    Task 7 起這顆鎖是每個 slot 各自一份，A 卡住不會佔用 B 的鎖。
     """
     while True:
         await asyncio.sleep(unquarantine_after_seconds)
         try:
-            await _retry_quarantined(adapter, unquarantine_after_seconds)
+            await _retry_quarantined(adapter, unquarantine_after_seconds, user_id=user_id)
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.exception("agent watchdog：retry_quarantined 失敗")
+            log.exception("agent watchdog：retry_quarantined 失敗（user_id=%s）", user_id)
 
 
-async def _retry_quarantined(adapter, older_than_seconds: float) -> None:
+async def _retry_quarantined(adapter, older_than_seconds: float, *, user_id: int | None = None) -> None:
     async with adapter.supervisor.lock:
-        await asyncio.to_thread(_retry_quarantined_blocking, adapter, older_than_seconds)
+        await asyncio.to_thread(_retry_quarantined_blocking, adapter, older_than_seconds, user_id)
 
 
-def _retry_quarantined_blocking(adapter, older_than_seconds: float) -> None:
+def _retry_quarantined_blocking(adapter, older_than_seconds: float, user_id: int | None = None) -> None:
     cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=older_than_seconds)
     with adapter._session_factory() as session:
-        n = brepo.unquarantine_stale_raw_inbox(session, older_than=cutoff)
+        n = brepo.unquarantine_stale_raw_inbox(session, older_than=cutoff, user_id=user_id)
         session.commit()
         if n:
-            log.info("watchdog 解除 %d 筆 quarantine raw_inbox 待重試", n)
+            log.info("watchdog 解除 %d 筆 quarantine raw_inbox 待重試（user_id=%s）", n, user_id)
 
 
 async def _reconcile_unknown_quota(adapter, grace_seconds: float) -> None:

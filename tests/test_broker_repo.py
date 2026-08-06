@@ -185,6 +185,44 @@ def test_raw_inbox_stage_list_process_quarantine_round_trip(session):
     assert refreshed.quarantine is True and refreshed.error == "缺 fill_id"
 
 
+def test_list_unprocessed_raw_inbox_scoped_to_user_id(session):
+    """Task 7（D6/D9）：agent per-slot RawInboxWorker 傳 `user_id` 精確篩選
+    `RawInbox.user_id == user_id`——不是 `IS NULL OR =`，未蓋章的 NULL 列不會被任何 agent
+    slot 誤認領（只由不帶 user_id 的 in-process worker 處理，D5）；不帶 `user_id`（in-process
+    既有呼叫）維持全量、位元級不變。"""
+    brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}', user_id=1)
+    brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"b":1}', user_id=2)
+    brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"c":1}')  # NULL（in-process 舊列）
+    session.commit()
+
+    scoped_to_1 = brepo.list_unprocessed_raw_inbox(session, user_id=1)
+    assert [r.payload for r in scoped_to_1] == ['{"a":1}']
+
+    scoped_to_2 = brepo.list_unprocessed_raw_inbox(session, user_id=2)
+    assert [r.payload for r in scoped_to_2] == ['{"b":1}']
+
+    assert len(brepo.list_unprocessed_raw_inbox(session)) == 3  # 不篩：既有 in-process 行為
+
+
+def test_unquarantine_stale_raw_inbox_scoped_to_user_id(session):
+    """Task 7（D6）：per-slot watchdog 的 quarantine 解除 scope 到自己的 user，不誤解除/誤
+    重試其他 user 的殘留（I8：跨 user 完全互不影響）。"""
+    row_a = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}', user_id=1)
+    row_b = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"b":1}', user_id=2)
+    session.commit()
+    for row in (row_a, row_b):
+        row.received_at = dt.datetime(2020, 1, 1)
+        session.add(row)
+        brepo.quarantine_raw_inbox(session, row, error="待重試")
+    session.commit()
+
+    reopened = brepo.unquarantine_stale_raw_inbox(session, older_than=dt.datetime(2025, 1, 1), user_id=1)
+    session.commit()
+    assert reopened == 1
+    assert session.get(RawInbox, row_a.id).quarantine is False
+    assert session.get(RawInbox, row_b.id).quarantine is True  # user 2 的列不受影響
+
+
 def test_unquarantine_stale_raw_inbox_reopens_old_rows(session):
     row = brepo.stage_raw_inbox(session, kind="deal_report", broker="shioaji", payload='{"a":1}')
     session.commit()

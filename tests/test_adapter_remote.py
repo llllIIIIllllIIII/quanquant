@@ -282,6 +282,24 @@ async def test_remote_cancel_trade_not_found_propagates(engine):
         assert s.exec(select(Order)).one().status == "submitted"
 
 
+async def test_remote_update_offline_fails_fast_no_new_reservation(engine):
+    """Task 7（D9）：`gateway.ready=False` 時改單必須在 `check_update` 之前就被拒絕——
+    `check_update` 若判定口數增加會建立 delta QuotaReservation（DB 決策段的一部分），offline
+    fail-fast 必須搬到它之前，這筆保留列才不會被建立又要靠例外分支釋放。比照既有
+    `test_remote_place_offline_fails_fast_no_db_rows`/`test_remote_cancel_offline_rejected_
+    state_unchanged` 的驗收手法：委託狀態不變、且完全沒有新的 QuotaReservation 列。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    with Session(engine) as s:
+        reservations_before = len(list(s.exec(select(QuotaReservation))))
+    gw.ready = False
+    with pytest.raises(OrderError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"  # 改單失敗不影響委託本身狀態
+        assert len(list(s.exec(select(QuotaReservation)))) == reservations_before  # 沒建新保留列
+
+
 async def test_remote_update_timeout_marks_unknown_keeps_quota(engine):
     gw = _FakeGateway()
     a, ack = await _placed_order(engine, gw, _guard(engine))

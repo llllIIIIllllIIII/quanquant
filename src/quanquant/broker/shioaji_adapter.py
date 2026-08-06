@@ -688,6 +688,15 @@ class ShioajiAdapter:
             )
             if order is None:
                 raise OrderError(f"找不到委託 broker_order_id={broker_order_id!r}")
+            # Inc1 D9：offline fail-fast——`check_update` 若判定口數增加會建立 delta
+            # QuotaReservation（DB 決策段的一部分），這筆保留在改單真的送不出去時還得靠
+            # `_send_gate`/`_do_update` 的例外分支釋放；搬到這裡、`check_update` 之前，
+            # 與 `place()` 的既有寫法（冪等查找 miss 之後、`check_place` 之前）同一位置語意——
+            # agent 未連線時直接拒絕，連保留列都不建立，不進 DB 決策段（比照 spec D9「offline
+            # 擋新單」）。`_send_gate` 內仍保留同一判定作為縱深防禦第二層（若在這個檢查通過
+            # 後、native 呼叫前才斷線，那裡的 unavailable→failed＋退配額語意不變）。
+            if self._remote_gateway is not None and not self._remote_gateway.ready:
+                raise OrderError("agent 未連線，無法改單")
             new_price = price if price is not None else order.price
             new_qty = qty if qty is not None else order.qty
             request_hash = canonical_payload_hash(

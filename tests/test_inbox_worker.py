@@ -58,7 +58,7 @@ def _noop_order_report_mapper(payload: dict, *, account: str | None = None) -> O
 
 
 def _worker(engine, *, deal_mapper=_ok_deal_mapper, order_report_mapper=_noop_order_report_mapper,
-            supervisor=None, ops_alerter=None):
+            supervisor=None, ops_alerter=None, user_id=None):
     return RawInboxWorker(
         session_factory=lambda: Session(engine),
         supervisor=supervisor or BrokerSupervisor(),
@@ -66,6 +66,7 @@ def _worker(engine, *, deal_mapper=_ok_deal_mapper, order_report_mapper=_noop_or
         order_report_mapper=order_report_mapper,
         idle_interval=0.01,
         ops_alerter=ops_alerter,
+        user_id=user_id,
     )
 
 
@@ -104,6 +105,30 @@ def test_deal_report_resolves_order_by_composite_scope_and_applies_fill(session,
         assert order.filled_qty == 1
         row = s.exec(select(RawInbox)).first()
         assert row.processed is True and row.quarantine is False
+
+
+def test_worker_scoped_to_user_id_ignores_other_users_rows(session, engine):
+    """Task 7（D6/D9）：per-slot RawInboxWorker（傳 `user_id`）批次查詢只認領這個 user
+    蓋章的列——另一個 user（或未蓋章 NULL）的殘留完全不被撿走、不影響 batch 的 handled 計數，
+    跨 user 隔離（I8）在 worker 這一層直接驗證。"""
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload()), user_id=2,  # 另一個 user 的列
+        )
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload()),  # 未蓋章 NULL（in-process 舊列）
+        )
+        s.commit()
+
+    worker = _worker(engine, user_id=1)  # 這個 slot 只認領 user_id=1
+    assert worker.process_batch_once() == 0
+
+    with Session(engine) as s:
+        rows = s.exec(select(RawInbox)).all()
+        assert len(rows) == 2
+        assert all(r.processed is False and r.quarantine is False for r in rows)  # 完全沒被動到
 
 
 def test_unresolvable_order_correlation_quarantines_not_dropped(session, engine):

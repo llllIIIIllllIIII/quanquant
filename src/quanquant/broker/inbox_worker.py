@@ -187,6 +187,7 @@ class RawInboxWorker:
         batch_limit: int = 50,
         order_events: "OrderEventHub | None" = None,
         ops_alerter=None,
+        user_id: int | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._supervisor = supervisor
@@ -197,6 +198,11 @@ class RawInboxWorker:
         self._batch_limit = batch_limit
         self._order_events = order_events
         self._ops = ops_alerter  # T0.3：回報進 quarantine 時發營運告警（fire-and-forget，純疊加）
+        # Inc1 D6：`user_id=None`（預設）＝in-process 單一 worker，批次不篩 user（既有行為
+        # 位元級不變）；agent 模式每個 UserAgentSlot 各自一個 worker，傳自己的 slot.user_id
+        # ——批次查詢只認領這個 user 蓋章的列（`repository.list_unprocessed_raw_inbox` 的
+        # `RawInbox.user_id == user_id` 精確比對），跨 user 完全無共享可變狀態（I8）。
+        self._user_id = user_id
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
@@ -234,7 +240,11 @@ class RawInboxWorker:
         """同步、可直接測試。回傳「確定處理完」（processed 或 quarantine）的列數；
         非預期例外的列不計入（見模組 docstring 的例外分類）。"""
         with self._session_factory() as scan_session:
-            row_ids = [r.id for r in brepo.list_unprocessed_raw_inbox(scan_session, limit=self._batch_limit)]
+            row_ids = [
+                r.id for r in brepo.list_unprocessed_raw_inbox(
+                    scan_session, limit=self._batch_limit, user_id=self._user_id,
+                )
+            ]
         handled = 0
         for row_id in row_ids:
             try:
