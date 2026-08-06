@@ -11,12 +11,14 @@ Standard message format makes every alert state which condition fired:
     📐 對象值：18,000        (only when the right side is an indicator)
     🗓 K棒：2026-06-16 10:35（收盤結算）
 """
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
 
 from quanquant.notify.base import Notification
 
+log = logging.getLogger(__name__)
 _CST = timezone(timedelta(hours=8))
 
 
@@ -70,4 +72,6 @@ class TelegramNotifier:
                     json={"chat_id": self._chat_id, "text": text},
                 )
         except Exception:
-            pass  # a Telegram outage must never block alerts / the poll loop
+            # Telegram 中斷絕不能阻塞 alerts / poll loop，但也不再靜默——記一次 warning，
+            # 否則告警投遞失敗完全不可見（Tier0 C#4，與告警機制疊加放大）。
+            log.warning("Telegram 告警投遞失敗（已略過，不阻塞 alerts/poll loop）", exc_info=True)

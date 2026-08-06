@@ -58,6 +58,7 @@ async def run_order_watchdog(
     login_min_interval: float,
     unquarantine_after_seconds: float = 300.0,
     unknown_reconcile_grace_seconds: float = 300.0,
+    ops_alerter=None,
 ) -> None:
     backoff = interval
     last_login_monotonic = 0.0
@@ -89,6 +90,10 @@ async def run_order_watchdog(
                 message = redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", []))
                 log.warning("watchdog 重連失敗: %s", message)
                 state.mark_unhealthy(message)
+                # T0.3 告警（純疊加）：重連失敗通知，訊息已 redact（可能夾帶 login/activate_ca
+                # 的 api_key/ca_passwd/person_id）。OpsAlerter.connect_failed 自帶節流+吞錯。
+                if ops_alerter is not None:
+                    ops_alerter.connect_failed(message)
                 state.reconnect_attempts += 1
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
                 await asyncio.sleep(backoff)
@@ -114,6 +119,24 @@ async def run_order_watchdog(
                     "watchdog unknown quota reconcile 失敗: %s",
                     redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", [])),
                 )
+
+
+async def run_agent_watchdog(adapter, *, unquarantine_after_seconds: float) -> None:
+    """agent 通道模式的精簡 watchdog：只做 DB-only 背景工作。
+
+    連線/重連/健康是 agent 端與 WS 端點的責任；`_reconcile_unknown_quota`
+    需要 native 查詢，Increment 0 在 agent 模式停用（保守後果：unknown 委託的
+    配額維持保留、不會超賣），Increment 1 以下行 query_qty 指令補回。
+    supervisor.lock 在 agent 模式背後沒有 native → 即決策 5 的「獨立 server 鎖」。
+    """
+    while True:
+        await asyncio.sleep(unquarantine_after_seconds)
+        try:
+            await _retry_quarantined(adapter, unquarantine_after_seconds)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("agent watchdog：retry_quarantined 失敗")
 
 
 async def _retry_quarantined(adapter, older_than_seconds: float) -> None:

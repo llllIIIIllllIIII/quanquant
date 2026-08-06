@@ -112,6 +112,51 @@ def test_watchdog_backoff_increases_on_repeated_connect_failure(engine):
     assert state.reconnect_attempts >= 1
 
 
+def test_watchdog_reconnect_failure_alerts_connect_failed_with_redacted_message(engine):
+    """T0.3：重連失敗時通知 OpsAlerter.connect_failed，訊息必須已 redact（login 例外可能
+    夾帶 api_key/ca_passwd/person_id）。"""
+
+    class _RecordingAlerter:
+        def __init__(self):
+            self.connect_failed_calls = []
+
+        def connect_failed(self, message):
+            self.connect_failed_calls.append(message)
+
+    class _AlwaysFails:
+        def __init__(self):
+            self.supervisor = BrokerSupervisor()
+            self._api = None
+            self.secrets_to_redact = ["topsecretkey"]
+
+        async def connect(self):
+            raise RuntimeError("login failed api_key=topsecretkey")
+
+        async def reconcile(self):
+            pass
+
+    adapter = _AlwaysFails()
+    state = OrderSessionState()
+    alerter = _RecordingAlerter()
+
+    async def scenario():
+        task = asyncio.create_task(run_order_watchdog(
+            adapter, state, interval=0.01, login_min_interval=0.0,
+            unquarantine_after_seconds=9999, unknown_reconcile_grace_seconds=9999,
+            ops_alerter=alerter,
+        ))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+    assert len(alerter.connect_failed_calls) >= 1
+    assert all("topsecretkey" not in m for m in alerter.connect_failed_calls)  # 已 redact
+
+
 class _MinimalAdapter:
     """只給 watchdog 的 DB-only 背景工作（unquarantine/unknown reconcile）用，永遠健康、
     不觸發重連邏輯。"""

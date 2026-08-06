@@ -10,10 +10,19 @@
   <p class="error-banner">下單子系統目前未啟用，無法送出新委託（歷史委託仍可查看）。</p>
   {% endif %}
 
+  {# owner-only 全域 kill switch 控制（server 端切換仍一律經 assert_owner，非只靠此隱藏）。 #}
+  {% if is_owner %}
+  {% include "partials/kill_switch_control.html" %}
+  {% endif %}
+
   <div class="form-error-slot"></div>
 
-  <form hx-post="/orders" hx-swap="none">
-    <input type="hidden" name="client_order_id" value="{{ client_order_id }}">
+  <!-- hx-disabled-elt：送出期間停用送出鈕，杜絕「回應還沒回來前的 double-submit」——連點的
+       第二下會帶同一顆 client_order_id（成功回應才會 OOB 換鍵），撞 repository 冪等短路而靜默
+       回既有委託、不建新單，使用者感覺「沒反應」。 -->
+  <form hx-post="/orders" hx-swap="none" hx-disabled-elt="find button[type='submit']"
+        x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
+    <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
     <div class="grid">
       <label>商品
         <select name="symbol">{% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
@@ -27,13 +36,28 @@
     </div>
     <div class="grid">
       <label>價格
-        <input name="price" type="text" placeholder="18000">
+        <!-- bug 1（simtrade 實測回歸）：MKT 時改用 readonly（而非 disabled）——disabled
+             欄位完全依賴瀏覽器/HTMX 排除送出的行為，這件事本身無法用 TestClient 驗證
+             （見 docs/superpowers/reviews/2026-07-25 驗收殘留：真瀏覽器 UI/HTMX 未經真
+             瀏覽器互動）；readonly 一律隨表單送出，切到 MKT 時同時把顯示/送出值自動歸零
+             （見下方 price_type 的 x-on:change），讓後端一律收得到明確的 price=0，不需要
+             再依賴「有沒有送出這個欄位」。空值/None 後端 _parse_order_price 仍有防線
+             （見 web/routers/orders.py），這裡是前端層再多一道保險。 -->
+        <input name="price" type="text" placeholder="18000" x-model="priceValue" x-bind:readonly="priceType === 'MKT'">
       </label>
       <label>價格類型
-        <select name="price_type"><option value="LMT">限價</option><option value="MKT">市價</option></select>
+        <select name="price_type" x-model="priceType"
+                x-on:change="if (priceType === 'MKT') { priceValue = '0'; if (orderType === 'ROD') orderType = 'IOC'; }">
+          <option value="LMT">限價</option><option value="MKT">市價</option>
+        </select>
       </label>
       <label>委託類型
-        <select name="order_type"><option value="ROD">ROD</option><option value="IOC">IOC</option><option value="FOK">FOK</option></select>
+        <!-- TAIFEX 市價單不接受 ROD——MKT 時只能選 IOC/FOK，LMT 才可以 ROD。 -->
+        <select name="order_type" x-model="orderType">
+          <option value="ROD" x-bind:disabled="priceType === 'MKT'">ROD</option>
+          <option value="IOC">IOC</option>
+          <option value="FOK">FOK</option>
+        </select>
       </label>
       <label>倉別
         <select name="octype"><option value="New">新倉</option><option value="Cover">平倉</option><option value="Auto">自動</option></select>
@@ -51,11 +75,23 @@
     <a role="button" class="{{ 'contrast' if mode == 'sim' else '' }}" href="/orders?mode=sim">模擬</a>
   </div>
 
-  <h4>委託</h4>
-  <div hx-get="/orders/list?mode={{ mode }}" hx-trigger="load, refreshorders from:body" hx-swap="innerHTML"></div>
+  <!-- SSE 推送取代盲輪詢：委託/成交/部位有變動時，後端 /orders/stream 推一個 orders-changed
+       事件（主要由 RawInboxWorker 非同步成交落地觸發，見 broker/inbox_worker.py），瀏覽器據此
+       重抓自己 user-scoped 的委託/部位。保留 load（首載）與 refreshorders from:body（本分頁
+       下單/改單/取消當下即時刷新）；不再每 2s 盲輪詢、不再壓 event loop/supervisor 鎖。 -->
+  <div hx-ext="sse" sse-connect="/orders/stream">
+    <div id="agent-status-box"
+         hx-get="/orders/agent-status"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
 
-  <h4>部位</h4>
-  <div hx-get="/orders/positions" hx-trigger="load, refreshorders from:body" hx-swap="innerHTML"></div>
+    <h4>委託</h4>
+    <div hx-get="/orders/list?mode={{ mode }}"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+
+    <h4>部位</h4>
+    <div hx-get="/orders/positions"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+  </div>
 
   <!-- 改單 modal -->
   <dialog :open="open">

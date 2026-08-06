@@ -29,6 +29,14 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""  # alerts → Telegram (browser-only when unset)
     telegram_chat_id: str = ""
 
+    # 營運/開發告警（T0.3）：與上面 3 人共用的價格警示 chat 分離，走獨立 dev chat。
+    # token 留空 → 沿用 telegram_bot_token（同一 bot，只是送不同 chat）；chat_id 留空 →
+    # ops 告警整體 no-op（不誤入共用 chat）。事件：下單失敗/quarantine/feed 停滯/reconcile
+    # 漂移/kill switch/connect 失敗。
+    ops_telegram_bot_token: str = ""
+    ops_telegram_chat_id: str = ""
+    feed_stale_alert_seconds: float = 90.0  # 盤中報價停滯逾此秒數 → 營運告警（僅交易時段判定）
+
     # Market Pulse v0.1 — price-velocity audio + Telegram alerts.
     # Audio/cooldown/toggle live in the browser; the backend only computes the
     # Velocity Level and pushes Telegram when ENTERING the configured high level.
@@ -78,6 +86,11 @@ class Settings(BaseSettings):
     order_unquarantine_after_seconds: float = 300.0   # 較慢週期：多久沒解隔離的 raw_inbox 再重試
     order_unknown_reconcile_grace_seconds: float = 300.0  # unknown 委託等多久才判定失敗+釋放配額
     order_confirm_token_cleanup_interval_seconds: float = 3600.0  # 過期/已消費 token 清理週期
+
+    # --- 本機 broker agent 通道（Increment 0，單一信任使用者） ---
+    order_channel: str = "inprocess"    # inprocess | agent（agent=Shioaji I/O 在使用者本機執行）
+    agent_ws_token: str = ""            # agent WS 靜態 token；空字串=agent 通道停用
+    agent_command_timeout_seconds: float = 10.0  # server 等 cmd_ack 逾時（逾時→unknown 保守）
 
 
 @lru_cache(maxsize=1)

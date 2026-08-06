@@ -27,6 +27,7 @@ from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import OrderAck, Position
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_poller, get_session
+from quanquant.web.routers.orders import _parse_optional_update_price, _parse_order_price
 
 
 def _hidden(text: str, name: str) -> str | None:
@@ -70,22 +71,48 @@ class _FakeService:
             raise AuthorizationError("not owner")
         return [Position(symbol="TXF", direction="long", qty=1, avg_price=Decimal("18000"))]
 
+    def positions_snapshot(self, *, actor_user_id):
+        if self._deny_user == actor_user_id:
+            raise AuthorizationError("not owner")
+        return [Position(symbol="TXF", direction="long", qty=1, avg_price=Decimal("18000"))]
+
     def on_fill(self, handler):
         pass
 
 
 class _FakeRiskGuard:
-    def __init__(self):
+    def __init__(self, owner_ids=None):
         self.kill_switch = False
+        # owner_ids=None → 允許所有人（既有測試預設：assert_owner 為 no-op、is_owner 恆真）；
+        # 傳集合則只有集合內的 user 是 owner（kill switch 非 owner→403 測試用）。
+        self._owner_ids = None if owner_ids is None else set(owner_ids)
+        self.set_kill_switch_calls = []
 
     def set_kill_switch(self, value):
+        self.set_kill_switch_calls.append(value)
         self.kill_switch = value
 
+    def is_owner(self, actor_user_id):
+        return self._owner_ids is None or actor_user_id in self._owner_ids
+
     def assert_owner(self, actor_user_id):
-        pass
+        if self._owner_ids is not None and actor_user_id not in self._owner_ids:
+            raise AuthorizationError("not owner")
 
     def issue_confirm_token(self, session, *, actor_user_id, payload_hash):
         return f"TOKEN-{payload_hash}"
+
+
+class _FakeOps:
+    """假 ops_alerter：只記錄 kill_switch(...) 呼叫（API 見 notify/ops_alerter.py）。"""
+
+    def __init__(self):
+        self.kill_switch_calls = []
+
+    def kill_switch(self, *, enabled, actor_user_id, open_order_count=0, detail=""):
+        self.kill_switch_calls.append(
+            {"enabled": enabled, "actor_user_id": actor_user_id, "open_order_count": open_order_count}
+        )
 
 
 @pytest.fixture
@@ -99,7 +126,12 @@ def fake_guard():
 
 
 @pytest.fixture
-def order_client(engine, user, fake_service, fake_guard):
+def fake_ops():
+    return _FakeOps()
+
+
+@pytest.fixture
+def order_client(engine, user, fake_service, fake_guard, fake_ops):
     def _session_override():
         with Session(engine) as s:
             yield s
@@ -109,6 +141,7 @@ def order_client(engine, user, fake_service, fake_guard):
     app.dependency_overrides[get_poller] = lambda: None
     app.state.order_service = fake_service
     app.state.order_risk_guard = fake_guard
+    app.state.ops_alerter = fake_ops
     c = TestClient(app)
     c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
     return c
@@ -127,6 +160,41 @@ def test_two_get_requests_generate_different_client_order_ids(order_client):
     assert a != b
 
 
+def test_place_form_price_input_uses_readonly_not_disabled_for_mkt(order_client):
+    """bug 1（simtrade 實測回歸）前端強化：MKT 時的 price 欄位改用 readonly（一律隨表單
+    送出），不再用 disabled——disabled 欄位是否真的被瀏覽器/HTMX 排除在送出範圍外，這件事
+    本身無法用 TestClient 驗證（見 docs/superpowers/reviews/2026-07-25 驗收殘留：「真瀏覽器
+    UI/HTMX 未經真瀏覽器互動」），readonly 讓後端永遠收得到明確的 price 欄位值，不必依賴
+    這個無法驗證的前提。"""
+    resp = order_client.get("/orders")
+    price_tag = re.search(r'<input name="price"[^>]*>', resp.text)
+    assert price_tag is not None, resp.text
+    tag = price_tag.group(0)
+    assert "readonly" in tag  # 用 x-bind:readonly（或等效綁定），欄位一律送出
+    assert "disabled" not in tag  # 不再用 disabled（會被排除在 FormData 之外）
+
+
+def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
+    """委託/部位改用 SSE 推送（sse:orders-changed）取代每 2s 盲輪詢：頁面要有 sse-connect
+    容器、三個 div 的 trigger 含 sse:orders-changed（agent 狀態 badge + 委託 + 部位，Task 9
+    加了第一個）、且不再有 every 2s 盲輪詢（消除對 event loop / supervisor 鎖的壓力）。保留
+    refreshorders（本分頁動作當下即時刷新）與防連點。"""
+    text = order_client.get("/orders").text
+    assert 'sse-connect="/orders/stream"' in text  # SSE 連線容器
+    assert text.count("sse:orders-changed") == 3  # agent 狀態 + 委託 + 部位 三個 div 都靠 SSE 觸發
+    assert "every 2s" not in text  # 不再盲輪詢
+    assert "refreshorders from:body" in text  # 動作當下本分頁仍即時刷新
+    assert 'hx-get="/orders/list' in text and 'hx-get="/orders/positions"' in text
+    assert "hx-disabled-elt" in text  # 送出期間停用送出鈕（防 double-submit）
+
+
+def test_orders_stream_without_hub_returns_empty_stream_not_500(order_client):
+    """/orders/stream：app.state.order_events 未接線（此 fixture 未設 hub）時回空 stream、
+    不 500——與 alerts_stream 同慣例，端點在無 lifespan 的測試/停用情境不壞。"""
+    resp = order_client.get("/orders/stream")
+    assert resp.status_code == 200
+
+
 def test_place_order_sim_sends_directly(order_client, fake_service, user):
     resp = order_client.post("/orders", data={
         "client_order_id": "C1", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "18000",
@@ -134,6 +202,37 @@ def test_place_order_sim_sends_directly(order_client, fake_service, user):
     })
     assert resp.status_code == 200
     assert len(fake_service.placed) == 1
+
+
+def test_place_success_rotates_client_order_id_via_oob_swap(order_client, fake_service, user):
+    """反向/下一筆委託不得重用同一顆 client_order_id（simtrade 實測回歸：市價買單成功後，
+    反向賣單沿用同鍵、payload 不同，被 repository 冪等防護擋成「已存在但 payload 不同」）。
+    下單成功後回傳的 body 必須帶一個 out-of-band swap，把下單面板 hidden input
+    （id=client-order-id-input）換成全新的 UUID，讓下一筆用新鍵。"""
+    submitted = "C-REUSE"
+    resp = order_client.post("/orders", data={
+        "client_order_id": submitted, "symbol": "TXF", "action": "Buy", "qty": "1", "price": "18000",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert 'hx-swap-oob="true"' in resp.text
+    assert 'id="client-order-id-input"' in resp.text
+    fresh = _hidden(resp.text, "client_order_id")
+    assert fresh is not None
+    assert fresh != submitted  # 成功後換了全新的鍵
+    assert re.fullmatch(r"[0-9a-f-]{36}", fresh) is not None  # 是新生成的 UUID
+
+
+def test_place_failure_keeps_same_client_order_id_for_retry_idempotency(order_client, fake_service, user):
+    """失敗路徑（此處為 LMT 留白的表單錯誤）不得輪替 client_order_id——round3 #7 的設計是
+    「同一張表單的 HTTP retry 沿用同鍵才能冪等去重」，只有**成功**才換鍵。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-KEEP", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",  # LMT 留白 → 表單錯誤
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 0
+    assert 'hx-swap-oob="true"' not in resp.text  # 失敗不換鍵
 
 
 def test_place_order_real_two_step_confirm_round_trip(order_client, fake_service, user):
@@ -150,6 +249,174 @@ def test_place_order_real_two_step_confirm_round_trip(order_client, fake_service
     second = order_client.post("/orders", data={**form, "confirm_token": token})
     assert second.status_code == 200
     assert len(fake_service.placed) == 1  # 帶 token 那次真的送出去了
+
+
+# ---------------------------------------------------------------------------
+# T0.3(B) kill switch runtime 開關：owner-only 端點 + 告警 + 最小 UI
+# ---------------------------------------------------------------------------
+
+def _seed_order(session, user, *, client_order_id, request_hash, status, broker_order_id, ordno):
+    brepo.set_order_ack(
+        session,
+        brepo.create_order(
+            session, client_order_id=client_order_id, request_hash=request_hash, user_id=user.id,
+            mode="sim", broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-07-27",
+        ).id,
+        broker_order_id=broker_order_id, ordno=ordno, status=status,
+    )
+
+
+def test_kill_switch_owner_turns_on_toggles_and_alerts_with_open_order_count(
+    order_client, session, fake_guard, fake_ops, user
+):
+    """owner 翻 ON：200、guard.kill_switch 變 True、ops.kill_switch 被呼叫（enabled=True、
+    帶正確 open_order_count——只算 submitted/partfilled，不算 filled）。"""
+    _seed_order(session, user, client_order_id="KOPEN", request_hash="KH1", status="submitted",
+                broker_order_id="KB-OPEN", ordno="KO")
+    _seed_order(session, user, client_order_id="KDONE", request_hash="KH2", status="filled",
+                broker_order_id="KB-DONE", ordno="KD")
+    session.commit()
+
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true"})
+    assert resp.status_code == 200
+    assert fake_guard.kill_switch is True
+    assert len(fake_ops.kill_switch_calls) == 1
+    call = fake_ops.kill_switch_calls[0]
+    assert call["enabled"] is True
+    assert call["actor_user_id"] == user.id
+    assert call["open_order_count"] == 1  # 只算未成交掛單，filled 不算
+    assert 'hx-post="/orders/kill-switch"' in resp.text  # 回傳更新後的控制片段
+
+
+def test_kill_switch_owner_turns_off(order_client, fake_guard, fake_ops, user):
+    fake_guard.kill_switch = True
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "false"})
+    assert resp.status_code == 200
+    assert fake_guard.kill_switch is False
+    assert fake_ops.kill_switch_calls[-1]["enabled"] is False
+
+
+def test_kill_switch_non_owner_gets_403_and_does_not_toggle(order_client, fake_guard, fake_ops, user):
+    """非 owner → 403、set_kill_switch 未被呼叫、狀態不變、不發告警。"""
+    fake_guard._owner_ids = set()  # 沒有任何 owner → 目前 user 不是 owner
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true"})
+    assert resp.status_code == 403
+    assert fake_guard.kill_switch is False
+    assert fake_guard.set_kill_switch_calls == []
+    assert fake_ops.kill_switch_calls == []
+
+
+def test_kill_switch_without_risk_guard_does_not_500(engine, user):
+    """risk_guard 為 None（下單子系統關）→ 優雅回應（200 停用片段），不是 500。"""
+    def _session_override():
+        with Session(engine) as s:
+            yield s
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _session_override
+    app.dependency_overrides[get_poller] = lambda: None
+    # 刻意不設 app.state.order_risk_guard → get_order_risk_guard 回 None
+    c = TestClient(app)
+    c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
+    resp = c.post("/orders/kill-switch", data={"enabled": "true"})
+    assert resp.status_code == 200
+    assert "未啟用" in resp.text
+
+
+def test_orders_page_shows_kill_switch_control_for_owner(order_client):
+    text = order_client.get("/orders").text
+    assert 'hx-post="/orders/kill-switch"' in text
+
+
+def test_orders_page_hides_kill_switch_control_for_non_owner(order_client, fake_guard):
+    fake_guard._owner_ids = set()  # user 非 owner
+    text = order_client.get("/orders").text
+    assert 'hx-post="/orders/kill-switch"' not in text
+
+
+# ---- bug 1（simtrade 實測回歸）：_parse_order_price 對 None 的確切防線單元測試 ----
+# 直接鎖定 web/routers/orders.py::_parse_order_price 這個「確切呼叫 Decimal(...) 的位置」
+# 對 raw=None（disabled 欄位不送出時 form.get() 的真實回傳值）一定安全，不靠 HTTP 層間接
+# 驗證——`Decimal(None)` 會炸 `TypeError: conversion from NoneType to Decimal is not
+# supported`，_parse_order_price 用 `(raw or "").strip()` 把 None 與空字串統一處理，
+# 兩者都不會走到裸的 `Decimal(raw)` 呼叫。
+
+def test_parse_order_price_none_for_mkt_returns_zero_not_typeerror():
+    assert _parse_order_price(None, price_type="MKT") == Decimal("0")
+
+
+def test_parse_order_price_none_for_lmt_returns_zero_not_typeerror():
+    """LMT 缺值一樣不炸 TypeError——回 0 後交給 OrderRequest.__post_init__ 的 price>0
+    檢查擋下（走使用者可見的表單錯誤，不是未經處理的例外）。"""
+    assert _parse_order_price(None, price_type="LMT") == Decimal("0")
+
+
+def test_parse_order_price_none_price_type_returns_zero_not_typeerror():
+    """price_type 本身也缺席（例如非本頁面送出的畸形請求）時，raw=None 仍不炸 TypeError。"""
+    assert _parse_order_price(None, price_type=None) == Decimal("0")
+
+
+def test_parse_optional_update_price_none_returns_none_not_typeerror():
+    """改單路徑同樣的確切呼叫點：raw=None（欄位整個缺席）回 None（沿用既有值），不裸呼叫
+    Decimal(None)。"""
+    assert _parse_optional_update_price(None) is None
+
+
+def test_parse_optional_update_price_empty_string_returns_none():
+    assert _parse_optional_update_price("") is None
+
+
+def test_parse_optional_update_price_valid_string_returns_decimal():
+    assert _parse_optional_update_price("18500") == Decimal("18500")
+
+
+# ---- bug 2：市價單（MKT）不再因 price 而報 decimal.ConversionSyntax ----
+
+def test_place_order_mkt_with_empty_price_succeeds_defaults_to_zero(order_client, fake_service, user):
+    """MKT（市價單）price 欄位留白（Alpine 停用時瀏覽器也不會送出這個欄位）不應報
+    decimal.ConversionSyntax，應直接視為 price=0 成功送出。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-MKT", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "MKT", "order_type": "IOC", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 1
+    assert fake_service.placed[0].price == Decimal("0")
+
+
+def test_place_order_mkt_without_price_field_at_all_succeeds(order_client, fake_service, user):
+    """price 欄位整個缺席（HTML disabled input 不會被送出）也要一樣成功，不是只處理空字串。"""
+    form = {
+        "client_order_id": "C-MKT2", "symbol": "TXF", "action": "Buy", "qty": "1",
+        "price_type": "MKT", "order_type": "IOC", "octype": "New",
+    }
+    resp = order_client.post("/orders", data=form)
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 1
+    assert fake_service.placed[0].price == Decimal("0")
+
+
+def test_place_order_lmt_with_empty_price_shows_form_error_not_500(order_client, fake_service, user):
+    """LMT（限價單）留白仍要求價格——不強制歸零，只是不再拋出未經處理的 ConversionSyntax
+    原始例外訊息，而是走既有的表單錯誤流程（200 + 錯誤訊息，不是 500）。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-LMT-EMPTY", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 0
+
+
+def test_place_order_mkt_with_rod_rejected(order_client, fake_service, user):
+    """TAIFEX 市價單不接受 ROD，只能搭配 IOC/FOK。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-MKTROD", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "MKT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert len(fake_service.placed) == 0
 
 
 def test_place_order_without_service_shows_disabled_message(engine, user):
@@ -186,6 +453,14 @@ def test_update_order_authorization_error_maps_to_403(order_client, fake_service
     assert resp.status_code == 403
 
 
+def test_positions_snapshot_renders_for_owner(order_client, fake_service, user):
+    """positions 端點改用無鎖同步快照（positions_snapshot，離開 event loop、不搶 supervisor
+    鎖）後，owner 仍能正常取得並渲染部位。"""
+    resp = order_client.get("/orders/positions")
+    assert resp.status_code == 200
+    assert "TXF" in resp.text and "多" in resp.text  # 部位表有渲染出多單
+
+
 def test_positions_non_owner_gets_403(order_client, fake_service, user):
     fake_service._deny_user = user.id
     resp = order_client.get("/orders/positions")
@@ -211,6 +486,77 @@ def test_orders_list_scoped_by_mode(order_client, session, user):
     sim = order_client.get("/orders/list?mode=sim").text
     real = order_client.get("/orders/list?mode=real").text
     assert sim.count("<tr") <= 2 and real.count("<tr") <= 2  # header + 至多一筆資料列
+
+
+def test_order_table_shows_cancel_and_edit_buttons_only_for_live_open_orders(order_client, session, user,
+                                                                              fake_service):
+    """bug 2 附帶驗證：order_table.html 的取消/改單按鈕只在 submitted/partfilled、有
+    broker_order_id、且屬於目前 service 綁定 mode（live_mode）的委託才顯示——避免對已結案
+    委託（filled/cancelled）或非目前 mode 的委託誤顯示可操作的按鈕。"""
+    brepo.set_order_ack(
+        session,
+        brepo.create_order(session, client_order_id="OPEN1", request_hash="H1", user_id=user.id, mode="sim",
+                            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+                            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+                            trading_day="2026-06-16").id,
+        broker_order_id="B-OPEN", ordno="O-OPEN", status="submitted",
+    )
+    brepo.set_order_ack(
+        session,
+        brepo.create_order(session, client_order_id="DONE1", request_hash="H2", user_id=user.id, mode="sim",
+                            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+                            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+                            trading_day="2026-06-16").id,
+        broker_order_id="B-DONE", ordno="O-DONE", status="filled",
+    )
+    session.commit()
+
+    text = order_client.get("/orders/list?mode=sim").text
+    assert 'hx-get="/orders/B-OPEN/edit"' in text
+    assert 'hx-delete="/orders/B-OPEN"' in text
+    assert 'hx-get="/orders/B-DONE/edit"' not in text
+    assert 'hx-delete="/orders/B-DONE"' not in text
+
+
+def test_order_table_shows_avg_fill_price_not_committed_zero_price_for_filled_mkt_order(
+    order_client, session, user
+):
+    """bug C 回歸：市價單（MKT）委託價 `orders.price` 恆為 0（委託本來就無價，這是對的），
+    真實成交價在 `deals.price`／已由 `apply_order_fill` 累加進 `orders.avg_fill_price`
+    （見 broker/repository.py）。委託列表對已成交/部分成交的委託必須顯示成交均價，不能
+    照舊顯示委託價 0（那會讓使用者誤以為成交價是 0）。未成交的委託仍應顯示委託價。"""
+    filled_order = brepo.create_order(
+        session, client_order_id="FILLED1", request_hash="H1", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("0"), price_type="MKT", order_type="IOC", octype="New",
+        trading_day="2026-07-27",
+    )
+    brepo.set_order_ack(session, filled_order.id, broker_order_id="B-FILLED", ordno="O-FILLED",
+                        status="submitted")
+    session.commit()
+    with Session(session.get_bind()) as s:
+        order = s.get(type(filled_order), filled_order.id)
+        brepo.apply_order_fill(s, order, fill_qty=1, fill_price=Decimal("43737"))
+        s.commit()
+
+    pending_order = brepo.create_order(
+        session, client_order_id="PENDING1", request_hash="H2", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("18500"), price_type="LMT", order_type="ROD", octype="New",
+        trading_day="2026-07-27",
+    )
+    brepo.set_order_ack(session, pending_order.id, broker_order_id="B-PENDING", ordno="O-PENDING",
+                        status="submitted")
+    session.commit()
+
+    text = order_client.get("/orders/list?mode=sim").text
+    assert "18500" in text  # 未成交委託仍顯示委託價
+
+    # 精準定位 FILLED1 那一列（id="order-{id}"），確認成交均價顯示出來、不是裸的委託價 0。
+    rows = re.findall(rf'<tr id="order-{filled_order.id}">.*?</tr>', text, re.DOTALL)
+    assert len(rows) == 1
+    assert "43737" in rows[0]
+    assert re.search(r"<td[^>]*>0(\.0+)?</td>", rows[0]) is None  # 不再顯示裸的委託價 0
 
 
 def test_edit_order_form_without_service_shows_disabled_message(engine, user):
@@ -246,26 +592,52 @@ class _FakeTrade:
 
 
 class _FakeApi:
-    """假 shioaji client：不連真網路，place_order/update_order 同步回傳並記錄呼叫參數。"""
+    """假 shioaji client：不連真網路，place_order/update_order 同步回傳並記錄呼叫參數。
+
+    bug 2/3 修正後比照真實 SDK 契約（`_core.pyi`）：`cancel_order(trade)`／
+    `update_order(trade, price=, qty=)` 一律收 `Trade` 物件——收到非 Trade-like（沒有
+    `.order` 屬性，例如呼叫端誤傳 ordno 字串）就 raise `TypeError`，模擬真實 SDK
+    （`argument 'trade': 'str' object is not an instance of 'Trade'`）。`place_order`
+    送出後把回傳的 Trade 記進 `_live_trades`（以 `order.id` 為 key，比照真實 SDK
+    `list_trades()` 語意），`ShioajiAdapter._find_trade_by_ordno` 呼叫
+    `update_status()` + `list_trades()` 才找得到對應 Trade 物件。"""
 
     def __init__(self):
         self.futopt_account = type("Acc", (), {"account_id": "F1"})()
         self._seq = 0
         self.updated = []  # [(ordno, price, qty), ...]
+        self._live_trades: dict = {}
 
     def Order(self, **kw):
         return kw
 
     def place_order(self, contract, order):
         self._seq += 1
-        return _FakeTrade(f"ORD{self._seq}", f"SEQ{self._seq}")
+        trade = _FakeTrade(f"ORD{self._seq}", f"SEQ{self._seq}")
+        self._live_trades[trade.order.id] = trade
+        return trade
 
-    def cancel_order(self, ordno):
-        return _FakeTrade(ordno, f"SEQ-{ordno}")
+    def update_status(self, account=None, **kw):
+        pass
 
-    def update_order(self, ordno, **kw):
-        self.updated.append((ordno, kw.get("price"), kw.get("qty")))
-        return _FakeTrade(ordno, f"SEQ-{ordno}")
+    def list_trades(self):
+        return list(self._live_trades.values())
+
+    @staticmethod
+    def _assert_trade(trade) -> None:
+        if not hasattr(trade, "order"):
+            raise TypeError(
+                f"argument 'trade': {type(trade).__name__!r} object is not an instance of 'Trade'"
+            )
+
+    def cancel_order(self, trade):
+        self._assert_trade(trade)
+        return trade
+
+    def update_order(self, trade, **kw):
+        self._assert_trade(trade)
+        self.updated.append((trade.order.id, kw.get("price"), kw.get("qty")))
+        return trade
 
     def logout(self):
         pass
@@ -332,6 +704,43 @@ def test_real_place_two_step_confirm_round_trip_creates_order(engine, user):
 
     broker_order_id = _place_real_order(client, engine)
     assert broker_order_id  # 真的送出去了（adapter._api.place_order 有回 ordno/seqno）
+
+
+def test_real_cancel_round_trip_sends_trade_object_not_ordno_string(engine, user):
+    """bug 2/3 端到端驗收：DELETE /orders/{id} 全走真實元件（route→RiskGuard→adapter），
+    native cancel_order 收到的必須是 Trade 物件（`_FakeApi.cancel_order` 對非 Trade-like
+    輸入 raise TypeError，模擬真實 SDK 契約），不是先前直接塞 ordno 字串的舊行為。"""
+    guard = _real_guard(engine, owner_user_ids=frozenset({user.id}))
+    adapter = _real_adapter(engine, guard)
+    client = _real_client(engine, user, adapter, guard)
+    broker_order_id = _place_real_order(client, engine, client_order_id="C-CANCEL")
+
+    resp = client.delete(f"/orders/{broker_order_id}")
+    assert resp.status_code == 200
+
+    with Session(engine) as s:
+        order = brepo.find_order_by_broker_id(s, broker="shioaji", account="F1", mode="real",
+                                              broker_order_id=broker_order_id)
+        assert order.status == "cancelled"
+
+
+def test_real_place_mkt_order_with_empty_price_succeeds_through_full_pipeline(engine, user):
+    """bug 2 端到端驗收：表單→OrderRequest→RiskGuard→adapter 全走真實元件（sim 模式跳過
+    兩階段確認），MKT + 空/0 價格 + IOC 不再報 decimal.ConversionSyntax，也不被
+    price>0 檢查擋下。"""
+    guard = _real_guard(engine, owner_user_ids=frozenset({user.id}))
+    adapter = _real_adapter(engine, guard, mode="sim")
+    client = _real_client(engine, user, adapter, guard)
+
+    resp = client.post("/orders", data={
+        "client_order_id": "C-MKT-REAL", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "",
+        "price_type": "MKT", "order_type": "IOC", "octype": "New",
+    })
+    assert resp.status_code == 200
+    with Session(engine) as s:
+        order = brepo.find_order_by_client_order_id(s, "C-MKT-REAL")
+        assert order is not None and order.status == "submitted"
+        assert order.price == Decimal("0")
 
 
 def test_real_update_round_trip_price_only_does_not_deadlock(engine, user):

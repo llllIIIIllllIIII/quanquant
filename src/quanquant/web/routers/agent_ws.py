@@ -1,0 +1,169 @@
+"""本機 broker agent 的 WebSocket 端點（上行回報/ack、下行指令的傳輸層）。
+
+鐵律：本 receive 迴圈絕不取得 supervisor.lock、絕不 inline await 長工作
+（login 觸發的 reconcile 一律 create_task）——否則 receive 迴圈等 reconcile、
+reconcile 等 cmd_ack、cmd_ack 需要 receive 迴圈 → 死鎖。
+"""
+import asyncio
+import logging
+import secrets as _secrets
+
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
+from sqlalchemy import func
+from sqlmodel import select
+
+from quanquant.broker.agent_protocol import (
+    DownReportAck, UpCmdAck, UpHealth, UpLogin, UpReport, parse_uplink,
+)
+from quanquant.broker.inbox_worker import commit_raw_callback
+from quanquant.config import get_settings
+from quanquant.db.models import RawInbox
+
+log = logging.getLogger(__name__)
+router = APIRouter()
+
+
+@router.websocket("/ws/agent")
+async def agent_ws(websocket: WebSocket) -> None:
+    settings = get_settings()
+    state = websocket.app.state
+    channel = getattr(state, "agent_channel", None)
+    token = websocket.headers.get("x-agent-token", "")
+    await websocket.accept()
+    # 修：secrets.compare_digest 對非 ASCII str 直接 raise TypeError（Starlette 的 header
+    # 依 ASGI spec 用 latin-1 解碼，理論上可出現非 ASCII 字元）；比對一律先各自 encode 成
+    # bytes 再交給 compare_digest，bytes 版本沒有這個限制，token 不符時照樣安全回 1008。
+    if (channel is None or not settings.agent_ws_token
+            or not _secrets.compare_digest(
+                token.encode("utf-8"), settings.agent_ws_token.encode("utf-8")
+            )):
+        await websocket.close(code=1008)
+        return
+    # 連線洩漏防呆：這三個 app.state 屬性務必在 channel.attach 之前讀完——缺任一個
+    # （wiring 未完成）就直接關閉連線並 return，channel 才不會卡在 attached 態卻永遠等不到
+    # 對應的 finally 清理（之後真正的 agent 連線會被誤判成「已有連線」而被踢掉，永久連不上）。
+    try:
+        order_state = state.order_session_state
+        adapter = state.order_service
+        session_factory = state.order_session_factory
+    except AttributeError:
+        log.error(
+            "agent WS wiring 不完整（缺 order_session_state/order_service/"
+            "order_session_factory），拒絕連線"
+        )
+        await websocket.close(code=1011)
+        return
+    hub = getattr(state, "order_events", None)
+    if channel.connected:
+        channel.detach()   # 新連線取代殘留半開連線（agent 重啟；無條件，不帶 generation）
+    my_generation = channel.attach(websocket.send_json)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if channel.generation != my_generation:
+                # 這條連線已被更新的連線取代（generation 已前進）——舊連線收到的訊息一律
+                # 靜默忽略，不再處理／不再改動 channel 狀態，讓迴圈自然落到 finally 退場。
+                log.info("agent WS 舊連線（generation=%s）已被新連線取代，忽略後續訊息並退場",
+                         my_generation)
+                break
+            try:
+                msg = parse_uplink(data)
+            except ValidationError:
+                log.warning("agent 上行訊息格式不符，忽略：%s", str(data)[:200])
+                continue
+            if isinstance(msg, UpLogin):
+                # codex round3 fix1/fix3：count 查詢＋決策＋mark_logged_in＋adapter.account
+                # 設定整段包在 inbox_lock 內——與 UpReport 分支的 commit 序列化（消 TOCTOU：
+                # 舊連線的 report commit 飛行中時，這裡的 count 查詢會等它 commit 完才跑，
+                # 不會看到「尚未落地」的 0 而誤放行換帳號）。
+                async with channel.inbox_lock:
+                    if adapter.account and msg.account != adapter.account:
+                        # codex round2 fix2：agent 端的 tripwire（buffer.assert_account）只擋
+                        # 得住「尚未送出」的回報列；server 已 commit RawInbox 並 ack、worker
+                        # 尚未處理的列不受保護——這個窗口換帳號登入，worker 之後映射
+                        # order_report 用的是 mutable adapter.account（已被新帳號覆蓋），舊
+                        # 帳號的回報會被錯配進新帳號的部位/委託。查詢未處理列數，有殘留就
+                        # 整個拒絕這次 login；沒有殘留才放行（帳號覆蓋屬正常換帳號重啟）。
+                        unprocessed = await asyncio.to_thread(
+                            _count_unprocessed_raw_inbox, session_factory
+                        )
+                        if unprocessed > 0:
+                            # codex round3 fix1（HIGH）：只 continue 會留下半開連線——agent
+                            # 端的 pump 不等 login 確認就送 report，若 UpReport 分支沒檔會被
+                            # 拒帳號的回報照樣 commit+ack。直接關閉連線消滅半開態；agent 端
+                            # 會 backoff 重連，帳號不符會一直停在離線（UI 可見）。
+                            log.warning(
+                                "拒絕帳號切換登入，關閉連線：尚有 %d 筆未處理回報"
+                                "（原帳號 %s、新帳號 %s）",
+                                unprocessed, adapter.account, msg.account,
+                            )
+                            await websocket.close(code=1008)
+                            break
+                    channel.mark_logged_in(msg.account)
+                    adapter.account = msg.account
+                order_state.mark_ready()
+                if hub is not None:
+                    hub.publish()
+                asyncio.create_task(_reconcile_after_login(adapter))
+            elif isinstance(msg, UpReport):
+                # codex round3 fix2（HIGH）：未登入（或已被更新連線取代）一律不 commit、不
+                # ack——堵住「login 被拒/尚未確認時，agent 端提早送出的 report 仍被落地」的
+                # 跨帳號錯配缺口。agent 端該列維持 unacked，之後正常登入才會補送。
+                if not channel.logged_in or channel.generation != my_generation:
+                    log.warning(
+                        "忽略未登入連線的回報（event_id=%s），不 commit 也不 ack", msg.event_id
+                    )
+                    continue
+                async with channel.inbox_lock:
+                    await asyncio.to_thread(
+                        commit_raw_callback, session_factory,
+                        kind=msg.kind, broker="shioaji", payload=msg.payload,
+                    )
+                    await websocket.send_json(
+                        DownReportAck(event_id=msg.event_id).model_dump()
+                    )
+            elif isinstance(msg, UpCmdAck):
+                channel.resolve_ack(msg)
+            elif isinstance(msg, UpHealth):
+                channel.note_heartbeat()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        # 觀測用（不改變既有中斷語意）：非 WebSocketDisconnect 的例外原本就會讓迴圈往上炸、
+        # 帶著 finally 清理連線，這裡只加一行 log 讓「炸在哪、為什麼」不再無聲無息。
+        log.exception("agent WS 處理上行訊息失敗")
+        raise
+    finally:
+        # 只有這條連線仍是目前這一代（沒被更新的連線取代）時，detach 才真的生效——
+        # 也只有真的生效才標 offline/publish，避免舊連線的遲到 finally 誤傷新連線。
+        was_current = channel.generation == my_generation
+        channel.detach(my_generation)
+        if was_current:
+            order_state.mark_disabled("agent 離線")
+            if hub is not None:
+                hub.publish()
+            log.warning("agent WS 連線中斷，下單暫停（等待 agent 重連）")
+
+
+async def _reconcile_after_login(adapter) -> None:
+    try:
+        await adapter.reconcile()
+    except Exception:
+        log.exception("agent 登入後 reconcile 失敗（best-effort，不影響連線）")
+
+
+def _count_unprocessed_raw_inbox(session_factory) -> int:
+    """同步 DB 查詢（呼叫端須用 asyncio.to_thread 包起來，receive 迴圈鐵律：絕不 inline
+    await 長工作）：尚未處理的 RawInbox 列數——換帳號登入前的安全檢查（codex round2
+    fix2）。codex round4 修正：不再排除 quarantine==True 的列——quarantined 列仍是「未
+    處理」，run_agent_watchdog 的 _retry_quarantined 之後會自動解除隔離讓 worker 重新
+    處理；若那時帳號已切到新帳號，舊帳號的 order_report 會用新帳號的 mutable
+    adapter.account 映射，造成延遲跨帳號錯配。換帳號 guard 必須擋下所有
+    processed==False 列，不論 quarantine 與否。"""
+    with session_factory() as session:
+        return session.exec(
+            select(func.count()).where(
+                RawInbox.processed == False,  # noqa: E712 - SQLAlchemy 表達式需字面 == 比較
+            )
+        ).one()

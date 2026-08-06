@@ -23,7 +23,8 @@ import asyncio
 import json
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
+from typing import TYPE_CHECKING
 
 from sqlmodel import Session
 
@@ -32,6 +33,9 @@ from quanquant.broker.position_tracker import PositionMismatchError, PositionTra
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill
 from quanquant.db.models import Order, RawInbox
+
+if TYPE_CHECKING:
+    from quanquant.broker.order_events import OrderEventHub
 
 log = logging.getLogger(__name__)
 
@@ -75,6 +79,8 @@ class RawInboxWorker:
         tracker: PositionTracker | None = None,
         idle_interval: float = 1.0,
         batch_limit: int = 50,
+        order_events: "OrderEventHub | None" = None,
+        ops_alerter=None,
     ) -> None:
         self._session_factory = session_factory
         self._supervisor = supervisor
@@ -83,12 +89,18 @@ class RawInboxWorker:
         self._tracker = tracker or PositionTracker()
         self._idle_interval = idle_interval
         self._batch_limit = batch_limit
+        self._order_events = order_events
+        self._ops = ops_alerter  # T0.3：回報進 quarantine 時發營運告警（fire-and-forget，純疊加）
         self._stop = asyncio.Event()
 
     async def run(self) -> None:
         while not self._stop.is_set():
             async with self._supervisor.lock:
                 handled = await asyncio.to_thread(self.process_batch_once)
+            # 有列真的落地了（成交/委託狀態變更）→ 推 SSE，瀏覽器據此重抓委託/部位（取代盲輪詢）。
+            # 發布點在 to_thread 回來後、已回到 event loop 執行緒，故可直接呼叫、不需 call_soon_threadsafe。
+            if handled and self._order_events is not None:
+                self._order_events.publish()
             if handled == 0:
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=self._idle_interval)
@@ -142,8 +154,16 @@ class RawInboxWorker:
             except (ValueError, PositionMismatchError) as exc:
                 session.rollback()
                 row = session.get(RawInbox, row_id)
+                kind = row.kind if row is not None else "?"  # commit 前先取（expire_on_commit 後不再讀 detached row）
                 brepo.quarantine_raw_inbox(session, row, error=str(exc))
                 session.commit()
+                # T0.3 告警（純疊加）：quarantine 落地後才通知；取值/呼叫包 try/except 吞掉，
+                # 告警絕不能反噬處理流程（此列已成功 quarantine，DB 狀態不受告警影響）。
+                if self._ops is not None:
+                    try:
+                        self._ops.quarantine(row_id=row_id, kind=kind, error=str(exc))
+                    except Exception:
+                        log.exception("quarantine 告警失敗（已吞，不影響處理流程）")
 
     @staticmethod
     def _decode_payload(raw: str) -> dict:
@@ -173,6 +193,21 @@ class RawInboxWorker:
                 f"無法解析委託關聯（broker={fill.broker!r},account={fill.account!r},mode={fill.mode!r},"
                 f"ordno={fill.ordno!r},broker_order_id={fill.broker_order_id!r}），quarantine 待重建"
             )
+
+        # 真實成交回報（FuturesDealEvent）沒有 octype 欄位（見
+        # ShioajiAdapter._map_deal_report 說明）——mapper 回傳的 fill.octype 此刻只是滿足
+        # Fill.__post_init__ 型別驗證的占位值，正確值一律用上面剛解析到的對應 Order 當初下單
+        # 時存的 octype 覆蓋。解不到對應 Order 的情況已經在上面 raise ValueError quarantine
+        # 掉，不會走到這裡（「解不到就 quarantine，不亂猜」）。
+        #
+        # symbol 同理覆蓋（部位顯示 bug 收尾）：真實 FuturesDealEvent 的 `code` 欄位是具體
+        # 月合約代碼（如 "TXFH6"），mapper（_map_deal_report）照原樣帶出；但 Order.symbol／
+        # ShioajiAdapter.symbol／positions() 查詢一律用通用商品代碼（如 "TXF"，見
+        # config.Settings.symbol）。若直接採用 mapper 給的具體合約代碼寫入
+        # BrokerPosition.symbol，會跟 `list_open_positions(symbol=self.symbol)` 的過濾條件
+        # 對不起來——部位明明已入帳，`positions()` 卻永遠查不到。一律以解析到的
+        # Order.symbol（通用代碼）為準，不信任 mapper 給的具體合約代碼。
+        fill = _dc_replace(fill, octype=order.octype, symbol=order.symbol)
 
         trading_day = brepo.trading_day_for(fill.ts)
         deal = brepo.stage_deal(

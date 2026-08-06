@@ -1,0 +1,21 @@
+<div id="kill-switch-control"
+     style="margin:0 0 1rem;padding:.6rem .9rem;border-radius:6px;border:1px solid {{ '#c0392b' if kill_switch else 'var(--pico-muted-border-color,#ccc)' }};{% if kill_switch %}background:rgba(192,57,43,.12);{% endif %}">
+  {% if disabled|default(false) %}
+  <span class="muted">⚪ Kill switch 無法使用（下單子系統未啟用）</span>
+  {% else %}
+  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+    <strong style="{% if kill_switch %}color:#c0392b;{% endif %}">
+      {% if kill_switch %}🔴 Kill switch 已啟動 — 拒絕所有新單{% else %}🟢 下單正常{% endif %}
+    </strong>
+    <!-- 一鍵切到相反狀態；swap 自身（outerHTML）。翻 ON 只擋新單、不自動撤既有掛單。 -->
+    <form hx-post="/orders/kill-switch" hx-target="#kill-switch-control" hx-swap="outerHTML" style="margin:0;">
+      <input type="hidden" name="enabled" value="{{ 'false' if kill_switch else 'true' }}">
+      {% if kill_switch %}
+      <button type="submit" class="secondary" style="margin:0;">解除（恢復下單）</button>
+      {% else %}
+      <button type="submit" class="contrast" style="margin:0;">啟動 Kill switch（拒絕新單）</button>
+      {% endif %}
+    </form>
+  </div>
+  {% endif %}
+</div>

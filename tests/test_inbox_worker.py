@@ -49,14 +49,26 @@ def _noop_order_report_mapper(payload: dict) -> OrderReport:
     return OrderReport(**payload)
 
 
-def _worker(engine, *, deal_mapper=_ok_deal_mapper, order_report_mapper=_noop_order_report_mapper, supervisor=None):
+def _worker(engine, *, deal_mapper=_ok_deal_mapper, order_report_mapper=_noop_order_report_mapper,
+            supervisor=None, ops_alerter=None):
     return RawInboxWorker(
         session_factory=lambda: Session(engine),
         supervisor=supervisor or BrokerSupervisor(),
         deal_mapper=deal_mapper,
         order_report_mapper=order_report_mapper,
         idle_interval=0.01,
+        ops_alerter=ops_alerter,
     )
+
+
+class _RecordingAlerter:
+    """假 OpsAlerter：記錄 quarantine 呼叫 kwargs（T0.3 告警串接）；本身絕不 raise。"""
+
+    def __init__(self) -> None:
+        self.quarantine_calls: list[dict] = []
+
+    def quarantine(self, **kw) -> None:
+        self.quarantine_calls.append(kw)
 
 
 def _seed_order(session, **over):
@@ -102,6 +114,103 @@ def test_unresolvable_order_correlation_quarantines_not_dropped(session, engine)
         assert s.exec(select(Deal)).first() is None  # 沒有部分寫入
         row = s.exec(select(RawInbox)).first()
         assert row.quarantine is True and row.processed is False
+
+
+def test_quarantine_emits_ops_alert_with_row_id_kind_and_error(session, engine):
+    """T0.3：走進 quarantine 分支時通知 OpsAlerter（row_id/kind/error）。"""
+    alerter = _RecordingAlerter()
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(ordno="GHOST", broker_order_id="GHOST-B")),
+        )
+        s.commit()
+        row_id = s.exec(select(RawInbox)).first().id
+
+    worker = _worker(engine, ops_alerter=alerter)
+    worker.process_batch_once()
+    assert len(alerter.quarantine_calls) == 1
+    call = alerter.quarantine_calls[0]
+    assert call["row_id"] == row_id and call["kind"] == "deal_report"
+    assert "無法解析委託關聯" in call["error"]
+
+
+def test_normal_processing_does_not_emit_quarantine_alert(session, engine):
+    alerter = _RecordingAlerter()
+    _seed_order(session)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    worker = _worker(engine, ops_alerter=alerter)
+    worker.process_batch_once()
+    assert alerter.quarantine_calls == []  # 正常落地不發告警
+
+
+def test_deal_report_octype_comes_from_resolved_order_not_mapper_payload(session, engine):
+    """成交回報（真實 FuturesDealEvent）本身沒有 octype 欄位；_process_deal 必須用解析到的
+    對應 Order 的 octype 覆蓋 mapper 回傳的任何占位值，不是照單全收 mapper 給的值
+    （見 broker/shioaji_adapter.py::_map_deal_report 的 "Auto" 占位說明）。"""
+    _seed_order(session, octype="Cover", action="Sell")  # 對應委託是平倉
+
+    def _mapper_with_wrong_octype_placeholder(payload: dict) -> Fill:
+        return Fill(
+            broker=payload["broker"], fill_id=payload["fill_id"], ordno=payload["ordno"],
+            broker_order_id=payload["broker_order_id"], symbol=payload["symbol"],
+            action=payload["action"], price=Decimal(payload["price"]), qty=int(payload["qty"]),
+            fee=Decimal(payload["fee"]), octype="Auto", ts=payload["ts"],
+            account=payload["account"], mode=payload["mode"], user_id=None,
+        )
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
+                              payload=json.dumps(_deal_payload(action="Sell")))
+        s.commit()
+
+    worker = _worker(engine, deal_mapper=_mapper_with_wrong_octype_placeholder)
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        # 沒有預先開倉的部位：若 octype 真的被覆蓋成 Cover（對應 Order 的值），Cover 分支
+        # 會因為找不到開倉部位而 quarantine；若沒被覆蓋、停留在 mapper 給的占位 "Auto"，
+        # Auto 分支會直接成功開一個新的 short 部位（不 quarantine）——用這個反差證明覆蓋真的
+        # 發生。
+        row = s.exec(select(RawInbox)).first()
+        assert row.quarantine is True and row.processed is False
+        assert s.exec(select(BrokerPosition)).first() is None
+
+
+def test_deal_report_symbol_comes_from_resolved_order_not_specific_contract_code(session, engine):
+    """部位顯示 bug 回歸：真實 FuturesDealEvent 的 `code` 欄位是「具體月合約代碼」
+    （如 "TXFH6"），不是我方全域慣用的「通用商品代碼」（如 "TXF"，見 config.Settings.symbol/
+    ShioajiAdapter.symbol，下單表單、`positions()` 查詢一律用這個通用代碼）。若成交回報直接
+    照抄 mapper 給的 `payload["code"]` 當 BrokerPosition.symbol，會跟 `list_open_positions`
+    用 `symbol=self.symbol="TXF"` 查詢的過濾條件對不起來——部位明明已入帳，`positions()`
+    卻永遠查不到（使用者看到的現象是「部位沒顯示」）。同 octype 的既有覆蓋慣例：symbol 一律
+    以解析到的 Order.symbol（通用代碼）為準，不信任 mapper 給的具體合約代碼。"""
+    _seed_order(session, symbol="TXF")  # 下單當下存的是通用代碼
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(symbol="TXFH6")),  # 成交回報帶的是具體月合約代碼
+        )
+        s.commit()
+
+    worker = _worker(engine)
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        pos = s.exec(select(BrokerPosition)).first()
+        assert pos is not None
+        assert pos.symbol == "TXF"  # 不是 mapper 給的 "TXFH6"
+
+        # 與 ShioajiAdapter.positions() 實際查詢條件一致：symbol=self.symbol（通用代碼）。
+        found = brepo.list_open_positions(
+            s, user_id=1, broker="shioaji", account="F1", mode="sim", symbol="TXF",
+        )
+        assert len(found) == 1
 
 
 def test_position_mismatch_quarantines_without_partial_deal_write(session, engine):

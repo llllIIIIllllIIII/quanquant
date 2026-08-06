@@ -57,6 +57,32 @@ def test_order_request_rejects_illegal_enums(field, bad):
         _req(**{field: bad})
 
 
+# ---- bug 2：price 驗證改成 price_type 感知——MKT 不需要價格 ----
+
+def test_order_request_allows_zero_price_for_mkt_order():
+    """MKT（市價單）price 一律視為 0，不再套用 LMT 的 price>0 規則。"""
+    req = _req(price=Decimal("0"), price_type="MKT", order_type="IOC")
+    assert req.price == Decimal("0")
+
+
+def test_order_request_rejects_negative_price_even_for_mkt():
+    """MKT 放寬 price==0，但仍不可為負——不是完全不驗證。"""
+    with pytest.raises(ValueError):
+        _req(price=Decimal("-1"), price_type="MKT", order_type="IOC")
+
+
+def test_order_request_rejects_mkt_with_rod_order_type():
+    """TAIFEX 市價單不接受 ROD，只能搭配 IOC/FOK。"""
+    with pytest.raises(ValueError):
+        _req(price=Decimal("0"), price_type="MKT", order_type="ROD")
+
+
+def test_order_request_still_rejects_lmt_zero_price():
+    """既有規則不得因為 MKT 的放寬而跟著弱化：LMT 仍要求 price>0。"""
+    with pytest.raises(ValueError):
+        _req(price=Decimal("0"), price_type="LMT")
+
+
 def test_fill_carries_user_mode_and_broker_order_id():
     f = Fill(
         broker="shioaji", fill_id="F1", ordno="O1", broker_order_id="B1", symbol="TXF", action="Sell",
@@ -131,6 +157,7 @@ def test_protocol_is_runtime_checkable_duck():
         async def cancel(self, broker_order_id, *, actor_user_id): ...
         async def update(self, broker_order_id, *, actor_user_id, price=None, qty=None, confirm_token=None): ...
         async def positions(self, *, actor_user_id): ...
+        def positions_snapshot(self, *, actor_user_id): ...
         def on_fill(self, handler): ...
 
     assert isinstance(_Impl(), OrderService)

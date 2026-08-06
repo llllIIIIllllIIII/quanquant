@@ -15,16 +15,20 @@ from sqlmodel import Session
 
 from quanquant.alerts.engine import run_alert_engine
 from quanquant.broker.lifecycle import run_confirm_token_cleanup, shutdown_order_subsystem
+from quanquant.broker.order_events import OrderEventHub
 from quanquant.broker.preflight import order_subsystem_preflight
 from quanquant.broker.redaction import redact_secrets
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.broker.watchdog import run_order_watchdog
 from quanquant.candles.builder import CandleBuilder
+from quanquant.candles.market_calendar import session_now
 from quanquant.candles.repo import prune_quotes, upsert_candles
 from quanquant.config import Settings, get_settings
 from quanquant.db.engine import get_engine, init_db
 from quanquant.db.models import Quote
+from quanquant.market_hours import CST
 from quanquant.notify import TelegramNotifier, build_notify
+from quanquant.notify.ops_alerter import build_ops_alerter
 from quanquant.poller import QuoteEvent, QuotePoller
 from quanquant.pulse.engine import PulseEngine, run_pulse_engine
 from quanquant.pulse.prefs import load_telegram_enabled
@@ -32,12 +36,26 @@ from quanquant.sources.registry import make_source
 from quanquant.web.deps import get_current_user
 from quanquant.web.routers import alerts, candles, dashboard, health, stats, trades
 from quanquant.web.routers import admin as admin_routes
+from quanquant.web.routers import agent_ws as agent_ws_routes
 from quanquant.web.routers import auth as auth_routes
 from quanquant.web.routers import orders as orders_routes
 from quanquant.web.routers import pulse as pulse_routes
 from quanquant.web.templating import STATIC_DIR
 
 log = logging.getLogger(__name__)
+
+
+def _write_market_rows(rows, quote_row) -> None:
+    """同步 DB 寫入（candle upsert + 可選 Quote insert），設計成在 threadpool 執行——讓
+    event loop 在等 SQLite 寫鎖時仍能 fan-out tick / 推報價 SSE，避免「K 線與價格都停住」。
+    保留原本兩段各自的寫入語意（upsert_candles 內部自行 commit；Quote 另開 session commit）。"""
+    if rows:
+        with Session(get_engine()) as session:
+            upsert_candles(session, rows)
+    if quote_row is not None:
+        with Session(get_engine()) as session:
+            session.add(quote_row)
+            session.commit()
 
 
 async def _persist_market_data(
@@ -56,6 +74,7 @@ async def _persist_market_data(
     builder = CandleBuilder(symbol)
     queue = poller.subscribe()
     last_quote_write = 0.0
+    last_write_error_log = 0.0
     try:
         while True:
             event = await queue.get()
@@ -63,25 +82,28 @@ async def _persist_market_data(
                 continue
             snap = event.snapshot
             try:
-                rows = builder.on_snapshot(snap)  # every tick → accurate OHLCV
-                if rows:
-                    with Session(get_engine()) as session:
-                        upsert_candles(session, rows)
+                rows = builder.on_snapshot(snap)  # every tick → accurate OHLCV（CPU，留在 loop）
                 now = time.monotonic()
+                quote_row = None
                 if now - last_quote_write >= quote_write_min_interval:
                     last_quote_write = now
-                    with Session(get_engine()) as session:
-                        session.add(
-                            Quote(
-                                symbol=snap.symbol,
-                                price=snap.price,
-                                volume=snap.volume,
-                                fetched_at=snap.fetched_at.replace(tzinfo=None),
-                            )
-                        )
-                        session.commit()
+                    quote_row = Quote(
+                        symbol=snap.symbol,
+                        price=snap.price,
+                        volume=snap.volume,
+                        fetched_at=snap.fetched_at.replace(tzinfo=None),
+                    )
+                if rows or quote_row is not None:
+                    # DB 寫入丟 threadpool：SQLite 寫鎖等待不再凍住 event loop（tick fan-out /
+                    # 報價 SSE 續跑）。await 之後才取下一筆，故寫入仍依 tick 順序序列化、K 棒正確。
+                    await asyncio.to_thread(_write_market_rows, rows, quote_row)
             except Exception:
-                pass  # never let a write error stop the market-data feed
+                # 不讓寫入錯誤停掉行情 feed（韌性），但不再靜默吞掉——節流每 30s 記一次完整
+                # traceback，否則正準 candle store 寫入失敗會全無觀測性（Tier0 C#3）。
+                now = time.monotonic()
+                if now - last_write_error_log >= 30.0:
+                    last_write_error_log = now
+                    log.exception("市場資料寫入失敗，已略過此筆（每 30s 記一次）")
     finally:
         poller.unsubscribe(queue)
 
@@ -123,6 +145,132 @@ async def _prune_quotes_loop() -> None:
         await asyncio.sleep(24 * 3600)
 
 
+def _feed_stale_check(poller, ops_alerter, threshold: float, session_open_fn) -> None:
+    """單次判定（抽出以利測試，不必真跑無限 loop）：**僅在交易時段**且 poller 報價停滯逾
+    `threshold` 秒時，才發 feed_stale 告警。休市（週末/夜盤收盤後/盤間）時 `session_open_fn()`
+    回 False → 直接返回，避免每晚對著關閉的市場狂噴告警（本項驗收重點）。"""
+    if poller is None or ops_alerter is None:
+        return
+    if not session_open_fn():
+        return
+    if poller.is_stale(threshold):
+        ops_alerter.feed_stale(age_seconds=poller.seconds_since_snapshot())
+
+
+async def run_feed_watchdog(
+    poller, ops_alerter, *, threshold: float, interval: float = 30.0, session_open_fn
+) -> None:
+    """盤中報價停滯 watchdog（T0.3）：每 `interval` 秒做一次 `_feed_stale_check`。判定/告警
+    任何例外一律吞掉並記 log，不讓 watchdog 自己掛掉。"""
+    while True:
+        try:
+            _feed_stale_check(poller, ops_alerter, threshold, session_open_fn)
+        except Exception:
+            log.exception("feed watchdog 判定失敗（已吞，續跑）")
+        await asyncio.sleep(interval)
+
+
+async def _scan_orphan_orders_once(session_factory, ops_alerter) -> None:
+    """T0.2：surface 孤兒委託（pending/sending + 無券商識別碼）——process 曾在送單落地前崩潰，
+    券商端**可能已收單/成交**，故不自動改狀態/釋放配額（會少算曝險→過度交易），只明顯記錄
+    交人工/reconcile 對照券商端後收尾。開機當下任何 pending+NULL 都是前次執行殘留的孤兒。
+
+    in-process／agent 兩種通道共用（Task 8）：in-process 在 connect 成功後原位呼叫；
+    agent 分支沒有 native connect 時機，改在 wiring 完成時排一次同樣的 one-shot task。
+    """
+    try:
+        from quanquant.broker import repository as _brepo
+        with session_factory() as _s:
+            orphans = _brepo.list_pending_orphans_older_than(
+                _s, older_than=datetime.now(timezone.utc).replace(tzinfo=None)
+            )
+        if orphans:
+            log.warning(
+                "偵測到 %d 筆孤兒委託（送單落地前崩潰，券商端可能已成交，未自動處理）：client_order_id=%s"
+                "——請對照券商端後手動收尾其保留配額",
+                len(orphans), [o.client_order_id for o in orphans],
+            )
+    except Exception:
+        log.exception("孤兒委託掃描失敗")
+
+
+async def _start_agent_channel_subsystem(
+    app: FastAPI, settings: Settings, tasks: list, order_state: OrderSessionState, ops_alerter,
+) -> None:
+    """ORDER_CHANNEL=agent 分支（Task 8）：Shioaji I/O 交給使用者本機 broker agent，經
+    `/ws/agent` 上下行；server 端仍是唯一決策者（風控/冪等/配額全在這裡，未變）。
+
+    Increment 0 硬限制：僅支援 `ORDER_MODE=sim`（agent 端目前只做模擬撮合，real 走 CA 簽署
+    尚未實作）；未設定 `AGENT_WS_TOKEN`／owner id 皆是刻意停用（非故障，/healthz 仍 200）。
+    """
+    from decimal import Decimal
+
+    from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
+    from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
+    from quanquant.broker.shioaji_adapter import ShioajiAdapter
+    from quanquant.broker.supervisor import BrokerSupervisor
+    from quanquant.broker.watchdog import run_agent_watchdog
+
+    if settings.order_mode != "sim":
+        order_state.mark_unhealthy("agent 通道 Increment 0 僅支援 ORDER_MODE=sim")
+        return
+    if not settings.agent_ws_token:
+        order_state.mark_disabled("未設定 AGENT_WS_TOKEN，agent 通道停用")
+        return
+    owner_ids = parse_owner_ids(settings.order_owner_user_ids)
+    if not owner_ids:
+        order_state.mark_disabled("order_owner_user_ids 未設定，下單子系統未啟用")
+        return
+
+    supervisor = BrokerSupervisor()
+
+    def _order_session() -> Session:
+        return Session(get_engine())
+
+    risk_guard = RiskGuard(
+        session_factory=_order_session,
+        secret=settings.session_secret or "dev-only-insecure",
+        owner_user_ids=owner_ids,
+        symbol_whitelist=parse_whitelist(settings.order_symbol_whitelist),
+        max_qty_per_order=settings.order_max_qty_per_order,
+        max_qty_per_day=settings.order_max_qty_per_day,
+        max_orders_per_day=settings.order_max_orders_per_day,
+        confirm_token_ttl_seconds=settings.order_confirm_token_ttl_seconds,
+        kill_switch_initial=settings.order_kill_switch_initial,
+    )
+    channel = AgentChannel()
+    gateway = AgentNativeGateway(channel,
+                                 timeout_seconds=settings.agent_command_timeout_seconds)
+    adapter = ShioajiAdapter(
+        api_key="", secret_key="", ca_path=None, ca_passwd=None, person_id=None,
+        symbol=settings.symbol, mode="sim", session_factory=_order_session,
+        supervisor=supervisor, risk_guard=risk_guard,
+        sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+        ops_alerter=ops_alerter, remote_gateway=gateway,
+    )
+    inbox_worker = RawInboxWorker(
+        session_factory=_order_session, supervisor=supervisor,
+        deal_mapper=adapter._map_deal_report,
+        order_report_mapper=adapter._map_order_report,
+        order_events=getattr(app.state, "order_events", None),
+        ops_alerter=ops_alerter,
+    )
+    app.state.agent_channel = channel
+    app.state.order_service = adapter
+    app.state.order_risk_guard = risk_guard
+    app.state.order_inbox_worker = inbox_worker
+    app.state.order_session_factory = _order_session
+    order_state.mark_disabled("agent 未連線")     # 等 agent 上線；/healthz 200
+    tasks.append(asyncio.create_task(inbox_worker.run()))
+    tasks.append(asyncio.create_task(run_agent_watchdog(
+        adapter, unquarantine_after_seconds=settings.order_unquarantine_after_seconds)))
+    # T0.2：agent 分支沒有 native connect 時機可以掛「connect 成功後跑一次」，故在 wiring
+    # 完成時直接排一次 one-shot 孤兒掃描（可視性，不影響啟動）。
+    tasks.append(asyncio.create_task(_scan_orphan_orders_once(_order_session, ops_alerter)))
+    log.info("agent 通道下單子系統已配線，等待本機 broker agent 連線")
+
+
 async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) -> None:
     """Task 8 readiness gate：ORDER_MODE 拼錯（`order_subsystem_preflight` raise
     RuntimeError）只讓下單子系統停用並反映在 `/healthz`——**不**讓整個 app 起不來，行情/日誌
@@ -136,6 +284,14 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     app.state.order_service = None
     app.state.order_risk_guard = None
     app.state.order_inbox_worker = None
+    ops_alerter = getattr(app.state, "ops_alerter", None)  # T0.3：lifespan 已建好，這裡取用傳遞
+
+    if settings.order_channel not in ("inprocess", "agent"):
+        order_state.mark_unhealthy(f"ORDER_CHANNEL 設定錯誤: {settings.order_channel!r}")
+        return
+    if settings.order_channel == "agent":
+        await _start_agent_channel_subsystem(app, settings, tasks, order_state, ops_alerter)
+        return
 
     try:
         order_enabled, order_disabled_reason = order_subsystem_preflight(settings)
@@ -145,7 +301,9 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         return
 
     if not order_enabled:
-        order_state.mark_unhealthy(order_disabled_reason or "下單子系統未啟用")
+        # 刻意停用（缺 key/owner/CA）：非故障，/healthz 仍算健康（200）。設定錯（上面的
+        # RuntimeError 分支）才是 mark_unhealthy → /healthz 回 503。
+        order_state.mark_disabled(order_disabled_reason or "下單子系統未啟用")
         log.info("下單子系統未啟用: %s", order_disabled_reason)
         return
 
@@ -177,10 +335,13 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         person_id=settings.shioaji_person_id or None, symbol=settings.symbol,
         mode=settings.order_mode, session_factory=_order_session, supervisor=supervisor,
         risk_guard=risk_guard, sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+        ops_alerter=ops_alerter,
     )
     inbox_worker = RawInboxWorker(
         session_factory=_order_session, supervisor=supervisor,
         deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+        order_events=getattr(app.state, "order_events", None),
+        ops_alerter=ops_alerter,
     )
 
     try:
@@ -197,6 +358,10 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         )
         order_state.mark_unhealthy(message)
         log.error("下單子系統 connect 失敗（fail closed）: %s", message)
+        # T0.3 告警（純疊加）：務必用已 redact 的 message（原始 exc 可能夾帶
+        # api_key/ca_passwd/person_id），不可用原始 exc。
+        if ops_alerter is not None:
+            ops_alerter.connect_failed(message)
         return
 
     order_state.mark_ready()
@@ -204,11 +369,24 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     app.state.order_risk_guard = risk_guard
     app.state.order_inbox_worker = inbox_worker
     tasks.append(asyncio.create_task(inbox_worker.run()))
+    # T0.2：開機做一次 best-effort reconcile——原本 reconcile 只在斷線重連後才跑（watchdog），
+    # 正常開機不會補回停機期間券商端的委託/狀態變更。失敗不擋啟動（watchdog 後續仍會補）；
+    # sim 下 list_trades() 空、no-op。
+    try:
+        await adapter.reconcile()
+    except Exception as exc:
+        log.warning(
+            "開機 reconcile 失敗（不擋啟動，watchdog 後續重試）: %s",
+            redact_secrets(str(exc), secrets=getattr(adapter, "secrets_to_redact", [])),
+        )
+    # T0.2：surface 孤兒委託（Task 8 抽成模組級 helper，agent 分支共用）。
+    await _scan_orphan_orders_once(_order_session, ops_alerter)
     tasks.append(asyncio.create_task(run_order_watchdog(
         adapter, order_state, interval=settings.order_watchdog_interval_seconds,
         login_min_interval=settings.order_login_min_interval_seconds,
         unquarantine_after_seconds=settings.order_unquarantine_after_seconds,
         unknown_reconcile_grace_seconds=settings.order_unknown_reconcile_grace_seconds,
+        ops_alerter=ops_alerter,
     )))
     tasks.append(asyncio.create_task(run_confirm_token_cleanup(
         _order_session, interval=settings.order_confirm_token_cleanup_interval_seconds,
@@ -223,6 +401,11 @@ async def lifespan(app: FastAPI):
     notify = build_notify(settings)
     app.state.notify = notify
 
+    # T0.3 營運告警管道（獨立 dev chat，與 3 人共用的價格警示分離；未設定則整體 no-op）。
+    ops_alerter = build_ops_alerter(settings, mode=settings.order_mode)
+    ops_alerter.attach_loop(asyncio.get_running_loop())
+    app.state.ops_alerter = ops_alerter
+
     use_shioaji = bool(
         settings.source == "shioaji"
         and settings.shioaji_api_key
@@ -232,6 +415,9 @@ async def lifespan(app: FastAPI):
     source = make_source("taifex" if use_shioaji else settings.source)
     poller = QuotePoller(source, settings.symbol, settings.poll_interval_seconds)
     app.state.poller = poller
+    # 委託/成交/部位變動的 SSE ping hub：無條件建立（即使下單子系統停用，/orders/stream
+    # 端點也有 hub 可訂閱，只是永不觸發），供 RawInboxWorker 發布、/orders/stream 訂閱。
+    app.state.order_events = OrderEventHub()
 
     # Market Pulse: classify tick velocity off the un-coalesced poller stream;
     # the level is stamped onto the quote SSE, Telegram fires on entering Extreme.
@@ -284,6 +470,13 @@ async def lifespan(app: FastAPI):
 
     await _start_order_subsystem(app, settings, tasks)
 
+    # T0.3 盤中報價停滯 watchdog：session_open_fn 複用 calendar-aware 的 `session_now`
+    # （market_calendar），休市（週末/假日/夜盤收盤後/盤間）一律回 None→False，不誤噴告警。
+    tasks.append(asyncio.create_task(run_feed_watchdog(
+        poller, ops_alerter, threshold=settings.feed_stale_alert_seconds,
+        session_open_fn=lambda: session_now(datetime.now(CST)) is not None,
+    )))
+
     try:
         yield
     finally:
@@ -315,6 +508,7 @@ def create_app() -> FastAPI:
 
     app.include_router(auth_routes.router)    # public: /login, /logout
     app.include_router(health.router)         # public: /healthz
+    app.include_router(agent_ws_routes.router)  # public: /ws/agent（token 認證，非 cookie）
 
     protected = [Depends(get_current_user)]
     app.include_router(dashboard.router, dependencies=protected)

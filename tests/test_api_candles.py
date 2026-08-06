@@ -208,8 +208,10 @@ def test_healthz_reflects_order_session_state_when_present(client):
     client.app.dependency_overrides[get_order_session_state] = lambda: state
 
     r = client.get("/healthz")
+    assert r.status_code == 503  # T0.3：unhealthy（非 disabled）→ /healthz 回 503
     body = r.json()["order_subsystem"]
     assert body == {
+        "status": "unhealthy",  # T0.3：新增健康分級（disabled/ready/unhealthy）
         "ready": False, "last_error": "connect 失敗，下單子系統停用: boom", "reconnect_attempts": 3,
     }
 
