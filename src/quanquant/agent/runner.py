@@ -277,7 +277,11 @@ class AgentRunner:
         try:
             await self._transport.send(
                 UpLogin(protocol=PROTOCOL_VERSION, account=self._account,
-                        mode=self._mode).model_dump()
+                        mode=self._mode,
+                        # Inc1 D7/R3-2：health_epoch 是本 session 的健康狀態基準宣告。
+                        # G2 failstop latch/epoch 追蹤是後續 task 的 runtime 接線，這裡先給
+                        # 0（訊息合法的最小欄位傳遞），實際單調遞增計數由之後的 task 補上。
+                        health_epoch=0).model_dump()
             )
             tasks = [
                 asyncio.create_task(self._pump()),
@@ -349,7 +353,13 @@ class AgentRunner:
                 if sent_at is not None and (now - sent_at) < self._resend_after:
                     continue
                 await self._transport.send(
-                    UpReport(event_id=row.id, kind=row.kind, payload=row.payload).model_dump()
+                    # Inc1 D5：UpReport 必填 account/mode（回報歸屬蓋章，I7）。理想上應在
+                    # buffer.append() 當下（callback 落地那一刻）就蓋章存進 outbox 列
+                    # （D11 buffer schema 升級是後續 task），這裡先用 runner 當下的
+                    # session account/mode 作為來源——同一個 buffer 檔本就受
+                    # `assert_account` tripwire 保護，同一 session 內不會跨帳號。
+                    UpReport(event_id=row.id, kind=row.kind, account=self._account,
+                             mode=self._mode, payload=row.payload).model_dump()
                 )
                 self._inflight[row.id] = now
 
@@ -365,7 +375,7 @@ class AgentRunner:
                 await asyncio.to_thread(self._buffer.mark_sent, msg.event_id)
                 self._inflight.pop(msg.event_id, None)
             elif isinstance(msg, DownHealth):
-                await self._transport.send(UpHealth().model_dump())
+                await self._transport.send(self._make_health().model_dump())
             else:
                 # place/cancel/update/reconcile：inline 序列執行＝agent 端 native 序列化
                 # 第一層（同一時間只有一則下行指令在跑），child pipe lock 為第二層。
@@ -373,23 +383,34 @@ class AgentRunner:
 
     async def _execute_command(self, msg: Any) -> None:
         op = _to_op(msg)
+        # Inc1 D4：UpCmdAck.event_id 是走 outbox at-least-once 的追蹤鍵（與 UpReport 共用
+        # 補送機制）。command ledger／outbox 接線是後續 task 的 runtime 範圍，這裡先給
+        # 佔位值 0（訊息合法的最小欄位傳遞），不影響本 task 的協定/dispatch 行為。
+        ack_event_id = 0
         try:
             reply = await asyncio.to_thread(
                 self._child.request, op, timeout=self._child_command_timeout
             )
         except TimeoutError:
-            ack = UpCmdAck(cmd_id=msg.cmd_id, ok=False, error_kind="timeout",
-                           message="agent 子程序無回應")
+            ack = UpCmdAck(cmd_id=msg.cmd_id, event_id=ack_event_id, ok=False,
+                           error_kind="timeout", message="agent 子程序無回應")
         else:
-            ack = UpCmdAck(cmd_id=msg.cmd_id, ok=bool(reply.get("ok")),
-                           result=reply.get("result"), error_kind=reply.get("error_kind"),
-                           message=reply.get("message"))
+            ack = UpCmdAck(cmd_id=msg.cmd_id, event_id=ack_event_id,
+                           ok=bool(reply.get("ok")), result=reply.get("result"),
+                           error_kind=reply.get("error_kind"), message=reply.get("message"))
         await self._transport.send(ack.model_dump())
 
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_interval)
-            await self._transport.send(UpHealth().model_dump())
+            await self._transport.send(self._make_health().model_dump())
+
+    def _make_health(self) -> UpHealth:
+        # Inc1 D9/G2：status/health_epoch 是 fail-stop latch 狀態機的 wire 表現——那條狀態
+        # 機（child 落地失敗→latch→拒新指令→lease→probe 恢復）是後續 task 的 runtime 接線。
+        # 這裡先固定回報 status="ok"、health_epoch=0（訊息合法的最小欄位傳遞），與 Inc0
+        # 既有行為等價（agent 目前尚不會偵測/latch failstop）。
+        return UpHealth(status="ok", detail=None, health_epoch=0)
 
     async def _child_watchdog(self) -> None:
         """定期 ping SDK 子程序（#203 凍結偵測）：False 或例外（含逾時）一律視為凍結，

@@ -32,7 +32,7 @@ async def test_request_resolves_when_ack_arrives():
     task = asyncio.create_task(ch.request({"type": "health", "cmd_id": "c1"},
                                           cmd_id="c1", timeout=1))
     await asyncio.sleep(0)
-    ch.resolve_ack(UpCmdAck(cmd_id="c1", ok=True, result={"x": 1}))
+    ch.resolve_ack(UpCmdAck(cmd_id="c1", event_id=1, ok=True, result={"x": 1}))
     ack = await task
     assert ack.ok and sink.msgs[0]["cmd_id"] == "c1"
 
@@ -137,7 +137,7 @@ def _req():
 
 
 async def test_gateway_place_maps_ack_fields_and_serializes_price_as_str():
-    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", ok=True,
+    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", event_id=1, ok=True,
                                    result={"ordno": "101AA1", "broker_order_id": "101AA1"}))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
     assert await gw.place(_req()) == {"ordno": "101AA1", "broker_order_id": "101AA1"}
@@ -145,15 +145,15 @@ async def test_gateway_place_maps_ack_fields_and_serializes_price_as_str():
 
 
 async def test_gateway_trade_not_found_raises_typed():
-    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", ok=False, error_kind="trade_not_found",
-                                   result={"ordno": "NOPE"}))
+    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", event_id=1, ok=False,
+                                   error_kind="trade_not_found", result={"ordno": "NOPE"}))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
     with pytest.raises(TradeNotFoundError):
         await gw.cancel("NOPE")
 
 
 async def test_gateway_error_message_preserves_broker_code_for_classification():
-    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", ok=False, error_kind="exception",
+    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", event_id=1, ok=False, error_kind="exception",
                                    message="code: 406 Please sign F002 first"))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
     with pytest.raises(OrderError) as ei:
@@ -166,7 +166,7 @@ async def test_gateway_error_message_preserves_broker_code_for_classification():
 # isinstance 分支穩定判 "unknown"（不必依賴訊息字串裡沒有 code: 4xx 這種巧合）。----
 
 async def test_gateway_timeout_error_kind_raises_typed_and_classified_unknown():
-    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", ok=False, error_kind="timeout",
+    ch = _StubChannel(ack=UpCmdAck(cmd_id="x", event_id=1, ok=False, error_kind="timeout",
                                    message="agent 子程序無回應"))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
     with pytest.raises(AgentCommandTimeoutError) as ei:

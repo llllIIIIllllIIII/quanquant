@@ -7,7 +7,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from quanquant.broker.agent_protocol import (
     DownCancel, DownPlace, DownReconcile, DownUpdate, PlaceNative, UpCmdAck,
@@ -16,6 +16,18 @@ from quanquant.broker.base import (
     AgentCommandTimeoutError, AgentUnavailableError, OrderError, TradeNotFoundError,
 )
 from quanquant.broker.types import OrderRequest
+
+# Inc1 D4/D7 §7：設計預設 agent_command_expiry_seconds=120（新設定，尚未接線到
+# Settings——command ledger／過期收斂是後續 task 的 runtime 範圍）。這裡先用同一預設值
+# 算出 DownPlace/DownCancel/DownUpdate 必填的 expires_at（訊息合法的最小欄位傳遞）。
+_DEFAULT_COMMAND_EXPIRY_SECONDS = 120
+
+
+def _default_expires_at() -> str:
+    deadline = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(
+        seconds=_DEFAULT_COMMAND_EXPIRY_SECONDS
+    )
+    return deadline.isoformat()
 
 
 class AgentChannel:
@@ -107,7 +119,8 @@ class AgentNativeGateway:
 
     async def place(self, req: OrderRequest) -> dict:
         cmd = DownPlace(
-            cmd_id=uuid.uuid4().hex, mode="sim",
+            cmd_id=uuid.uuid4().hex, account=self._channel.account, mode="sim",
+            expires_at=_default_expires_at(),
             native=PlaceNative(action=req.action, price=str(req.price), qty=req.qty,
                                price_type=req.price_type, order_type=req.order_type,
                                octype=req.octype),
@@ -118,12 +131,14 @@ class AgentNativeGateway:
         return {"ordno": result.get("ordno"), "broker_order_id": result.get("broker_order_id")}
 
     async def cancel(self, ordno: str) -> None:
-        cmd = DownCancel(cmd_id=uuid.uuid4().hex, mode="sim", ordno=ordno)
+        cmd = DownCancel(cmd_id=uuid.uuid4().hex, account=self._channel.account, mode="sim",
+                         expires_at=_default_expires_at(), ordno=ordno)
         self._unwrap(await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id,
                                                  timeout=self._timeout))
 
     async def update(self, ordno: str, *, price, qty: int, price_type: str | None = None) -> None:
-        cmd = DownUpdate(cmd_id=uuid.uuid4().hex, mode="sim", ordno=ordno,
+        cmd = DownUpdate(cmd_id=uuid.uuid4().hex, account=self._channel.account, mode="sim",
+                         expires_at=_default_expires_at(), ordno=ordno,
                          price=(str(price) if price is not None else None),
                          qty=qty, price_type=price_type)
         self._unwrap(await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id,

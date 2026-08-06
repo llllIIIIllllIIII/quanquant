@@ -77,7 +77,7 @@ def test_bad_token_closed(ws_env):
 def test_login_marks_ready_sets_account_schedules_reconcile(ws_env):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_session_state.ready)
         assert ws_env.state.order_service.account == "F1"
         assert _wait(lambda: ws_env.state.order_service.reconcile_calls == 1)
@@ -89,9 +89,9 @@ def test_report_staged_then_acked(ws_env, engine):
     # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
-                      "payload": {"trade_id": "T1"}})
+                      "account": "F1", "mode": "sim", "payload": {"trade_id": "T1"}})
         assert ws.receive_json() == {"type": "report_ack", "event_id": 7}
     with Session(engine) as s:
         rows = s.exec(select(RawInbox)).all()
@@ -103,10 +103,10 @@ def test_duplicate_report_resend_both_staged_and_acked(ws_env, engine):
     # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         for _ in range(2):
             ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
-                          "payload": {"trade_id": "T1"}})
+                          "account": "F1", "mode": "sim", "payload": {"trade_id": "T1"}})
             assert ws.receive_json()["event_id"] == 7
     with Session(engine) as s:
         assert len(s.exec(select(RawInbox)).all()) == 2
@@ -128,8 +128,9 @@ def test_report_ack_only_after_commit_success(ws_env, engine, monkeypatch, caplo
     received = []
     try:
         with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-            ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
-            ws.send_json({"type": "report", "event_id": 5, "kind": "deal_report", "payload": {}})
+            ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+            ws.send_json({"type": "report", "event_id": 5, "kind": "deal_report",
+                         "account": "F1", "mode": "sim", "payload": {}})
             # 現行例外語意（Task 8 附加需求 3）：commit 失敗會讓 receive 迴圈 log.exception
             # 後 re-raise、連線斷線——不論客端在哪個時點觀察到例外（receive_json() 當場，或
             # with 區塊結束時背景 task join 再拋），照實接住，只驗證關鍵事實：沒有 ack。
@@ -147,7 +148,8 @@ def test_report_ack_only_after_commit_success(ws_env, engine, monkeypatch, caplo
 def test_cmd_ack_routed_to_channel(ws_env):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-        ws.send_json({"type": "cmd_ack", "cmd_id": "c9", "ok": True, "result": {}})
+        ws.send_json({"type": "cmd_ack", "cmd_id": "c9", "event_id": 1, "ok": True,
+                     "result": {}})
         assert _wait(lambda: len(ws_env.state.agent_channel.acks) == 1)
         assert ws_env.state.agent_channel.acks[0].cmd_id == "c9"
 
@@ -158,9 +160,9 @@ def test_login_reconcile_not_inline_receive_loop_stays_responsive(ws_env, engine
     adapter.block = asyncio.Event()   # reconcile 永久卡住
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         ws.send_json({"type": "report", "event_id": 1, "kind": "order_report",
-                      "payload": {"k": 1}})
+                      "account": "F1", "mode": "sim", "payload": {"k": 1}})
         # reconcile 卡住時 report 仍被處理 → 證明 login 用 create_task 非 inline await
         assert ws.receive_json() == {"type": "report_ack", "event_id": 1}
     adapter.block.set()
@@ -170,10 +172,10 @@ def test_invalid_frame_ignored_connection_survives(ws_env):
     # codex round3 fix2：UpReport 分支現在要求 channel.logged_in——先 login 才能送 report。
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         ws.send_json({"type": "evil"})
         ws.send_json({"type": "report", "event_id": 2, "kind": "order_report",
-                      "payload": {}})
+                      "account": "F1", "mode": "sim", "payload": {}})
         assert ws.receive_json()["event_id"] == 2
 
 
@@ -248,16 +250,16 @@ def test_ws_rejects_when_token_unset_default_empty(engine, monkeypatch):
 def test_stale_connection_message_ignored_after_superseded(ws_env):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_old:
-        ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
         with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_new:
-            ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+            ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
             assert _wait(lambda: ws_env.state.order_service.account == "F2")
 
             # 舊連線的 socket 仍開著；重送一次 login（F1）——若舊 handler 沒被 generation
             # 擋下，會被當成合法上行訊息處理，把 account 改回 F1，蓋掉新連線剛登入的 F2。
-            ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+            ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
             time.sleep(0.1)
 
             assert ws_env.state.order_service.account == "F2"     # 未被舊連線的訊息改回去
@@ -268,13 +270,13 @@ def test_stale_connection_finally_does_not_disable_new_connection(ws_env):
     client = TestClient(ws_env)
     old_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"})
     ws_old = old_cm.__enter__()
-    ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+    ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
     assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
     new_cm = client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"})
     ws_new = new_cm.__enter__()
     try:
-        ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F2")
 
         old_cm.__exit__(None, None, None)   # 手動關閉舊連線（觸發它的 finally），新連線仍開著
@@ -302,7 +304,7 @@ def test_receive_loop_unexpected_exception_logged_and_reraised(ws_env, monkeypat
     # 驗的行為，只是在這個測試工具下顯現的位置是 context manager 出口而非 receive_json()。
     with pytest.raises(RuntimeError, match="boom"):
         with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-            ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+            ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
             ws.receive_json()
     assert "agent WS 處理上行訊息失敗" in caplog.text
     assert _wait(lambda: ws_env.state.order_session_state.disabled)
@@ -316,7 +318,7 @@ def test_receive_loop_unexpected_exception_logged_and_reraised(ws_env, monkeypat
 def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env, engine):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
-        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
         assert _wait(lambda: ws_env.state.order_session_state.ready)
 
@@ -326,7 +328,7 @@ def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env
         s.commit()
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
-        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         time.sleep(0.2)   # 給 server 足夠時間處理（若未擋下，account 會被改成 F2）
         assert ws_env.state.order_service.account == "F1"          # 沒被換掉
         assert ws_env.state.order_session_state.ready is False     # 這次 login 未生效
@@ -335,11 +337,11 @@ def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env
 def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engine):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
-        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
-        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F2")   # 無未處理列：放行
         assert _wait(lambda: ws_env.state.order_session_state.ready)
 
@@ -358,7 +360,7 @@ def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engi
 def test_login_rejected_closes_connection(ws_env, engine):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
-        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
     # 未處理列（processed=False, quarantine=False）殘留 → 觸發換帳號 guard。
@@ -367,7 +369,7 @@ def test_login_rejected_closes_connection(ws_env, engine):
         s.commit()
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
-        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         with pytest.raises(WebSocketDisconnect):
             ws2.receive_json()   # 連線被關閉（1008）——不再是半開態
 
@@ -387,7 +389,7 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
     # 錯配。換帳號 guard 必須擋下「所有」processed==False 列，不論 quarantine 與否。
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws1:
-        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
     # 一筆已被隔離、但仍未處理的 RawInbox（quarantine=True）——之後 watchdog 的
@@ -397,7 +399,7 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
         s.commit()
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws2:
-        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         with pytest.raises(WebSocketDisconnect):
             ws2.receive_json()   # 連線被關閉（1008）——quarantined 列也要擋下換帳號
 
@@ -408,8 +410,10 @@ def test_login_account_switch_blocked_by_quarantined_rows(ws_env, engine):
 def test_report_before_login_not_staged_not_acked(ws_env, engine):
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws:
-        ws.send_json({"type": "report", "event_id": 99, "kind": "deal_report", "payload": {}})
-        ws.send_json({"type": "health"})   # 確認迴圈仍活著（report 被忽略不代表連線掛了）
+        ws.send_json({"type": "report", "event_id": 99, "kind": "deal_report",
+                     "account": "F1", "mode": "sim", "payload": {}})
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
+        # 確認迴圈仍活著（report 被忽略不代表連線掛了）
         assert _wait(lambda: ws_env.state.agent_channel.last_heartbeat is not None)
     with Session(engine) as s:
         assert s.exec(select(RawInbox)).all() == []   # 未登入的 report 沒有被 staged
@@ -433,14 +437,15 @@ def test_toctou_report_commit_serializes_against_login_switch(ws_env, engine, mo
 
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_old:
-        ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 1})
+        ws_old.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: ws_env.state.order_service.account == "F1")
 
-        ws_old.send_json({"type": "report", "event_id": 1, "kind": "deal_report", "payload": {}})
+        ws_old.send_json({"type": "report", "event_id": 1, "kind": "deal_report",
+                         "account": "F1", "mode": "sim", "payload": {}})
         assert entered.wait(timeout=2), "commit 應已進入（卡在 blocking commit 中）"
 
         with client.websocket_connect("/ws/agent", headers={"x-agent-token": "tok"}) as ws_new:
-            ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 1})
+            ws_new.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
 
             # 舊 report 的 commit 仍卡住（inbox_lock 未釋放）：F2 login 的 count 查詢必須被
             # 序列化在 commit 完成之後才判定——輪詢一段時間內帳號都不該被換成 F2。

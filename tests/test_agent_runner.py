@@ -71,7 +71,9 @@ async def test_run_once_sends_login_first(tmp_path):
     assert tr.sent[0]["account"] == "F1" and tr.sent[0]["mode"] == "sim"
     # codex round2 fix1：protocol 版本必填化後，UpLogin 不再有 default——runner 必須顯式帶
     # protocol=PROTOCOL_VERSION，否則建構就會 ValidationError。
-    assert tr.sent[0]["protocol"] == 1
+    # Inc1 D7：硬升 v2，PROTOCOL_VERSION 現為 2。
+    assert tr.sent[0]["protocol"] == 2
+    assert tr.sent[0]["health_epoch"] == 0
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -127,7 +129,8 @@ async def test_downlink_place_dispatched_to_child_and_acked(tmp_path):
     r = _runner(tr, child, buf)
     r.ensure_child()
     task = asyncio.create_task(r.run_once())
-    tr.incoming.put_nowait({"type": "place", "cmd_id": "c1", "mode": "sim",
+    tr.incoming.put_nowait({"type": "place", "cmd_id": "c1", "account": "F1", "mode": "sim",
+                            "expires_at": "2026-08-07T00:00:00",
                             "native": {"action": "Buy", "price": "0", "qty": 1,
                                        "price_type": "MKT", "order_type": "IOC",
                                        "octype": "Auto"}})
@@ -145,8 +148,8 @@ async def test_child_timeout_yields_error_ack(tmp_path):
     r = _runner(tr, child, buf)
     r.ensure_child()
     task = asyncio.create_task(r.run_once())
-    tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c2", "mode": "sim",
-                            "ordno": "101AA1"})
+    tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c2", "account": "F1", "mode": "sim",
+                            "expires_at": "2026-08-07T00:00:00", "ordno": "101AA1"})
     await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
     ack = next(m for m in tr.sent if m.get("type") == "cmd_ack")
     assert ack["ok"] is False and ack["error_kind"] == "timeout"
