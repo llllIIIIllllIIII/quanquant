@@ -353,3 +353,23 @@ price/qty 覆寫成改單後的值）。修復回合 2 把 ack applier 的終結
 「遲到 ack 遇已 resolved」的既有規則 5 語意一致。至此兩維 CAS 在 resolver 與 applier 兩側
 都是原子 UPDATE，雙向 last-writer-wins 的競態閉合（re-reviewer 獨立驗證 route 層 re-apply
 亦 safe by construction），完整落地 §5 不變量表 I6「同一交易至多套用一次」的字面保證。
+
+**(f) G2① latch 觸發條件收緊：主寫入失敗即 latch，不再要求「含退化寫入亦失敗」（codex
+終審 C5 裁決）**
+
+§4/§5 原描述（見「G2 fail-stop 狀態機」①）「SDK child 的 callback 落地失敗（**含退化寫入
+亦失敗**）→ 經 IPC 通知父程序＋寫獨立 sentinel 檔 → 父程序 latch」——字面要求雙寫（主寫入
+＋退化寫入）都失敗才觸發 latch。codex 終審（Inc1 收尾）指出此字面要求會造成 I1（零丟單）
+中斷的縫：主寫入（SQLite）失敗、退化寫入（純檔案 append-only）成功時，舊版依字面不 latch、
+直接回傳成功——但退化寫入只是「事後人工救援」的最後手段，缺乏交易/索引/查詢能力，agent
+端 outbox at-least-once（`runner.py::AgentRunner._pump` 只讀 SQLite buffer）完全看不到只
+落在退化檔的事件，也沒有自動 reinjection 機制，這些事件會在沒有任何顯式訊號的情況下悄悄
+從零丟單保證裡漏出去。裁決收緊為：**主寫入一旦失敗即 latch**（`native_runner.py::
+_wrap_on_raw`／`_trigger_failstop_latch`），退化寫入是否成功只影響 sentinel/IPC 通知的
+訊息內容（註明退化檔路徑供人工救援）與這次 callback 呼叫是否 raise（雙寫皆失敗才 raise，
+維持既有例外語意），不再影響是否 latch 的決定。同一輪收尾（codex C4）額外在 child 進程內
+加了一道 `ChildFailstopLatch`（`threading.Event`，callback 執行緒同步 trip，`_dispatch`
+呼叫 native place/cancel/update 前再檢查一次）——堵住父程序「最後一次 `_latched` 檢查通過
+後、RPC 尚未真正排程執行前」的 asyncio 排程競態窗，是①「SDK child 的 callback 落地失敗
+→ 經 IPC 通知父程序」這條鏈之外，child 本地額外補的一道更即時防線，父 latch（②-⑧）續管
+sentinel/epoch/health 等跨程序協調責任不變。
