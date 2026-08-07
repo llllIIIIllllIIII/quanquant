@@ -157,10 +157,13 @@ class _NativeGatewayLike(Protocol):
 
     @property
     def ready(self) -> bool: ...
-    async def place(self, req: OrderRequest, *, cmd_id: str) -> dict: ...
-    async def cancel(self, ordno: str, *, cmd_id: str) -> None: ...
+    @property
+    def admission_ready(self) -> bool: ...
+    async def place(self, req: OrderRequest, *, cmd_id: str, expires_at: str | None = None) -> dict: ...
+    async def cancel(self, ordno: str, *, cmd_id: str, expires_at: str | None = None) -> None: ...
     async def update(
-        self, ordno: str, *, price, qty: int, price_type: str | None = None, cmd_id: str
+        self, ordno: str, *, price, qty: int, price_type: str | None = None, cmd_id: str,
+        expires_at: str | None = None,
     ) -> None: ...
     async def trades_snapshot(self, after): ...
     async def query_qty(self, ordno: str) -> "int | None": ...
@@ -472,7 +475,11 @@ class ShioajiAdapter:
             # `_classify_place_failure` 會判 failed 並安全退配額），語意對齊 native 模式
             # `_api is None` 那支「下單 session 尚未就緒」的 fail-fast，但用 agent 自己的
             # 例外型別，讓呼叫端的失敗分類邏輯自然落到既有 failed 分支，不必額外特判。
-            if not self._remote_gateway.ready:
+            # C2（HIGH，codex 終審）：這裡是 place/update 唯一會建新 DB 決策列的送單前
+            # 最後守門（_send_gate 只給 place/update 呼叫，cancel 不經這裡）——改查
+            # `admission_ready`（pending_health/failstop/lease 過期三態下皆 False），不再
+            # 用寬鬆的 `ready`（那個定義留給 reconcile/query_qty 等唯讀背景動作）。
+            if not self._remote_gateway.admission_ready:
                 raise AgentUnavailableError("agent 未連線或未登入")
         elif self._api is None:
             raise OrderError("下單 session 尚未就緒")
@@ -507,8 +514,11 @@ class ShioajiAdapter:
             # 保證在跨網路後被削弱）。搬到這裡之後：existing 命中（無論 gateway 狀態）一律
             # 走上面冪等分支；只有「查無既有列、確定要建新委託」時才檢查 gateway 是否就緒，
             # 且仍在任何 `session.commit()` 之前，維持「連 Order/配額列都不建」的原始保證
-            # （行為矩陣「gateway.ready=False（place 進入時）」一列不變）。
-            if self._remote_gateway is not None and not self._remote_gateway.ready:
+            # （行為矩陣「gateway.ready=False（place 進入時）」一列不變）。C2（HIGH，codex
+            # 終審）：改查 `admission_ready`——pending_health/failstop/lease 過期三態下也
+            # 要在這裡 fail-fast，不得漏到下面才被 `_send_gate` 擋（那時 Order/reservation/
+            # ledger 已經建好，`_send_gate` 擋下後還要走例外分支釋放，不如在這裡就不建）。
+            if self._remote_gateway is not None and not self._remote_gateway.admission_ready:
                 raise OrderError("agent 未連線，無法下單")
 
             if self._risk_guard is not None:
@@ -556,7 +566,14 @@ class ShioajiAdapter:
                     expiry_seconds=self._agent_command_expiry_seconds,
                 )
                 agent_commands.insert_command(session, cmd=cmd)
+                # C9：在這個 session 仍存活的當下就把 `expires_at` 讀成純字串——`cmd` 是
+                # ORM 物件，`session.commit()`（下一行）預設 `expire_on_commit=True` 會讓
+                # 它的屬性全部過期，`_do_place()` 是之後才在 `_supervisor.run()` 裡執行
+                # （這個 `with session:` 區塊早已結束/session 已關閉），屆時再讀
+                # `cmd.expires_at` 會觸發對已關閉 session 的 lazy refresh 而炸
+                # `DetachedInstanceError`。純字串沒有這個問題，可以安全跨到閉包裡用。
                 cmd_id = cmd.cmd_id
+                cmd_expires_at = cmd.expires_at.isoformat()
             session.commit()
             # callback-before-ack：Order 此刻已 commit（client_order_id→user_id/mode 就位，
             # ordno/broker_order_id 仍是 NULL 佔位），即使成交回報早於下面的 native 呼叫完成，
@@ -566,7 +583,11 @@ class ShioajiAdapter:
             try:
                 await self._send_gate(actor_user_id)
                 if self._remote_gateway is not None:
-                    return await self._remote_gateway.place(req, cmd_id=cmd_id)
+                    # C9：`expires_at` 傳這筆指令在 ledger 建立當下凍結的值（上面已讀成
+                    # 純字串 `cmd_expires_at`），不讓 gateway 自己另外重算。
+                    return await self._remote_gateway.place(
+                        req, cmd_id=cmd_id, expires_at=cmd_expires_at
+                    )
                 return await asyncio.to_thread(self._place_blocking, req)
             except RiskError:
                 # send gate 擋下（如 kill switch）：確定沒送出，直接標 failed，不留在
@@ -756,6 +777,10 @@ class ShioajiAdapter:
                 )
                 agent_commands.insert_command(session, cmd=cmd)
                 cmd_id = cmd.cmd_id
+                # C9：見 place() 同名變數說明——趁 session 還活著讀成純字串，避免
+                # `session.commit()`（下一行，`expire_on_commit=True`）之後、`_do_cancel()`
+                # 才讀 `cmd.expires_at` 觸發對已關閉 session 的 lazy refresh 而炸。
+                cmd_expires_at = cmd.expires_at.isoformat()
                 session.commit()
 
         async def _do_cancel() -> None:
@@ -772,7 +797,10 @@ class ShioajiAdapter:
             if self._remote_gateway is not None:
                 if not self._remote_gateway.ready:
                     raise OrderError("agent 未連線")
-                await self._remote_gateway.cancel(ordno, cmd_id=cmd_id)
+                # C9：`expires_at` 傳 ledger 建立當下凍結的值（見 place() 同名參數說明）。
+                await self._remote_gateway.cancel(
+                    ordno, cmd_id=cmd_id, expires_at=cmd_expires_at
+                )
                 return
             if self._api is None:
                 raise OrderError("下單 session 尚未就緒")
@@ -834,8 +862,10 @@ class ShioajiAdapter:
             # 與 `place()` 的既有寫法（冪等查找 miss 之後、`check_place` 之前）同一位置語意——
             # agent 未連線時直接拒絕，連保留列都不建立，不進 DB 決策段（比照 spec D9「offline
             # 擋新單」）。`_send_gate` 內仍保留同一判定作為縱深防禦第二層（若在這個檢查通過
-            # 後、native 呼叫前才斷線，那裡的 unavailable→failed＋退配額語意不變）。
-            if self._remote_gateway is not None and not self._remote_gateway.ready:
+            # 後、native 呼叫前才斷線，那裡的 unavailable→failed＋退配額語意不變）。C2
+            # （HIGH，codex 終審）：改查 `admission_ready`——pending_health/failstop/lease
+            # 過期三態下也要在這裡 fail-fast，不建 delta reservation。
+            if self._remote_gateway is not None and not self._remote_gateway.admission_ready:
                 raise OrderError("agent 未連線，無法改單")
             new_price = price if price is not None else order.price
             new_qty = qty if qty is not None else order.qty
@@ -890,15 +920,39 @@ class ShioajiAdapter:
                 except IntegrityError:
                     session.rollback()
                     if brepo.has_unresolved_update_command(session, client_order_id=client_order_id):
+                        # C8（MEDIUM，codex 終審）：撞單飛鍵——這次嘗試在 `check_update`
+                        # 階段（若 delta>0）已經 reserve 並 commit 過一筆 delta
+                        # QuotaReservation（見模組頂部「已知落差」說明：check_update 內部
+                        # 自行 commit，早於這裡的 ledger insert 撞鍵，回滾救不回它）。撞鍵
+                        # 代表這筆 ledger 從未真正落地送出，若不清理會永久孤兒佔用配額——
+                        # 這是「正常請求可確定觸發」的路徑（兩個併發改單就會踩到），不是
+                        # crash 才會發生的窄窗。只在這次的 reservation_id 未被贏家（現存
+                        # unresolved 的 update ledger 列）引用時才釋放：
+                        # `reservation_id_for_update` 是 client_order_id+request_hash 的
+                        # 確定性推導，相同內容重送會得到同一個 reservation_id——這種情況
+                        # release 會誤傷贏家仍在使用中的保留列，必須跳過。
+                        if reservation_id is not None:
+                            winner_reservation_id = brepo.unresolved_update_reservation_id(
+                                session, client_order_id=client_order_id
+                            )
+                            if winner_reservation_id != reservation_id:
+                                brepo.release_quota(session, reservation_id=reservation_id)
+                                session.commit()
                         raise OrderError("前一筆改單結果未定，請稍候或確認前次改單狀態") from None
                     raise
                 cmd_id = cmd.cmd_id
+                # C9：見 place() 同名變數說明——趁 session 還活著（`with` 區塊尚未結束）讀成
+                # 純字串，避免 `_do_update()`（`with` 區塊結束、session 已關閉之後才執行）
+                # 再讀 `cmd.expires_at` 觸發對已關閉 session 的 lazy refresh 而炸。
+                cmd_expires_at = cmd.expires_at.isoformat()
 
         async def _do_update() -> None:
             await self._send_gate(actor_user_id)
             if self._remote_gateway is not None:
+                # C9：`expires_at` 傳 ledger 建立當下凍結的值（見 place() 同名參數說明）。
                 await self._remote_gateway.update(
-                    ordno, price=new_price, qty=new_qty, price_type=price_type, cmd_id=cmd_id
+                    ordno, price=new_price, qty=new_qty, price_type=price_type, cmd_id=cmd_id,
+                    expires_at=cmd_expires_at,
                 )
                 return
             await asyncio.to_thread(self._update_blocking, ordno, new_price, new_qty, price_type)

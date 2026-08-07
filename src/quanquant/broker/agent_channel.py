@@ -48,6 +48,18 @@ class AgentChannel:
         self.last_ok_heartbeat: float | None = None
         self.health_status = "unknown"
         self.failstop = False
+        # C2（HIGH，codex 終審）：admission 專用的嚴格 readiness 旗標——`admission_ready`
+        # （見該 property）不能只看 socket+logged_in（那是寬鬆的 `ready`，供 reconcile/
+        # query_qty 等唯讀背景動作使用），還必須反映「這個 session 是否真的收過一則被
+        # 接受的 status='ok' UpHealth，且尚未被 lease 過期/failstop 判定作廢」。
+        # `mark_logged_in`（重新宣告本 session）與 `detach`（斷線）都重設為 False；
+        # `note_health` 接受一則 ok 才設 True，接受一則 failstop 立刻設回 False；
+        # `mark_lease_expired`（server 端 heartbeat lease 過期，見 `agent_registry.
+        # run_health_lease_watchdog`）也立刻設回 False。少了這個旗標，
+        # `AgentNativeGateway.admission_ready`（`shioaji_adapter.py` place/update 的
+        # admission 檢查唯一依據）在 pending_health／failstop／lease 過期時仍會回 True，
+        # 照常建 Order/QuotaReservation/AgentCommand ledger 列。
+        self._health_confirmed_ok = False
         # codex round1 fix2：雙連線 generation——新連線取代舊連線後，舊 WS handler 較晚才
         # 跑到自己的 finally 時，若無條件 detach()，會把新連線也拆掉、誤標 offline。每次
         # attach() 遞增這個計數，detach(generation) 只在呼叫者手上的 generation 仍是目前值
@@ -70,7 +82,31 @@ class AgentChannel:
 
     @property
     def ready(self) -> bool:
+        """連線存活＋已登入（不含健康狀態）——`AgentChannel.request()` 的內部守門、
+        reconcile／query_qty（唯讀、背景維護動作）沿用這個既有的寬鬆定義：只要連線還在、
+        已登入，就允許嘗試往返，不因為健康狀態尚未確認（pending_health）就整個拒絕
+        round-trip（`_reconcile_inner` 既有 docstring：對帳不 fail-fast，未就緒視同本次
+        無新進展）。**admission（place/update 建新 DB 決策列）改查 `admission_ready`**（見
+        該 property docstring，C2 修復），不再共用這個寬鬆定義。"""
         return self._send is not None and self.logged_in
+
+    @property
+    def admission_ready(self) -> bool:
+        """C2（HIGH，codex 終審）：admission 專用的嚴格 readiness——連線存活＋已登入＋本
+        session 已收過被接受的 `status='ok'`（`_health_confirmed_ok`）＋目前未
+        failstop。pending_health（剛登入，還沒收到第一則健康回報）、failstop（已收到明確
+        故障回報）、lease 過期（久未收到 ok，`mark_lease_expired` 已被呼叫）三態下皆為
+        False——`AgentNativeGateway.admission_ready` 直接委派這個 property，是
+        place/update 的 admission 檢查唯一依據（見 shioaji_adapter.py `_send_gate`/offline
+        fail-fast），堵住 codex 終審 C2 抓到的「這三態下 admission 仍建 Order/reservation/
+        ledger」的縫。**與 `ready`（寬鬆，見上）刻意分離**——reconcile/query_qty 等唯讀
+        背景動作不受這個嚴格條件影響，只有真的會建新 DB 決策列的 place/update 才查這個。"""
+        return (
+            self._send is not None
+            and self.logged_in
+            and self._health_confirmed_ok
+            and not self.failstop
+        )
 
     def attach(self, send_json: Callable[[dict], Awaitable[None]]) -> int:
         self._generation += 1
@@ -82,6 +118,7 @@ class AgentChannel:
             return  # 舊連線的遲到 detach：已被新連線取代，不動目前狀態。
         self._send = None
         self.logged_in = False
+        self._health_confirmed_ok = False  # C2：斷線立即讓 ready 失效
         pending, self._pending = self._pending, {}
         for fut in pending.values():
             if not fut.done():
@@ -91,12 +128,15 @@ class AgentChannel:
         """`health_epoch`：Inc1 D9/G2⑤/R3-2——UpLogin 宣告的本 session 健康狀態基準，**直接
         覆寫**（非取 max）本連線的已見最大 epoch，讓 buffer 重建後較低的 epoch 也能在新連線
         被正確接受，不被舊連線遺留的較高 max 永久拒收（見 R5-1「buffer 重建 epoch 歸零→
-        重宣告不死鎖」）。login 後健康狀態重置為 pending（未收過本連線任何健康回報）。"""
+        重宣告不死鎖」）。login 後健康狀態重置為 pending（未收過本連線任何健康回報）——
+        `_health_confirmed_ok` 同步重設 False（C2：pending_health 期間 `ready` 必須是
+        False，等這條連線收到第一則被接受的 ok 才轉真）。"""
         self.logged_in = True
         self.account = account
         self._health_max_epoch = health_epoch
         self.health_status = "unknown"
         self.failstop = False
+        self._health_confirmed_ok = False
 
     def note_heartbeat(self) -> None:
         self.last_heartbeat = time.monotonic()
@@ -114,7 +154,19 @@ class AgentChannel:
         self.failstop = status == "failstop"
         if status == "ok":
             self.last_ok_heartbeat = time.monotonic()
+            self._health_confirmed_ok = True  # C2：本 session 首次/再次確認健康，ready 可轉真
+        else:
+            self._health_confirmed_ok = False  # C2：failstop 立即讓 ready 失效
         return True
+
+    def mark_lease_expired(self) -> None:
+        """C2（HIGH，codex 終審）：server 端 heartbeat lease 過期時，由
+        `agent_registry.run_health_lease_watchdog` 呼叫——與斷線/failstop 同等級的「立即讓
+        ready 失效」事件，堵住 `gateway.ready` 在 lease 過期後仍誤判健康、繼續放行
+        place/update 建 Order/reservation/ledger 的縫。不動 `_health_max_epoch`（lease 過期
+        不是一則新的 health_epoch 宣告，之後遲到的舊 ok 仍受既有 epoch 單調性擋下；真正讓
+        它恢復的是下一則被接受、epoch 夠新的 ok，經 `note_health` 重新設回 True）。"""
+        self._health_confirmed_ok = False
 
     def resolve_ack(self, ack: UpCmdAck) -> None:
         fut = self._pending.pop(ack.cmd_id, None)
@@ -159,15 +211,33 @@ class AgentNativeGateway:
     def ready(self) -> bool:
         return self._channel.ready
 
-    async def place(self, req: OrderRequest, *, cmd_id: str) -> dict:
+    @property
+    def admission_ready(self) -> bool:
+        """C2（HIGH，codex 終審）：委派 `AgentChannel.admission_ready`——`shioaji_adapter.py`
+        place/update 的 admission 檢查（`_send_gate`／offline fail-fast）改查這個，不再查
+        寬鬆的 `ready`（見 `AgentChannel.admission_ready` docstring）。"""
+        return self._channel.admission_ready
+
+    async def place(self, req: OrderRequest, *, cmd_id: str, expires_at: str | None = None) -> dict:
         # Inc1 D4/Task 8：`cmd_id` 由呼叫端（ShioajiAdapter 決策段）提供——必須與該指令已經
         # 送前持久化的 `agent_commands` 列同一個 cmd_id，UpCmdAck 的兩維 CAS applier
         # （`agent_commands.apply_command_ack`）才能用 cmd_id 命中同一列。不再自行
         # `uuid.uuid4()`（Inc0 舊行為：ledger 尚不存在時 gateway 自己決定 id 即可，Task 8
         # 之後 id 的權威來源改成 ledger）。
+        #
+        # C9（LOW，codex 終審）：`expires_at` 同理應由呼叫端傳入這筆指令在 ledger 建立當下
+        # 凍結的值（`AgentCommand.expires_at`）——不能像舊版一樣在這裡獨立重新呼叫
+        # `_default_expires_at()` 算一次。理由：(1) 若 `agent_command_expiry_seconds`
+        # 設定值非本模組硬編碼的 `_DEFAULT_COMMAND_EXPIRY_SECONDS`，這裡會算出完全不同的
+        # 到期時間；(2) 即使設定值恰好相同，這裡的 `datetime.now()` 也是比 ledger insert
+        # 晚一步才算的另一個時間點，與 ledger 記的值不是同一個字串——之後若這筆指令觸發
+        # 重連補送（`agent_commands.to_downlink_dict`），補送用的是 ledger 凍結的原始值，
+        # 造成同一個 cmd_id 首次下行與補送下行的 `expires_at` 不一致。`expires_at=None`
+        # 保留給沒有 ledger（測試/尚未接線呼叫端）的舊呼叫方式，退回原本的預設值計算，
+        # 不強制所有呼叫端改動。
         cmd = DownPlace(
             cmd_id=cmd_id, account=self._channel.account, mode="sim",
-            expires_at=_default_expires_at(),
+            expires_at=expires_at if expires_at is not None else _default_expires_at(),
             native=PlaceNative(action=req.action, price=str(req.price), qty=req.qty,
                                price_type=req.price_type, order_type=req.order_type,
                                octype=req.octype),
@@ -177,18 +247,22 @@ class AgentNativeGateway:
         result = self._unwrap(ack)
         return {"ordno": result.get("ordno"), "broker_order_id": result.get("broker_order_id")}
 
-    async def cancel(self, ordno: str, *, cmd_id: str) -> None:
+    async def cancel(self, ordno: str, *, cmd_id: str, expires_at: str | None = None) -> None:
+        # C9：見 `place()` 同名參數說明。
         cmd = DownCancel(cmd_id=cmd_id, account=self._channel.account, mode="sim",
-                         expires_at=_default_expires_at(), ordno=ordno)
+                         expires_at=expires_at if expires_at is not None else _default_expires_at(),
+                         ordno=ordno)
         self._unwrap(await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id,
                                                  timeout=self._timeout))
 
     async def update(
-        self, ordno: str, *, price, qty: int, price_type: str | None = None, cmd_id: str
+        self, ordno: str, *, price, qty: int, price_type: str | None = None, cmd_id: str,
+        expires_at: str | None = None,
     ) -> None:
+        # C9：見 `place()` 同名參數說明。
         cmd = DownUpdate(cmd_id=cmd_id, account=self._channel.account, mode="sim",
-                         expires_at=_default_expires_at(), ordno=ordno,
-                         price=(str(price) if price is not None else None),
+                         expires_at=expires_at if expires_at is not None else _default_expires_at(),
+                         ordno=ordno, price=(str(price) if price is not None else None),
                          qty=qty, price_type=price_type)
         self._unwrap(await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id,
                                                  timeout=self._timeout))

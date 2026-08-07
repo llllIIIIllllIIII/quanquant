@@ -17,6 +17,7 @@ import pytest
 from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
+from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
 from quanquant.broker.agent_commands import apply_command_ack
 from quanquant.broker.agent_protocol import UpCmdAck
 from quanquant.broker.base import (
@@ -63,19 +64,29 @@ class _FakeGateway:
         self.result = {"ordno": "101AA1", "broker_order_id": "101AA1"}
         self.raise_exc = None
         self.snapshot = ([], None)
+        self.last_expires_at = None  # C9：記錄最後一次呼叫收到的 expires_at，供 wire 斷言
 
-    async def place(self, req, *, cmd_id=None):
+    @property
+    def admission_ready(self) -> bool:
+        # C2：測試替身沒有真正的健康狀態機——鏡射 `ready`，讓既有「gw.ready = False」
+        # 寫法對 place/update 的 admission 檢查（現在改查 admission_ready）仍然生效。
+        return self.ready
+
+    async def place(self, req, *, cmd_id=None, expires_at=None):
         self.place_calls.append(req)
+        self.last_expires_at = expires_at
         if self.raise_exc:
             raise self.raise_exc
         return self.result
 
-    async def cancel(self, ordno, *, cmd_id=None):
+    async def cancel(self, ordno, *, cmd_id=None, expires_at=None):
         self.cancel_calls.append(ordno)
+        self.last_expires_at = expires_at
         if self.raise_exc:
             raise self.raise_exc
 
-    async def update(self, ordno, *, price, qty, price_type=None, cmd_id=None):
+    async def update(self, ordno, *, price, qty, price_type=None, cmd_id=None, expires_at=None):
+        self.last_expires_at = expires_at
         if self.raise_exc:
             raise self.raise_exc
 
@@ -147,6 +158,105 @@ async def test_remote_place_offline_fails_fast_no_db_rows(engine):
     with Session(engine) as s:
         assert s.exec(select(Order)).all() == []
         assert s.exec(select(QuotaReservation)).all() == []
+
+
+# ---------------------------------------------------------------------------
+# C2（HIGH，codex 終審）：gateway.admission_ready 必須反映真健康——pending_health/
+# failstop/lease 過期時 admission 不得建任何 DB 決策列（Order/QuotaReservation/
+# AgentCommand）。用真的 AgentChannel/AgentNativeGateway（不是 _FakeGateway——
+# `_FakeGateway.ready` 只是可自由設定的 bool，測不到 AgentChannel 本身的健康收斂邏輯，
+# 也就測不到這個修復）。`ready`（寬鬆，只看連線存活＋已登入）刻意與 `admission_ready`
+# 分離——reconcile/query_qty 等唯讀背景動作不受健康狀態影響，只有真的會建新 DB 決策列
+# 的 place/update 才查 `admission_ready`；下面測試會同時斷言兩者，證明這個刻意的分離。
+# ---------------------------------------------------------------------------
+
+
+def _no_decision_rows(engine) -> None:
+    with Session(engine) as s:
+        assert s.exec(select(Order)).all() == []
+        assert s.exec(select(QuotaReservation)).all() == []
+        assert s.exec(select(AgentCommand)).all() == []
+
+
+def _real_channel_adapter(engine, channel, guard=None):
+    gw = AgentNativeGateway(channel, timeout_seconds=1)
+    a = ShioajiAdapter(api_key="", secret_key="", ca_path=None, ca_passwd=None,
+                       person_id=None, symbol="TXF", mode="sim",
+                       session_factory=lambda: Session(engine),
+                       supervisor=BrokerSupervisor(), risk_guard=guard,
+                       sim_fee_per_lot=Decimal("20"), remote_gateway=gw)
+    a.account = "F1"
+    channel.account = "F1"
+    return a
+
+
+async def test_place_blocked_no_db_rows_when_pending_health(engine):
+    """C2 三態之一：剛登入、本 session 尚未收過任何被接受的 `UpHealth(ok)`
+    （pending_health）——`admission_ready` 必須是 False（`ready` 寬鬆定義仍是 True，
+    連線本身還活著），place admission 拒絕、不建任何 DB 決策列。"""
+    channel = AgentChannel()
+    channel.attach(lambda msg: None)
+    channel.mark_logged_in("F1")  # 未 note_health
+    assert channel.ready is True  # 寬鬆定義：連線+已登入即真，供 reconcile/query_qty 使用
+    assert channel.admission_ready is False
+    a = _real_channel_adapter(engine, channel, _guard(engine))
+    with pytest.raises(OrderError):
+        await a.place(_req(), actor_user_id=1)
+    _no_decision_rows(engine)
+
+
+async def test_place_blocked_no_db_rows_when_failstop(engine):
+    """C2 三態之二：agent 已回報 `status="failstop"`。"""
+    channel = AgentChannel()
+    channel.attach(lambda msg: None)
+    channel.mark_logged_in("F1")
+    channel.note_health(status="ok", health_epoch=0)
+    channel.note_health(status="failstop", health_epoch=1)
+    assert channel.ready is True
+    assert channel.admission_ready is False
+    a = _real_channel_adapter(engine, channel, _guard(engine))
+    with pytest.raises(OrderError):
+        await a.place(_req(), actor_user_id=1)
+    _no_decision_rows(engine)
+
+
+async def test_place_blocked_no_db_rows_when_lease_expired(engine):
+    """C2 三態之三：曾經 admission_ready，但 server 端 heartbeat lease 過期
+    （`AgentChannel.mark_lease_expired`，由 `agent_registry.run_health_lease_watchdog`
+    呼叫）——`admission_ready` 必須立即失效，不必等下一則 UpHealth。"""
+    channel = AgentChannel()
+    channel.attach(lambda msg: None)
+    channel.mark_logged_in("F1")
+    channel.note_health(status="ok", health_epoch=0)
+    assert channel.admission_ready is True
+    channel.mark_lease_expired()
+    assert channel.ready is True  # 連線仍活著（lease 過期不等於斷線）
+    assert channel.admission_ready is False
+    a = _real_channel_adapter(engine, channel, _guard(engine))
+    with pytest.raises(OrderError):
+        await a.place(_req(), actor_user_id=1)
+    _no_decision_rows(engine)
+
+
+async def test_update_blocked_no_new_reservation_when_channel_pending_health(engine):
+    """C2：`update()` 的 offline fail-fast 同樣要吃到新語意——先用 `_FakeGateway`
+    （`ready=True`）正常送出一張委託，再把 adapter 換上一個真 `AgentChannel`（pending_
+    health，未 note_health），驗證 update 被擋、沒有新 QuotaReservation。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    with Session(engine) as s:
+        reservations_before = len(list(s.exec(select(QuotaReservation))))
+
+    channel = AgentChannel()
+    channel.attach(lambda msg: None)
+    channel.mark_logged_in("F1")  # pending_health：未 note_health
+    a._remote_gateway = AgentNativeGateway(channel, timeout_seconds=1)
+
+    with pytest.raises(OrderError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"  # 改單失敗不影響委託本身狀態
+        assert len(list(s.exec(select(QuotaReservation)))) == reservations_before  # 沒建新保留列
 
 
 async def test_remote_place_idempotent_replay_served_while_offline(engine):
@@ -410,14 +520,14 @@ async def test_update_singleflight_rejects_second_unresolved_update(engine):
     decision 段插 ledger 就撞 `uq_agent_cmd_update_singleflight`，轉友善訊息「前一筆改單
     結果未定」，且第二筆的 ledger 列**不會**落地（`agent_commands` 只有第一筆）。
 
-    已知落差（見 `agent_commands.py` 模組頂部說明／task-8-report.md）：`RiskGuard.
-    check_update` 內部會自行 commit 它建立的 delta `QuotaReservation`，這個 commit 早於
-    ledger insert 撞鍵，因此撞鍵後的 `session.rollback()` 救不回它——第二次嘗試會留下一筆
-    孤兒 `reserved`。**更正（Task 8 修復 round 1）**：這筆孤兒列**不是**「不會被誤算進已用
-    配額」——`repository._ACTIVE_QUOTA_STATES=("reserved","confirmed")`，`quota_used_today`
-    照樣會把它算進當日已用配額，一路占用到 trading_day 換日才不再計入這個 trading_day 的
-    加總（多扣不少扣、安全方向，不是永久卡死；watchdog/人工其後仍可用『查無對應 ledger 列』
-    辨識並清理）。這裡精確驗證這個已知結果，不假裝它不存在。"""
+    C8（MEDIUM，codex 終審）修復：`RiskGuard.check_update` 內部會自行 commit 它建立的
+    delta `QuotaReservation`，這個 commit 早於 ledger insert 撞鍵，撞鍵後的
+    `session.rollback()` 本身救不回它——但這不再是「已知落差、放著不管」：撞鍵代表這筆
+    ledger 從未真正落地送出，adapter 現在會在撞鍵當下主動查詢贏家（U1）目前的
+    reservation_id，若這次（U2）自己 reserve 的 reservation_id 與贏家不同（本測試的
+    U1/U2 qty 不同 → request_hash 不同 → reservation_id 不同），就原子釋放這筆孤兒
+    reservation——不再永久占用配額（codex 終審 C8 原話：「正常請求可確定觸發，非 crash
+    窗口」，兩個併發改單就會踩到）。"""
     gw = _FakeGateway()
     a, ack = await _placed_order(engine, gw, _guard(engine))
     a._agent_user_id = 1
@@ -434,11 +544,48 @@ async def test_update_singleflight_rejects_second_unresolved_update(engine):
 
     with Session(engine) as s:
         # ledger 沒有第二筆（singleflight 真正擋下的是這個——未來重連補送/watchdog 只看
-        # agent_commands，孤兒 reservation 不會被誤判成「有一筆待收斂的指令」）。
+        # agent_commands，這筆孤兒 reservation 不會被誤判成「有一筆待收斂的指令」）。
         assert len(list(s.exec(select(AgentCommand)))) == cmds_before
         rows = list(s.exec(select(QuotaReservation)))
         orphan = next(r for r in rows if r.qty == 4)
-        assert orphan.state == "reserved"  # 已知落差：check_update 自己的 commit 救不回
+        assert orphan.state == "released"  # C8：撞鍵孤兒 reservation 已被主動釋放
+        winner = next(r for r in rows if r.qty == 2)  # U1（qty=3，delta=2）仍是贏家的保留列
+        assert winner.state == "reserved"  # U1 尚未 ack，仍在 unresolved，配額不受影響
+
+
+async def test_update_singleflight_loser_with_same_content_does_not_release_winner_reservation(engine):
+    """C8（MEDIUM，codex 終審）：撞鍵嘗試若與贏家內容完全相同（同一 `qty`/`price` →
+    `reservation_id_for_update` 是 client_order_id+request_hash 的確定性推導，會得到**同一個
+    reservation_id**）——這種情況下絕不能釋放，那正是贏家（U1）目前仍在使用中的保留列，
+    釋放會讓贏家後續 ack 時 `confirm_quota` 命中一個已被 release 的列（`state='reserved'`
+    的 CAS 會落空），造成配額帳務錯誤。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    a._agent_user_id = 1
+    gw.raise_exc = AgentCommandTimeoutError("逾時")  # U1（qty=5，delta=4）卡在 unresolved
+    with pytest.raises(AgentCommandTimeoutError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=5)
+
+    with Session(engine) as s:
+        reservations = list(s.exec(select(QuotaReservation)))
+        winner = next(r for r in reservations if r.qty == 4)  # U1 的 delta 保留列
+        winner_reservation_id = winner.reservation_id
+        assert winner.state == "reserved"
+        reservations_count_before = len(reservations)
+
+    gw.raise_exc = None
+    # U2：完全相同的內容（同 qty=5）——`reservation_id_for_update` 是 client_order_id+
+    # request_hash 的確定性推導，內容相同會得到與 U1 相同的 reservation_id，撞鍵後不得
+    # 誤釋放贏家的保留列。
+    with pytest.raises(OrderError, match="前一筆改單結果未定"):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=5)
+
+    with Session(engine) as s:
+        reservation = s.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == winner_reservation_id)
+        ).one()
+        assert reservation.state == "reserved"  # 贏家的保留列完全沒被動到
+        assert len(list(s.exec(select(QuotaReservation)))) == reservations_count_before  # 沒新增列
 
 
 async def test_cancel_not_blocked_by_unresolved_update_singleflight(engine):
@@ -545,3 +692,30 @@ async def test_place_uses_configured_agent_command_expiry_seconds(engine):
     await a.place(_req(), actor_user_id=1)
     cmd = _find_cmd(engine, client_order_id="c-1", kind="place")
     assert cmd.expires_at - cmd.created_at == timedelta(seconds=45)
+
+
+async def test_place_wire_expires_at_matches_ledger_frozen_value_not_gateway_default(engine):
+    """C9（LOW，codex 終審）：首次下行（非重連補送）也必須用 ledger 建立當下凍結的
+    `expires_at`——不能像舊版一樣讓 `AgentNativeGateway.place()` 自己獨立呼叫
+    `_default_expires_at()` 重算一次（該函式固定用 `agent_channel.py` 模組層硬編碼的
+    `_DEFAULT_COMMAND_EXPIRY_SECONDS=120`，與這裡設定的 45 秒完全不同）。用非預設值
+    （45s）配置：若舊 bug 還在，wire frame 的 `expires_at` 會是「建立時間+約 120 秒」，
+    與 ledger 記的「建立時間+45 秒」相差近 75 秒，明顯不相等——這裡直接比對 wire frame
+    （`gw.last_expires_at`）與 ledger 值字串相等，不只驗 DB。"""
+    gw = _FakeGateway()
+    a = ShioajiAdapter(
+        api_key="", secret_key="", ca_path=None, ca_passwd=None, person_id=None,
+        symbol="TXF", mode="sim", session_factory=lambda: Session(engine),
+        supervisor=BrokerSupervisor(), risk_guard=_guard(engine),
+        sim_fee_per_lot=Decimal("20"), remote_gateway=gw,
+        agent_command_expiry_seconds=45,
+    )
+    a.account = "F1"
+    await a.place(_req(), actor_user_id=1)
+    cmd = _find_cmd(engine, client_order_id="c-1", kind="place")
+    assert gw.last_expires_at == cmd.expires_at.isoformat()
+
+    # cancel 走同一套修法，一併驗證 wire frame（place 已用掉 gw.result 的 "101AA1"）。
+    await a.cancel("101AA1", actor_user_id=1)
+    cancel_cmd = _find_cmd(engine, client_order_id="c-1", kind="cancel")
+    assert gw.last_expires_at == cancel_cmd.expires_at.isoformat()

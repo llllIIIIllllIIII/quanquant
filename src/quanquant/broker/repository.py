@@ -572,6 +572,22 @@ def has_unresolved_risky_commands_other_account(
     return session.exec(stmt).first() is not None
 
 
+def unresolved_update_reservation_id(session: Session, *, client_order_id: str) -> str | None:
+    """C8（MEDIUM，codex 終審）：取得目前贏得 update 單飛鍵（`uq_agent_cmd_update_
+    singleflight`）的那筆未 resolved ledger 列的 `reservation_id`（可能是 None——純改價/
+    減量 update 不建立 delta 保留列）。呼叫端（`shioaji_adapter.update()` 撞鍵後的孤兒
+    reservation 清理，見 C8 修復）用來判斷這次撞鍵嘗試自己 reserve 的 reservation_id 是否
+    與贏家相同——相同代表同一內容重送（`reservation_id_for_update` 是 client_order_id+
+    request_hash 的確定性推導），不得誤釋放贏家仍在使用中的保留列；不同才代表這次嘗試的
+    保留列真的是孤兒，可以安全釋放。"""
+    stmt = select(AgentCommand.reservation_id).where(
+        AgentCommand.client_order_id == client_order_id,
+        AgentCommand.kind == "update",
+        AgentCommand.resolved_at.is_(None),
+    ).limit(1)
+    return session.exec(stmt).first()
+
+
 def has_unresolved_update_command(session: Session, *, client_order_id: str) -> bool:
     """Task 8：`ShioajiAdapter.update` 的 ledger insert 撞到 `uq_agent_cmd_update_singleflight`
     partial unique index 後，用這個查詢確認撞的正是這個單飛鍵（同一 `client_order_id` 已有

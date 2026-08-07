@@ -88,14 +88,20 @@ class _FakeGateway:
         self.snapshot = ([], None)
         self.result = {"ordno": "O1", "broker_order_id": "B1"}
 
-    async def place(self, req, *, cmd_id=None):
+    @property
+    def admission_ready(self) -> bool:
+        # C2：測試替身鏡射 ready，讓既有 gw_ready 寫法對 place/update 的 admission 檢查
+        # （現在改查 admission_ready）仍然生效。
+        return self.ready
+
+    async def place(self, req, *, cmd_id=None, expires_at=None):
         self.place_calls.append(req)
         return self.result
 
-    async def cancel(self, ordno, *, cmd_id=None):
+    async def cancel(self, ordno, *, cmd_id=None, expires_at=None):
         pass
 
-    async def update(self, ordno, *, price, qty, price_type=None, cmd_id=None):
+    async def update(self, ordno, *, price, qty, price_type=None, cmd_id=None, expires_at=None):
         pass
 
     async def trades_snapshot(self, after):

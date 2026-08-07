@@ -85,3 +85,13 @@ async def run_health_lease_watchdog(
                     "UpHealth(ok)）", slot.user_id, lease_seconds,
                 )
                 slot.session_state.mark_unhealthy("健康回報逾時（lease 過期）")
+                # C2（HIGH，codex 終審）：`session_state`（UI/badge 用）過去是唯一被更新的
+                # readiness 訊號——`channel.admission_ready`（`AgentNativeGateway.
+                # admission_ready` 委派讀這個，是 place/update admission 檢查的唯一依據）
+                # 並不受影響，導致 lease 過期後 HTTP 下單路徑仍會誤判健康、照常建
+                # Order/reservation/ledger。這裡同步 invalidate channel 的健康旗標，讓兩個
+                # readiness 訊號一致收斂（`channel.ready`——連線存活＋已登入的寬鬆定義，供
+                # reconcile/query_qty 用——刻意不受影響，lease 過期不等於斷線）。
+                mark_lease_expired = getattr(channel, "mark_lease_expired", None)
+                if mark_lease_expired is not None:
+                    mark_lease_expired()
