@@ -291,7 +291,10 @@ sqlite3 quanquant.db "SELECT reservation_id, user_id, mode, trading_day, qty, st
 ## 6. fail-stop 演練（G2）
 
 **目的**：驗證 agent 本機 durable buffer 寫入失敗時的 fail-stop 狀態機——拒絕新指令、UI
-紅燈、（若有設定）Telegram 告警，修復後自動探測恢復。
+紅燈、（若有設定）Telegram 告警，修復儲存問題後**手動重啟 agent** 才會恢復（2026-08-08
+設計降級：G2 恢復不再是 session 進行中自動探測，只在 agent 程序啟動時做一次 storage
+probe，通過才清除 fail-stop；latch 之後若不重啟 agent，會一路保持 fail-stop 到操作者
+手動介入為止）。
 
 **做法**：把 agent 的本機 buffer 目錄整個改成唯讀，讓 agent 端「主寫入（SQLite）」與
 「退化寫入（純檔案 append）」**兩條路徑都失敗**（只鎖 `outbox.db` 檔本身不夠——那樣
@@ -312,12 +315,14 @@ sqlite3 quanquant.db "SELECT reservation_id, user_id, mode, trading_day, qty, st
    已知的次要邊界情況（唯讀範圍波及了原本設計成獨立路徑的 sentinel 檔），核心的「拒絕新
    指令＋最終仍會回報 failstop」結論不受影響，健康訊息會靠週期性心跳（約 15 秒一次）補上。
 5. 再送一筆新單，確認被拒（agent 端直接拒絕，不會嘗試呼叫永豐 API）。
-6. 復原權限：
+6. 修復儲存問題後**重啟 agent**（Ctrl-C 再啟動）：
    ```bash
    chmod -R u+w ~/.quanquant-agent
    ```
-7. 等待最多約 5-15 秒（agent 每 5 秒探測一次 buffer 是否恢復可寫），確認 badge 恢復綠燈，
-   新單恢復正常。
+   復原權限後，回到跑 `quanquant-agent` 的終端機，Ctrl-C 停掉這個 agent 程序，用同一組
+   token/sim key 重新啟動（見情境 5 步驟 4 的啟動指令）。
+7. 觀察 agent 啟動時的終端機輸出，應出現一行「已從 failstop 恢復（啟動時儲存探測通過）」
+   的 log；回頭確認 orders 頁 badge 恢復綠燈，新單恢復正常。
 
 **預期結果**：
 - 步驟 4：badge 轉紅，文案為「agent 儲存故障，交易已停止」（不得洩漏 agent 本機的原始
@@ -326,7 +331,10 @@ sqlite3 quanquant.db "SELECT reservation_id, user_id, mode, trading_day, qty, st
   fail-stop（拒絕新單）」告警；恢復後應再收到一則「agent 解除 fail-stop」告警。
 - 步驟 5：新單被拒，且**不應**在永豐 sim 後台看到這筆委託真的被送出（agent 落地失敗時是
   「先發現寫不進去、再決定要不要送」，不是「送出去才發現寫不進去」）。
-- 步驟 7：探針通過後 badge 自動恢復綠燈，不需要重啟 agent 或重新登入。
+- 步驟 6-7（2026-08-08 設計降級）：badge **不會**在原地自動恢復——G2 恢復只在 agent 程序
+  啟動時做一次 storage probe，session 進行中 latch 後永不自動解除。必須先修好底層儲存
+  問題、**手動重啟 agent 程序**，新一輪啟動時的探測通過後才會清除 fail-stop、badge 才會
+  轉綠；重啟後只需要沿用同一組 token/sim key 即可，不需要重新在網頁端做任何額外操作。
 
 **檢查方式**：
 ```bash
@@ -353,6 +361,7 @@ chmod 644 ~/.quanquant-agent/outbox.db ~/.quanquant-agent/outbox.db-wal \
   ~/.quanquant-agent/outbox.db-shm ~/.quanquant-agent/outbox.db.degraded.jsonl
 ```
 這個版本下，sentinel 寫入會成功、badge 轉紅應在 1-2 秒內發生，且不會有上述例外雜訊。
+同樣地，`chmod` 復原權限後仍需照上面步驟 6 手動重啟 agent 才會恢復（不會原地自動恢復）。
 
 ---
 

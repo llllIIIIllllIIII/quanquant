@@ -274,6 +274,7 @@ per-user 隔離單位＝**UserAgentSlot**；跨 user 完全無共享可變 runti
 - **Round 6（2026-08-07）：REVISE（G2 閉合）**——R5-1 RESOLVED（含 R4-1/R3-3/R2-3/R1-3 全鏈 RESOLVED，G2 依重定義語意閉合）。剩 2 BLOCKER：R6-1 單飛 index 用 nullable ordno 互斥失效 → 改鍵 `client_order_id`＋admission 拒無 ordno 的 Order；R6-2 終態 resolver 會搶先明確未執行 ack 造成不可逆錯誤 confirm → 適用集合限縮為 transport_acked＋outcome=unknown。＋1 LOW 實作期（R6-3 IntegrityError 精確辨認）。**v7 已全數修訂納入**，標 `codex R6-n`。
 - **Round 7（2026-08-07）：APPROVE**——R6-1/R6-2 覆核皆 RESOLVED、無新發現；G1、重定義後的 G2、G3 全部閉合，多人隔離與 in-process 零變更維持成立。設計收斂完成。
 - **2026-08-07 使用者拍板**：D3 改兩層（per-user 開關＋保留全站總閘，v8 已更新）；D7 硬升 v2、D9 healthz 語意變更照案通過；其餘 8 條照預設方案（D2 TTL 30 天/單枚/移除舊密鑰、D4 配額保留至當日收盤、D8 保守 confirm、D10 一人一帳號先綁先贏等）。設計定案 → writing-plans。
+- **2026-08-08 使用者拍板**：G2 恢復降級為手動重啟（啟動時 probe）——8 輪終審證明 in-session 自動恢復複雜度超過價值。詳見 §10 (g) 改寫段與 `.superpowers/sdd/codex-final-fixes-report.md` Round 8 fixes。
 
 ---
 
@@ -374,91 +375,71 @@ _wrap_on_raw`／`_trigger_failstop_latch`），退化寫入是否成功只影響
 → 經 IPC 通知父程序」這條鏈之外，child 本地額外補的一道更即時防線，父 latch（②-⑧）續管
 sentinel/epoch/health 等跨程序協調責任不變。
 
-**(g) G2④ 解除動作（recovery）實現為 session-restart，而非原地 respawn child（codex 終審
-round5 收斂；round6 修正持久化順序）**
+**(g) G2④ 解除動作（recovery）— 歷史：session-restart（round5-7）；現行：啟動時
+probe、手動重啟恢復（2026-08-08 使用者拍板，設計降級）**
 
 §4 D9「G2 fail-stop 狀態機」④「解除條件＝storage probe（對同一 buffer 寫入→commit→讀回）
-才准回報 `status="ok"`」這個**解除條件**本身不變；但 codex 終審 round3-5 對「解除條件通過
-之後的**恢復動作**該怎麼做」連續三輪發現縫（R3-4 respawn 專屬 backoff、R4-a/b/c/d
-shield/收割/重驗/帳號 fatal、R5-a 收尾未完成 account/fatal/ping 語意、R5-b sentinel
-compare-and-clear 非原子、R5-d mismatch cleanup 又是未 fenced worker）——根因是「原地
-respawn」要求在一個**活著的** asyncio session 內原子替換 child process，每加一層 fencing
-就冒出更窄的 late-worker/TOCTOU，打地鼠打不完。round5 裁決把恢復動作改為：**探針通過→
-持久化 epoch／清 sentinel→解 latch→結束整條 session（terminate child，best-effort）→
-交給 `run_forever()` 既有的 session 迴圈重啟**，新 session 走既有硬化 spawn 路徑
-（`ensure_child()`，含既有帳號不符 fatal）→重新登入→`UpLogin` 宣告新 epoch→server
-`pending_health`→heartbeat ok。原地 respawn 的專屬機制（`AgentRunner._respawn_child()`、
-`ChildHandle.respawn(expected_generation)`、`_respawn_stage`/`_respawn_backoff*`）整組
-移除；`SessionRestartRequested`（`runner.py`）是新增的內部控制流訊號，`run_forever()`
-特別處理（不當一般例外記錄、且強制不因「session 存活時間跨過 stable_session_seconds」而
-重設重連 backoff，避免持續故障下登入頻率失控——詳細推演見
-`.superpowers/sdd/codex-final-fixes-report.md` Round 5 fixes 段）。這個改動使「無 in-place
-respawn ⇒ 無 late terminate/start worker、無 mismatch cleanup fencing」（R5-a/R5-d 結構性
-消失）、「session 重啟時 `_load_persisted_health()` 重讀 durable 狀態，讓 sentinel 清除的
-TOCTOU 自然收斂」（R5-b 失去殺傷力）——D9④ 的**解除條件**文字不變，只是「解除後具體怎麼把
-系統帶回 healthy」這個實作細節從「原地換血」改為「結束並重啟 session」。
+才准回報 `status="ok"`」這個**解除條件**本身不變（D9④ 原文不改，見上方，本節只記錄
+「解除條件通過之後的恢復動作該怎麼做」這段實作史的最終落點）。
 
-**round6 修正（N6-1/N6-2，codex 終審 round6，HIGH）**：round5 版本內部的執行順序是
-「探針通過→持久化 epoch／清 sentinel→解 latch→（鎖外）排一筆 ok health frame→
-best-effort／可取消地 terminate child→raise `SessionRestartRequested`」，這個順序本身
-仍有兩個縫：①清 sentinel 時 child（sentinel 唯一 writer，`native_runner.py
-_trigger_failstop_latch`）可能還活著，`clear_sentinel()`（unlink）與 child 端可能仍在
-進行的 `write_sentinel()`（replace）之間是真正的檔案系統層級 TOCTOU；②terminate 排在解
-latch 之後、且是 best-effort/可取消的，這段期間 server 可能已經因為那筆 ok health frame
-短暫恢復 admission，但實際還在跑的可能是那個已經被判定永久故障、甚至還沒真的死透的舊
-child。round6 裁決把順序改為**先殺 writer、再清狀態；健康由新 session 宣告**：探針通過→
-**同步 terminate child 並驗證已死**（`expected_generation` fencing 防止取消後遲到的
-worker 誤殺新 session 的 child；terminate 失敗或驗不死＝保留 latch/sentinel、本輪放棄、
-交下一輪重試）→persist epoch→清 sentinel（此時 child 已確認死亡，① 的 TOCTOU 結構性
-消失）→解 latch→**不排 ok health frame**、直接 raise `SessionRestartRequested`（② 的
-提前恢復窗口消失，健康改由新 session 自己的正常 heartbeat/`_health_sender` 宣告）。
-`ChildHandle.terminate()` 新增 `expected_generation` 選填參數（沿用 R3-1 的
-`_lock`/`_generation` fencing 機制，不傳則維持既有無條件終止語意，既有呼叫端不受影響）。
-同一輪順帶修正 `_child_watchdog` 改用既有但先前無 production caller 的
-`ChildHandle.ping_detail()`（child 本地 latch 已 tripped 時即使 pipe 仍活著也視為不健康，
-是 failstop IPC 通知失敗時的安全網），以及 `run_once()` 的 `asyncio.wait(FIRST_EXCEPTION)`
-`done` set 可能同時收攏多個例外時的確定性選擇優先序（`FatalAgentError`＞
-`SessionRestartRequested`＞其他）。詳細推演與測試清單見
-`.superpowers/sdd/codex-final-fixes-report.md` Round 6 fixes 段。
+**歷史（round3-7，已被本次降級取代，僅供追溯）**：codex 終審 round3-5 對「原地 respawn
+child」連續三輪發現縫（R3-4 respawn 專屬 backoff、R4-a/b/c/d shield/收割/重驗/帳號
+fatal、R5-a 收尾未完成 account/fatal/ping 語意、R5-b sentinel compare-and-clear 非
+原子、R5-d mismatch cleanup 又是未 fenced worker）——根因是「原地 respawn」要求在一個
+**活著的** asyncio session 內原子替換 child process，每加一層 fencing 就冒出更窄的
+late-worker/TOCTOU，打地鼠打不完。round5 裁決改為 session-restart：探針通過→持久化
+epoch／清 sentinel→解 latch→結束整條 session（terminate child）→交給 `run_forever()`
+既有的 session 迴圈重啟，新 session 走既有硬化 spawn 路徑重新登入、宣告新 epoch，健康由
+新 session 自己的 heartbeat 宣告（`SessionRestartRequested` 是當時新增的內部控制流訊
+號）。round6（N6-1/N6-2）修正執行順序為「先殺 writer、再清狀態；健康由新 session 宣
+告」，堵住 sentinel 的 replace/unlink TOCTOU 與短暫誤判恢復的窗口。round7（R7-1/R7-2）
+再補兩個殘餘縫：`ChildHandle.terminate()` 的 kill/join 後 `is_alive()` 真驗死
+（R7-1）；`fault_token` nonce 供 terminate 前後比對，偵測 child 死前最後一刻又落地一筆
+新故障的 dying-gasp（R7-2）。這一整條演進（`_recover()`／`_recovery_prober()`／
+`SessionRestartRequested`／dying-gasp fault_token 比對）在 round3-7 每一輪都被證明
+「解法本身又長出新的窄縫」——連同本次降級這一輪，累計 8 輪終審打磨的證據，是促成下方
+2026-08-08 拍板的直接理由。
 
-**round7 修正（R7-1/R7-2，codex 終審 round7，HIGH）**：round6 的 N6-1「同步 terminate
-child 並驗證已死」本身有兩個殘餘縫。
+**2026-08-08 使用者拍板：G2 恢復降級為手動重啟（啟動時 probe）**——上述 round3-7 處理的
+每一個縫，全部源自「必須在一個活著的 session 內、跟一個可能仍在寫 sentinel 的 child 打
+交道」這個前提；8 輪終審的結論是這個前提帶來的複雜度已經超過 in-session 自動恢復本身的
+價值。裁決：**恢復檢查只在 agent 程序啟動時做一次**（`AgentRunner._startup_recovery_
+probe()`，`run_forever()` 進入主迴圈之前呼叫一次）——此刻單執行緒、`ensure_child()`
+尚未被呼叫過、沒有 child、沒有並發 sentinel writer，round3-7 打磨的每一道防線在這個
+時間點結構性不需要：
 
-R7-1：`ChildHandle.terminate()` 的驗死檢查沒有真正生效——`kill()`+`join(timeout=5)` 後
-舊版無條件把 `self._process` 設 `None`，`join` 逾時（「這 5 秒內沒等到它退出」）被誤當成
-「確認死亡」，讓 `alive` 屬性此後永遠回報 `False`，即使底層進程其實仍在跑。`_recover()`
-靠 `self._child.alive` 做的二次確認因此形同虛設——不管子程序真死沒死，`terminate()`
-都回報「已死」。修法：`terminate()` 在 `kill()`+`join(5s)` 後明確檢查
-`process.is_alive()`——仍活著就保留 `self._process`/`self._conn`（不清狀態），回傳
-`False`；`_recover()` 既有的 `if self._child.alive:` 檢查因此開始正確生效，不需要另外
-改動判斷邏輯本身。
+- `_load_persisted_health()`（既有，建構子內）讀到 sentinel（latched）時，對同一
+  buffer 執行一次 storage probe（寫→commit→讀回，`DurableBuffer.probe()`，解除條件
+  本身不變）。
+- 探針通過：持久化 epoch→清 sentinel→解 latch，記一行 info log「已從 failstop 恢復
+  （啟動時儲存探測通過）」。持久化任一步失敗（C3 邏輯沿用）：保持 latched，等下一次
+  程序重啟再試，不在這裡重試。
+- 探針失敗：保持 latched，agent 以 failstop 模式運行（native 呼叫前的 latch gate 繼續
+  拒絕 mutating 指令，health sender 繼續回報 `status="failstop"`）——不排程重試，底層
+  儲存問題需要操作者人工修復、修好後手動重啟這個 agent 程序。
+- **session 進行中 latch 後永不自動解除**——這是與 round5-7 版本最根本的行為差異：舊版
+  有 `_recovery_prober()` 週期性（預設每 5 秒）重驗並可能觸發 session-restart；新版只
+  在程序啟動的那一刻探測一次，之後任何一次 `_latch()`（child 經 IPC 通知父程序觸發）
+  都不會再被任何背景迴圈重新探測，唯一能讓 latch 解除的路徑是重啟整個 agent 程序。
 
-R7-2：N6-1 只驗證「child 已確認死亡」，沒有驗證「child 死之前，這段 terminate 窗口內有沒有
-又落地一筆全新的故障」（dying-gasp）——latch 之後 child 進程仍然活著，SDK callback 執行緒
-不受本地 latch（`ChildFailstopLatch`）攔阻自己的落地路徑（那只擋 `_dispatch` 呼叫 native
-mutating op 前的窗口，不擋 callback 本身），unrelated 的 SDK push（如未結案委託的成交
-回報）仍可能觸發一次全新的落地失敗，寫入一筆帶新 `detail`／舊版固定 `epoch=-1` 佔位值的
-新 sentinel——這筆新故障可能恰好卡在 `_recover()` 已判定要 terminate、但 `kill()`/`join()`
-真正生效之間的窄窗。舊版一旦驗到死亡就無條件清 sentinel／解 latch，這筆新故障的訊號會這樣
-悄悄消失——reconcile 快照補不回（只有 order_id/seqno/status，落 order_report，無 deal
-明細）、degraded JSONL 也沒有自動 reinjection，不可接受。修法：
-1. `write_sentinel`（`buffer.py`）新增選填 `fault_token` 欄位；`_trigger_failstop_latch`
-   （`native_runner.py`）每次呼叫都產生一個全新 `uuid4().hex` 唯一 nonce 隨 sentinel 寫入
-   ——不是舊版那種每次故障都寫同一個字面 `epoch=-1` 的固定值（那個寫法本身就是 R5-b
-   記載過的舊卡死模式：exact-match 比對永遠判定「沒有變化」）。
-2. `_recover()` 在 terminate **之前**先讀一次 sentinel 記下 `before_token`；child 確認
-   死亡之後**重讀**一次記下 `after_token`。`after_token == before_token`（含兩者皆為
-   `None`——沒有 sentinel、或舊格式 sentinel 沒有這個欄位，向後相容）才走既有持久化／
-   清除／解 latch 流程；不同則保留 sentinel／保持 latch（`_health_epoch` 記憶體內
-   +=1），child 已確認死亡故仍 `raise SessionRestartRequested` 結束 session——下一個
-   session 重新 `_load_persisted_health()` 會讀到保留的 sentinel，繼續回報
-   `status="failstop"`，等下一輪（沒有任何 in-flight terminate 競態的）recovery 對這筆
-   保留下來的故障重試。
+移除：`AgentRunner._recover()`、`_recovery_prober()`、`SessionRestartRequested`（連同
+`run_forever()`/`_select_session_end_exception()` 對它的特別處理——`_select_session_
+end_exception()` 簡化回單純的 `FatalAgentError` 優先序）、terminate 前後 `fault_token`
+before/after 比對（dying-gasp 偵測）、recovery 專屬的 persist_only/stage 機制。
 
-明確澄清（避免未來誤讀）：**reconcile 不是 deal recovery**——`native.trades_snapshot()`
-只回傳 order-level 的 order_id/seqno/status，落 `order_report`，沒有成交（deal）明細；
-**degraded JSONL 需人工重灌**——退化寫入路徑（`_try_degraded_write`）純檔案 append-only，
-沒有自動 reinjection 機制，任何只落在退化檔的事件都需要操作者事後人工介入重新灌回。§4/§5
-描述 reconcile／degraded JSONL 之處均不得再以「reconcile 會補回」或「degraded 檔會自動
-救回」的描述理解——兩者只是事後救援線索，不是自動收斂機制。詳細推演與測試清單見
-`.superpowers/sdd/codex-final-fixes-report.md` Round 7 fixes 段。
+保留（round3-7 打磨出的機制中，不屬於「session 進行中自動恢復」本身、仍有其他呼叫端在
+用的部分不動）：latch trip 全部路徑（child 內 `ChildFailstopLatch` trip-first、父程序
+`_latch()`、sentinel durable、`fault_token` 欄位改為純診斷資訊）；`UpCommandRejected`、
+health epoch/`UpLogin` 宣告、heartbeat lease、`pending_health`、`ping_detail`
+watchdog、單一 health sender（`_health_sender`）；`ChildHandle.terminate()` 的
+`expected_generation` fencing／`is_alive()` 驗死（R7-1 的修——好衛生，`ensure_child()`
+的 respawn 路徑、shutdown/frozen 路徑仍在用）。
+
+明確澄清（沿用，不受本次降級影響）：**reconcile 不是 deal recovery**——`native.
+trades_snapshot()` 只回傳 order-level 的 order_id/seqno/status，落 `order_report`，
+沒有成交（deal）明細；**degraded JSONL 需人工重灌**——退化寫入路徑（`_try_degraded_
+write`）純檔案 append-only，沒有自動 reinjection 機制，任何只落在退化檔的事件都需要
+操作者事後人工介入重新灌回。§4/§5 描述 reconcile／degraded JSONL 之處均不得再以
+「reconcile 會補回」或「degraded 檔會自動救回」的描述理解——兩者只是事後救援線索，不是
+自動收斂機制。詳細推演與測試清單見 `.superpowers/sdd/codex-final-fixes-report.md`
+Round 8 fixes 段（round3-7 的完整歷史見同檔 Round 5-7 fixes 段）。

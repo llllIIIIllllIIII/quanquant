@@ -110,9 +110,9 @@ class ChildFailstopLatch:
         `(tripped, fault_seq)`——`tripped` 走 `Event.is_set()`（無鎖，property 本身）、
         `fault_seq` 另外進 `_seq_lock`——兩次讀取之間若 `trip()` 剛好插進來（callback
         執行緒與 `child_main` 主迴圈本就是不同執行緒），會讓 ping reply 帶出「tripped=
-        False 卻 fault_seq=1」這種不該自然發生、但確實可觀測到的不一致快照——recovery
-        端（`runner.py::AgentRunner._recover`）拿它核對故障狀態時可能被誤導（例如誤判
-        『這次重驗看到的還是舊故障』或反過來看漏新故障）。改成單一鎖內一次讀齊兩個欄位：
+        False 卻 fault_seq=1」這種不該自然發生、但確實可觀測到的不一致快照——拿它核對
+        故障狀態的呼叫端可能被誤導（例如誤判『這次重驗看到的還是舊故障』或反過來看漏新
+        故障）。改成單一鎖內一次讀齊兩個欄位：
         `trip()` 本身也是同一把 `_seq_lock` 內完成 test-and-set＋遞增，讀寫共用一把鎖天然
         互斥，保證這裡回傳的兩個值永遠對應同一個時間點的狀態，不會有「一半新一半舊」的
         中間態。`_dispatch()` 的 `ping` 分支改呼叫這個方法取代原本的兩次獨立呼叫。"""
@@ -144,16 +144,15 @@ def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail:
     最後防線）。
 
     R7-2（HIGH，codex 終審 round7）：每次呼叫都產生一個全新、獨一無二的 fault_token
-    （uuid4 hex，只要求「跟上一次/下一次不同」，equality 比對即足夠支撐 `AgentRunner.
-    _recover()` 的偵測需求，不需要跨程序協調也不需要嚴格遞增）隨 sentinel 一起寫入。
-    理由：舊版固定寫 epoch=-1 這個字面值，`_recover()` 若拿它跟自己記得的舊值做
+    （uuid4 hex，只要求「跟上一次/下一次不同」）隨 sentinel 一起寫入。理由（歷史）：舊版
+    固定寫 epoch=-1 這個字面值，當時的 `AgentRunner._recover()` 若拿它跟自己記得的舊值做
     exact-match 比對，會因為「每次故障都寫同一個 -1」而永遠判定「沒有變化」——這正是
-    R5-b 記載過的舊卡死模式（見 buffer.py write_sentinel/runner.py _recover 兩處
-    docstring）。改用每次呼叫都不同的 token，`_recover()` 才能可靠分辨「這是同一筆故障」
-    還是「child 死前最後一刻又落地了一筆全新的故障」（dying-gasp）。同一次故障事件如果
-    經過多個呼叫路徑重複觸發本函式，每次仍會拿到不同的 token——這是刻意的，child 端不
-    需要、也沒有能力判斷「這是重複通知還是新故障」，這個判斷交給父程序端的 before/after
-    比對。"""
+    R5-b 記載過的舊卡死模式（見 buffer.py write_sentinel docstring）。2026-08-08 G2 恢復
+    降級為啟動時 probe 後，`_recover()` 的 before/after token 比對（dying-gasp 偵測）已
+    隨之移除——這裡仍保留每次呼叫產生獨一無二 token 的行為，純粹當 sentinel 的診斷資訊
+    （供操作者/日誌人工判讀「這是不是同一筆故障」），不再有任何自動比對消費端。同一次
+    故障事件如果經過多個呼叫路徑重複觸發本函式，每次仍會拿到不同的 token——這是刻意的，
+    child 端不需要、也沒有能力判斷「這是重複通知還是新故障」。"""
     fault_token = uuid.uuid4().hex
     if latch is not None:
         latch.trip()
@@ -322,9 +321,10 @@ def _dispatch(native, op: dict, *, latch: "ChildFailstopLatch | None" = None,
         # ping 一律回 ok=True，recovery 用它做「新 child 真的可用」的獨立確認時完全看不出
         # child 是否在 connect 後又故障一次（假 healthy 縫）。
         # R4-b（HIGH，codex 終審 round4）：額外帶上 `generation`（child_main 啟動時蓋章的
-        # 世代）與 `fault_seq`（本地 latch 的單調故障序號）——recovery 可核對這兩個值是否
-        # 與先前觀察到的一致，不只看 `latched` 這個瞬時 bool（見 runner.py
-        # `AgentRunner._recover` docstring）。
+        # 世代）與 `fault_seq`（本地 latch 的單調故障序號）——供呼叫端核對這兩個值是否
+        # 與先前觀察到的一致，不只看 `latched` 這個瞬時 bool（`fault_seq` 目前無 production
+        # 消費端，隨 `AgentRunner._recover()` 於 2026-08-08 移除失去唯一潛在用途，保留當
+        # 協議欄位/介面完整性）。
         # Round5 點修（codex 終審 round5）：`(latched, fault_seq)` 改用 `ChildFailstopLatch.
         # snapshot()` 單一鎖內一次讀齊——不再是「先讀 tripped（無鎖）、再讀 fault_seq
         # （另外進鎖）」的兩次獨立呼叫，避免兩次讀取之間夾著一次 `trip()` 造成的不一致

@@ -75,44 +75,24 @@ class FatalAgentError(RuntimeError):
     需要人工介入」，直接停止（不 respawn、不 backoff），把例外原樣往外拋給 main。"""
 
 
-class SessionRestartRequested(RuntimeError):
-    """Round5（codex 終審 round5 收斂，取代原地 respawn）／Round6（N6-1/N6-2 修正持久化
-    順序）：`AgentRunner._recover()` 完成本機原子轉移（probe 通過→**child 已同步
-    terminate 並驗證死亡**→epoch/sentinel 持久化成功→latch 解除，見 `_recover()`
-    docstring）後，用來讓 `run_once()` 乾淨結束、把控制權交還 `run_forever()` 的內部
-    訊號——語意上不是真正的錯誤，`run_forever()` 特別處理（不當成一般例外
-    `log.exception`，也不得被誤判為「session 存活夠久」而重置重連 backoff，見
-    `run_forever()` docstring）。raise 這個訊號時 child 必然已經確認死亡（不是 Round5
-    版本那種「先解 latch、才 best-effort/可取消地 terminate」），下一輪 `ensure_child()`
-    必然會 spawn 一個全新的 child，不會誤沿用舊的。
-
-    之所以選擇「結束整條 session」而非原地把 child 換掉：原地 respawn（codex 終審
-    round3-5 反覆打地鼠——R3-4 respawn 專屬 backoff、R4-a/b/c/d shield/收割/重驗/帳號
-    fatal、R5-a 收尾未完成 account/fatal/ping 語意、R5-b sentinel compare-and-clear 非
-    原子、R5-d mismatch cleanup 又是未 fenced worker）需要在一個活著的 asyncio session
-    內原子替換 child——每加一層 fencing 就冒出更窄的 late-worker/TOCTOU。結束整個
-    session、改走 `run_forever()`→`ensure_child()` 這條既有硬化路徑重新 spawn，這是本案
-    裡最久經考驗、覆蓋最完整的路徑（一般 crash／`ChildFrozenError`／`FatalAgentError` 本來
-    就走它），不需要再造一條平行的「原地換血」機制。"""
-
-
 def _select_session_end_exception(exceptions: list[BaseException]) -> BaseException:
     """N6-3（MEDIUM，codex 終審 round6）：`AgentRunner.run_once()` 的 `asyncio.wait(
     FIRST_EXCEPTION)` 回傳的 `done` 是個 `set`，可能同時收攏多個例外——迭代順序不保證。
-    這裡收集到的 `exceptions` 依確定性優先序挑一個 raise：
+    這裡收集到的 `exceptions` 依確定性優先序挑一個 raise：`FatalAgentError`（最嚴重，
+    不可重試）＞其他一般例外（任一個皆可，語意上等價，`run_forever` 一律照 backoff 重試
+    處理）。
 
-    - `FatalAgentError`（最嚴重，不可重試）＞`SessionRestartRequested`（recovery 受控
-      重啟訊號，`run_forever` 需要精確識別才能正確處理 backoff——見其 docstring）＞
-      其他一般例外（任一個皆可，語意上等價，`run_forever` 一律照 backoff 重試處理）。
+    2026-08-08（設計降級，使用者拍板）：原本這裡還有第二層優先序
+    `SessionRestartRequested`（in-session recovery 的受控重啟訊號）——隨 G2 恢復降級為
+    「只在 agent 程序啟動時做一次 storage probe」（見 `AgentRunner._startup_recovery_
+    probe`），`_recover()`/`_recovery_prober()` 整組移除，`SessionRestartRequested` 已無
+    任何生產路徑會 raise，一併刪除（以簡為準）。
 
-    理由：若 `SessionRestartRequested` 被別的例外蓋掉，`run_forever` 會誤判成一般失敗
-    而非「recovery 已完成的受控重啟」；若 `FatalAgentError` 被蓋掉，不可重試的致命錯誤
-    可能被當一般錯誤重試，持續燒 Shioaji 每日登入配額。`exceptions` 保證非空（呼叫端只
-    在有例外時才呼叫）。"""
-    for cls in (FatalAgentError, SessionRestartRequested):
-        for exc in exceptions:
-            if isinstance(exc, cls):
-                return exc
+    理由：若 `FatalAgentError` 被別的例外蓋掉，不可重試的致命錯誤可能被當一般錯誤重試，
+    持續燒 Shioaji 每日登入配額。`exceptions` 保證非空（呼叫端只在有例外時才呼叫）。"""
+    for exc in exceptions:
+        if isinstance(exc, FatalAgentError):
+            return exc
     return exceptions[0]
 
 
@@ -230,12 +210,13 @@ class ChildHandle:
 
     # Round5（codex 終審 round5 收斂）：`respawn(expected_generation)`（R4-a 加的
     # generation-scoped terminate+start transaction）已隨 `AgentRunner._respawn_child()`
-    # 一併移除——recovery 不再原地換血 child，改為結束整個 session、交給
-    # `run_forever()`→`ensure_child()` 這條既有硬化路徑重新 spawn（見 runner.py
-    # `AgentRunner._recover`/`SessionRestartRequested` docstring）。`start()`/`terminate()`/
+    # 一併移除——child 不會被原地換血，respawn 一律走結束整個 session、交給
+    # `run_forever()`→`ensure_child()` 這條既有硬化路徑重新 spawn。`start()`/`terminate()`/
     # `_rpc()`/`poll_failstop()` 共用的 `_lock`＋`_generation` fencing（R3-1）本身保留
     # 不動——那是保護「併發 RPC vs. 任何一次 terminate+start 交替」的通用機制，`ensure_
-    # child()` 本來就會呼叫 `terminate()`/`start()`，這道防線仍然需要。
+    # child()` 本來就會呼叫 `terminate()`/`start()`，這道防線仍然需要（2026-08-08：G2 恢復
+    # 降級為啟動時 probe 後，`ensure_child()` 仍是這道 fencing 唯一的生產呼叫端——respawn
+    # 只發生在 `ChildFrozenError`/一般連線失敗後的下一輪，不再有 recovery 觸發的路徑）。
 
     def request(self, op: dict, *, timeout: float) -> dict:
         # R3-1：在進入鎖（可能因為併發 respawn 而卡住）之前，先捕捉「這次呼叫意圖操作的
@@ -347,9 +328,10 @@ class ChildHandle:
         逾時/異常時同樣回 `None`（拿不到，呼叫端不得假設未變）。
 
         N6-4（codex 終審 round6）：Round5 把 recovery 收斂為 session-restart 後，這個方法
-        一度失去唯一呼叫端——原本 `AgentRunner._recover()` 在原地 respawn 後用它重驗新
-        child，隨 `_respawn_child()` 一併移除，留下 dead code。現在 `AgentRunner.
-        _child_watchdog()` 改用這個方法取代 `ping()`（見其 docstring），成為目前唯一的
+        一度失去唯一呼叫端——原本 `AgentRunner._recover()`（2026-08-08 已隨 G2 恢復降級
+        移除，見 `AgentRunner._startup_recovery_probe` docstring）在原地 respawn 後用它
+        重驗新 child，隨 `_respawn_child()` 一併移除，留下 dead code。現在 `AgentRunner.
+        _child_watchdog()` 改用這個方法取代 `ping()`（見其 docstring），是目前唯一的
         production caller：child 本地 latch 已 tripped 時，即使 pipe 本身仍活著、
         `ok=True`，watchdog 也視為不健康——是 failstop 專用 IPC 通知（`native_runner.py
         _trigger_failstop_latch` 的 `failstop_conn.send()`）萬一失敗時的安全網。"""
@@ -361,35 +343,37 @@ class ChildHandle:
                 "generation": reply.get("generation"), "fault_seq": reply.get("fault_seq")}
 
     def terminate(self, *, expected_generation: int | None = None) -> bool | None:
-        """N6-1（HIGH，codex 終審 round6）：`expected_generation`——`AgentRunner._recover()`
-        的同步 terminate 呼叫（`asyncio.to_thread` 包裝）若被取消，底層 thread pool worker
-        不受影響仍會跑完（asyncio 的取消只中斷呼叫端的 await，不會真的停止已提交給執行緒池
-        的任務）；這個「孤兒」worker 可能在很久之後（跨過整個 session 結束、下一輪
-        `ensure_child()` 已經 respawn 出全新 generation 的 child）才真正拿到 `_lock`
-        執行到這裡——沒有 fencing 的話會把新 child 錯殺。呼叫端（`_recover()`）在**進入
-        鎖之前**捕捉當下的 generation，這裡在鎖內（真正動 `_process`/`_conn` 之前）重新
-        核對，不符即 no-op：完全不碰目前這一代 process/conn，等同於「這次 terminate 意圖
-        已經過期」。不傳（`expected_generation=None`，既有的所有呼叫端——`start()` 失敗
-        清理、`_poison()`、`ensure_child()`、`run_forever` 的 `ChildFrozenError` 處理——
-        維持既有無條件終止語意，不受影響）。
+        """N6-1（HIGH，codex 終審 round6）：`expected_generation`——原本主要供
+        `AgentRunner._recover()`（2026-08-08 已隨 G2 恢復降級移除，見
+        `AgentRunner._startup_recovery_probe` docstring）的同步 terminate 呼叫使用：
+        `asyncio.to_thread` 包裝的呼叫若被取消，底層 thread pool worker 不受影響仍會跑完
+        （asyncio 的取消只中斷呼叫端的 await，不會真的停止已提交給執行緒池的任務）；這個
+        「孤兒」worker 可能在很久之後（跨過整個 session 結束、下一輪 `ensure_child()`
+        已經 respawn 出全新 generation 的 child）才真正拿到 `_lock` 執行到這裡——沒有
+        fencing 的話會把新 child 錯殺。呼叫端在**進入鎖之前**捕捉當下的 generation，這裡
+        在鎖內（真正動 `_process`/`_conn` 之前）重新核對，不符即 no-op：完全不碰目前這一
+        代 process/conn，等同於「這次 terminate 意圖已經過期」。不傳
+        （`expected_generation=None`，既有的所有呼叫端——`start()` 失敗清理、
+        `_poison()`、`ensure_child()`、`run_forever` 的 `ChildFrozenError` 處理——維持既有
+        無條件終止語意，不受影響）。這個機制本身不是 `_recover()` 專屬——`ensure_child()`
+        的既有 respawn 路徑（`ChildFrozenError` 後）本來就會呼叫 `terminate()`，一樣受益
+        於這道 fencing；`_recover()` 移除後，`expected_generation` 這個選填參數暫時沒有
+        production 呼叫端顯式傳值（保留介面，供未來需要精確世代核對的呼叫端使用）。
 
-        R7-1（HIGH，codex 終審 round7）：舊版 `kill()`+`join(timeout=5)` 後未檢查
-        `process.is_alive()` 就無條件把 `self._process` 設 `None`——`join` 逾時只代表
-        「這 5 秒內沒等到它退出」，不代表真的死了；舊版把「遺失 handle」誤當成「確認
-        死亡」，讓 `alive` 屬性此後永遠回報 `False`（因為 `self._process` 已經是
-        `None`），即使底層 OS 進程其實仍在跑（仍可能繼續寫 sentinel／落地事件）。
-        `_recover()` 原本設計要靠 `self._child.alive` 在 terminate 後二次確認
-        （N6-1），但這個誤判讓那道防線形同虛設——不管子程序真死沒死，這裡都會回報
-        「已死」，`_recover()` 因此永遠會往下清 sentinel/latch；若舊 child 其實還活著，
-        新一輪 `ensure_child()` 又會 spawn 出第二個 child，兩個 child 併發碰同一個
-        buffer/sentinel。
+        R7-1（HIGH，codex 終審 round7，好衛生，shutdown/frozen 路徑仍在用）：舊版
+        `kill()`+`join(timeout=5)` 後未檢查 `process.is_alive()` 就無條件把
+        `self._process` 設 `None`——`join` 逾時只代表「這 5 秒內沒等到它退出」，不代表真的
+        死了；舊版把「遺失 handle」誤當成「確認死亡」，讓 `alive` 屬性此後永遠回報
+        `False`（因為 `self._process` 已經是 `None`），即使底層 OS 進程其實仍在跑（仍可能
+        繼續寫 sentinel／落地事件）。原本這道二次確認主要是給 `_recover()`（已移除）用來
+        判斷要不要繼續清 sentinel/latch；現在保留下來是單純的正確性/衛生修復——任何呼叫端
+        （`ensure_child()` 的 respawn、`shutdown`）都不該在子程序其實還活著的情況下誤判
+        「已死」。
 
         修法：保留 local `process` 參照；`kill()`+`join(timeout=5)` 後明確檢查
         `process.is_alive()`——仍活著就**不清** `self._process`/`self._conn`/failstop
-        conn（保留 handle，讓呼叫端能重試、`alive` 屬性能誠實反映現況），回傳 `False`
-        （目前唯一依賴回傳值的呼叫端是 `_recover()`，但即使不看回傳值，`_recover()`
-        既有的 `if self._child.alive:` 二次確認現在也會正確生效——因為 `_process` 沒被
-        誤清）。只有在（沒有 process 需要處理，或 process 確認已死）時才清理資源。
+        conn（保留 handle，讓呼叫端能重試、`alive` 屬性能誠實反映現況），回傳 `False`。
+        只有在（沒有 process 需要處理，或 process 確認已死）時才清理資源。
 
         回傳值三態（既有呼叫端多半忽略回傳值，見下）：`None`＝generation 已過期／no-op
         （完全沒碰任何 process，比照舊版既有語意，見
@@ -398,9 +382,9 @@ class ChildHandle:
         （或本來就沒有 process）；`False`＝`kill()`+`join(5s)` 後仍驗到 `alive`（R7-1
         新增）。既有呼叫端（`_poison()`／`start()` 失敗清理／`ensure_child()`／
         `run_forever()` 的 `ChildFrozenError` 處理）目前都忽略回傳值——這些呼叫時機都是
-        「pipe 已判死」或「即將整個 respawn」等場景，不像 `_recover()` 那樣需要靠這裡的
-        結果決定要不要動 durable 狀態；即使忽略回傳值，這些呼叫端也不會因為這次修法而
-        變得更不安全，因為 `alive` 屬性本身現在更誠實了。"""
+        「pipe 已判死」或「即將整個 respawn」等場景，不需要靠這裡的結果決定要不要動
+        durable 狀態；即使忽略回傳值，這些呼叫端也不會因此變得更不安全，因為 `alive`
+        屬性本身現在更誠實了。"""
         with self._lock:
             if expected_generation is not None and expected_generation != self._generation:
                 log.warning(
@@ -492,7 +476,6 @@ class AgentRunner:
                  child_ping_timeout: float = 20.0, heartbeat_interval: float = 15.0,
                  backoff_base: float = 1.0, backoff_max: float = 60.0,
                  stable_session_seconds: float = 30.0,
-                 recovery_probe_interval: float = 5.0,
                  failstop_poll_timeout: float = 1.0) -> None:
         self._transport = transport
         self._buffer = buffer
@@ -516,20 +499,18 @@ class AgentRunner:
         self._backoff_history: list[float] = []
 
         # Inc1 D9/G2（Task 12）：fail-stop 狀態機。`_recovery_lock` 只包本機原子轉移
-        # （latch/epoch++/sentinel 寫入；probe→清 latch/sentinel→snapshot），絕不 await
-        # 任何網路 I/O（R3-3）——WS send 一律搬到 lock 外，見 `_health_sender`。
-        self._recovery_probe_interval = recovery_probe_interval
+        # （latch/epoch++/sentinel 寫入），絕不 await 任何網路 I/O（R3-3）——WS send 一律
+        # 搬到 lock 外，見 `_health_sender`。2026-08-08（設計降級，使用者拍板）：G2 恢復
+        # 不再有「session 進行中週期性重驗」這個概念——`_recovery_probe_interval`／
+        # `_recovery_prober()`／`_recover()` 整組移除；恢復檢查改成只在 `run_forever()`
+        # 開始前做一次（見 `_startup_recovery_probe`），這把鎖仍然保護 `_latch()` 與
+        # `_startup_recovery_probe` 對 `_latched`/`_health_epoch`/sentinel 的互斥存取。
         self._failstop_poll_timeout = failstop_poll_timeout
         self._recovery_lock = asyncio.Lock()
         self._latched = False
         self._latch_detail: str | None = None
         self._health_epoch = 0
         self._health_queue: asyncio.Queue = asyncio.Queue()
-        # Round5（codex 終審 round5 收斂）：不再有「respawn 專屬 backoff」這個獨立概念——
-        # recovery 不再原地登入換 child，探針通過後直接結束 session，真正的登入節流交還給
-        # run_forever() 既有的 session backoff（`_backoff_base`/`_backoff_max`），見
-        # `_recover()`/`SessionRestartRequested`/`run_forever()` 三處 docstring 與登入頻率
-        # 推演（`.superpowers/sdd/codex-final-fixes-report.md` Round 5 fixes 段）。
         self._load_persisted_health()
 
     def _load_persisted_health(self) -> None:
@@ -566,7 +547,7 @@ class AgentRunner:
         R4-c（MEDIUM，codex 終審 round4）：`expected_generation`——呼叫端（`_failstop_
         watchdog`）在鎖外核對過 notice 的 generation 與當下 `self._child.generation` 相符
         後才呼叫這裡；但「核對通過」與「真正拿到 `_recovery_lock`」之間仍有一段沒有互斥
-        的窗口（`_recovery_lock` 可能正被另一個 `_recover()`／`_latch()` 呼叫佔住），這段
+        的窗口（`_recovery_lock` 可能正被另一個 `_latch()` 呼叫佔住），這段
         期間 child 若換代，鎖外核對過的 generation 就過期了。這裡在拿到鎖之後、真正改動
         任何狀態之前，用同一個快照重新核對一次——不符即 no-op（完全不動 `_latched`/
         `_health_epoch`/sentinel），避免把一則過期通知套用到目前這一代健康的新 child 身上。
@@ -590,211 +571,74 @@ class AgentRunner:
             await asyncio.to_thread(self._buffer.write_sentinel, epoch=epoch, detail=detail)
         self._health_queue.put_nowait(epoch)
 
-    async def _recover(self) -> None:
-        """G2④/⑤/⑦（Round5 收斂為 session-restart）／**N6-1/N6-2（HIGH，codex 終審
-        round6）：先殺 writer、再清狀態；健康由新 session 宣告**——這是本方法目前的權威
-        順序，取代 Round5 版本「先解 latch/清 sentinel、才 best-effort/可取消地 terminate
-        child」的順序缺陷。危險情境：sentinel（`buffer.py::write_sentinel`/
-        `clear_sentinel`）唯一的落地失敗 writer 是 child（`native_runner.py
-        ::_trigger_failstop_latch`）——Round5 版本若在 child 仍活著時就呼叫
-        `clear_sentinel()`（unlink），與 child 端可能仍在進行的 `write_sentinel()`
-        （replace）之間就是真正的檔案系統層級 TOCTOU（併發 replace/unlink，新故障的
-        sentinel 可能被舊清除動作刪掉）；Round5 版本也會在 terminate 完成前就先解 latch、
-        排一筆 "ok" health frame，讓 server 短暫誤判這個連線已恢復可用，但當下真正在跑的
-        其實還是那個已經被判定永久故障（且尚未真的死透）的舊 child。
+    async def _startup_recovery_probe(self) -> None:
+        """G2④ 手動重啟恢復（2026-08-08，設計降級，使用者拍板，取代 Round3-7 打磨出的
+        session-restart 自動恢復）：**恢復檢查只在 agent 程序啟動時做一次**——`run_forever()`
+        在進入主迴圈之前呼叫這裡，此刻 `ensure_child()` 尚未被呼叫過、沒有任何 child
+        程序、也沒有任何並發的 sentinel writer（唯一的 writer 是 child 的 callback 執行緒，
+        見 `native_runner.py::_trigger_failstop_latch`）。
 
-        新順序（本方法的權威流程，`_recovery_lock` 內全程持有，見下方「取消安全性自證」）：
-          1. `probe` 通過（同 Round5）。
-          2. **同步 terminate child 並驗證已死**：`asyncio.to_thread(self._child.
-             terminate, expected_generation=...)` 後檢查 `self._child.alive is False`。
-             `expected_generation`（進入這段之前捕捉的 `self._child.generation`）防的是
-             這次 `to_thread` 呼叫本身被取消後，底層 thread pool worker 仍在背景跑完、
-             很久之後才真正拿到 `ChildHandle._lock`——那時若已經是另一個 session 的新
-             generation child，`ChildHandle.terminate()` 的 fencing（見其 docstring）
-             會讓這次遲到呼叫 no-op，不誤殺新 child。terminate 呼叫本身失敗（例外）或
-             terminate 後仍驗到 `alive is True`（kill/join 沒有真正生效，或 fencing
-             因為某種原因判定 no-op）——**保留 latch/sentinel 原封不動，本輪直接放棄，
-             交給下一輪 `_recovery_prober` 重試**，不繼續往下做任何持久化。
-          3. child 已確認死亡＝sentinel 唯一 writer 消失——此後 `write_sentinel()`
-             （replace）與接下來的 `clear_sentinel()`（unlink）之間不再可能併發（嚴格
-             happens-before：任何 child 死前最後一刻的寫入必然已經完整落地，才輪到這裡
-             執行 unlink）。**R7-2（HIGH，codex 終審 round7）修正**：happens-before 本身
-             不足夠——這次「死前最後一次寫入」的內容可能是一筆全新、從未被處理過的故障
-             （dying-gasp，見下方專屬段落），無條件清除會讓這筆新故障的訊號悄悄消失。這裡
-             改成先比對 terminate 前後讀到的 sentinel `fault_token`：不變才
-             `set_health_epoch(epoch)`→`clear_sentinel()`→`self._latched = False`（C3
-             的持久化優先序不變，見下方）；改變則保留 sentinel／latch，見下方「R7-2
-             dying-gasp」段落。`test_agent_failstop.py` 的
-             `test_child_dying_gasp_new_fault_token_preserved_not_cleared_new_session_still_failstop`
-             （取代 round6 的
-             `test_child_dying_gasp_write_happens_before_clear_never_races_replace_unlink`）
-             明確驗證這兩種分支。
-          4. **不在這裡排 ok health frame**（Round5 版本在解 latch 之後、terminate 之前
-             會 `self._health_queue.put_nowait(epoch)`）：直接 `raise
-             SessionRestartRequested`，讓 `run_once()` 乾淨結束整條 session，這個舊
-             session 全程不再送出任何 `status="ok"` 的健康訊框。
-          5. 新 session（`run_once()` 開頭）：`_load_persisted_health()`（sentinel 已清
-             →unlatched）→`ensure_child()`（child 早在步驟 2 就已確認死亡，`alive`
-             必為 False，因此必然真的 spawn 一個全新 generation 的 child，不會誤沿用
-             已經被判定永久故障的舊 child）→重新登入→`UpLogin` 宣告新 epoch→server
-             `pending_health`→**健康 "ok" 由新 session 自己正常的
-             heartbeat/`_health_sender` 發出**，不是這裡代發的。
+        舊版 `_recover()`（Round3-7，8 輪終審逐輪打磨）處理的每一個縫——探針期間 child 又
+        故障（dying-gasp/fault_token 比對）、terminate 是否真的驗死、`asyncio.to_thread`
+        取消後孤兒 worker 遲到、清 sentinel 與 child 寫入之間的 replace/unlink TOCTOU——
+        全部源自「必須在一個活著的 session 內、跟一個可能仍在寫 sentinel 的 child 打交道」
+        這個前提。在程序啟動的這個時間點，這個前提結構性不成立：沒有 child 可以在 probe
+        之後、之前又寫入新故障，也沒有其他 thread/process 會併發碰 buffer/sentinel——這裡
+        因此不需要 terminate、不需要 dying-gasp 偵測、不需要 generation fencing，只是單純
+        的「讀一次 sentinel、探一次 buffer、決定要不要清」。
 
-        取消安全性自證：
-          - 在步驟 2 之前／進行中被取消：`async with self._recovery_lock:` 的
-            `__aexit__` 即使在 `CancelledError` 傳播時也會正常釋放鎖（Python context
-            manager 的通用語意），`_latched`/sentinel/`_health_epoch` 全部未被動過——
-            下一輪 `_recovery_prober`（同一 session 若還活著）或下一個 session 的
-            `_load_persisted_health()` 會重新嘗試，等同「這輪 recovery 沒發生過」。
-            `asyncio.to_thread(self._child.terminate, ...)` 呼叫端被取消後，底層
-            thread pool worker 遲到執行的安全性由 `ChildHandle.terminate()` 自己的
-            `expected_generation` fencing 保證（見上）。
-          - 步驟 3 完成之後（`_latched=False`，鎖釋放）才被取消：剩下只有 raise
-            `SessionRestartRequested` 這個純記憶體動作，即使真的在這裡被取消，durable
-            狀態（sentinel 已清、epoch 已持久化）與 in-memory 狀態（`_latched=False`）
-            已經彼此一致，新 session 重讀 durable 狀態得到的結論仍然正確
-            （unlatched）。
+        流程：
+          1. 建構子的 `_load_persisted_health()` 已經讀過 sentinel——`self._latched` 為
+             `False`（沒有 latch，或 buffer 本來就是全新的）時直接返回，不做任何探測（不對
+             健康的 buffer 做無謂的探測寫入）。
+          2. `latched` 時對同一 buffer 執行一次 storage probe（`DurableBuffer.probe()`：
+             寫→commit→讀回）。
+          3. 探針**失敗**：保持 latched，agent 以 failstop 模式運行（native 呼叫前的
+             latch gate——`_execute_mutating_command`／`_dispatch`——繼續拒絕一切
+             mutating 指令，health sender 繼續回報 `status="failstop"`）。這裡**不**排
+             程重試——底層儲存問題需要操作者人工修復，修好後手動重啟這個 agent 程序（新一輪
+             `run_forever()` 呼叫會再探一次）。
+          4. 探針**通過**：持久化 epoch（`set_health_epoch`）→清 sentinel
+             （`clear_sentinel`）→`self._latched = False`。持久化任一步失敗：保留
+             latched（C3 的邏輯沿用——不能讓 in-memory 狀態「假裝恢復」但 durable 狀態其實
+             沒有真的恢復），記錯，直接返回（同樣不重試，等下一次程序重啟）。全部成功才記一行
+             info log「已從 failstop 恢復（啟動時儲存探測通過）」，供操作者從 log 確認。
 
-        R5-b（沿用，不受本次順序調整影響）：清除 sentinel 前不做 exact-match 的
-        `epoch` 比對（原本是為了防「清除途中 child 又落地新故障，把新故障的 sentinel
-        誤刪」，但 exact-match 版本會被 child 端故障時寫入的佔位 `epoch=-1`
-        永久卡死，見 `test_epoch_negative_one_sentinel_on_restart_can_still_recover`）。
-        N6-1 用「先確認 writer 死亡」取代了這個比對原本想防的 TOCTOU，兩者互補：
-        exact-match 比對防的是「內容對不對」，N6-1 防的是「清除當下還可能有人在寫」。
+        session 進行中 latch 後永不自動解除——這個方法只在 `run_forever()` 開始前被呼叫
+        一次，之後任何一次 `_latch()`（child 經 failstop IPC 通知父程序觸發）都不會再被
+        任何背景迴圈重新探測；唯一能讓 `self._latched` 回到 `False` 的路徑是重啟整個
+        agent 程序（新的 `AgentRunner`/`run_forever()` 呼叫）。
 
-        C3（HIGH，codex 終審）修復（順序不變）：`_latched` 翻 False 必須排在兩個 durable
-        持久化步驟（寫 epoch、清 sentinel）**之後**、且兩者皆成功才翻——舊版先翻
-        `_latched=False` 再做持久化，若中途任一步失敗（I/O 例外），in-memory 狀態已經
-        「假裝恢復」（G2②的 latch 檢查會放行 mutating 指令），但 durable 狀態其實還沒真的
-        恢復（sentinel 仍在／epoch 沒真的持久化），造成「部分失敗卻誤判 healthy」。持久化
-        順序（epoch 先、sentinel 後）刻意選成：即使 epoch 寫成功但清 sentinel 失敗，下次
-        啟動時 sentinel 仍存在會正確重新載入 latch，且 `_load_persisted_health` 取
-        `max(sentinel.epoch, buffer meta)` 保證不會用到落後的舊 epoch；反過來若先清
-        sentinel 才寫 epoch、epoch 寫失敗，下次啟動會誤判「未 latch」且 epoch 讀到過舊的
-        值。任一步失敗：保留 latch、記錯，不動 `_health_epoch`，留給下一輪
-        `_recovery_prober` 重試（探針＋持久化都很便宜，不涉及任何登入，重試沒有配額
-        顧慮）。
-
-        R7-2（HIGH，codex 終審 round7）：N6-1 只驗證「child 已確認死亡」，沒有驗證
-        「child 死之前，有沒有在 terminate 這段窗口內又落地一筆全新的故障」——dying-gasp。
-        危險情境：child 已經因為第一筆故障被 latch（sentinel 記著第一筆故障的權威內容），
-        `_recover()` 探針通過、正要 terminate 這個「已知壞掉」的 child；但 SDK callback
-        執行緒是獨立執行緒，不受本地 latch（`ChildFailstopLatch`）攔阻它自己的落地路徑
-        （`ChildFailstopLatch` 只擋 `_dispatch` 呼叫 native place/cancel/update 前的
-        mutating RPC，不擋 `on_raw` callback 本身——latch 之後仍可能有 unrelated 的 SDK
-        push（如未結案委託的成交回報）觸發一次全新的 `_on_raw` 呼叫，若這次寫入依然失敗，
-        會再次呼叫 `_trigger_failstop_latch()` 寫入一筆**新的** sentinel（新 detail、新
-        `fault_token`）——這次寫入可能恰好卡在 `_recover()` 已經決定要 terminate、但
-        `kill()`/`join()` 真正生效之間的窄窗。這筆新故障的 reconcile 快照補不回（只有
-        order_id/seqno/status，落 order_report，無 deal 明細）、degraded JSONL 也沒有
-        自動 reinjection——舊版 N6-1 只看「child 死了沒」，一旦死了就無條件清 sentinel／
-        解 latch，這筆新故障的訊號會這樣悄悄消失，不可接受。
-
-        修法（codex round7 處方逐條）：
-          1. `fault_token`（`buffer.py write_sentinel`/`native_runner.py
-             _trigger_failstop_latch`）：child 每次落地失敗都帶一個全新 uuid4 nonce，
-             不是舊版卡死模式那種固定字面 `epoch=-1`（見兩處 docstring）。
-          2. 這裡在 terminate **之前**（拿到 probe 結果之後）先讀一次 sentinel，記下
-             `before_token`；child 確認死亡（N6-1 步驟 2 完成）之後**重讀**一次，記下
-             `after_token`。
-          3. `after_token == before_token`（含兩者皆為 `None`——沒有 sentinel、或舊格式
-             sentinel 沒有這個欄位，向後相容）＝這段窗口內沒有新故障寫入，走既有 N6-1
-             步驟 3（persist／clear／unlatch）。
-          4. `after_token != before_token`＝dying-gasp：child 死前最後一刻確實又落地了一筆
-             新故障。**不**持久化、**不**清 sentinel、**不**解 latch——sentinel 原封不動
-             保留在磁碟上（內容就是 child 這次寫入的新故障，含新 `fault_token`），
-             `_latched` 維持 `True`。`_health_epoch` 在記憶體內 +=1（供之後任何健康訊框
-             使用；不強求立即持久化——新 session 的 `_load_persisted_health()` 會用
-             `max(sentinel.epoch, buffer meta)` 重新推導，見其 docstring，這裡的
-             `epoch=-1` 佔位值走既有 R5-b 的 fallback 語意，不是新機制）。child 已確認
-             死亡（N6-1 仍然生效，這一點不受影響），所以這裡仍然 `raise
-             SessionRestartRequested`——沒有活著的 child 可用，session 沒有繼續存在的
-             意義；下一個 session 開頭 `_load_persisted_health()` 會重新讀到這筆保留下來
-             的 sentinel，繼續回報 `status="failstop"`，`_recovery_prober` 在新 session
-             裡對這個（這次沒有任何 in-flight terminate 競態的）sentinel 重試，屆時
-             before/after token 相同，才會真正收斂清除。"""
+        `_recover()`／`_recovery_prober()`／`SessionRestartRequested`／dying-gasp
+        fault_token 比對／`ChildHandle.terminate(expected_generation=...)` 在 recovery
+        路徑上的呼叫，隨此次降級整組移除——`fault_token` 欄位本身保留在 sentinel
+        （`buffer.py::write_sentinel`）當純診斷資訊，`ChildHandle.terminate()` 的
+        `expected_generation` fencing／is_alive 驗死機制也保留（`ensure_child()` 的
+        respawn 路徑、shutdown 路徑仍在用），只是不再有 recovery 這個呼叫端。詳細推演見
+        `.superpowers/sdd/codex-final-fixes-report.md` Round 8 fixes 段。"""
         async with self._recovery_lock:
             if not self._latched:
                 return
             ok = await asyncio.to_thread(self._buffer.probe)
             if not ok:
+                log.error(
+                    "agent 啟動時 storage probe 失敗，保持 failstop latch——請修復底層"
+                    "儲存問題後重啟這個 agent 程序（不會自動重試）"
+                )
                 return
             epoch = self._health_epoch
-
-            # R7-2 步驟 2（terminate 前）：先讀一次 sentinel token 快照，供 terminate 完成
-            # （child 確認死亡）之後重讀比對，偵測 dying-gasp。
-            before_sentinel = await asyncio.to_thread(self._buffer.read_sentinel)
-            before_token = (before_sentinel or {}).get("fault_token")
-
-            # N6-1 步驟 2：先殺 writer、同步驗證已死——generation fencing（見
-            # ChildHandle.terminate() docstring）防止取消後遲到的 worker 誤殺新 session
-            # 的 child。terminate 失敗或驗不死：保留 latch/sentinel，本輪放棄，不繼續。
-            generation = getattr(self._child, "generation", None)
             try:
-                await asyncio.to_thread(
-                    self._child.terminate, expected_generation=generation
-                )
+                await asyncio.to_thread(self._buffer.set_health_epoch, epoch)
+                await asyncio.to_thread(self._buffer.clear_sentinel)
             except Exception:
                 log.exception(
-                    "N6-1: recovery 同步 terminate child 失敗，保留 latch/sentinel，"
-                    "本輪放棄，留給下一輪 _recovery_prober 重試"
+                    "G2④ 啟動時恢復的持久化步驟失敗（epoch 寫入／sentinel 清除），保持"
+                    "failstop latch——請修復底層儲存問題後重啟這個 agent 程序"
                 )
                 return
-            if self._child.alive:
-                log.error(
-                    "N6-1: recovery terminate child 後仍驗到 alive=True（kill/join 未真正"
-                    "生效，或 generation fencing 判定過期 no-op），保留 latch/sentinel，"
-                    "本輪放棄，留給下一輪 _recovery_prober 重試"
-                )
-                return
-
-            # R7-2 步驟 3（terminate 後、child 已確認死亡）：重讀 sentinel token，與
-            # terminate 前的快照比對——不同代表 child 死前最後一刻又落地了一筆新故障
-            # （dying-gasp），必須保留這筆新故障的訊號，不可繼續往下清除。
-            after_sentinel = await asyncio.to_thread(self._buffer.read_sentinel)
-            after_token = (after_sentinel or {}).get("fault_token")
-            if after_token != before_token:
-                log.error(
-                    "R7-2: recovery 偵測 dying-gasp——child 死亡前又落地一筆新故障"
-                    "（fault_token 由 %r 變為 %r），保留 sentinel／保持 latch，本輪不清除"
-                    "，degraded JSONL 已有這筆事件的救援副本（reconcile 補不回成交明細，"
-                    "需人工介入重灌），留給下一輪 _recovery_prober（新 session）重試",
-                    before_token, after_token,
-                )
-                self._health_epoch += 1
-                if after_sentinel is not None:
-                    self._latch_detail = after_sentinel.get("detail", self._latch_detail)
-                dying_gasp = True
-            else:
-                # N6-1 步驟 3：child（sentinel 唯一 writer）已確認死亡，且 terminate 前後
-                # sentinel 內容未變——清 sentinel 與 child 落地失敗時的寫入之間不再可能
-                # 併發，也沒有 dying-gasp 需要保留，這時才持久化。
-                try:
-                    await asyncio.to_thread(self._buffer.set_health_epoch, epoch)
-                    await asyncio.to_thread(self._buffer.clear_sentinel)
-                except Exception:
-                    log.exception(
-                        "G2④ recover 持久化步驟失敗（epoch 寫入／sentinel 清除），保持"
-                        "latch，留給下一輪 _recovery_prober 重試"
-                    )
-                    return
-                self._latched = False
-                self._latch_detail = None
-                dying_gasp = False
-        # N6-2 步驟 4：不在這裡排 ok health frame——新 session 自己的
-        # heartbeat/_health_sender 會宣告健康，這裡只負責乾淨結束 session。child 不論
-        # 哪個分支都已確認死亡（N6-1），session 沒有繼續存在的意義，一律結束。
-        if dying_gasp:
-            raise SessionRestartRequested(
-                "agent recovery 偵測到 child 死前最後一刻又落地一筆新故障（dying-gasp，"
-                "fault_token 改變）——child 已確認終止，但保留 sentinel／latch，主動結束"
-                "session 觸發受控重啟（新 session 讀到保留的 sentinel 會繼續回報"
-                "failstop，等下一輪 recovery 對這筆保留下來的故障重試）"
-            )
-        raise SessionRestartRequested(
-            "agent 儲存 probe 通過、child 已確認終止、latch 已解除，主動結束 session 觸發"
-            "受控重啟（下一輪走既有硬化 ensure_child/登入路徑，健康由新 session 宣告）"
-        )
+            self._latched = False
+            self._latch_detail = None
+        log.info("已從 failstop 恢復（啟動時儲存探測通過）")
 
     async def _reject_failstop(self, cmd_id: str) -> None:
         """G2②：latch 期間拒絕 mutating 指令——volatile `UpCommandRejected` **直送 WS，
@@ -810,23 +654,18 @@ class AgentRunner:
         /子程序凍結。session 存活時間由 run_forever 用 time.monotonic() 量測，決定是否
         重設重連 backoff（見 module docstring）。
 
-        Round5：每次新 session 開始都重新 `_load_persisted_health()`——不只建構子跑一次。
-        這一步是 session-restart 收斂 recovery 的防禦層：上一輪 session 若不是經
-        `_recover()` 正常結束（例如 `ChildFrozenError`／一般例外中途打斷），或
-        `_recovery_prober` 因為 terminate 失敗/驗不死而保留 latch（N6-1），這裡會重新
-        讀到正確的 durable 狀態，不會誤以為自己是健康的。N6-1 之後 `_recover()` 本身已經
-        結構性消除了 sentinel 的 replace/unlink TOCTOU（見其 docstring）——這一步「重啟
-        後重讀」現在是額外一層防線，不是收斂 TOCTOU 的必要手段。
+        每次新 session 開始都重新 `_load_persisted_health()`——不只建構子跑一次：上一輪
+        session 若因為 `ChildFrozenError`／一般例外中途打斷，這裡會重新讀到正確的 durable
+        狀態，不會誤以為自己是健康的（2026-08-08 之後，唯一會改動 durable latch 狀態的
+        路徑是 `_latch()`〔trip〕與 `run_forever()` 開頭的 `_startup_recovery_probe()`
+        〔啟動時 probe〕，這裡的重讀是純防禦層，不承擔收斂任何 TOCTOU 的責任）。
 
         N6-3（MEDIUM，codex 終審 round6）：`asyncio.wait(FIRST_EXCEPTION)` 的 `done` 是個
-        `set`，可能同時收攏多個例外（例如 `_recover()` 完成觸發 `SessionRestartRequested`
-        的同時，另一個 task 也因為 transport 斷線炸出例外）——`set` 的迭代順序不保證，
-        「取第一個」等同看 hash 排序碰運氣：`SessionRestartRequested` 若被別的例外蓋掉，
-        `run_forever` 會誤判成一般失敗而非「recovery 已完成的受控重啟」，讓 backoff 邏輯
-        亂套；反過來 `FatalAgentError` 若被蓋掉，不可重試的致命錯誤可能被當一般錯誤重試，
-        持續燒 Shioaji 登入配額。改用 `_select_session_end_exception()` 收集 `done` 裡
-        全部例外、依確定性優先序（`FatalAgentError`＞`SessionRestartRequested`＞其他）
-        選一個 raise，不受 set 迭代順序影響。"""
+        `set`，可能同時收攏多個例外——`set` 的迭代順序不保證，「取第一個」等同看 hash 排序
+        碰運氣：`FatalAgentError` 若被別的例外蓋掉，不可重試的致命錯誤可能被當一般錯誤
+        重試，持續燒 Shioaji 登入配額。改用 `_select_session_end_exception()` 收集 `done`
+        裡全部例外、依確定性優先序（`FatalAgentError`＞其他）選一個 raise，不受 set 迭代
+        順序影響。"""
         self._load_persisted_health()
         self.ensure_child()
         await self._transport.connect()
@@ -852,7 +691,6 @@ class AgentRunner:
                 asyncio.create_task(self._child_watchdog()),
                 asyncio.create_task(self._health_sender()),
                 asyncio.create_task(self._failstop_watchdog()),
-                asyncio.create_task(self._recovery_prober()),
             ]
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             exceptions = [exc for t in done if (exc := t.exception()) is not None]
@@ -875,20 +713,18 @@ class AgentRunner:
         用它當判準會讓 backoff 每輪重設、指數退避失效——凍結 respawn 迴圈會無節制地重打
         Shioaji 登入，燒每日 1000 次額度）。stop() 後迴圈結束。
 
-        Round5（codex 終審 round5 收斂）：`SessionRestartRequested`——`_recover()` 完成本機
-        原子轉移＋terminate child 後主動拋出的受控訊號——**一律視為「失敗結束」，永不重設
-        backoff**，即使這輪 session 存活時間（含 latch 期間反覆 probe 的等待）剛好跨過
-        `stable_session_seconds` 門檻也一樣。理由（見報告「登入頻率推演」）：recovery 本身
-        不再有獨立的 respawn backoff 節流真正的 Shioaji 登入頻率——那個角色現在完全由這裡
-        的 session backoff 承擔；若把「探針通過所以這輪 session 存活夠久」誤判成「連線穩定
-        健康」而重設 backoff，在持續故障但每輪都要一段時間才探針通過的情境下，backoff 會
-        被反覆打回 base，形同每次 recovery 完成就立刻重新登入一次，登入頻率不再受
-        `backoff_max` 節制。強制不重設之後，最壞情況下 backoff 會單調成長並封頂在
-        `backoff_max`，穩態登入頻率因此保證 ≤ 1/`backoff_max`（預設每 60 秒至多一次）。"""
+        2026-08-08（設計降級，使用者拍板）：進入主迴圈之前先呼叫一次
+        `_startup_recovery_probe()`（G2 恢復——見其 docstring）——這是整條 agent 程序生命
+        週期裡唯一一次自動恢復嘗試；此後任何一輪 `run_once()` 的失敗/重試都不會再觸發
+        任何恢復檢查，session 進行中被 latch 就一路 latch 到程序被人工重啟為止。舊版
+        `SessionRestartRequested`（`_recover()` 完成本機轉移後主動拋出、`run_forever` 需
+        特別處理不重設 backoff 的受控訊號）隨 `_recover()` 一併移除——現在沒有任何路徑會
+        因為「recovery 完成」而結束 session，下面的 except 分支只剩 `FatalAgentError`／
+        `ChildFrozenError`／一般例外三種既有情境。"""
+        await self._startup_recovery_probe()
         backoff = self._backoff_base
         while not self._stopping:
             session_start = time.monotonic()
-            recovery_restart = False
             try:
                 await self.run_once()
             except FatalAgentError:
@@ -898,13 +734,6 @@ class AgentRunner:
                 log.error("agent 遇到不可重試的致命錯誤，停止（不重試）")
                 self.stop()
                 raise
-            except SessionRestartRequested:
-                log.info(
-                    "agent recovery 已完成本機轉移（epoch/sentinel 持久化成功、latch 解除、"
-                    "child 已 terminate），主動結束本次 session，交下一輪 ensure_child 走"
-                    "全新硬化 spawn/登入路徑（Round5：session-restart 收斂，取代原地 respawn）"
-                )
-                recovery_restart = True
             except ChildFrozenError:
                 log.warning("agent 子程序疑似凍結（issue #203），terminate 後下一輪 respawn")
                 self._child.terminate()
@@ -914,7 +743,7 @@ class AgentRunner:
                 log.exception("agent WS session 異常結束，準備依 backoff 重連")
 
             elapsed = time.monotonic() - session_start
-            if elapsed >= self._stable_session_seconds and not recovery_restart:
+            if elapsed >= self._stable_session_seconds:
                 backoff = self._backoff_base
             self._backoff_history.append(backoff)
 
@@ -1133,14 +962,6 @@ class AgentRunner:
             # 換代」這段窗口（見其 docstring）。
             await self._latch(notice.get("detail") or "child 回報 buffer 落地失敗",
                               expected_generation=notice_generation)
-
-    async def _recovery_prober(self) -> None:
-        """G2④：latch 期間週期性嘗試 storage probe，通過就呼叫 `_recover()` 解除 latch。
-        未 latch 時直接跳過（no-op），避免對健康的 buffer 做無謂的探測寫入。"""
-        while True:
-            await asyncio.sleep(self._recovery_probe_interval)
-            if self._latched:
-                await self._recover()
 
     async def _child_watchdog(self) -> None:
         """定期 ping SDK 子程序（#203 凍結偵測）：N6（順帶，codex 終審 round6）改用

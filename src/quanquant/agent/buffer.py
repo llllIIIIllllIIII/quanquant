@@ -135,13 +135,15 @@ class DurableBuffer:
         不影響這裡成功與否。寫暫存檔再 `os.replace` 原子改名，避免中途崩潰留下半寫檔案。
 
         R7-2（HIGH，codex 終審 round7）：`fault_token`——child 端（`native_runner.py
-        _trigger_failstop_latch`）每次落地失敗都會帶一個新產生的唯一 nonce，供
-        `AgentRunner._recover()` 在 terminate 前後兩次讀取比對，偵測「child 死前最後一刻
-        又落地一筆新故障」（dying-gasp，見其 docstring）。選填、預設 `None`——只有在提供
-        時才寫入 JSON（省略鍵，不是寫入字面 `null`），維持既有呼叫端（`AgentRunner._latch`
-        的父程序端覆寫、以及所有既有測試對 `read_sentinel()` 的精確 dict 比對）逐位元組
-        向後相容；讀到沒有這個欄位的舊格式 sentinel 時，`read_sentinel().get("fault_token")`
-        自然回 `None`，不會誤判成「跟新故障撞了同一個 token」（那樣反而會誤觸發保留邏輯）。"""
+        _trigger_failstop_latch`）每次落地失敗都會帶一個新產生的唯一 nonce。原本供
+        `AgentRunner._recover()` 在 terminate 前後兩次讀取比對、偵測「child 死前最後一刻
+        又落地一筆新故障」（dying-gasp）；2026-08-08 G2 恢復降級為啟動時 probe 後，
+        `_recover()` 本身已移除，這個欄位不再有任何 in-session 比對消費端，純粹保留當
+        sentinel 的診斷資訊（供操作者/日誌人工判讀「這是不是同一筆故障」）。選填、預設
+        `None`——只有在提供時才寫入 JSON（省略鍵，不是寫入字面 `null`），維持既有呼叫端
+        （`AgentRunner._latch` 的父程序端覆寫、以及所有既有測試對 `read_sentinel()` 的精確
+        dict 比對）逐位元組向後相容；讀到沒有這個欄位的舊格式 sentinel 時，
+        `read_sentinel().get("fault_token")` 自然回 `None`。"""
         path = self._sentinel_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         data: dict = {"epoch": epoch, "detail": detail}
