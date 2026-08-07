@@ -82,10 +82,21 @@ class ChildFailstopLatch:
 
 def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail: str) -> None:
     """C4/C5（HIGH，codex 終審）共用：callback 主寫入失敗（不論退化寫入是否成功）觸發的
-    latch 動作——寫 sentinel（durable，buffer 之外路徑）＋trip child 本地 thread-safe
-    latch（C4，供 `_dispatch` 呼叫 native 前再檢查）＋經專用 IPC channel（R2-8）通知父程序。
-    三步各自吞例外（寫 sentinel/IPC 通知本身失敗不能讓呼叫端更難排錯，仍靠子程序心跳凍結
-    偵測——issue #203 既有防線——當最後防線）。"""
+    latch 動作——trip child 本地 thread-safe latch（C4，供 `_dispatch` 呼叫 native 前再檢查）
+    ＋寫 sentinel（durable，buffer 之外路徑）＋經專用 IPC channel（R2-8）通知父程序。
+
+    N1（HIGH，codex 終審 round2）：`latch.trip()` 必須是**第一個動作**，排在任何 I/O
+    （sentinel fsync／IPC send）之前——`trip()` 只是設一個 `threading.Event`，純記憶體、
+    不阻塞；若像舊版一樣把它排在 sentinel/IPC 之後，這兩段 I/O（尤其 sentinel 的
+    `os.fsync`）卡住的期間，`_dispatch`（child 主迴圈，與 callback 不同執行緒）仍會讀到
+    `latch.tripped is False`，放行新的 mutating native 呼叫——這正是 child latch「故障後
+    沒有立即 trip」的縫。trip 本身冪等（`Event.set()` 重複呼叫安全），下面 `_wrap_on_raw`
+    也會在呼叫本函式之前搶先 trip 一次，這裡重複 trip 不影響正確性，只是防禦性地確保
+    「即使有其他呼叫路徑漏了搶先 trip，這裡仍第一手補上」。sentinel/IPC 通知各自吞例外
+    （本身失敗不能讓呼叫端更難排錯，仍靠子程序心跳凍結偵測——issue #203 既有防線——當
+    最後防線）。"""
+    if latch is not None:
+        latch.trip()
     log.error("callback 主寫入落地失敗，觸發 G2 fail-stop latch: %s", detail)
     try:
         # child 不持有 epoch 狀態（那由父程序統一管理）——這裡寫的 epoch=-1 只是佔位，
@@ -97,8 +108,6 @@ def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail:
     except Exception:
         log.error("sentinel 寫入也失敗，僅能靠 IPC 通知父程序（若 IPC 也失敗，"
                   "父程序仍會靠子程序心跳凍結偵測——issue #203 既有防線——察覺異常）")
-    if latch is not None:
-        latch.trip()
     if failstop_conn is not None:
         try:
             failstop_conn.send({"type": "failstop", "detail": detail})
@@ -170,6 +179,14 @@ def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox,
         try:
             return buffer.append(kind, payload, account=account, mode=mode)
         except Exception as primary_exc:
+            # N1（HIGH，codex 終審 round2）：主寫入一旦失敗，第一個動作就是 trip 本地
+            # latch（純記憶體、不阻塞）——排在下面的退化寫入／`_trigger_failstop_latch`
+            # 的 sentinel fsync／IPC send 這些 I/O 之前，堵住「I/O 阻塞期間 `_dispatch`
+            # 仍讀到 `latch.tripped is False`、放行新 mutating native 呼叫」的縫。
+            # `_trigger_failstop_latch` 內部也會再 trip 一次（冪等），這裡提早搶先是為了
+            # 不必等退化寫入（同樣是一段 I/O）跑完才 trip。
+            if latch is not None:
+                latch.trip()
             try:
                 _try_degraded_write(buffer, kind, payload, account=account, mode=mode)
             except Exception as degraded_exc:

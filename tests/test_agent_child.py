@@ -6,6 +6,7 @@ import multiprocessing as mp
 import threading
 from decimal import Decimal
 
+import quanquant.agent.native_runner as nr
 from quanquant.agent.buffer import DurableBuffer
 from quanquant.agent.native_runner import ChildFailstopLatch, _dispatch, child_main
 from quanquant.agent.testing import FakeNativeClient, fake_native_factory
@@ -210,6 +211,96 @@ def test_child_main_rejects_mutating_op_after_dual_write_failure_trips_latch(tmp
 
     _rpc(conn, {"op": "shutdown"})
     t.join(timeout=5)
+
+
+# ---- N1（HIGH，codex 終審 round2）：primary append 失敗後，latch 必須是「第一個動作」，
+# 排在退化寫入/sentinel fsync/IPC 這些 I/O 之前——I/O 阻塞期間 child 主迴圈不得放行新的
+# mutating native 呼叫。用可控的 threading.Event 讓「callback 執行緒卡在 I/O 中」與
+# 「主執行緒斷言 tripped＋跑 _dispatch」精確交錯（不是機率性競態）。----
+
+
+def test_on_raw_trips_latch_before_degraded_write_io_blocks(tmp_path, monkeypatch):
+    """primary `buffer.append` 拋錯後，`_wrap_on_raw._on_raw` 必須先 `latch.trip()` 才去做
+    退化寫入——這裡把 `_try_degraded_write` 換成卡住不放的假 I/O，驗證：卡住期間
+    `latch.tripped` 已經是 True，且同一時間 `_dispatch` 一個 mutating op 會被擋下、
+    native 完全不會被呼叫。舊版（trip 排在退化寫入之後）在這個卡住的窗口內
+    `latch.tripped` 仍是 False，這支測試會在舊版程式碼上紅（revert 這次修法即可重現）。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    monkeypatch.setattr(
+        buf, "append", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("primary boom"))
+    )
+    entered_io = threading.Event()
+    release_io = threading.Event()
+
+    def _blocked_degraded_write(*a, **k):
+        entered_io.set()
+        assert release_io.wait(timeout=5), "退化寫入卡住逾時，測試設計有誤"
+
+    monkeypatch.setattr(nr, "_try_degraded_write", _blocked_degraded_write)
+
+    account_box = nr._AccountBox()
+    account_box.value = "F1"
+    latch = nr.ChildFailstopLatch()
+    on_raw = nr._wrap_on_raw(buf, mode="sim", account_box=account_box, latch=latch)
+
+    callback_thread = threading.Thread(target=lambda: on_raw("deal_report", {"n": 1}))
+    callback_thread.start()
+    try:
+        assert entered_io.wait(timeout=5), "callback 執行緒應已卡在退化寫入 I/O 內"
+
+        # N1 核心斷言：退化寫入 I/O 仍卡住的當下，latch 必須已經 trip。
+        assert latch.tripped is True
+
+        native = fake_native_factory(
+            credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF", mode="sim",
+            on_raw=lambda *a, **k: None,
+        )
+        native.connect()
+        reply = _dispatch(
+            native, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
+                     "price_type": "MKT", "order_type": "IOC", "octype": "Auto"},
+            latch=latch,
+        )
+        assert reply["ok"] is False and reply["error_kind"] == "failstop"
+    finally:
+        release_io.set()
+        callback_thread.join(timeout=5)
+
+
+def test_trigger_failstop_latch_trips_before_sentinel_write_io_blocks(tmp_path, monkeypatch):
+    """`_trigger_failstop_latch` 內部也必須把 trip 排在 sentinel fsync／IPC 之前——即使
+    未來有呼叫路徑不經 `_wrap_on_raw` 提早 trip，直接呼叫這個函式也要保證同樣的順序。
+    用卡住的 `buffer.write_sentinel` 模擬 fsync 阻塞，驗證卡住期間 `_dispatch` 已經看得到
+    tripped=True、native 完全不會被呼叫。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    entered_io = threading.Event()
+    release_io = threading.Event()
+
+    def _blocked_write_sentinel(*a, **k):
+        entered_io.set()
+        assert release_io.wait(timeout=5), "sentinel 寫入卡住逾時，測試設計有誤"
+
+    monkeypatch.setattr(buf, "write_sentinel", _blocked_write_sentinel)
+    latch = nr.ChildFailstopLatch()
+
+    t = threading.Thread(
+        target=lambda: nr._trigger_failstop_latch(buf, None, latch, "detail")
+    )
+    t.start()
+    try:
+        assert entered_io.wait(timeout=5), "應已卡在 sentinel 寫入 I/O 內"
+        assert latch.tripped is True  # I/O 仍卡住時 latch 已經 trip
+
+        native = fake_native_factory(
+            credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF", mode="sim",
+            on_raw=lambda *a, **k: None,
+        )
+        native.connect()
+        reply = _dispatch(native, {"op": "cancel", "ordno": "X"}, latch=latch)
+        assert reply["ok"] is False and reply["error_kind"] == "failstop"
+    finally:
+        release_io.set()
+        t.join(timeout=5)
 
 
 def test_real_process_spawn_smoke(tmp_path):
