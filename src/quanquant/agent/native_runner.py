@@ -28,6 +28,7 @@ durable）＋經**專用 IPC channel**（`failstop_conn`，`child_main` 的獨�
 import json
 import logging
 import os
+import threading
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
@@ -52,6 +53,57 @@ def _default_native_factory(*, credentials: dict, symbol: str, mode: str,
         ca_path=None, ca_passwd=None, person_id=None,
         symbol=symbol, mode=mode, on_raw=on_raw,
     )
+
+
+class ChildFailstopLatch:
+    """C4（HIGH，codex 終審）：child 進程內 thread-safe latch——SDK callback 執行緒
+    （Solace/.NET，與 `child_main` 主迴圈不同執行緒）偵測到 buffer 落地失敗時同步
+    `trip()`（純記憶體 `threading.Event`，不必等父程序 IPC round-trip），`_dispatch` 在
+    真正呼叫 native place/cancel/update **之前**再檢查一次，堵住「父程序最後一次
+    `AgentRunner._latched` 檢查通過後、`asyncio.to_thread(child.request, ...)` 尚未真正
+    排程執行前」這段 asyncio 排程邊界的競態窗——那段期間父程序自己的 `_latch()`（受
+    `_recovery_lock` 保護、經 IPC round-trip 才會被 `_failstop_watchdog` 處理）可能還沒
+    完成，但這個特定 RPC 已經送到子程序、來不及被父程序攔下。子程序本地判定天然比父程序
+    更即時（同進程、無 IPC round-trip），是這道縫唯一堵得住的地方；父 latch（G2①⑤⑦）續管
+    sentinel/epoch/health 這些跨程序協調責任不變，這裡只加一道「native 呼叫前再確認」的
+    本地防線。`threading.Event` 天然 thread-safe，`child_main` 主迴圈（單執行緒）與 SDK
+    callback 執行緒可安全共用同一份，不需要額外的鎖。"""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+
+    def trip(self) -> None:
+        self._event.set()
+
+    @property
+    def tripped(self) -> bool:
+        return self._event.is_set()
+
+
+def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail: str) -> None:
+    """C4/C5（HIGH，codex 終審）共用：callback 主寫入失敗（不論退化寫入是否成功）觸發的
+    latch 動作——寫 sentinel（durable，buffer 之外路徑）＋trip child 本地 thread-safe
+    latch（C4，供 `_dispatch` 呼叫 native 前再檢查）＋經專用 IPC channel（R2-8）通知父程序。
+    三步各自吞例外（寫 sentinel/IPC 通知本身失敗不能讓呼叫端更難排錯，仍靠子程序心跳凍結
+    偵測——issue #203 既有防線——當最後防線）。"""
+    log.error("callback 主寫入落地失敗，觸發 G2 fail-stop latch: %s", detail)
+    try:
+        # child 不持有 epoch 狀態（那由父程序統一管理）——這裡寫的 epoch=-1 只是佔位，
+        # 父程序收到 IPC 通知後會用自己遞增後的權威值覆寫這個 sentinel（見 runner.py
+        # AgentRunner._latch）；即使父程序來不及覆寫就再次崩潰，sentinel 存在本身已經
+        # 足以讓下次啟動視為 latch（durable 的定義只看「存在與否」，不依賴這裡的 epoch
+        # 值精確與否）。
+        buffer.write_sentinel(epoch=-1, detail=detail)
+    except Exception:
+        log.error("sentinel 寫入也失敗，僅能靠 IPC 通知父程序（若 IPC 也失敗，"
+                  "父程序仍會靠子程序心跳凍結偵測——issue #203 既有防線——察覺異常）")
+    if latch is not None:
+        latch.trip()
+    if failstop_conn is not None:
+        try:
+            failstop_conn.send({"type": "failstop", "detail": detail})
+        except Exception:
+            log.error("failstop IPC 通知也失敗——callback 執行緒已無法對外示警")
 
 
 class _AccountBox:
@@ -87,15 +139,32 @@ def _try_degraded_write(buffer: DurableBuffer, kind: str, payload: dict, *,
 
 
 def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox,
-                  failstop_conn=None):
+                  failstop_conn=None, latch: "ChildFailstopLatch | None" = None):
     """把 `buffer.append` 包一層，補上 D5/I7 要求的 account/mode 蓋章——SDK callback
     只給 (kind, payload)，account 從 `account_box`（connect 成功後才填）動態讀取。
 
-    G2①：主寫入失敗 → 退化寫入；兩者皆失敗 → 寫 sentinel（durable，buffer 之外路徑）＋
-    經 `failstop_conn`（獨立於 RPC pipe 的專用 IPC channel，R2-8）通知父程序，之後原樣
-    re-raise（callback 執行緒/呼叫端仍需要知道這次真的沒有落地，維持既有例外語意，不吞
-    ——SDK callback 若因此失敗，`child_main` 的既有 try/except 會把它轉成結構化的
-    `error_kind="exception"` reply，這是本來就有的正常錯誤回報路徑，本函式不改變它）。"""
+    C5（HIGH，codex 終審，收緊自 spec 原案「雙寫失敗才 latch」）：**主寫入（SQLite）一旦
+    失敗就直接 latch**——不再讓「退化寫入是否成功」決定要不要 latch。理由：退化寫入
+    （`_try_degraded_write`）是純檔案 append-only，缺乏 SQLite 的交易/索引/查詢能力，
+    只是「事後人工救援」的最後手段，不是與主寫入等價的替代落地路徑；agent 端 outbox
+    at-least-once（`runner.py::AgentRunner._pump` 只讀 SQLite buffer）完全看不到只落在
+    退化檔的事件，也沒有自動 reinjection 機制——舊版「退化寫入成功就不 latch」會讓這些
+    事件在沒有任何顯式訊號的情況下悄悄從零丟單（I1）保證裡漏出去（codex 終審 C5 原話：
+    「degraded JSONL 成功即回傳、不 latch、又無 reinjection → I1 中斷」）。退化寫入仍然
+    嘗試（降低真的完全遺失的機率、留人工救援線索），但寫入結果只影響訊息內容與回傳值，
+    不再影響是否 latch 的決定：
+      - 主寫入失敗＋退化寫入成功：仍 latch（`_trigger_failstop_latch`）＋回傳 -1
+        （沒有 SQLite row id 可回，呼叫端本就不依賴它），**不** raise（維持既有回傳語意，
+        呼叫端/callback thread 不需要另外處理例外）。
+      - 主寫入失敗＋退化寫入也失敗：仍 latch＋原樣 re-raise（callback 執行緒/呼叫端仍需要
+        知道這次真的沒有落地——SDK callback 若因此失敗，`child_main`/`native.py::
+        _on_order_cb` 的既有 try/except 會把它轉成結構化的 `error_kind="exception"`
+        reply 或再試一次 `_unparsed` 退化重試，這是本來就有的正常錯誤回報路徑，本函式
+        不改變它）。
+
+    C4：`latch`（`ChildFailstopLatch`，child 進程內 thread-safe，見其 docstring）在任一次
+    主寫入失敗時同步 trip——與父程序的 IPC round-trip 無關，`_dispatch` 在真正呼叫 native
+    place/cancel/update 前會再檢查一次。"""
     def _on_raw(kind: str, payload: dict) -> int:
         account = account_box.value
         try:
@@ -103,33 +172,35 @@ def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox,
         except Exception as primary_exc:
             try:
                 _try_degraded_write(buffer, kind, payload, account=account, mode=mode)
-                return -1  # 退化寫入成功：沒有 SQLite row id 可回，呼叫端本就不依賴它
             except Exception as degraded_exc:
                 detail = (
                     f"buffer 落地失敗（主寫入: {primary_exc}；退化寫入: {degraded_exc}）"
                 )
-                log.error("callback 落地雙寫皆失敗，觸發 G2 fail-stop latch: %s", detail)
-                try:
-                    # child 不持有 epoch 狀態（那由父程序統一管理）——這裡寫的 epoch=-1
-                    # 只是佔位，父程序收到 IPC 通知後會用自己遞增後的權威值覆寫這個 sentinel
-                    # （見 runner.py AgentRunner._latch）；即使父程序來不及覆寫就再次崩潰，
-                    # sentinel 存在本身已經足以讓下次啟動視為 latch（durable 的定義只看
-                    # 「存在與否」，不依賴這裡的 epoch 值精確與否）。
-                    buffer.write_sentinel(epoch=-1, detail=detail)
-                except Exception:
-                    log.error("sentinel 寫入也失敗，僅能靠 IPC 通知父程序（若 IPC 也失敗，"
-                              "父程序仍會靠子程序心跳凍結偵測——issue #203 既有防線——察覺異常）")
-                if failstop_conn is not None:
-                    try:
-                        failstop_conn.send({"type": "failstop", "detail": detail})
-                    except Exception:
-                        log.error("failstop IPC 通知也失敗——callback 執行緒已無法對外示警")
+                _trigger_failstop_latch(buffer, failstop_conn, latch, detail)
                 raise
+            detail = (
+                f"buffer 主寫入失敗（{primary_exc}），已改寫入退化檔供人工救援："
+                f"{_degraded_write_path(buffer)}（純檔案 append-only、非 SQLite，不會被"
+                "agent outbox 自動送達 server，需人工介入重新灌回或補送）"
+            )
+            _trigger_failstop_latch(buffer, failstop_conn, latch, detail)
+            return -1  # 退化寫入成功：沒有 SQLite row id 可回，呼叫端本就不依賴它
     return _on_raw
 
 
-def _dispatch(native, op: dict) -> dict:
+def _dispatch(native, op: dict, *, latch: "ChildFailstopLatch | None" = None) -> dict:
     kind = op["op"]
+
+    if kind in ("place", "cancel", "update") and latch is not None and latch.tripped:
+        # C4（HIGH，codex 終審）：native 呼叫正前方再次檢查本地 latch（同進程、無 IPC
+        # round-trip，比父程序的 `AgentRunner._latched` 更即時）——callback 執行緒偵測到
+        # 落地失敗、trip() latch 的那一刻，與這筆 RPC 已經被父程序送到子程序的那一刻剛好
+        # 交錯時的最後防線。回傳的 reply 形狀與父程序 `_reject_failstop` 送的
+        # `UpCommandRejected` 用同一個 error_kind="failstop"，`agent_commands.py` 既有的
+        # `_EXPLICIT_REJECT_KINDS` 轉移表天然吃得下（place→failed+release、cancel→不動
+        # Order+audit、update→只 release delta）。
+        return {"ok": False, "error_kind": "failstop",
+                "message": "agent buffer 落地失敗（child 本地 latch），拒絕執行 native 呼叫"}
 
     if kind == "connect":
         return {"ok": True, "account": native.connect()}
@@ -195,6 +266,7 @@ def child_main(
     factory = native_factory or _default_native_factory
     secrets = [v for v in credentials.values() if v]
     buffer = DurableBuffer(buffer_path)
+    latch = ChildFailstopLatch()  # C4：child 進程內 thread-safe latch，貫穿 callback/dispatch
 
     # (g) mode!="sim" 時不建 native client（防禦層 3）——所有 op 一律回 mode_mismatch。
     native = None
@@ -202,7 +274,7 @@ def child_main(
     if mode == "sim":
         native = factory(credentials=credentials, symbol=symbol, mode=mode,
                          on_raw=_wrap_on_raw(buffer, mode=mode, account_box=account_box,
-                                              failstop_conn=failstop_conn))
+                                              failstop_conn=failstop_conn, latch=latch))
 
     while True:
         op = conn.recv()
@@ -219,7 +291,7 @@ def child_main(
             continue
 
         try:
-            reply = _dispatch(native, op)
+            reply = _dispatch(native, op, latch=latch)
         except TradeNotFoundError as exc:
             message = redact_secrets(str(exc), secrets=secrets)
             conn.send({"ok": False, "error_kind": "trade_not_found", "message": message,

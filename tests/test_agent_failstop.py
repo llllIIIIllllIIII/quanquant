@@ -107,21 +107,46 @@ def test_wrap_on_raw_primary_write_success_no_sentinel(tmp_path):
 
 
 def test_wrap_on_raw_degraded_write_succeeds_when_primary_fails(tmp_path, monkeypatch):
-    """主寫入（SQLite）失敗，退化寫入（純檔案）成功——不觸發 latch，也不 raise。"""
+    """C5（HIGH，codex 終審，收緊自 spec 原案「雙寫失敗才 latch」）：主寫入（SQLite）失敗、
+    退化寫入（純檔案）成功——**仍然 latch**（degraded 檔僅供人工救援，不是與主寫入等價的
+    落地路徑，見 `_wrap_on_raw` docstring），但不 raise（維持既有回傳語意，呼叫端/callback
+    thread 不需要另外處理例外）。"""
     buf = DurableBuffer(tmp_path / "o.db")
     monkeypatch.setattr(
         buf, "append", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sqlite boom"))
     )
+    parent_conn, child_conn = mp.Pipe()
     account_box = nr._AccountBox()
     account_box.value = "F1"
-    on_raw = nr._wrap_on_raw(buf, mode="sim", account_box=account_box)
+    on_raw = nr._wrap_on_raw(buf, mode="sim", account_box=account_box, failstop_conn=child_conn)
     result = on_raw("deal_report", {"n": 1})
     assert result == -1  # 退化寫入沒有 SQLite row id 可回
     degraded_path = nr._degraded_write_path(buf)
     assert degraded_path.exists()
     line = json.loads(degraded_path.read_text(encoding="utf-8").strip().splitlines()[-1])
     assert line == {"kind": "deal_report", "payload": {"n": 1}, "account": "F1", "mode": "sim"}
-    assert not buf.has_sentinel()  # 沒有真的雙寫失敗，不該 latch
+    assert buf.has_sentinel()  # C5：主寫入失敗即 latch，degraded 檔只是救援副本
+    sentinel = buf.read_sentinel()
+    assert "sqlite boom" in sentinel["detail"] and str(degraded_path) in sentinel["detail"]
+    assert parent_conn.poll(2), "父程序應收到 failstop IPC 通知（degraded 成功也要通知）"
+    notice = parent_conn.recv()
+    assert notice["type"] == "failstop"
+
+
+def test_wrap_on_raw_primary_failure_trips_child_latch_even_when_degraded_succeeds(tmp_path, monkeypatch):
+    """C4/C5：`latch`（`ChildFailstopLatch`）在主寫入失敗時同步 trip——不論退化寫入是否
+    成功，`_dispatch` 才能在 native 呼叫前即時看到（不必等 IPC round-trip）。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    monkeypatch.setattr(
+        buf, "append", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sqlite boom"))
+    )
+    account_box = nr._AccountBox()
+    account_box.value = "F1"
+    latch = nr.ChildFailstopLatch()
+    on_raw = nr._wrap_on_raw(buf, mode="sim", account_box=account_box, latch=latch)
+    assert latch.tripped is False
+    on_raw("deal_report", {"n": 1})
+    assert latch.tripped is True
 
 
 def test_wrap_on_raw_double_failure_writes_sentinel_and_notifies_parent_then_reraises(
@@ -488,6 +513,65 @@ async def test_recover_after_probe_passes_restores_ok_clears_sentinel_sets_epoch
     await _until(lambda: any(
         h["status"] == "ok" and h["health_epoch"] == 1 for h in tr.healths()
     ))
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recover_stays_latched_when_epoch_persist_fails(tmp_path, monkeypatch):
+    """C3（HIGH，codex 終審）：`_recover()` 的兩個持久化步驟（先 epoch、後 sentinel）任一
+    失敗都必須保留 latch、不送 ok——舊版先翻 `_latched=False` 才做持久化，部分失敗會讓
+    in-memory 狀態「假裝恢復」（G2②的 latch 檢查放行 mutating 指令），但 durable 狀態
+    其實沒有真的恢復。這裡讓 `set_health_epoch` 直接 raise，驗證 probe 通過後仍卡在
+    latched、沒有任何 `status="ok"` 的健康訊框送出。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    monkeypatch.setattr(
+        buf, "set_health_epoch", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("epoch persist boom"))
+    )
+
+    await asyncio.sleep(0.15)  # 讓至少一輪 _recovery_prober 跑過（probe 會過，epoch 寫入會炸）
+    assert r._latched is True  # 仍 latched
+    # 注意：tr.healths() 累積連線存續期間送過的所有健康訊框，含 login 後立刻送出的初始
+    # epoch=0 "ok"（latch 之前）——這裡要驗證的是「latch 之後（epoch=1）沒有任何 ok 被送
+    # 出」，不是「從來沒有送過 ok」。
+    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
+    assert buf.has_sentinel()  # sentinel 仍在（沒被清掉）
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recover_stays_latched_when_sentinel_clear_fails(tmp_path, monkeypatch):
+    """C3：反過來——epoch 寫入成功但 sentinel 清除失敗，一樣要保持 latch、不送 ok。且驗證
+    「先 epoch 後 sentinel」的順序意圖：epoch 已經真的持久化，下次啟動即使 sentinel 仍在，
+    讀到的 epoch 也是正確的最新值，不會用到落後的舊值。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    monkeypatch.setattr(
+        buf, "clear_sentinel", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("sentinel clear boom"))
+    )
+
+    await asyncio.sleep(0.15)
+    assert r._latched is True
+    # 同上一個測試：只驗「latch 之後（epoch=1）沒有 ok」，不是「從來沒有送過 ok」。
+    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
+    assert buf.get_health_epoch() == 1  # epoch 已經真的持久化（先 epoch 後 sentinel 的順序）
+    assert buf.has_sentinel()  # sentinel 清除失敗，仍在
 
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)

@@ -367,18 +367,36 @@ class AgentRunner:
         本機原子轉移——鎖本身的互斥已保證探針通過的當下不會有新的 `_latch()` 正在進行中
         （沒有『探針期間又壞了但沒被發現』的競態：新故障必須等到這把鎖釋放才能真正 latch，
         屆時 epoch 會再 +1，語意上等價於『先恢復又立即重新故障』，不違反任何不變量）。
-        `await transport.send` 永遠在鎖釋放之後才發生（經 `_health_sender`，不在這裡）。"""
+        `await transport.send` 永遠在鎖釋放之後才發生（經 `_health_sender`，不在這裡）。
+
+        C3（HIGH，codex 終審）修復：`_latched` 翻 False 必須排在兩個 durable 持久化步驟
+        （寫 epoch、清 sentinel）**之後**、且兩者皆成功才翻——舊版先翻 `_latched=False` 再做
+        持久化，若中途任一步失敗（I/O 例外），in-memory 狀態已經「假裝恢復」（G2②的 latch
+        檢查會放行 mutating 指令），但 durable 狀態其實還沒真的恢復（sentinel 仍在／epoch
+        沒真的持久化），造成「部分失敗卻誤判 healthy」。持久化順序（epoch 先、sentinel
+        後）刻意選成：即使 epoch 寫成功但清 sentinel 失敗，下次啟動時 sentinel 仍存在會
+        正確重新載入 latch，且 `_load_persisted_health` 取 `max(sentinel.epoch, buffer
+        meta)` 保證不會用到落後的舊 epoch；反過來若先清 sentinel 才寫 epoch、epoch 寫失敗，
+        下次啟動會誤判「未 latch」且 epoch 讀到過舊的值。任一步失敗：保留 latch、記錯，
+        不動 `_health_epoch`、不推進健康佇列，留給下一輪 `_recovery_prober` 重試。"""
         async with self._recovery_lock:
             if not self._latched:
                 return
             ok = await asyncio.to_thread(self._buffer.probe)
             if not ok:
                 return
+            epoch = self._health_epoch
+            try:
+                await asyncio.to_thread(self._buffer.set_health_epoch, epoch)
+                await asyncio.to_thread(self._buffer.clear_sentinel)
+            except Exception:
+                log.exception(
+                    "G2④ recover 持久化步驟失敗（epoch 寫入／sentinel 清除），保持 latch，"
+                    "留給下一輪 _recovery_prober 重試"
+                )
+                return
             self._latched = False
             self._latch_detail = None
-            await asyncio.to_thread(self._buffer.clear_sentinel)
-            await asyncio.to_thread(self._buffer.set_health_epoch, self._health_epoch)
-            epoch = self._health_epoch
         self._health_queue.put_nowait(epoch)
 
     async def _reject_failstop(self, cmd_id: str) -> None:

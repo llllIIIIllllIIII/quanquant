@@ -7,7 +7,7 @@ import threading
 from decimal import Decimal
 
 from quanquant.agent.buffer import DurableBuffer
-from quanquant.agent.native_runner import child_main
+from quanquant.agent.native_runner import ChildFailstopLatch, _dispatch, child_main
 from quanquant.agent.testing import FakeNativeClient, fake_native_factory
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
@@ -134,6 +134,81 @@ def test_child_refuses_non_sim_mode(tmp_path):
     reply = _rpc(parent_conn, {"op": "connect"})
     assert reply["ok"] is False and reply["error_kind"] == "mode_mismatch"
     _rpc(parent_conn, {"op": "shutdown"})
+    t.join(timeout=5)
+
+
+# ---- C4（HIGH，codex 終審）：child 進程內 thread-safe latch——native 呼叫正前方再檢查一次
+# ----
+
+
+def test_dispatch_blocks_native_when_latch_tripped_before_check(tmp_path):
+    """模擬「parent 最後一次 `AgentRunner._latched` 檢查已通過、`asyncio.to_thread(child.
+    request, ...)` 尚未真正排程執行」這段窗——用 `threading.Barrier` 讓「callback 執行緒
+    trip() latch」與「主執行緒即將呼叫 `_dispatch()`」在同一個會合點交錯，`t.join()` 確保
+    trip() 保證發生在 `_dispatch()` 的 tripped 檢查之前才放行（而非仰賴機率性的真實競態），
+    驗證 native.place 完全不會被呼叫——子程序 callback 落地也完全沒發生，buffer 仍是空的。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    latch = ChildFailstopLatch()
+    native = fake_native_factory(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                                 mode="sim", on_raw=buf.append)
+    native.connect()
+
+    barrier = threading.Barrier(2)
+
+    def _callback_thread():
+        barrier.wait(timeout=5)
+        latch.trip()  # 模擬 SDK callback 執行緒偵測到雙寫落地失敗，同步 trip
+
+    t = threading.Thread(target=_callback_thread)
+    t.start()
+    barrier.wait(timeout=5)  # 與 callback 執行緒同時抵達會合點
+    t.join(timeout=5)  # 確保 trip() 已完成才做 dispatch 檢查（模擬「trip 發生在檢查前」）
+
+    reply = _dispatch(native, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
+                                "price_type": "MKT", "order_type": "IOC", "octype": "Auto"},
+                       latch=latch)
+    assert reply["ok"] is False and reply["error_kind"] == "failstop"
+    assert buf.pending() == []  # native.place 完全沒被呼叫，沒有任何 order/deal 回報落地
+
+
+def test_dispatch_ignores_latch_for_readonly_ops(tmp_path):
+    """C4：latch 只擋 place/cancel/update 三種 mutating op——唯讀 op（ping/query_qty/
+    reconcile）不受影響，latch 中仍能正常回應（G2②的既有邊界：latch 不擋唯讀查詢）。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    latch = ChildFailstopLatch()
+    latch.trip()
+    native = fake_native_factory(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                                 mode="sim", on_raw=buf.append)
+    native.connect()
+
+    reply = _dispatch(native, {"op": "ping"}, latch=latch)
+    assert reply["ok"] is True
+
+
+def test_child_main_rejects_mutating_op_after_dual_write_failure_trips_latch(tmp_path, monkeypatch):
+    """C4：`child_main` 主迴圈真的接線 latch——SDK callback（這裡用 `FakeNativeClient`
+    的同步呼叫模擬）雙寫落地失敗時，經 `_wrap_on_raw` 觸發的 `latch.trip()` 必須讓緊接著
+    的下一筆 mutating RPC 在 `_dispatch` 的 native 呼叫前被擋下。用 monkeypatch
+    `DurableBuffer.append`（class 層級——`child_main` 內部自建的 buffer instance 也會受
+    影響，測試拿不到那個 instance 的參照）模擬主寫入失敗；退化寫入走真實檔案路徑（正常
+    會成功，只 latch 不 raise，見 C5）。驗證：第一筆 place 本身仍完整執行（native.place
+    已經被呼叫，callback 只是在事後才發現落地失敗），但**緊接著的下一筆** mutating op
+    會被本地 latch 擋下——這正是 C4 要堵的窗：即使父程序的 IPC 通知還沒被
+    `_failstop_watchdog` 處理，child 本地已經知道自己壞了。"""
+    monkeypatch.setattr(
+        DurableBuffer, "append",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("primary boom"))
+    )
+    conn, t = _start_child_thread(tmp_path)
+    _rpc(conn, {"op": "connect"})
+    reply1 = _rpc(conn, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
+                         "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
+    assert reply1["ok"] is True  # 這筆 native 呼叫本身沒被擋（latch 是「呼叫前」才生效）
+
+    reply2 = _rpc(conn, {"op": "cancel", "ordno": "101AA1"})
+    assert reply2["ok"] is False and reply2["error_kind"] == "failstop"
+
+    _rpc(conn, {"op": "shutdown"})
     t.join(timeout=5)
 
 
