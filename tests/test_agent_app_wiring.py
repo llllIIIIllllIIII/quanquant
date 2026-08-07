@@ -130,6 +130,25 @@ async def test_agent_mode_slot_adapter_uses_configured_command_expiry_seconds(en
     assert slot.adapter._agent_command_expiry_seconds == 45
 
 
+async def test_agent_mode_two_owners_get_isolated_slot_runtimes(engine, monkeypatch):
+    """I8 釘樁測試（opus 驗收 MEDIUM）：`_start_agent_channel_subsystem` 的 slot 建置迴圈
+    必須為每個 owner 各建一份 `BrokerSupervisor`（見 `web/app.py` 迴圈內
+    `slot_supervisor = BrokerSupervisor()`），否則「A 慢不排隊 B」（I8：per-user 完全無共享
+    可變 runtime 狀態，見 `agent_registry.py` module docstring）會在多人場景下失效——A 的
+    reconcile 卡住會連帶佔住 B 的鎖。現有 wiring 測試只用單 owner
+    （`order_owner_user_ids="1"`），沒有測試斷言兩個 slot 的 runtime 物件互相獨立；e2e 測試
+    另外自建 fixture，不走這條迴圈。這裡開兩個 owner，斷言 supervisor/channel/adapter/
+    session_state 兩兩不同物件，把「per-slot 各自一份」釘死。"""
+    app, state, tasks = await _run(_settings(order_owner_user_ids="1,2"), engine, monkeypatch)
+    slot1 = app.state.agent_registry.get(1)
+    slot2 = app.state.agent_registry.get(2)
+    assert slot1 is not None and slot2 is not None
+    assert slot1.supervisor is not slot2.supervisor
+    assert slot1.channel is not slot2.channel
+    assert slot1.adapter is not slot2.adapter
+    assert slot1.session_state is not slot2.session_state
+
+
 async def test_agent_mode_slot_adapter_reconcile_stages_with_slot_user_id(engine, monkeypatch):
     """Task 8 修復（round 1）驗收：`_start_agent_channel_subsystem` 建 slot 的 `ShioajiAdapter`
     必須傳 `agent_user_id=uid`，否則 `_stage_reconcile_results`（agent 模式對帳落地路徑）用

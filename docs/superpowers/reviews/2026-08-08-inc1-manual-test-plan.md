@@ -1,6 +1,6 @@
 # 本機 Broker Agent Increment 1（多人 simtrade）— 人工測試流程
 
-**適用範圍**：`feat/agent-multiuser-inc1` 分支，Task 1-13 全數完成（1089 pytest 綠、ruff
+**適用範圍**：`feat/agent-multiuser-inc1` 分支，Task 1-13 全數完成（1154 pytest 綠、ruff
 全庫歸零）之後，交使用者實測用的 checklist。比照 Inc0 Task 16 的驗收記錄風格
 （`docs/superpowers/reviews/2026-08-06-local-broker-agent-inc0-sim-verification.md`），
 但範圍擴大到多人隔離／command ledger／fail-stop／unknown 收斂等 Inc1 新增機制。
@@ -45,7 +45,7 @@
    cd /Users/henrychang/Desktop/MyProjects/QuanQuant
    git status                 # 確認在 feat/agent-multiuser-inc1，且無未預期改動
    uv sync --extra dev
-   uv run pytest -q           # 全套自動化測試作為起跑點基線，應為 1089 passed
+   uv run pytest -q           # 全套自動化測試作為起跑點基線，應為 1154 passed
    ```
 2. 確認至少有一個既有 QuanQuant 帳號（`uv run quanquant-user list`）；情境 3/4 完整版需要
    **兩個**帳號與**兩組**永豐 simtrade API Key/Secret，沒有第二組時見各情境的替代方案。
