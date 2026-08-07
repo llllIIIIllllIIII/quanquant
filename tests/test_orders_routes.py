@@ -20,7 +20,7 @@ from sqlmodel import Session, select
 
 from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker import repository as brepo
-from quanquant.broker.base import AuthorizationError, OrderError, RiskError
+from quanquant.broker.base import AuthorizationError, RiskError
 from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
