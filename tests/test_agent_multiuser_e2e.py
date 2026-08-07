@@ -223,6 +223,11 @@ def test_two_users_place_report_fill_and_data_isolated(two_user_env):
                        "result": {"ordno": "OA1", "broker_order_id": "BA1"}})
         ws_b.send_json({"type": "cmd_ack", "cmd_id": "cmd-b-1", "event_id": 1, "ok": True,
                        "result": {"ordno": "OB1", "broker_order_id": "BB1"}})
+        # C1（HIGH，codex 終審）：server 現在會在 applier commit 完成後回一則 DownReportAck
+        # （event_id=cmd_ack 的 event_id）——不讀掉這則，下面針對 report（event_id=2）的
+        # 單次 receive_json() 會先收到這則殘留在佇列裡的 event_id=1，斷言必敗。
+        assert ws_a.receive_json() == {"type": "report_ack", "event_id": 1}
+        assert ws_b.receive_json() == {"type": "report_ack", "event_id": 1}
 
         def _acked(client_order_id, ordno):
             with Session(env.engine) as s:

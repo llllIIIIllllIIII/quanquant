@@ -251,6 +251,92 @@ def test_cmd_ack_routed_to_channel(ws_env):
         assert _slot(ws_env).channel.acks[0].cmd_id == "c9"
 
 
+# ---- C1（HIGH，codex 終審）：cmd_ack 必須在 applier commit 完成後收到 DownReportAck，
+# 否則 agent 端 outbox（runner.py::_pump）對這筆 cmd_ack 永久重送（逾時→重送→server
+# no-op→再逾時……）。----
+
+
+def _seed_cmd_ack_ledger(engine, *, owner_id: int, cmd_id: str, client_order_id: str) -> None:
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id=client_order_id, request_hash="H", user_id=owner_id, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("21500"), price_type="LMT", order_type="ROD", octype="Auto",
+            trading_day="2026-08-07",
+        )
+        order.status = "unknown"
+        s.add(order)
+        brepo.reserve_quota(s, reservation_id=client_order_id, user_id=owner_id, mode="sim",
+                            trading_day="2026-08-07", qty=1, daily_limit=100)
+        s.add(AgentCommand(
+            cmd_id=cmd_id, user_id=owner_id, kind="place", broker="shioaji",
+            account="F1", mode="sim", client_order_id=client_order_id,
+            reservation_id=client_order_id,
+            payload=json.dumps({"action": "Buy", "price": "21500", "qty": 1, "price_type": "LMT",
+                                 "order_type": "ROD", "octype": "Auto"}),
+            expires_at=dt.datetime(2099, 1, 1),
+        ))
+        s.commit()
+
+
+def test_cmd_ack_owned_found_receives_down_report_ack_after_commit(ws_env, engine):
+    """C1：owned＋found 的 cmd_ack，applier commit 完成後必須收到 DownReportAck(event_id)。"""
+    owner_id = ws_env.state.agent_test_owner_id
+    _seed_cmd_ack_ledger(engine, owner_id=owner_id, cmd_id="cmd-ack-1", client_order_id="c-ack-1")
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "cmd_ack", "cmd_id": "cmd-ack-1", "event_id": 9, "ok": True,
+                     "result": {"ordno": "OA1", "broker_order_id": "BA1"}})
+        assert ws.receive_json() == {"type": "report_ack", "event_id": 9}
+
+
+def test_cmd_ack_duplicate_transport_cas_loser_still_receives_event_ack(ws_env, engine):
+    """C1：第二次以後同 cmd_id 的 cmd_ack（transport CAS 輸掉，`outcome.transport_won=
+    False`）仍是 owned+found——一樣要回 DownReportAck，讓 agent 端 outbox 能把這筆
+    mark_sent、停止重送。"""
+    owner_id = ws_env.state.agent_test_owner_id
+    _seed_cmd_ack_ledger(engine, owner_id=owner_id, cmd_id="cmd-ack-2", client_order_id="c-ack-2")
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "cmd_ack", "cmd_id": "cmd-ack-2", "event_id": 9, "ok": True,
+                     "result": {"ordno": "OA2", "broker_order_id": "BA2"}})
+        assert ws.receive_json() == {"type": "report_ack", "event_id": 9}
+
+        ws.send_json({"type": "cmd_ack", "cmd_id": "cmd-ack-2", "event_id": 9, "ok": True,
+                     "result": {"ordno": "OA2", "broker_order_id": "BA2"}})
+        assert ws.receive_json() == {"type": "report_ack", "event_id": 9}
+
+
+def test_cmd_ack_commit_failure_sends_no_ack(ws_env, monkeypatch, caplog):
+    """C1：`apply_command_ack` commit 失敗（DB 例外）——不得送出任何 DownReportAck（否則
+    agent 端會誤判已送達、不再重送，造成靜默丟單）。零丟單紅線，同
+    `test_report_ack_only_after_commit_success` 既有手法。"""
+    import quanquant.web.routers.agent_ws as agent_ws_module
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("apply_command_ack boom")
+
+    monkeypatch.setattr(agent_ws_module, "apply_command_ack", _boom)
+    caplog.set_level("ERROR", logger="quanquant.web.routers.agent_ws")
+    client = TestClient(ws_env)
+    received = []
+    try:
+        with client.websocket_connect(
+            "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+        ) as ws:
+            ws.send_json({"type": "cmd_ack", "cmd_id": "cmd-boom", "event_id": 1, "ok": True,
+                         "result": {}})
+            received.append(ws.receive_json())
+    except Exception:
+        pass
+    assert not any(isinstance(m, dict) and m.get("type") == "report_ack" for m in received), (
+        "commit 失敗仍收到 report_ack——commit-then-ack 順序被破壞"
+    )
+    assert "agent WS 處理上行訊息失敗" in caplog.text
+
+
 def test_query_result_routed_to_channel_and_no_report_ack_sent(ws_env):
     """Task 11（D7 R1-7）：UpQueryResult 只 resolve pending future，不進 outbox 補送機制、
     不觸發 DownReportAck——連線不必先登入（同 cmd_ack 分支既有行為，query_result 本身無

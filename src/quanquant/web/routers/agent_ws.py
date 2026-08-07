@@ -202,6 +202,19 @@ async def agent_ws(websocket: WebSocket) -> None:
                         apply_command_ack, session_factory, cmd_id=msg.cmd_id,
                         user_id=agent_user_id, ack=msg,
                     )
+                    if outcome.found and not outcome.user_mismatch:
+                        # C1（HIGH，codex 終審）：applier commit 完成後立刻回 DownReportAck——
+                        # agent 端 `runner.py::_receive_loop` 只在收到這則才 `buffer.mark_sent()`
+                        # （見 `_pump`），缺這步會讓 agent 的 outbox 對這筆 cmd_ack 永久重送
+                        # （逾時→重送→server 再 no-op→再逾時……無限循環）。owned＋found（含
+                        # transport CAS 輸掉的重複重送，`outcome.transport_won=False`，代表
+                        # agent 端上一次送出的同一筆還沒被 mark_sent、仍在重試佇列）都要 ack；
+                        # user mismatch／查無 ledger 維持不 ack（同 UpReport 分支既有的
+                        # commit-then-ack 順序：commit 失敗會讓例外往上拋、這裡連
+                        # send_json 都不會跑到，天然滿足「commit 失敗不得 ack」）。
+                        await websocket.send_json(
+                            DownReportAck(event_id=msg.event_id).model_dump()
+                        )
                 if outcome.user_mismatch:
                     # R1-5：cmd_id 存在但屬於別的 user——拒絕＋告警，完全不觸碰、不 ack。
                     log.warning(
