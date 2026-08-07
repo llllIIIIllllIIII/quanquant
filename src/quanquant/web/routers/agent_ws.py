@@ -27,7 +27,8 @@ from quanquant.auth.agent_tokens import validate_token
 from quanquant.broker import repository as brepo
 from quanquant.broker.agent_commands import apply_command_ack, prepare_replay
 from quanquant.broker.agent_protocol import (
-    DownReportAck, UpCmdAck, UpHealth, UpLogin, UpQueryResult, UpReport, parse_uplink,
+    DownReportAck, UpCmdAck, UpCommandRejected, UpHealth, UpLogin, UpQueryResult, UpReport,
+    parse_uplink,
 )
 from quanquant.broker.inbox_worker import commit_raw_callback
 from quanquant.db.models import User
@@ -133,7 +134,12 @@ async def agent_ws(websocket: WebSocket) -> None:
                         )
                         await websocket.close(code=1008)
                         break
-                    channel.mark_logged_in(msg.account)
+                    # Inc1 D9/G2⑤/⑥（Task 12）：UpLogin 宣告本 session 的 health_epoch 基準
+                    # （直接覆寫，非取 max——見 AgentChannel.mark_logged_in docstring／R5-1）；
+                    # 廢除「登入即 ready」——slot 進 pending_health，`session_state.ready`
+                    # 維持目前值（多半是斷線時留下的 not-ready）直到收到本連線一則有效
+                    # UpHealth(ok)（見下方 UpHealth 分支）才轉 ready。
+                    channel.mark_logged_in(msg.account, health_epoch=msg.health_epoch)
                     adapter.account = msg.account
                     # Task 10（D4 重連補送，限同 scope）：四步 guard 全過、mark_logged_in
                     # 後，立刻查詢＋直送這個 user 在**這次登入綁定帳號**下尚未 transport ack
@@ -147,7 +153,9 @@ async def agent_ws(websocket: WebSocket) -> None:
                     )
                     for down in replay_cmds:
                         await websocket.send_json(down)
-                order_state.mark_ready()
+                # D9⑥：不再在這裡 mark_ready()——slot 停在目前狀態（pending_health）等這條
+                # 連線收到有效 UpHealth(ok) 才轉 ready；仍 publish 一次讓 UI 感知「已登入、
+                # 等待健康確認」這個中繼狀態的變化（帳號/連線本身已經變了）。
                 if hub is not None:
                     hub.publish()
                 asyncio.create_task(_reconcile_after_login(adapter))
@@ -210,8 +218,55 @@ async def agent_ws(websocket: WebSocket) -> None:
                 # Task 11（D7 R1-7）：volatile——只 resolve 這個 slot 的 pending future
                 # （reconcile 快照／query_qty），不進 outbox 補送機制、不回 DownReportAck。
                 channel.resolve_query_result(msg)
+            elif isinstance(msg, UpCommandRejected):
+                # Inc1 D9/G2②/R2-5（Task 12）：failstop latch 期間 agent 拒絕的 mutating
+                # 指令——合成一筆 error_kind="failstop" 的 UpCmdAck 餵給既有兩維 CAS
+                # applier（唯一效果套用入口，同 UpCmdAck 分支），落 acked_error＋依轉移表
+                # failed/release delta（`_EXPLICIT_REJECT_KINDS` 已納入 failstop）。與
+                # UpCmdAck 分支共用 `inbox_lock`（同樣寫 `resolved_at`，序列化理由同該分支）。
+                synth_ack = UpCmdAck(cmd_id=msg.cmd_id, event_id=0, ok=False,
+                                     error_kind=msg.error_kind,
+                                     message="agent failstop latch 生效，拒絕執行")
+                async with channel.inbox_lock:
+                    outcome = await asyncio.to_thread(
+                        apply_command_ack, session_factory, cmd_id=msg.cmd_id,
+                        user_id=agent_user_id, ack=synth_ack,
+                    )
+                if outcome.user_mismatch:
+                    log.warning(
+                        "agent WS：cmd_rejected user 不符（cmd_id=%s，連線 user_id=%s），忽略",
+                        msg.cmd_id, agent_user_id,
+                    )
+                    ops = getattr(state, "ops_alerter", None)
+                    if ops is not None:
+                        ops.emit(
+                            "agent_cmd_ack_user_mismatch", "cmd_ack user 不符",
+                            detail=f"cmd_id={msg.cmd_id} user_id={agent_user_id}", severity="warn",
+                        )
+                    continue
+                if not outcome.found:
+                    log.warning("agent WS：查無 cmd_id=%s 的 agent_commands 列，忽略", msg.cmd_id)
+                channel.resolve_ack(synth_ack)
             elif isinstance(msg, UpHealth):
-                channel.note_heartbeat()
+                # Inc1 D9/G2③/⑤/⑥（Task 12）：epoch 單調性（見 AgentChannel.note_health）；
+                # 只有這條連線仍是目前這一代（generation 未被取代）時，才據此改變
+                # `session_state`——舊連線的遲到健康訊息不該影響已被新連線取代的 slot 狀態
+                # （同 UpReport/UpLogin 分支既有 generation fencing 原則）。
+                was_failstop = channel.failstop
+                accepted = channel.note_health(status=msg.status, health_epoch=msg.health_epoch)
+                if accepted and channel.generation == my_generation:
+                    if msg.status == "ok":
+                        order_state.mark_ready()
+                    else:
+                        order_state.mark_unhealthy(msg.detail or "agent failstop latch 生效")
+                    if hub is not None:
+                        hub.publish()
+                    ops = getattr(state, "ops_alerter", None)
+                    if ops is not None and was_failstop != channel.failstop:
+                        # G2：連線/斷線不告警，只在健康語意「真的」轉換（進入/解除 failstop）
+                        # 時才報，不是每則 heartbeat 都送。
+                        ops.failstop(user_id=agent_user_id, enabled=channel.failstop,
+                                     detail=msg.detail or "")
     except WebSocketDisconnect:
         pass
     except Exception:

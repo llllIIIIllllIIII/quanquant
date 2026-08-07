@@ -102,6 +102,10 @@ class Settings(BaseSettings):
     # 傳入 `agent_command_expiry_seconds=`；那兩個模組層常數繼續保留、只作為函式簽名的
     # 預設 fallback（未顯式傳入時），不重複定義同一個名字。
     agent_command_expiry_seconds: int = 120
+    # D9/G2（Task 12）：server heartbeat lease——超過這個秒數沒收到本連線的
+    # UpHealth(status="ok") → slot 標 not-ready 擋新單（WS 連線存活不等於健康）；見
+    # broker/agent_registry.py 的 run_health_lease_watchdog。
+    agent_health_lease_seconds: int = 90
 
 
 @lru_cache(maxsize=1)

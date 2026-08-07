@@ -116,6 +116,21 @@ def test_kill_switch_wrapper_records_scope_self_vs_global():
     assert "個人" in fake_self.texts[0]
 
 
+def test_failstop_wrapper_enabled_and_disabled_messages():
+    """Inc1 D9/G2（Task 12）：agent fail-stop latch 事件——進入/解除各自的文案與 severity。"""
+    fake = _FakeNotifier(configured=True)
+    alerter = OpsAlerter(fake)
+    _drain(alerter, lambda: alerter.failstop(user_id=7, enabled=True, detail="buffer 落地失敗"))
+    assert "進入 fail-stop" in fake.texts[0] and "user_id=7" in fake.texts[0]
+    assert "buffer 落地失敗" in fake.texts[0]
+    assert "🚨" in fake.texts[0]   # critical
+
+    fake2 = _FakeNotifier(configured=True)
+    alerter2 = OpsAlerter(fake2)
+    _drain(alerter2, lambda: alerter2.failstop(user_id=7, enabled=False))
+    assert "解除 fail-stop" in fake2.texts[0]
+
+
 def test_build_ops_alerter_token_fallback_and_configured_gate():
     # ops token 空 → 沿用 telegram_bot_token；chat_id 有值 → configured
     s = SimpleNamespace(ops_telegram_bot_token="", telegram_bot_token="MAINTOK",

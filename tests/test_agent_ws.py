@@ -123,13 +123,18 @@ def test_bad_token_closed(ws_env):
             ws.receive_json()
 
 
-def test_login_marks_ready_sets_account_schedules_reconcile(ws_env):
+def test_login_marks_pending_health_then_upheath_ok_marks_ready(ws_env):
+    """D9⑥（Task 12）：廢除「登入即 ready」——login 後帳號/reconcile 立刻生效，但
+    `session_state.ready` 仍是 False（pending_health），直到收到本連線一則有效
+    `UpHealth(status="ok")` 才轉 ready（S#24）。"""
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
-        assert _wait(lambda: _slot(ws_env).session_state.ready)
-        assert _slot(ws_env).adapter.account == "F1"
+        assert _wait(lambda: _slot(ws_env).adapter.account == "F1")
         assert _wait(lambda: _slot(ws_env).adapter.reconcile_calls == 1)
+        assert _slot(ws_env).session_state.ready is False   # pending_health：未收 ok 前不 ready
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)
         assert ws_env.state.order_events.publishes >= 1
     assert _wait(lambda: _slot(ws_env).session_state.disabled)  # 斷線 → disabled
 
@@ -481,6 +486,7 @@ def test_login_account_switch_rejected_when_unprocessed_raw_inbox_pending(ws_env
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).adapter.account == "F1")
+        ws1.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
     # server 已 commit 但 worker 尚未處理的一筆 RawInbox（processed=False, quarantine=False）。
@@ -505,6 +511,7 @@ def test_login_account_switch_allowed_when_no_unprocessed_raw_inbox(ws_env, engi
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
         ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).adapter.account == "F2")   # 無未處理列：放行
+        ws2.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
 
@@ -602,6 +609,7 @@ def test_login_allowed_reconnect_same_account_even_with_own_unprocessed_rows_for
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws1.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
     with Session(engine) as s:
@@ -610,6 +618,7 @@ def test_login_allowed_reconnect_same_account_even_with_own_unprocessed_rows_for
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
         ws2.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws2.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)   # 沒被擋
 
 
@@ -686,6 +695,7 @@ def test_login_not_blocked_by_other_account_unresolved_cancel_command(ws_env, en
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
         ws.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
 
@@ -761,6 +771,7 @@ def test_issued_token_handshake_succeeds_and_updates_last_used_at(ws_env, engine
         "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
     ) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
     with Session(engine) as s:
@@ -817,6 +828,7 @@ def test_rotation_invalidates_old_token_new_token_still_works(ws_env, engine):
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": new_token}) as ws_new:
         ws_new.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws_new.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
 
@@ -838,6 +850,7 @@ def test_same_user_only_one_valid_token_after_rotation(ws_env, engine):
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": raw3}) as ws:
         ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
 
@@ -890,6 +903,7 @@ def test_reconnect_replay_resends_unresolved_command_then_late_ack_converges(ws_
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws1.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
     # ws1 已斷線（with 區塊結束觸發 channel.detach()）。直接在 DB 造一筆代表「送出去但斷線前
     # 從未收到任何 ack」的 place ledger 列。
@@ -942,6 +956,7 @@ def test_reconnect_replay_does_not_resend_other_account_commands_after_switch(ws
     client = TestClient(ws_env)
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
         ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws1.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
     with Session(engine) as s:
@@ -954,6 +969,7 @@ def test_reconnect_replay_does_not_resend_other_account_commands_after_switch(ws
 
     with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
         ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws2.send_json({"type": "health", "status": "ok", "health_epoch": 0})
         assert _wait(lambda: _slot(ws_env).session_state.ready)  # 換帳號被允許（cancel 不擋 guard）
         ws2.send_json({"type": "report", "event_id": 42, "kind": "deal_report",
                       "account": "F2", "mode": "sim", "payload": {}})

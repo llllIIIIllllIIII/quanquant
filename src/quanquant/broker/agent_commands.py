@@ -52,13 +52,17 @@ from quanquant.db.models import AgentCommand, Order, QuotaReservation
 # 也是同一份預設值的獨立常數，兩處都明確附註解、非重複定義同一個名字，避免誤以為共用）。
 DEFAULT_COMMAND_EXPIRY_SECONDS = 120
 
-# D4：agent 對每個 error_kind 的分類——timeout 是「非終結」的 acked_unknown；其餘五個是
+# D4：agent 對每個 error_kind 的分類——timeout 是「非終結」的 acked_unknown；其餘六個是
 # 「確定未執行」或「明確拒絕」的 acked_error。任何不在這個集合內的值（含 error_kind=None
 # 但 ok=False 的畸形 ack——理論上 Pydantic Literal 已擋掉，這裡是防禦層）一律 fail-safe
 # 落入 unknown 分支（寧可漏判 unknown，不可誤判 error 而提前 release/confirm——同
 # `_classify_place_failure` 的既有保守哲學）。
+# G2/R2-5（Task 12）：`failstop`——agent latch 期間拒絕執行的 volatile `UpCommandRejected`
+# 在 `agent_ws.py` 被合成為 `error_kind="failstop"` 的 `UpCmdAck` 餵給這裡的既有轉移表；
+# 語意等同其餘明確拒絕（place→failed+release、cancel→不動 Order+audit、update→只
+# release delta），不是「結果不明」，是「agent 確定沒有嘗試呼叫 native」。
 _EXPLICIT_REJECT_KINDS = frozenset(
-    {"trade_not_found", "exception", "mode_mismatch", "expired", "scope_mismatch"}
+    {"trade_not_found", "exception", "mode_mismatch", "expired", "scope_mismatch", "failstop"}
 )
 
 

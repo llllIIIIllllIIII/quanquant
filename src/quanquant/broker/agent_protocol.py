@@ -5,7 +5,10 @@ ValidationError（正式環境未部署、存量 agent 只有開發者自己，�
 變更集（詳見 docs/superpowers/specs/2026-08-06-local-broker-agent-inc1-design.md D7）：
 - `UpReport` +`account/mode`（必填，D5 回報歸屬蓋章不可變，I7）。
 - `UpCmdAck`（僅 mutating 指令 place/cancel/update）+`event_id`（D4：走 outbox
-  at-least-once，與 UpReport 共用補送機制）；`error_kind` 增 `expired`/`scope_mismatch`。
+  at-least-once，與 UpReport 共用補送機制）；`error_kind` 增 `expired`/`scope_mismatch`/
+  `failstop`（Task 12：`agent_ws.py` 收到 `UpCommandRejected` 時，server 端合成一筆
+  `error_kind="failstop"` 的 `UpCmdAck` 餵給既有 applier，走同一套 kind×outcome 轉移表，不
+  另開一條路徑；`agent_commands._EXPLICIT_REJECT_KINDS` 已納入）。
 - 新增 volatile `UpQueryResult`：reconcile 快照與 query_qty 結果共用（R1-7），無
   `event_id`、不進 outbox、不觸發 DownReportAck。
 - 新增 volatile `UpCommandRejected`：failstop 期間拒新指令用（R2-5），無 `event_id`、
@@ -126,7 +129,7 @@ class UpCmdAck(BaseModel):
     result: dict | None = None      # place: {"ordno","broker_order_id"}
     error_kind: Literal[
         "trade_not_found", "exception", "timeout", "mode_mismatch",
-        "expired", "scope_mismatch",
+        "expired", "scope_mismatch", "failstop",
     ] | None = None
     message: str | None = None      # 已經 agent 端 redact
 

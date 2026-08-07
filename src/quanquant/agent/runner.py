@@ -44,8 +44,8 @@ from pydantic import ValidationError
 
 from quanquant.broker.agent_protocol import (
     PROTOCOL_VERSION, DownCancel, DownHealth, DownPlace, DownQueryQty, DownReconcile,
-    DownReportAck, DownUpdate, UpCmdAck, UpHealth, UpLogin, UpQueryResult, UpReport,
-    parse_downlink,
+    DownReportAck, DownUpdate, UpCmdAck, UpCommandRejected, UpHealth, UpLogin, UpQueryResult,
+    UpReport, parse_downlink,
 )
 from quanquant.agent.native_runner import child_main
 
@@ -102,18 +102,27 @@ class ChildHandle:
         self._conn = None
         self._rpc_seq = 0
         self._poisoned = False
+        # Inc1 D9/G2①（Task 12）：獨立於 RPC pipe 之外的專用單向 IPC channel（R2-8）——
+        # child 只用來送 callback 落地雙寫失敗的通知，父程序（AgentRunner._failstop_watchdog）
+        # 是唯一消費端。`ctx.Pipe(duplex=False)` 回傳 (recv-only, send-only) 兩端。
+        self._failstop_parent_conn = None
+        self._failstop_child_conn = None
 
     def start(self) -> str:
         ctx = mp.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe()
+        failstop_parent_conn, failstop_child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
             target=child_main, args=(child_conn,),
             kwargs=dict(credentials=self._credentials, symbol=self._symbol, mode=self._mode,
-                        buffer_path=self._buffer_path, native_factory=self._native_factory),
+                        buffer_path=self._buffer_path, native_factory=self._native_factory,
+                        failstop_conn=failstop_child_conn),
         )
         process.start()
         self._process = process
         self._conn = parent_conn
+        self._failstop_parent_conn = failstop_parent_conn
+        self._failstop_child_conn = failstop_child_conn
         self._poisoned = False   # 全新 spawn 的子程序 + pipe：重置前一輪可能留下的中毒態。
         try:
             reply = self._rpc({"op": "connect"}, timeout=_CHILD_CONNECT_TIMEOUT)
@@ -124,6 +133,12 @@ class ChildHandle:
                 self._process.kill()
                 self._process.join(timeout=5)
                 self._process = None
+            if self._failstop_parent_conn is not None:
+                self._failstop_parent_conn.close()
+                self._failstop_parent_conn = None
+            if self._failstop_child_conn is not None:
+                self._failstop_child_conn.close()
+                self._failstop_child_conn = None
             raise RuntimeError(f"agent 子程序啟動失敗: {exc}") from exc
         if not reply.get("ok"):
             self.terminate()
@@ -220,6 +235,27 @@ class ChildHandle:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+        if self._failstop_parent_conn is not None:
+            self._failstop_parent_conn.close()
+            self._failstop_parent_conn = None
+        if self._failstop_child_conn is not None:
+            self._failstop_child_conn.close()
+            self._failstop_child_conn = None
+
+    def poll_failstop(self, timeout: float = 0.0) -> dict | None:
+        """G2①：（阻塞式，呼叫端須經 `asyncio.to_thread`）輪詢 child 的 failstop 專用
+        channel——與 RPC pipe（`_conn`）完全獨立，不受 rpc_id 比對/poison 邏輯影響。回傳
+        None 代表這次逾時內沒有新通知；channel 已關閉/不存在時同樣回 None（不 raise，呼叫端
+        `AgentRunner._failstop_watchdog` 是個無窮迴圈，不該被單次 poll 的例外打斷）。"""
+        conn = self._failstop_parent_conn
+        if conn is None:
+            return None
+        try:
+            if conn.poll(timeout):
+                return conn.recv()
+        except (EOFError, OSError):
+            return None
+        return None
 
     @property
     def alive(self) -> bool:
@@ -251,7 +287,9 @@ class AgentRunner:
                  child_command_timeout: float = 8.0, child_ping_interval: float = 10.0,
                  child_ping_timeout: float = 20.0, heartbeat_interval: float = 15.0,
                  backoff_base: float = 1.0, backoff_max: float = 60.0,
-                 stable_session_seconds: float = 30.0) -> None:
+                 stable_session_seconds: float = 30.0,
+                 recovery_probe_interval: float = 5.0,
+                 failstop_poll_timeout: float = 1.0) -> None:
         self._transport = transport
         self._buffer = buffer
         self._child = child
@@ -273,6 +311,32 @@ class AgentRunner:
         # 每輪 sleep 前的 backoff 值，僅供測試觀察退避序列形狀，不影響邏輯。
         self._backoff_history: list[float] = []
 
+        # Inc1 D9/G2（Task 12）：fail-stop 狀態機。`_recovery_lock` 只包本機原子轉移
+        # （latch/epoch++/sentinel 寫入；probe→清 latch/sentinel→snapshot），絕不 await
+        # 任何網路 I/O（R3-3）——WS send 一律搬到 lock 外，見 `_health_sender`。
+        self._recovery_probe_interval = recovery_probe_interval
+        self._failstop_poll_timeout = failstop_poll_timeout
+        self._recovery_lock = asyncio.Lock()
+        self._latched = False
+        self._latch_detail: str | None = None
+        self._health_epoch = 0
+        self._health_queue: asyncio.Queue = asyncio.Queue()
+        self._load_persisted_health()
+
+    def _load_persisted_health(self) -> None:
+        """啟動時（同步、建構子內）讀取 durable 狀態：sentinel 檔存在＝latch 仍在效（buffer
+        之外路徑，見 buffer.py write_sentinel docstring）——epoch 取 sentinel 記的值與 buffer
+        meta 存的值兩者較大者（sentinel 可能記著父程序來不及覆寫的佔位值 -1，這種情況下改信
+        buffer meta；buffer meta 若因為同一次故障也寫不進去，則沿用 sentinel 的值）。沒有
+        sentinel 時單純讀 buffer meta（預設 0，全新 buffer 或從未 latch 過）。"""
+        sentinel = self._buffer.read_sentinel()
+        if sentinel is not None:
+            self._latched = True
+            self._latch_detail = sentinel.get("detail")
+            self._health_epoch = max(int(sentinel.get("epoch", 0)), self._buffer.get_health_epoch())
+        else:
+            self._health_epoch = self._buffer.get_health_epoch()
+
     def ensure_child(self) -> None:
         """child 未活則 (re)start；child alive 但 self._account 遺失（接手他人已在跑的
         child 的邊界情況）視同需要重啟。回傳後 self._account 必為非空。"""
@@ -281,6 +345,50 @@ class AgentRunner:
         if self._child.alive:
             self._child.terminate()
         self._account = self._child.start()
+
+    async def _latch(self, detail: str) -> None:
+        """G2①/⑤/⑦：本機原子轉移（latch=True、epoch+=1、sentinel 寫入），只受
+        `_recovery_lock` 保護——**絕不 await 任何網路 I/O**（R3-3）：即使 `_health_sender`
+        當下卡在一個緩慢/卡住的 `transport.send()`，也不會拖住這裡，因為 sender 只在
+        「重驗」那一小段（純記憶體讀取）才持有這把鎖，實際送出永遠在鎖外（見
+        `_health_sender`）。latch 完成後把新 epoch 推進健康佇列，交給單一序列化 sender
+        擇機送出（不在這裡直接送）。"""
+        async with self._recovery_lock:
+            self._latched = True
+            self._latch_detail = detail
+            self._health_epoch += 1
+            epoch = self._health_epoch
+            await asyncio.to_thread(self._buffer.write_sentinel, epoch=epoch, detail=detail)
+        self._health_queue.put_nowait(epoch)
+
+    async def _recover(self) -> None:
+        """G2④/⑤/⑦：解除條件＝storage probe（對同一 buffer 寫入→commit→讀回）通過。
+        `_recovery_lock` 內完成「probe→清 latch/sentinel→取 (epoch,status) snapshot」的
+        本機原子轉移——鎖本身的互斥已保證探針通過的當下不會有新的 `_latch()` 正在進行中
+        （沒有『探針期間又壞了但沒被發現』的競態：新故障必須等到這把鎖釋放才能真正 latch，
+        屆時 epoch 會再 +1，語意上等價於『先恢復又立即重新故障』，不違反任何不變量）。
+        `await transport.send` 永遠在鎖釋放之後才發生（經 `_health_sender`，不在這裡）。"""
+        async with self._recovery_lock:
+            if not self._latched:
+                return
+            ok = await asyncio.to_thread(self._buffer.probe)
+            if not ok:
+                return
+            self._latched = False
+            self._latch_detail = None
+            await asyncio.to_thread(self._buffer.clear_sentinel)
+            await asyncio.to_thread(self._buffer.set_health_epoch, self._health_epoch)
+            epoch = self._health_epoch
+        self._health_queue.put_nowait(epoch)
+
+    async def _reject_failstop(self, cmd_id: str) -> None:
+        """G2②：latch 期間拒絕 mutating 指令——volatile `UpCommandRejected` **直送 WS，
+        不經 outbox**（buffer 已壞時仍能拒絕）。送不出去（transport 已斷）就讓例外原樣往外
+        拋，交給 `run_once` 的例外收攏斷線，之後由 server 端的 lease 判定 not-ready
+        （見 spec D9②：「送不出就斷線交 lease」）。"""
+        await self._transport.send(
+            UpCommandRejected(cmd_id=cmd_id, error_kind="failstop").model_dump()
+        )
 
     async def run_once(self) -> None:
         """單一 WS session：connect→login→pump/receive/heartbeat/watchdog 直到斷線/例外
@@ -293,16 +401,24 @@ class AgentRunner:
             await self._transport.send(
                 UpLogin(protocol=PROTOCOL_VERSION, account=self._account,
                         mode=self._mode,
-                        # Inc1 D7/R3-2：health_epoch 是本 session 的健康狀態基準宣告。
-                        # G2 failstop latch/epoch 追蹤是後續 task 的 runtime 接線，這裡先給
-                        # 0（訊息合法的最小欄位傳遞），實際單調遞增計數由之後的 task 補上。
-                        health_epoch=0).model_dump()
+                        # Inc1 D7/R3-2/G2⑤：health_epoch 是本 session 的健康狀態基準宣告——
+                        # 讀自建構子/`_load_persisted_health` 載入的目前值（latch 中則是
+                        # latch 當時的 epoch），buffer 重建歸零由這次宣告吸收（server 端據此
+                        # 重設本連線已見最大 epoch，見 agent_ws.py AgentChannel.mark_logged_in）。
+                        health_epoch=self._health_epoch).model_dump()
             )
+            # D9⑥：login 後立刻排一次健康回報（不等 heartbeat_interval）——server 端的
+            # pending_health 才能盡快收斂，不必乾等第一次 heartbeat（生產環境預設 15s，
+            # 太慢；latch 中一樣送、status 會如實回報 failstop）。
+            self._health_queue.put_nowait(self._health_epoch)
             tasks = [
                 asyncio.create_task(self._pump()),
                 asyncio.create_task(self._receive_loop()),
                 asyncio.create_task(self._heartbeat()),
                 asyncio.create_task(self._child_watchdog()),
+                asyncio.create_task(self._health_sender()),
+                asyncio.create_task(self._failstop_watchdog()),
+                asyncio.create_task(self._recovery_prober()),
             ]
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             for t in done:
@@ -400,7 +516,9 @@ class AgentRunner:
                 await asyncio.to_thread(self._buffer.mark_sent, msg.event_id)
                 self._inflight.pop(msg.event_id, None)
             elif isinstance(msg, DownHealth):
-                await self._transport.send(self._make_health().model_dump())
+                # G2⑧：不直接送——排進健康佇列，交單一序列化 sender 處理（出隊前重驗
+                # (epoch,status,latch)，見 `_health_sender`）。
+                self._health_queue.put_nowait(self._health_epoch)
             elif isinstance(msg, DownPlace | DownCancel | DownUpdate):
                 # Inc1 D4 agent 端①-④（順序即正確性）：inline 序列執行＝agent 端 native
                 # 序列化第一層（同一時間只有一則下行指令在跑），child pipe lock 為第二層。
@@ -433,12 +551,13 @@ class AgentRunner:
         )
 
     async def _execute_mutating_command(self, msg: Any) -> None:
-        """place/cancel/update：spec D4 agent 端①-④，順序即正確性。"""
+        """place/cancel/update：spec D4 agent 端①-④＋G2②latch 檢查，順序即正確性。"""
         cmd_id = msg.cmd_id
 
         # ① ledger 命中 → 不重執行，確保 outbox 有該 cmd 未送 ack（無則以存檔 result 補
         # append）。刻意排在②③之前（S#4）：已經真的執行過，就算 scope/expiry 這次看起來
-        # 不符，也不能改口——存檔結果才是唯一誠實的答案，重執行風險遠高於誤判。
+        # 不符，也不能改口——存檔結果才是唯一誠實的答案，重執行風險遠高於誤判。ledger 命中
+        # 的重播從不呼叫 native，latch 中也照常放行（G2 只擋「尚未真正執行過」的指令）。
         cached = await asyncio.to_thread(self._buffer.lookup_command, cmd_id)
         if cached is not None:
             await asyncio.to_thread(
@@ -446,6 +565,13 @@ class AgentRunner:
                 account=self._account, mode=self._mode,
             )
             return  # ack 交給 _pump 走 outbox at-least-once 送出，不在此直送。
+
+        # G2②：latch 中拒絕一切尚未真正執行過的 mutating 指令——volatile 直送，不進
+        # outbox（buffer 已壞時仍能拒絕）。排在①之後、②③之前：不做無謂的 scope/expiry
+        # 判斷，latch 期間一律先拒。
+        if self._latched:
+            await self._reject_failstop(cmd_id)
+            return
 
         # ② scope 核對（R1-2）：指令 account/mode 與目前登入 scope 不符 → scope_mismatch，
         # 不執行。best-effort 直送（不進 outbox）——未執行 native，遺失靠重送自然收斂
@@ -464,6 +590,13 @@ class AgentRunner:
                 cmd_id=cmd_id, event_id=0, ok=False, error_kind="expired",
                 message="指令已過期，agent 拒絕執行",
             ).model_dump())
+            return
+
+        # G2②（再驗一次）：spec 逐字要求「每次 native 呼叫前檢查」——上面②③本身雖無 await
+        # 邊界，仍在真正打 native 之前再確認一次，避免未來②③加上 I/O 後留下時間窗、也讓這裡
+        # 成為真正權威、緊貼 native 呼叫前的守門點。
+        if self._latched:
+            await self._reject_failstop(cmd_id)
             return
 
         # ④ 執行 native → 同一 SQLite 交易寫 command_ledger＋append ack 進 outbox → 泵送。
@@ -489,14 +622,51 @@ class AgentRunner:
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(self._heartbeat_interval)
-            await self._transport.send(self._make_health().model_dump())
+            self._health_queue.put_nowait(self._health_epoch)
 
-    def _make_health(self) -> UpHealth:
-        # Inc1 D9/G2：status/health_epoch 是 fail-stop latch 狀態機的 wire 表現——那條狀態
-        # 機（child 落地失敗→latch→拒新指令→lease→probe 恢復）是後續 task 的 runtime 接線。
-        # 這裡先固定回報 status="ok"、health_epoch=0（訊息合法的最小欄位傳遞），與 Inc0
-        # 既有行為等價（agent 目前尚不會偵測/latch failstop）。
-        return UpHealth(status="ok", detail=None, health_epoch=0)
+    async def _health_sender(self) -> None:
+        """G2⑧：唯一序列化送出 health frame 的地方（heartbeat／DownHealth 詢問／
+        latch／recover 都只 `put_nowait` 進佇列，不直接 send）。每個 frame 出隊後在
+        `_recovery_lock` 下重驗：`frame_epoch` 與目前 `_health_epoch` 不符 → 代表這個 frame
+        是在更新的 latch/recover 事件之前排進來的，已經過期，直接丟棄不送（已交付 wire 的
+        frame 無法撤回，但排隊中尚未送出的可以）。status/detail 一律讀「送出當下」的目前
+        值（不是排入當下的舊值），確保吻合的 epoch 一定對應目前正確的 status。實際
+        `transport.send` 在鎖釋放之後才發生（R3-3：不讓網路 I/O 卡住 lock，`_latch` 才能
+        永遠不被卡住的 send 拖住）。"""
+        while True:
+            frame_epoch = await self._health_queue.get()
+            async with self._recovery_lock:
+                if frame_epoch != self._health_epoch:
+                    continue
+                status = "failstop" if self._latched else "ok"
+                detail = self._latch_detail if self._latched else None
+                epoch = self._health_epoch
+            await self._transport.send(
+                UpHealth(status=status, detail=detail, health_epoch=epoch).model_dump()
+            )
+
+    async def _failstop_watchdog(self) -> None:
+        """G2①：child 落地失敗經獨立 IPC channel（R2-8，不混 RPC pipe）通知父程序——這裡是
+        唯一消費端，收到就立即呼叫 `_latch`（該呼叫本身不受任何網路 I/O 阻塞，見其
+        docstring）。`ChildHandle.poll_failstop` 是阻塞呼叫，搬到 thread 執行，逾時內沒有
+        通知就回 None、迴圈繼續。`getattr` 容錯（比照 `broker/watchdog.py::_probe_healthy`
+        既有慣例）：不支援這個介面的 child（測試替身／未來精簡實作）直接讓這個 task 正常
+        結束，不拋例外把整個 `run_once` 拖垮——等價於「這個 child 永遠不會回報 failstop」。"""
+        poll = getattr(self._child, "poll_failstop", None)
+        if poll is None:
+            return
+        while True:
+            notice = await asyncio.to_thread(poll, self._failstop_poll_timeout)
+            if notice is not None:
+                await self._latch(notice.get("detail") or "child 回報 buffer 落地失敗")
+
+    async def _recovery_prober(self) -> None:
+        """G2④：latch 期間週期性嘗試 storage probe，通過就呼叫 `_recover()` 解除 latch。
+        未 latch 時直接跳過（no-op），避免對健康的 buffer 做無謂的探測寫入。"""
+        while True:
+            await asyncio.sleep(self._recovery_probe_interval)
+            if self._latched:
+                await self._recover()
 
     async def _child_watchdog(self) -> None:
         """定期 ping SDK 子程序（#203 凍結偵測）：False 或例外（含逾時）一律視為凍結，

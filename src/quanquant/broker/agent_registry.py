@@ -11,9 +11,13 @@ session_state/supervisor/背景 task）；`AgentRegistry` 是 `user_id -> UserAg
 各自一份 `BrokerSupervisor` 鎖，A 的 reconcile 卡住只會佔住 A 自己的鎖，不影響 B 的 place。
 """
 import asyncio
+import logging
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
@@ -53,3 +57,31 @@ class AgentRegistry:
 
     def slots(self) -> Iterable[UserAgentSlot]:
         return self._slots.values()
+
+
+async def run_health_lease_watchdog(
+    registry: AgentRegistry, *, lease_seconds: float, interval: float = 5.0,
+) -> None:
+    """Inc1 D9/G2③（Task 12）：server 端 heartbeat lease——WS 連線存活不等於健康。這是
+    per-registry 全站唯一一份的背景 task（不是 per-slot），每輪掃過全部 slot；斷線本身已由
+    `agent_ws.py` 的 `finally` 立即 `mark_disabled`（更即時），這裡只補「連線仍開著、但本連線
+    的健康回報（`status="ok"`）已經斷流超過 `lease_seconds`」這一種情境——只在該 slot **目前
+    是 ready** 時才出手（`session_state.ready` 本就是 place/cancel/update route 的擋新單
+    依據，見 D9 admission gate），避免對本來就還在 pending_health／已離線的 slot 重複標記或
+    覆寫更明確的既有錯誤訊息。`channel.last_ok_heartbeat` 只在 `AgentChannel.note_health`
+    接受一則 `status="ok"` 時才更新，未曾收過任何 ok（如剛登入、尚在 pending_health）時為
+    `None`，此時 lease 判定天然不適用（`ready` 本就還是 False，不需要這裡插手）。"""
+    while True:
+        await asyncio.sleep(interval)
+        now = time.monotonic()
+        for slot in registry.slots():
+            channel = slot.channel
+            last_ok = getattr(channel, "last_ok_heartbeat", None)
+            if last_ok is None:
+                continue
+            if slot.session_state.ready and (now - last_ok) > lease_seconds:
+                log.warning(
+                    "agent health lease 過期，user_id=%s 標 not-ready（超過 %.0f 秒未收到 "
+                    "UpHealth(ok)）", slot.user_id, lease_seconds,
+                )
+                slot.session_state.mark_unhealthy("健康回報逾時（lease 過期）")

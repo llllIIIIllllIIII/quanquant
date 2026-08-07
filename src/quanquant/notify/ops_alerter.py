@@ -135,6 +135,17 @@ class OpsAlerter:
                   f"距最後一筆新鮮報價已 {age_seconds:.0f} 秒（僅交易時段判定）",
                   severity="critical", throttle=300.0)
 
+    def failstop(self, *, user_id, enabled: bool, detail: str = "") -> None:
+        """Inc1 D9/G2（Task 12）：agent fail-stop latch 事件——**連線/斷線本身不告警**（常態
+        雜訊，見 spec D9），只有健康語意真的進入/解除 failstop 才報，由呼叫端
+        （`web/routers/agent_ws.py` 的 UpHealth handler）只在狀態真的轉換時呼叫一次，不是
+        每則 heartbeat 都呼叫——這裡的節流是雙重保險，非唯一防線。"""
+        state = "進入 fail-stop（拒絕新單）" if enabled else "解除 fail-stop"
+        body = f"user_id={user_id}"
+        if detail:
+            body += f"\n{detail}"
+        self.emit("agent_failstop", f"agent {state}", body, severity="critical", throttle=60.0)
+
     def kill_switch(self, *, enabled: bool, actor_user_id, scope: str = "global",
                     open_order_count: int = 0, detail: str = "") -> None:
         """D3 兩層 kill switch：`scope` 區分「個人（我的）」急停 vs「全站總閘」，記進告警

@@ -224,7 +224,7 @@ async def _start_agent_channel_subsystem(
     from decimal import Decimal
 
     from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
-    from quanquant.broker.agent_registry import AgentRegistry, UserAgentSlot
+    from quanquant.broker.agent_registry import AgentRegistry, UserAgentSlot, run_health_lease_watchdog
     from quanquant.broker.inbox_worker import RawInboxWorker
     from quanquant.broker.lifecycle import run_confirm_token_cleanup
     from quanquant.broker.repository import BackfillConflictError, backfill_account_bindings
@@ -331,6 +331,11 @@ async def _start_agent_channel_subsystem(
     # 各跑一次；agent 分支沒有 native connect 時機可以掛「connect 成功後跑一次」，故在
     # wiring 完成時直接排一次 one-shot 掃描。
     tasks.append(asyncio.create_task(_scan_orphan_orders_once(_order_session, ops_alerter)))
+    # D9/G2③（Task 12）：server heartbeat lease——全站唯一一份、每輪掃過全部 slot（不是
+    # per-slot），WS 連線存活不等於健康，見 agent_registry.py 該函式 docstring。
+    tasks.append(asyncio.create_task(run_health_lease_watchdog(
+        registry, lease_seconds=settings.agent_health_lease_seconds,
+    )))
     log.info("agent 通道下單子系統已配線（%d 位 owner，各自獨立 slot），等待各自的本機 broker "
              "agent 連線", len(owner_ids))
 

@@ -8,9 +8,23 @@ Inc1 D11/D4（Task 9）：schema v2 加 outbox.account/mode/cmd_id ＋新表 com
 support agent 端 command ledger 執行去重（① ledger 命中不重執行，見 runner.py
 `_execute_mutating_command`）。`meta['schema_version']` 標記版本；升級三情境見
 `_ensure_schema_v2`。
+
+Inc1 D9/G2（Task 12）：本檔另提供三組 fail-stop 狀態機用的原語——
+  - `write_sentinel`/`read_sentinel`/`clear_sentinel`/`has_sentinel`：**buffer 之外**的
+    純檔案系統 durable latch 標記（`<buffer_path>.failstop`）——child 的 callback 落地
+    失敗（含退化寫入亦失敗）時，SQLite 本身可能已經壞了，不能指望再寫一筆 SQLite 列來
+    記錄「壞了」這件事；純檔案 open/write/flush/fsync/replace 是與 SQLite 完全獨立的
+    I/O 路徑，latch 狀態因此能在 agent 程序重啟後仍然存在（sentinel 存在＝latch）。
+  - `get_health_epoch`/`set_health_epoch`：`health_epoch` 持久化於 `meta` 表（G2⑤單調性，
+    latch 時 +1）——buffer 本身健康時才寫得進去；若 buffer 已壞，權威值退回 sentinel
+    檔內記的 epoch（見 `runner.py` 啟動時的復原邏輯）。
+  - `probe`：G2④ storage probe——對同一 buffer 寫入→commit→讀回，成功才代表可解除 latch、
+    回報 `status="ok"`。任何例外一律吞掉回 False（探針失敗是常見情境，不是呼叫端的錯）。
 """
 import json
+import os
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -104,6 +118,84 @@ class DurableBuffer:
 
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self._path, timeout=5)
+
+    @property
+    def path(self) -> str:
+        return self._path
+
+    # ------------------------------------------------------------------
+    # G2①/⑤（Task 12）：sentinel 檔（buffer 之外路徑，durable latch 標記）
+    # ------------------------------------------------------------------
+
+    def _sentinel_path(self) -> Path:
+        return Path(self._path + ".failstop")
+
+    def write_sentinel(self, *, epoch: int, detail: str) -> None:
+        """獨立於 SQLite 之外的 durable latch 標記——純檔案系統操作，buffer 本身寫壞了也
+        不影響這裡成功與否。寫暫存檔再 `os.replace` 原子改名，避免中途崩潰留下半寫檔案。"""
+        path = self._sentinel_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"epoch": epoch, "detail": detail}, ensure_ascii=False)
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def read_sentinel(self) -> dict | None:
+        path = self._sentinel_path()
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def clear_sentinel(self) -> None:
+        self._sentinel_path().unlink(missing_ok=True)
+
+    def has_sentinel(self) -> bool:
+        return self._sentinel_path().exists()
+
+    # ------------------------------------------------------------------
+    # G2④/⑤（Task 12）：health_epoch 持久化 ＋ storage probe
+    # ------------------------------------------------------------------
+
+    def get_health_epoch(self) -> int:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = 'health_epoch'"
+            ).fetchone()
+        return int(row[0]) if row is not None else 0
+
+    def set_health_epoch(self, epoch: int) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('health_epoch', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (str(epoch),),
+            )
+
+    def probe(self) -> bool:
+        """G2④：對同一 buffer 寫入→commit→讀回，成功才代表可解除 latch、回報 status="ok"。
+        任何例外（SQLite 仍壞）一律回 False，不 raise——呼叫端（`runner.py` 的 recovery
+        流程）據此判斷要不要繼續等下一輪，不需要 try/except 包這個呼叫。"""
+        token = uuid.uuid4().hex
+        try:
+            with self._conn() as conn:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES ('probe', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (token,),
+                )
+            with self._conn() as conn:
+                row = conn.execute(
+                    "SELECT value FROM meta WHERE key = 'probe'"
+                ).fetchone()
+            return row is not None and row[0] == token
+        except sqlite3.Error:
+            return False
 
     def append(self, kind: str, payload: dict, *, account: str | None = None,
                mode: str | None = None, cmd_id: str | None = None) -> int:

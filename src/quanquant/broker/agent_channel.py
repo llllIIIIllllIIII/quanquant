@@ -38,6 +38,16 @@ class AgentChannel:
         self.logged_in = False
         self.account = ""
         self.last_heartbeat: float | None = None
+        # Inc1 D9/G2（Task 12）：health 狀態機——`_health_max_epoch` 是本連線（per-session，
+        # 隨 mark_logged_in 重宣告而重設，R3-2/R5-1）已見過的最大 health_epoch；只有
+        # `health_epoch >= _health_max_epoch` 的 UpHealth 才會被接受（見 note_health）。
+        # `last_ok_heartbeat`：只在接受一則 status="ok" 時更新（G2③ lease 判定專用——
+        # `last_heartbeat` 是既有的「任何上行訊息都算存活」欄位，WS 連線存活不等於健康，
+        # 兩者刻意分開）。`failstop`/`health_status`：目前已知的健康語意，供 UI/告警參考。
+        self._health_max_epoch = 0
+        self.last_ok_heartbeat: float | None = None
+        self.health_status = "unknown"
+        self.failstop = False
         # codex round1 fix2：雙連線 generation——新連線取代舊連線後，舊 WS handler 較晚才
         # 跑到自己的 finally 時，若無條件 detach()，會把新連線也拆掉、誤標 offline。每次
         # attach() 遞增這個計數，detach(generation) 只在呼叫者手上的 generation 仍是目前值
@@ -77,12 +87,34 @@ class AgentChannel:
             if not fut.done():
                 fut.set_exception(AgentCommandTimeoutError("agent 連線中斷，指令結果未知"))
 
-    def mark_logged_in(self, account: str) -> None:
+    def mark_logged_in(self, account: str, *, health_epoch: int = 0) -> None:
+        """`health_epoch`：Inc1 D9/G2⑤/R3-2——UpLogin 宣告的本 session 健康狀態基準，**直接
+        覆寫**（非取 max）本連線的已見最大 epoch，讓 buffer 重建後較低的 epoch 也能在新連線
+        被正確接受，不被舊連線遺留的較高 max 永久拒收（見 R5-1「buffer 重建 epoch 歸零→
+        重宣告不死鎖」）。login 後健康狀態重置為 pending（未收過本連線任何健康回報）。"""
         self.logged_in = True
         self.account = account
+        self._health_max_epoch = health_epoch
+        self.health_status = "unknown"
+        self.failstop = False
 
     def note_heartbeat(self) -> None:
         self.last_heartbeat = time.monotonic()
+
+    def note_health(self, *, status: str, health_epoch: int) -> bool:
+        """G2 R2-3/R5-1：epoch 單調性——只接受 `health_epoch >= 已見最大`；較舊的一律忽略
+        （回傳 False，呼叫端不應據此改變 ready 狀態，讓「見過較大 epoch 後舊 ok 永不恢復」
+        成立）。任何被接受的 UpHealth 都算存活訊號（`note_heartbeat`）；只有被接受且
+        `status=="ok"` 才更新 `last_ok_heartbeat`（G2③ lease 判定專用）。"""
+        self.note_heartbeat()
+        if health_epoch < self._health_max_epoch:
+            return False
+        self._health_max_epoch = health_epoch
+        self.health_status = status
+        self.failstop = status == "failstop"
+        if status == "ok":
+            self.last_ok_heartbeat = time.monotonic()
+        return True
 
     def resolve_ack(self, ack: UpCmdAck) -> None:
         fut = self._pending.pop(ack.cmd_id, None)

@@ -14,11 +14,24 @@ mode!="sim" 時（防禦層 3，Increment 0 只做 sim）：完全不建立 nati
 callback：native client 建構時傳入 `on_raw=buffer.append`——SDK callback 執行緒（Solace/
 .NET）直接同步呼叫，`DurableBuffer.append()` 落地成功（INSERT+commit）才返回，符合 T0.1
 「跨程序保存、零丟單」的設計（見 `agent/buffer.py`）。
+
+Inc1 D9/G2①（Task 12）：callback 落地失敗時的雙層防線——主寫入（`buffer.append`，SQLite）
+失敗 → 退化寫入（`_try_degraded_write`，純檔案 append，與 SQLite 完全獨立的 I/O 路徑）；
+兩者皆失敗才是真正的「落地失敗」：寫 sentinel（`buffer.write_sentinel`，buffer 之外路徑，
+durable）＋經**專用 IPC channel**（`failstop_conn`，`child_main` 的獨立參數，R2-8：絕不
+與既有 RPC pipe 共用——那條 pipe 靠 `rpc_id` 比對，混用會讓遲到的 failstop 通知被誤判成
+「上一輪逾時後才姍姍來遲的 reply」直接丟棄，或反過來污染正常 RPC 的 rpc_id 序列）通知父
+程序。父程序收到通知後才是真正決定 latch／epoch++ 的權威（`runner.py` AgentRunner._latch）
+——child 端只負責「盡力通知＋盡力寫 sentinel」，不持有 epoch 狀態（那需要跨程序協調，交給
+父程序統一管理）。
 """
+import json
 import logging
+import os
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 from quanquant.agent.buffer import DurableBuffer
@@ -51,11 +64,67 @@ class _AccountBox:
         self.value: str | None = None
 
 
-def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox):
+def _degraded_write_path(buffer: DurableBuffer) -> Path:
+    return Path(buffer.path + ".degraded.jsonl")
+
+
+def _try_degraded_write(buffer: DurableBuffer, kind: str, payload: dict, *,
+                         account: str | None, mode: str) -> None:
+    """G2①退化寫入：SQLite 主寫入（`buffer.append`）失敗時的最後手段——純檔案
+    append-only（獨立於 SQLite 之外的 I/O 路徑，SQLite 損壞——如 WAL 檔鎖死/磁碟配額
+    ——不必然拖累這裡的成功率）。任何例外原樣往外拋，呼叫端（`_wrap_on_raw`）據以判定
+    「雙寫皆失敗」，觸發 G2① 的 sentinel＋IPC 通知流程。"""
+    path = _degraded_write_path(buffer)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(
+        {"kind": kind, "payload": payload, "account": account, "mode": mode},
+        ensure_ascii=False,
+    )
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox,
+                  failstop_conn=None):
     """把 `buffer.append` 包一層，補上 D5/I7 要求的 account/mode 蓋章——SDK callback
-    只給 (kind, payload)，account 從 `account_box`（connect 成功後才填）動態讀取。"""
+    只給 (kind, payload)，account 從 `account_box`（connect 成功後才填）動態讀取。
+
+    G2①：主寫入失敗 → 退化寫入；兩者皆失敗 → 寫 sentinel（durable，buffer 之外路徑）＋
+    經 `failstop_conn`（獨立於 RPC pipe 的專用 IPC channel，R2-8）通知父程序，之後原樣
+    re-raise（callback 執行緒/呼叫端仍需要知道這次真的沒有落地，維持既有例外語意，不吞
+    ——SDK callback 若因此失敗，`child_main` 的既有 try/except 會把它轉成結構化的
+    `error_kind="exception"` reply，這是本來就有的正常錯誤回報路徑，本函式不改變它）。"""
     def _on_raw(kind: str, payload: dict) -> int:
-        return buffer.append(kind, payload, account=account_box.value, mode=mode)
+        account = account_box.value
+        try:
+            return buffer.append(kind, payload, account=account, mode=mode)
+        except Exception as primary_exc:
+            try:
+                _try_degraded_write(buffer, kind, payload, account=account, mode=mode)
+                return -1  # 退化寫入成功：沒有 SQLite row id 可回，呼叫端本就不依賴它
+            except Exception as degraded_exc:
+                detail = (
+                    f"buffer 落地失敗（主寫入: {primary_exc}；退化寫入: {degraded_exc}）"
+                )
+                log.error("callback 落地雙寫皆失敗，觸發 G2 fail-stop latch: %s", detail)
+                try:
+                    # child 不持有 epoch 狀態（那由父程序統一管理）——這裡寫的 epoch=-1
+                    # 只是佔位，父程序收到 IPC 通知後會用自己遞增後的權威值覆寫這個 sentinel
+                    # （見 runner.py AgentRunner._latch）；即使父程序來不及覆寫就再次崩潰，
+                    # sentinel 存在本身已經足以讓下次啟動視為 latch（durable 的定義只看
+                    # 「存在與否」，不依賴這裡的 epoch 值精確與否）。
+                    buffer.write_sentinel(epoch=-1, detail=detail)
+                except Exception:
+                    log.error("sentinel 寫入也失敗，僅能靠 IPC 通知父程序（若 IPC 也失敗，"
+                              "父程序仍會靠子程序心跳凍結偵測——issue #203 既有防線——察覺異常）")
+                if failstop_conn is not None:
+                    try:
+                        failstop_conn.send({"type": "failstop", "detail": detail})
+                    except Exception:
+                        log.error("failstop IPC 通知也失敗——callback 執行緒已無法對外示警")
+                raise
     return _on_raw
 
 
@@ -115,8 +184,14 @@ def child_main(
     mode: str,
     buffer_path: str,
     native_factory: Callable[..., Any] | None = None,
+    failstop_conn=None,
 ) -> None:
-    """conn: multiprocessing.Connection（子端）。credentials={"api_key","secret_key"}。"""
+    """conn: multiprocessing.Connection（子端，既有 RPC pipe）。
+    credentials={"api_key","secret_key"}。`failstop_conn`（Inc1 D9/G2①，Task 12）：獨立於
+    `conn` 之外的專用單向 IPC channel（R2-8，`ChildHandle.start()` 用 `ctx.Pipe(duplex=False)`
+    建立、只送 callback 落地雙寫失敗的通知）——留 `None` 預設值以相容尚未接線這條 channel 的
+    既有呼叫端（測試/舊呼叫），此時退化寫入也失敗只會寫 sentinel，不會有 IPC 通知（父程序仍
+    可能靠既有子程序心跳凍結偵測——#203 防線——間接察覺異常，但不是即時的）。"""
     factory = native_factory or _default_native_factory
     secrets = [v for v in credentials.values() if v]
     buffer = DurableBuffer(buffer_path)
@@ -126,7 +201,8 @@ def child_main(
     account_box = _AccountBox()  # connect 成功後才填值，見 _wrap_on_raw docstring。
     if mode == "sim":
         native = factory(credentials=credentials, symbol=symbol, mode=mode,
-                         on_raw=_wrap_on_raw(buffer, mode=mode, account_box=account_box))
+                         on_raw=_wrap_on_raw(buffer, mode=mode, account_box=account_box,
+                                              failstop_conn=failstop_conn))
 
     while True:
         op = conn.recv()
