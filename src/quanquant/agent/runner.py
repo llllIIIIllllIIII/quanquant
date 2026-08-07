@@ -188,6 +188,35 @@ class ChildHandle:
                 raise RuntimeError(f"agent 子程序 connect 失敗: {reply}")
             return reply["account"]
 
+    def respawn(self, expected_generation: int) -> str | None:
+        """R4-a（HIGH，codex 終審 round4）：把 recovery 用的 terminate+start 合成單一
+        generation-scoped transaction，取代舊版 `_respawn_child()` 拆成兩個獨立、各自可被
+        取消的 `asyncio.to_thread` 呼叫（`terminate` 一個、`start` 一個）。危險情境：
+        `run_once()` 結束會 cancel 呼叫端（recovery 相關 task），但 `asyncio.to_thread`
+        底層真正在跑的 OS thread 無法被真的中止——若 terminate 的 thread 已完成、start 的
+        thread 卻在下一個 session 的 `ensure_child()` 已經合法 spawn 出新 child **之後**才
+        姍姍來遲執行，舊版會無條件覆寫 `self._process`/`self._conn`，把新 session 剛啟動
+        的健康 child 直接洩漏掉（process 沒人 terminate、Shioaji login 也沒登出）。
+
+        修法：terminate→start 全程在同一次 `with self._lock` 持有內完成，且動手前先核對
+        `expected_generation` 是否仍是目前 generation——呼叫端在真正發動這次 respawn
+        「意圖」的當下（呼叫本方法之前）捕捉這個快照；若這段期間（因為呼叫端被取消、
+        thread 排程延遲等原因）目前 generation 已經被別的呼叫（最常見是新 session 的
+        `ensure_child()`，它自己的 `start()` 也會讓 generation 前進）換過，代表這次呼叫
+        已經過期——no-op，完全不 terminate、不 start，回傳 `None`；呼叫端據此得知「這次
+        respawn 沒有生效」，交由下一輪重新讀取目前 generation/alive 狀態對帳，不會誤殺
+        任何後續已經換上的新 child，也不會在它之上再疊一個沒人管的重複 child。
+
+        generation 沒變則正常執行：terminate 目前 child（就算已經不 alive 也是 no-op）→
+        start 一個新的（內部已含一次 connect RPC、`_generation += 1`）→ 回傳新 child 回報
+        的 account（成功時保證非 None，呼叫端可放心用 `is None` 判斷是否過期）。`start()`
+        可能拋出的例外（連線失敗、帳號不符 `FatalAgentError`）原樣往外傳，語意不變。"""
+        with self._lock:
+            if expected_generation != self._generation:
+                return None
+            self.terminate()
+            return self.start()
+
     def request(self, op: dict, *, timeout: float) -> dict:
         # R3-1：在進入鎖（可能因為併發 respawn 而卡住）之前，先捕捉「這次呼叫意圖操作的
         # generation」——`_rpc()` 拿到鎖之後會重新核對，若這段等待期間 respawn 已經換代，
@@ -292,12 +321,17 @@ class ChildHandle:
         「新 child 是否又立即 latch」。回傳完整資訊：`ok`（存活/有回覆）、`latched`
         （native_runner 端 `ChildFailstopLatch.tripped`，見 `_dispatch` 的 ping 分支）；
         逾時/pipe 異常時 `ok=False, latched=None`（None 代表拿不到，呼叫端一律當成不安全
-        處理，不得視為「未 latch」而放行）。"""
+        處理，不得視為「未 latch」而放行）。
+
+        R4-b（HIGH，codex 終審 round4）：額外帶上 `generation`/`fault_seq`（child 自報，見
+        native_runner.py `_dispatch` ping 分支）——`AgentRunner._recover()` 在「清 sentinel
+        前原子重驗」時用得到；逾時/異常時同樣回 `None`（拿不到，呼叫端不得假設未變）。"""
         try:
             reply = self.request({"op": "ping"}, timeout=timeout)
         except TimeoutError:
-            return {"ok": False, "latched": None}
-        return {"ok": bool(reply.get("ok")), "latched": bool(reply.get("latched", False))}
+            return {"ok": False, "latched": None, "generation": None, "fault_seq": None}
+        return {"ok": bool(reply.get("ok")), "latched": bool(reply.get("latched", False)),
+                "generation": reply.get("generation"), "fault_seq": reply.get("fault_seq")}
 
     def terminate(self) -> None:
         with self._lock:
@@ -445,7 +479,7 @@ class AgentRunner:
             self._child.terminate()
         self._account = self._child.start()
 
-    async def _latch(self, detail: str) -> None:
+    async def _latch(self, detail: str, *, expected_generation: int | None = None) -> None:
         """G2①/⑤/⑦：本機原子轉移（latch=True、epoch+=1、sentinel 寫入），只受
         `_recovery_lock` 保護——**絕不 await 任何網路 I/O**（R3-3）：即使 `_health_sender`
         當下卡在一個緩慢/卡住的 `transport.send()`，也不會拖住這裡，因為 sender 只在
@@ -455,8 +489,28 @@ class AgentRunner:
 
         R3-4：新一輪故障一律重置 `_respawn_stage`——若沿用上一輪（可能是另一個 child 世代）
         留下的 `"persist_only"` 標記，下一次 `_recover()` 會誤以為「respawn 已經做過了，
-        這次只需要重試持久化」而跳過真正需要的 respawn。"""
+        這次只需要重試持久化」而跳過真正需要的 respawn。
+
+        R4-c（MEDIUM，codex 終審 round4）：`expected_generation`——呼叫端（`_failstop_
+        watchdog`）在鎖外核對過 notice 的 generation 與當下 `self._child.generation` 相符
+        後才呼叫這裡；但「核對通過」與「真正拿到 `_recovery_lock`」之間仍有一段沒有互斥
+        的窗口（`_recovery_lock` 可能正被另一個 `_recover()`／`_latch()` 呼叫佔住），這段
+        期間 child 若換代（例如 recovery 剛好 respawn 成功），鎖外核對過的 generation 就
+        過期了。這裡在拿到鎖之後、真正改動任何狀態之前，用同一個快照重新核對一次——不符
+        即 no-op（完全不動 `_latched`/`_health_epoch`/sentinel），避免把一則過期通知套用
+        到目前這一代健康的新 child 身上。呼叫端不傳（`expected_generation=None`，既有的
+        直接呼叫路徑／測試）視為「呼叫端自己已經確保沒有這個競態」，照舊無條件 latch。"""
         async with self._recovery_lock:
+            if expected_generation is not None:
+                current_generation = getattr(self._child, "generation", None)
+                if current_generation is not None and expected_generation != current_generation:
+                    log.warning(
+                        "R4-c: agent latch 呼叫過期（notice generation=%r，取得 "
+                        "_recovery_lock 後目前 generation=%r 已不同），no-op：等鎖期間 "
+                        "child 已換代，不誤 latch 目前這一代健康的 child",
+                        expected_generation, current_generation,
+                    )
+                    return
             self._latched = True
             self._latch_detail = detail
             self._health_epoch += 1
@@ -472,36 +526,115 @@ class AgentRunner:
         只解除 parent 這邊的 `_latched`，child 內部的本地 latch 依然 tripped，`_dispatch`
         會永久對 mutating op 回 failstop——parent 卻已經回報 healthy，形成假 healthy。
 
+        R4-a（HIGH，codex 終審 round4）：舊版把 terminate/start 拆成兩個獨立、各自可被
+        `asyncio.to_thread` 取消的呼叫——`run_once()` 結束會 cancel 這裡（連帶
+        `_recovery_prober`），但底層 OS thread 無法被真的中止，可能在下一個 session 的
+        `ensure_child()` 已經合法 spawn 出新 child 之後才姍姍來遲執行，把新 child 覆寫
+        掉（洩漏 process/login）。改用 `ChildHandle.respawn(expected_generation)`——terminate
+        +start 收成單一 generation-scoped transaction（見其 docstring），這裡只需要單一
+        `asyncio.to_thread(self._child.respawn, expected_generation)` 呼叫。
+
+        另外用 `asyncio.shield()` 包住這個呼叫、明確收割背景執行緒的最終結果
+        （`_reap_late_respawn` done callback）：`shield()` 不能真的阻止底層 OS thread 被
+        取消（thread 一旦開始執行就是這樣），但可以避免「取消發生時直接放生這個 Future，
+        結果被靜默丟棄、甚至觸發 asyncio 的『Task exception was never retrieved』警告」——
+        被取消後，背景執行緒最終的結果（成功/失敗/generation 過期的 no-op）改用 log 記錄，
+        不假裝這裡曾經觀察到它，下一輪 `_recover()` 一律重新讀 `self._child.generation`/
+        `alive` 對帳。
+
         R3-4④（HIGH，codex 終審 round3）：respawn 拿回的帳號若與這個 session 目前綁定的
         `self._account` 不符——不是「暫時性連線問題」，是需要人工介入的異常（例如憑證/
         帳號設定被動過手腳）；絕不能靜默改 `self._account` 繼續回報 healthy，直接
         `FatalAgentError`（下方 `except Exception` 只吞非 fatal 例外，不會誤攔）。
 
-        terminate 舊 child → respawn（沿用 `ChildHandle.start()`，內部已含一次 connect
-        RPC）→ 帳號核對 → R3-2：額外用 `ping_detail()`（而非 `ping()`）做「新 child 真的
-        可用、而且沒有立刻又 latch」的獨立確認——`ping()` 只回 bool，不足以擋住「新 child
-        在 connect 後、清 sentinel 前又故障一次」的假 healthy 縫（`ok=True` 但
-        `latched=True` 時，一樣視為不可用）。respawn/帳號核對(fatal 除外)/ping_detail 任一
-        步失敗：記錯、回 False，呼叫端（`_recover`）據此保留 latch、不持久化任何狀態，交
-        下一輪 `_recovery_prober` 依 respawn 專屬 backoff（R3-4①②）重試——不留下「parent
-        以為恢復了、child 其實沒換成功／又立刻壞掉」的中間態。成功才更新 `self._account`。
-        """
+        R4-d（MEDIUM，codex 終審 round4）：帳號不符時，新 child 其實已經成功啟動、連線
+        （`respawn()` 內部的 `start()` 已經跑完）——舊版直接 raise，沒有 terminate，這個
+        帳號不符的新 child 會繼續活著（process 沒殺、Shioaji session 沒登出），造成資源/
+        登入配額洩漏。raise 前先 terminate 掉它，不留殘留 child。
+
+        respawn（單一 generation-scoped transaction）→ 帳號核對（不符即 terminate+fatal，
+        R4-d）→ R3-2：額外用 `ping_detail()`（而非 `ping()`）做「新 child 真的可用、而且
+        沒有立刻又 latch」的獨立確認——`ping()` 只回 bool，不足以擋住「新 child 在 connect
+        後、清 sentinel 前又故障一次」的假 healthy 縫（`ok=True` 但 `latched=True` 時，一樣
+        視為不可用）。respawn（含過期 no-op）/帳號核對(fatal 除外)/ping_detail 任一步失敗：
+        記錯、回 False，呼叫端（`_recover`）據此保留 latch、不持久化任何狀態，交下一輪
+        `_recovery_prober` 依 respawn 專屬 backoff（R3-4①②）重試——不留下「parent 以為
+        恢復了、child 其實沒換成功／又立刻壞掉」的中間態。成功才更新 `self._account`。
+
+        `_recover()` 在真正清 sentinel 前還會再做一次獨立的 ping 重驗（R4-b），這裡的
+        `ping_detail()` 只是「respawn 剛完成那一刻」的快速確認，不是最終權威。"""
+        expected_generation = self._child.generation
+        respawn_task = asyncio.ensure_future(
+            asyncio.to_thread(self._child.respawn, expected_generation)
+        )
+
+        def _reap_late_respawn(task: "asyncio.Task") -> None:
+            # R4-a：呼叫端（這個協程）已經被取消，但底層 to_thread 開的 OS thread 一旦
+            # 開始執行就無法真的被中止，仍會在背景跑完——這個 done callback 收割它最終的
+            # 結果，不讓它靜默消失（也避免 asyncio 印出「Task exception was never
+            # retrieved」）。`ChildHandle.respawn()` 本身的 generation 檢查已經保證：即使
+            # 它真的跑完並換上了新 child，也只發生在它捕捉的 `expected_generation` 在它
+            # 拿到鎖的當下仍然 current 的情況——不會誤殺任何後續 session 已經換上的新
+            # child；下一輪 `_recover()`/`ensure_child()` 一律重新讀取目前 generation/
+            # alive 對帳，不依賴這個已經被取消呼叫端的回傳值。
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is not None:
+                log.warning(
+                    "R4-a: respawn（原意圖 generation=%d）在呼叫端取消後才於背景結束，"
+                    "且失敗，下一輪 _recover() 會重新對帳：%s", expected_generation, exc,
+                )
+                return
+            result = task.result()
+            if result is None:
+                log.info(
+                    "R4-a: respawn（原意圖 generation=%d）在呼叫端取消後才於背景結束，"
+                    "已過期（generation 已換代），no-op", expected_generation,
+                )
+            else:
+                log.warning(
+                    "R4-a: respawn（原意圖 generation=%d）在呼叫端取消後才於背景完成"
+                    "（account=%s），下一輪 _recover() 會重新讀取目前 generation/alive 對帳",
+                    expected_generation, result,
+                )
+
         try:
-            await asyncio.to_thread(self._child.terminate)
-            account = await asyncio.to_thread(self._child.start)
+            account = await asyncio.shield(respawn_task)
         except FatalAgentError:
             # R3-4①：帳號不符等不可重試錯誤——絕不能被下面的 `except Exception` 吞掉、
             # 落入 respawn backoff 的無限重試迴圈（每輪都是一次真的 Shioaji 登入）。原樣
             # 往外拋，交給 `_recover()`/`_recovery_prober` 一路傳到 `run_forever` 的既有
             # FatalAgentError 處置（停止、不重試）。
             raise
+        except asyncio.CancelledError:
+            # R4-a：呼叫端被取消——`respawn_task` 本身沒有被取消（`shield()` 保護），仍在
+            # 背景跑；掛上 done callback 收割它，然後照 asyncio 慣例原樣往外拋，讓取消
+            # 正確傳播（`_recover()`/`_recovery_prober` 的 `async with`/task 生命週期不受
+            # 影響）。
+            respawn_task.add_done_callback(_reap_late_respawn)
+            raise
         except Exception:
             log.exception("G2④ recovery：child respawn 失敗，保持 latch，留給下一輪重試")
             return False
+        if account is None:
+            # R4-a：respawn 呼叫過期（目標 generation 在它拿到鎖之前就已經被其他呼叫換
+            # 代）——no-op，完全沒有動到任何 child。當成失敗處理（回 False），交下一輪
+            # 重新讀取目前 generation 對帳後再試，不假設過期呼叫等價於成功。
+            log.warning(
+                "R4-a recovery：respawn 呼叫過期（目標 generation=%d 已被其他呼叫換代），"
+                "no-op，保持 latch，留給下一輪重新讀取 generation 對帳後重試",
+                expected_generation,
+            )
+            return False
         if self._account and account != self._account:
+            # R4-d：新 child 已經成功啟動、連線——raise 前先 terminate 掉它，不留殘留
+            # process/登入。
+            await asyncio.to_thread(self._child.terminate)
             raise FatalAgentError(
                 f"agent respawn 後新 child 回報的帳號（{account}）與目前 session 綁定帳號"
                 f"（{self._account}）不符——拒絕靜默切換帳號繼續回報 healthy，需人工介入"
+                "（新 child 已 terminate，不留下殘留 process）"
             )
         try:
             detail = await asyncio.to_thread(
@@ -561,7 +694,31 @@ class AgentRunner:
         meta)` 保證不會用到落後的舊 epoch；反過來若先清 sentinel 才寫 epoch、epoch 寫失敗，
         下次啟動會誤判「未 latch」且 epoch 讀到過舊的值。任一步失敗：保留 latch、記錯，
         不動 `_health_epoch`，`_respawn_stage` 維持 `"persist_only"`，留給下一輪
-        `_recovery_prober` 只重試持久化（不再 respawn/登入）。"""
+        `_recovery_prober` 只重試持久化（不再 respawn/登入）。
+
+        R4-b（HIGH，codex 終審 round4）：舊版只在 `_respawn_child()` 內做過**一次**
+        point-in-time ping，之後就直接寫 epoch/清 sentinel/解 latch——respawn 成功、
+        ping 通過的那一刻與真正清 sentinel 之間仍有一段窗口（哪怕只是幾個 `await
+        asyncio.to_thread` 的排程延遲），child 若在這段窗口內又 trip 一次（新故障，
+        不論 IPC 通知有沒有送達——通知本身也可能失敗），完全沒被偵測到，會被誤判成
+        healthy。且 `_respawn_stage == "persist_only"` 的輪次舊版完全跳過任何 child
+        重驗，直接嘗試持久化。修法：**每一輪**（不論剛 respawn 成功、還是先前輪已進入
+        persist_only）在寫 epoch/清 sentinel 前都重新 `ping_detail()` 一次，只有
+        `ok=True` 且 `latched=False` 才繼續；不符則保留 latch、把 `_respawn_stage` 重設
+        回 `None`（child 本地 latch 一旦 trip 就不會 rearm，繼續在 persist_only 原地重試
+        毫無意義，必須讓下一輪重新走一次完整 respawn）。
+
+        sentinel 清除改採 compare-and-clear 語意：清除前重讀一次 sentinel，確認其
+        `epoch` 欄位仍與 `self._health_epoch`（本輪要清的那份）相符才真的 unlink——
+        `epoch` 是既有 sentinel schema 就有的欄位、也是系統裡現成的「每次故障事件遞增
+        一次」版本號，不需要另外擴充 buffer.py 的 sentinel 格式。理由：child 端
+        `_trigger_failstop_latch`（native_runner.py）寫 sentinel 完全繞過這把
+        `_recovery_lock`（不同進程，鎖不到）——若在我們讀完 sentinel 到真正 unlink 之間，
+        child 剛好又落地一次新故障、直接覆寫了一份新的 sentinel（帶新故障的 epoch=-1
+        佔位值，或未來被父程序覆寫後的新 epoch），這裡如果不比對就清，會把「代表新故障」
+        的 sentinel 憑空刪掉——之後若 agent 進程崩潰，新故障的 durable latch 標記就這樣
+        丟失了。sentinel 內容已不存在（`None`）視為「沒東西可清」，照常放行（`clear_
+        sentinel()` 本身也是 `unlink(missing_ok=True)`，冪等）。"""
         async with self._recovery_lock:
             if not self._latched:
                 return
@@ -584,8 +741,43 @@ class AgentRunner:
                     return
                 self._respawn_backoff = self._respawn_backoff_base
                 self._respawn_stage = "persist_only"
+
+            # R4-b：清 sentinel 前的最終原子重驗——不論這輪是剛 respawn 成功、還是先前輪
+            # 已經進入 persist_only，一律重新 ping 一次確認 child 現在仍然健康。
+            try:
+                recheck = await asyncio.to_thread(
+                    self._child.ping_detail, timeout=self._child_ping_timeout
+                )
+            except Exception:
+                log.exception(
+                    "G2④ recover：清 sentinel 前重驗 child 例外，保持 latch，"
+                    "留給下一輪重新 respawn"
+                )
+                self._respawn_stage = None
+                return
+            if not recheck.get("ok") or recheck.get("latched"):
+                log.error(
+                    "G2④ recover：清 sentinel 前重驗 child 發現又故障（ok=%r, latched=%r），"
+                    "保持 latch，留給下一輪重新 respawn（child 本地 latch 無 rearm，"
+                    "原地重試 persist_only 沒有意義）",
+                    recheck.get("ok"), recheck.get("latched"),
+                )
+                self._respawn_stage = None
+                return
+
             epoch = self._health_epoch
             try:
+                current_sentinel = await asyncio.to_thread(self._buffer.read_sentinel)
+                if current_sentinel is not None and current_sentinel.get("epoch") != epoch:
+                    # compare-and-clear：sentinel 內容已經不是本輪要清的那份（child 在
+                    # 這之間又直接落地了一份新故障的 sentinel）——保留現狀，不清除，讓
+                    # 下一輪 `_latch()`/`_recover()` 依 sentinel 目前真正的內容重新處理。
+                    log.error(
+                        "G2④ recover：sentinel 內容在清除前已被改寫（現在 epoch=%r，"
+                        "預期 %r），疑似 child 又落地了新故障，保留現狀不清除",
+                        current_sentinel.get("epoch"), epoch,
+                    )
+                    return
                 await asyncio.to_thread(self._buffer.set_health_epoch, epoch)
                 await asyncio.to_thread(self._buffer.clear_sentinel)
             except Exception:
@@ -894,7 +1086,11 @@ class AgentRunner:
                     notice_generation, current_generation,
                 )
                 continue
-            await self._latch(notice.get("detail") or "child 回報 buffer 落地失敗")
+            # R4-c：把這裡核對過的 notice_generation 原樣往下傳——`_latch()` 拿到
+            # `_recovery_lock` 之後會用同一個快照再核對一次，堵住「核對通過→等鎖→child
+            # 換代」這段窗口（見其 docstring）。
+            await self._latch(notice.get("detail") or "child 回報 buffer 落地失敗",
+                              expected_generation=notice_generation)
 
     async def _recovery_prober(self) -> None:
         """G2④：latch 期間週期性嘗試 storage probe，通過就呼叫 `_recover()` 解除 latch。

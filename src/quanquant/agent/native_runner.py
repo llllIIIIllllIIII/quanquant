@@ -71,13 +71,35 @@ class ChildFailstopLatch:
 
     def __init__(self) -> None:
         self._event = threading.Event()
+        self._seq_lock = threading.Lock()
+        self._fault_seq = 0
 
     def trip(self) -> None:
-        self._event.set()
+        # R4-b（HIGH，codex 終審 round4）：`fault_seq` 只在「真正的 not-tripped→tripped
+        # 轉換」時遞增——`trip()` 在同一次故障事件內會被呼叫多次（`_wrap_on_raw` 搶先
+        # trip 一次、`_trigger_failstop_latch` 內部又呼叫一次，皆為既有的冪等防禦設計），
+        # 若每次呼叫都無條件 +1，會讓同一個邏輯上的故障被算成多筆，之後 recovery 拿它跟
+        # 自己記住的舊值比對時容易誤判。用一把小鎖包住 test-and-set：只有把 Event 從
+        # unset 轉成 set 的那一次才真的遞增；`Event.is_set()`/`.set()` 本身雖已 thread-safe，
+        # 但「先查後設」這兩步合起來需要額外的鎖才不會有兩個執行緒都判定自己是那次轉換。
+        with self._seq_lock:
+            if not self._event.is_set():
+                self._event.set()
+                self._fault_seq += 1
 
     @property
     def tripped(self) -> bool:
         return self._event.is_set()
+
+    @property
+    def fault_seq(self) -> int:
+        """R4-b：供 `ping` reply 攜帶——recovery 端用來核對「清 sentinel 前重驗的這次
+        ping，是不是跟之前觀察到的同一個故障狀態」。latch 在單一 child 進程內無 rearm，
+        因此對單一 child 而言這個值只會是 0（從未 trip）或 1（已 trip）——語意上等價於
+        `tripped` 這個 bool，這裡額外暴露成獨立欄位是為了讓 ping reply 的形狀更明確、
+        也讓未來若 latch 改為可 rearm 時不必再改協議欄位。"""
+        with self._seq_lock:
+            return self._fault_seq
 
 
 def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail: str, *,
@@ -214,7 +236,8 @@ def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox,
     return _on_raw
 
 
-def _dispatch(native, op: dict, *, latch: "ChildFailstopLatch | None" = None) -> dict:
+def _dispatch(native, op: dict, *, latch: "ChildFailstopLatch | None" = None,
+              generation: int = 0) -> dict:
     kind = op["op"]
 
     if kind in ("place", "cancel", "update") and latch is not None and latch.tripped:
@@ -268,7 +291,13 @@ def _dispatch(native, op: dict, *, latch: "ChildFailstopLatch | None" = None) ->
         # ping 一律回 ok=True，recovery 用它做「respawn 後新 child 真的可用」的獨立確認時
         # 完全看不出新 child 是否在 connect 後、清 sentinel 前又故障一次（假 healthy 縫，
         # 見 `AgentRunner._respawn_child`）。
-        return {"ok": True, "latched": bool(latch.tripped) if latch is not None else False}
+        # R4-b（HIGH，codex 終審 round4）：額外帶上 `generation`（child_main 啟動時蓋章的
+        # 世代）與 `fault_seq`（本地 latch 的單調故障序號）——recovery 在「清 sentinel 前
+        # 原子重驗」時可核對這兩個值是否與先前觀察到的一致，不只看 `latched` 這個瞬時
+        # bool（見 runner.py `AgentRunner._recover` docstring）。
+        return {"ok": True, "latched": bool(latch.tripped) if latch is not None else False,
+                "generation": generation,
+                "fault_seq": latch.fault_seq if latch is not None else 0}
 
     if kind == "shutdown":
         native.close()
@@ -326,7 +355,7 @@ def child_main(
             continue
 
         try:
-            reply = _dispatch(native, op, latch=latch)
+            reply = _dispatch(native, op, latch=latch, generation=generation)
         except TradeNotFoundError as exc:
             message = redact_secrets(str(exc), secrets=secrets)
             conn.send({"ok": False, "error_kind": "trade_not_found", "message": message,
