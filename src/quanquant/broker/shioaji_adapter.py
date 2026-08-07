@@ -603,14 +603,18 @@ class ShioajiAdapter:
                 )
                 raise
             except AgentCommandTimeoutError as exc:
-                # Task 8（D4 route 逾時路徑）：這個例外型別對映兩種情境——① route 自己的
-                # `asyncio.wait_for` 等 ack 逾時（真的還沒收到 ack）；② agent 已經回了一則
-                # error_kind="timeout" 的 ack（agent 自己的子程序無回應）——`_unwrap` 對這兩
-                # 種情境目前 raise 出同一個型別。`mark_timeout_observed` 的 CAS 用來分辨：
-                # True＝①，可放心走既有 unknown fail-safe；False＝ack 已經（透過
-                # `apply_command_ack`）在別的交易完整落地過，這裡必須完全不寫 Order/quota，
-                # 讓已落庫的結果（不論 ok/error/unknown）保持原樣（S#15/R1-1：Order 不得被
-                # 逾時路徑改回 unknown）。
+                # Task 8（D4 route 逾時路徑，修正 round 1）：這個例外型別實際對映
+                # `agent_channel.py` 至少 4 個觸發點，不是原先誤寫的「兩種情境」——
+                # ①`AgentChannel.request` 的 `await self._send(cmd)` 送出失敗（socket 已壞，
+                # 可能已部分送出）；②`asyncio.wait_for(fut, timeout)` 真的等不到 ack；
+                # ③`AgentChannel.detach()` 連線中斷時對所有 pending future `set_exception`
+                # （斷線，不是逾時但同型別）；④ agent 已經回了一則 `error_kind="timeout"` 的
+                # ack（agent 自己的子程序無回應，`_unwrap` 轉出）。`_unwrap`/呼叫端對這 4 種
+                # 情境目前一律 raise 出同一個型別，無法從型別本身分辨。`mark_timeout_observed`
+                # 的 CAS 才是真正分辨依據：True＝①/②/③（這個 cmd 從未收到任何 ack，可放心走
+                # 既有 unknown fail-safe）；False＝④（ack 已經透過 `apply_command_ack` 在別的
+                # 交易完整落地過），這裡必須完全不寫 Order/quota，讓已落庫的結果（不論
+                # ok/error/unknown）保持原樣（S#15/R1-1：Order 不得被逾時路徑改回 unknown）。
                 won = True
                 if self._remote_gateway is not None and cmd_id is not None:
                     with self._session_factory() as fail_session:

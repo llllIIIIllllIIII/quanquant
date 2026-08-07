@@ -284,6 +284,10 @@ async def _start_agent_channel_subsystem(
             supervisor=slot_supervisor, risk_guard=risk_guard,
             sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
             ops_alerter=ops_alerter, remote_gateway=gateway,
+            agent_user_id=uid,  # D5：per-slot scope 蓋章——沒有這行 _stage_reconcile_results/
+            # _persist_raw 落地的 RawInbox.user_id 恆為 None，per-slot RawInboxWorker（WHERE
+            # user_id=slot.user_id）永遠認領不到，資料孤兒化（Task 7 docstring 早已宣稱會傳，
+            # 但實際程式碼漏掉，見 task-8-report.md「已知落差」#4，本次補上）。
         )
         session_state = OrderSessionState()
         session_state.mark_disabled("agent 未連線")     # 等這個 user 的 agent 上線

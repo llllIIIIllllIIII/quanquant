@@ -12,6 +12,7 @@ import json
 from datetime import datetime, timedelta
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
@@ -139,6 +140,39 @@ def test_insert_command_persists_row(session, engine):
     with Session(engine) as s2:
         row = s2.get(AgentCommand, cmd.cmd_id)
         assert row is not None and row.outcome is None and row.resolved_at is None
+
+
+def test_has_unresolved_update_command_false_for_unrelated_integrity_error(session):
+    """Task 8 修復（round 1）負向覆蓋（codex R6-3）：`repository.has_unresolved_update_command`
+    必須精確辨認撞到的是不是 `uq_agent_cmd_update_singleflight` 這個 partial unique index——
+    這裡故意撞 `AgentCommand` 主鍵 `cmd_id`（與 update-singleflight 完全無關的另一種
+    `IntegrityError`），驗證：① 對這個撞鍵無關的 `client_order_id` 回 False；② 鏡射
+    `shioaji_adapter.update()` 決策段的實際 try/except 寫法，確認這種情況下原例外會被原樣
+    上拋，不會被誤轉成「前一筆改單結果未定」的友善訊息（那句訊息只該在真的撞到
+    update-singleflight 時出現）。"""
+    first = new_command(kind="place", user_id=1, broker=BROKER, account=ACCOUNT, mode=MODE,
+                         payload={}, client_order_id="c-pk-1")
+    insert_command(session, cmd=first)
+    session.commit()
+
+    colliding = new_command(kind="place", user_id=1, broker=BROKER, account=ACCOUNT, mode=MODE,
+                             payload={}, client_order_id="c-pk-2")
+    colliding.cmd_id = first.cmd_id  # 故意撞主鍵，不是 update-singleflight 那個 partial index
+
+    class _MisclassifiedAsSingleflight(Exception):
+        """僅供本測試辨識「誤判成單飛撞鍵」用，不對應任何生產例外型別。"""
+
+    with pytest.raises(IntegrityError):
+        try:
+            insert_command(session, cmd=colliding)
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            if brepo.has_unresolved_update_command(session, client_order_id="c-pk-2"):
+                raise _MisclassifiedAsSingleflight(
+                    "PK 撞鍵不該被誤判成 update-singleflight 撞鍵"
+                ) from None
+            raise
 
 
 # ---------------------------------------------------------------------------

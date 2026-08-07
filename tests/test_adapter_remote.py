@@ -413,9 +413,11 @@ async def test_update_singleflight_rejects_second_unresolved_update(engine):
     已知落差（見 `agent_commands.py` 模組頂部說明／task-8-report.md）：`RiskGuard.
     check_update` 內部會自行 commit 它建立的 delta `QuotaReservation`，這個 commit 早於
     ledger insert 撞鍵，因此撞鍵後的 `session.rollback()` 救不回它——第二次嘗試會留下一筆
-    孤兒 `reserved`（未 confirm、未 release，日終跨日自然歸零，不會被誤算進已用配額；
-    watchdog/人工其後可用『查無對應 ledger 列』辨識並清理）。這裡精確驗證這個已知結果，
-    不假裝它不存在。"""
+    孤兒 `reserved`。**更正（Task 8 修復 round 1）**：這筆孤兒列**不是**「不會被誤算進已用
+    配額」——`repository._ACTIVE_QUOTA_STATES=("reserved","confirmed")`，`quota_used_today`
+    照樣會把它算進當日已用配額，一路占用到 trading_day 換日才不再計入這個 trading_day 的
+    加總（多扣不少扣、安全方向，不是永久卡死；watchdog/人工其後仍可用『查無對應 ledger 列』
+    辨識並清理）。這裡精確驗證這個已知結果，不假裝它不存在。"""
     gw = _FakeGateway()
     a, ack = await _placed_order(engine, gw, _guard(engine))
     a._agent_user_id = 1

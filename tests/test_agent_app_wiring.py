@@ -120,6 +120,30 @@ async def test_agent_mode_happy_path_wires_state(engine, monkeypatch):
     assert len(tasks) >= 4                                  # +全域 confirm-token 清理 +孤兒掃描
 
 
+async def test_agent_mode_slot_adapter_reconcile_stages_with_slot_user_id(engine, monkeypatch):
+    """Task 8 修復（round 1）驗收：`_start_agent_channel_subsystem` 建 slot 的 `ShioajiAdapter`
+    必須傳 `agent_user_id=uid`，否則 `_stage_reconcile_results`（agent 模式對帳落地路徑）用
+    `self._agent_user_id` 蓋章 `RawInbox.user_id` 時恆為 None——per-slot `RawInboxWorker`
+    （`WHERE user_id=slot.user_id`）永遠認領不到，資料孤兒化。這裡直接呼叫 slot 自己的
+    adapter 做一次真實 DB 落地，確認落列的 `RawInbox.user_id` 等於這個 slot 的 owner。"""
+    from sqlmodel import select
+
+    from quanquant.db.models import RawInbox
+
+    app, state, tasks = await _run(_settings(), engine, monkeypatch)
+    slot = app.state.agent_registry.get(1)
+    assert slot.adapter._agent_user_id == 1     # 本次修復的核心斷言：不再是 None
+
+    n = slot.adapter._stage_reconcile_results(
+        [{"ordno": "O1", "status": "Filled"}], newest=None,
+    )
+    assert n == 1
+    with Session(engine) as s:
+        rows = list(s.exec(select(RawInbox)))
+    assert len(rows) == 1
+    assert rows[0].user_id == 1                 # 沒蓋章的話這裡會是 None（資料孤兒）
+
+
 # ---------------------------------------------------------------------------
 # Task 9：UI agent 連線狀態 badge —— GET /orders/agent-status partial + orders.html 掛載點
 # ---------------------------------------------------------------------------
