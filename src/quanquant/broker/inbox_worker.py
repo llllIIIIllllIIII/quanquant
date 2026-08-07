@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING
 
 from sqlmodel import Session
 
+from quanquant.broker import agent_commands
 from quanquant.broker import repository as brepo
 from quanquant.broker.position_tracker import PositionMismatchError, PositionTracker
 from quanquant.broker.supervisor import BrokerSupervisor
@@ -389,8 +390,42 @@ class RawInboxWorker:
                 f"不符（ordno={report.ordno!r}），fail closed",
             )
         brepo.mark_order_status(session, order, status=report.status)
+        if row.user_id is not None:
+            # Inc1 D4 終態 resolver 的 worker 掛載點（Task 11 修復回合 1，發現 2）：agent 模式
+            # 下這筆回報若把 Order 推進終態，同一交易內立刻收斂它掛著的 update-unknown／cancel
+            # 指令列，把收斂延遲從 watchdog 週期上限（`unknown_reconcile_grace_seconds`，預設
+            # 300s）壓到與這筆回報同一次處理。純 in-process（row.user_id is None）完全不受
+            # 影響——原路徑零變更。
+            self._resolve_agent_commands_after_terminal(session, order)
         brepo.mark_raw_inbox_processed(session, row)
         session.commit()
+
+    @staticmethod
+    def _resolve_agent_commands_after_terminal(session: Session, order: Order) -> None:
+        """D4 終態 resolver 的第二個掛載點（第一個是 watchdog 週期掃描，見 watchdog.py 的
+        `_reconcile_unknown_quota_agent`）：只在 Order 剛好落在終態（cancelled/failed/
+        filled）才有東西可做；`order.ordno is None` 時無法關聯任何 ledger 列，直接跳過
+        （呼叫端已保證 `row.user_id is not None`，這裡不重複判斷 agent/in-process）。
+
+        update 一律以 `real_qty=None` 呼叫 `agent_commands.resolve_one_unresolved_update`——
+        這裡是同步 DB 交易，沒有 `gateway.query_qty` round-trip 能力，天然只能走 D8「不可得」
+        保守 confirm 分支（不猜、不 release，低估風險比高估風險小，同 watchdog 終態分支的既有
+        哲學）；cancel 走既有 state-based report resolver。兩者都經 Task 11 修復回合 1（發現
+        1）修好的原子 CAS，與 watchdog 下一輪或遲到 ack 互不覆寫——誰先誰贏，輸家 no-op，不會
+        重複套效果（同一委託理論上可能同時被 watchdog 這輪與這裡搶著收斂，靠 CAS 保證恰一次）。
+        """
+        if order.ordno is None or order.status not in agent_commands.ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
+            return
+        updates = agent_commands.list_unresolved_unknown_updates_for_ordno(
+            session, user_id=order.user_id, ordno=order.ordno
+        )
+        for cmd_id in [r.cmd_id for r in updates]:
+            agent_commands.resolve_one_unresolved_update(session, cmd_id=cmd_id, real_qty=None)
+        cancels = agent_commands.list_unresolved_cancels_for_ordno(
+            session, user_id=order.user_id, ordno=order.ordno
+        )
+        for cmd_id in [r.cmd_id for r in cancels]:
+            agent_commands.resolve_one_unresolved_cancel(session, cmd_id=cmd_id)
 
     @staticmethod
     def _resolve_order_report_order(session: Session, report: OrderReport) -> Order | None:

@@ -916,6 +916,112 @@ def test_resolve_unresolved_cancel_via_report_noop_when_order_not_terminal(sessi
         assert s2.get(AgentCommand, cmd.cmd_id).resolved_at is None
 
 
+# ---------------------------------------------------------------------------
+# Task 11 修復回合 1（發現 1）：resolver 的 resolve 寫入改成原子 CAS（`_cas_resolve`，
+# `WHERE resolved_at IS NULL`）——與 ack path（`apply_command_ack`）互不覆寫，誰先誰贏，
+# 輸家 no-op，不套用任何 Order/quota 效果，也不改 outcome/resolved_via。
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_unresolved_cancel_via_report_cas_wins_race_then_late_ack_is_noop(session, engine):
+    """resolver 先贏 CAS（cancel state-based resolver，Order 已被別的回報推進終態）→ 之後
+    才抵達的第一次 ack 進 `apply_command_ack`——只能補 transport，不得覆寫 resolver 已經落地
+    的 outcome/resolved_via（比照既有 `test_local_resolution_then_late_ack_is_noop_on_
+    business_dimension` 的驗證手法，但這次驗證的是新加的 CAS 路徑，不是 `resolve_never_
+    dispatched`）。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    cmd = _cancel_cmd(session, ordno="O1")  # 尚未收到任何 ack（created/sent）
+
+    with Session(engine) as s2:
+        order = s2.exec(select(Order)).one()
+        brepo.mark_order_status(s2, order, status="cancelled")  # 別的回報先把 Order 推進終態
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        applied = resolve_unresolved_cancel_via_report(s2, row=row, order=order)
+        s2.commit()
+    assert applied is True
+
+    ack = _ok_ack(cmd.cmd_id)
+    outcome = apply_command_ack(lambda: Session(engine), cmd_id=cmd.cmd_id, user_id=1, ack=ack)
+    assert outcome.transport_won is True  # 這是這筆 cmd 第一次 transport ack
+    assert outcome.already_resolved is True and outcome.applied is False
+    assert outcome.outcome == "unknown"  # 維持 resolver 落地的值，不被遲到 ack 改寫
+
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.outcome == "unknown" and row.resolved_via == "report"
+        assert row.transport_acked_at is not None  # transport 欄位仍照補
+
+
+def test_resolve_unresolved_cancel_via_report_loses_race_to_earlier_ack_with_stale_row(session, engine):
+    """反向（真實跨交易 TOCTOU）：resolver 側先讀到 row（此刻 resolved_at 仍是 None，模擬
+    watchdog pre-check 通過瞬間）→ 期間第一次 ack 搶先在別的交易完整落地（transport_won +
+    resolved via ack）→ resolver 才真正執行、但手上仍是查完當下的舊 row 物件——`_cas_resolve`
+    的 `WHERE resolved_at IS NULL` 直接查 DB 當下狀態（不信任呼叫端可能過期的 Python 物件），
+    CAS 必須輸，不得覆寫 ack 已經落地的 outcome/resolved_via。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    cmd = _cancel_cmd(session, ordno="O1")
+
+    with Session(engine) as s_read:
+        stale_row = s_read.get(AgentCommand, cmd.cmd_id)
+        assert stale_row.resolved_at is None
+        s_read.expunge(stale_row)  # 模擬 resolver 側在讀到之後、真正呼叫前被搶走 CPU
+
+    ack = _ok_ack(cmd.cmd_id)
+    outcome = apply_command_ack(lambda: Session(engine), cmd_id=cmd.cmd_id, user_id=1, ack=ack)
+    assert outcome.applied is True and outcome.outcome == "ok"
+    with Session(engine) as s_check:
+        assert s_check.exec(select(Order)).one().status == "cancelled"
+
+    with Session(engine) as s_resolver:
+        order = s_resolver.exec(select(Order)).one()
+        applied = resolve_unresolved_cancel_via_report(s_resolver, row=stale_row, order=order)
+        s_resolver.commit()
+    assert applied is False  # CAS 輸，no-op
+
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.outcome == "ok" and row.resolved_via == "ack"  # 未被 resolver 覆寫
+        assert s2.exec(select(Order)).one().status == "cancelled"
+
+
+def test_resolve_update_via_query_qty_second_call_after_already_resolved_returns_race_lost(session, engine):
+    """update 版對應覆蓋：同一 update cmd 已經被 query_qty 分支正確 resolve(ok) 過（例如
+    watchdog 某一輪贏了）——resolver 之後被重複呼叫第二次（例如 worker 終態掛載點與 watchdog
+    對同一筆列重疊觸發，見 Task 11 修復回合 1 發現 2 新增的第二個掛載點），CAS 必須輸
+    （`"race_lost"`），不得把已經正確的 outcome='ok'/resolved_via='query_qty' 覆寫成
+    'unknown'/'report'，也不得再動 Order price/qty 或重複 confirm。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    cmd = _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    _mark_unknown_via_timeout(session, engine, cmd)
+
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=5)
+        s2.commit()
+    assert action == "confirmed"
+
+    with Session(engine) as s2:
+        order = s2.exec(select(Order)).one()
+        brepo.mark_order_status(s2, order, status="cancelled")  # Order 之後進終態（另一筆回報）
+        s2.commit()
+
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action2 = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=None)
+        s2.commit()
+    assert action2 == "race_lost"
+
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.outcome == "ok" and row.resolved_via == "query_qty"  # 未被覆寫
+        order = s2.exec(select(Order)).one()
+        assert order.qty == 5 and str(order.price) == "21600"  # 未被亂改回改單前
+        assert _quota_state(s2, "delta-1") == "confirmed"  # 未被重複轉移
+
+
 def test_list_unresolved_cancels_includes_created_sent_and_timeout(session, engine):
     """cancel 適用集合不像 update 那樣排除 created/sent（cancel 無 quota 效果，state-based
     掃描只看 Order 是否已終態，不需要先等 ack）。"""

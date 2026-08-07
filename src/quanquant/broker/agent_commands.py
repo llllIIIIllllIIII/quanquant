@@ -382,6 +382,36 @@ def _resolve(row: AgentCommand, *, outcome: str, resolved_via: str, result_json:
     row.result = result_json
 
 
+def _cas_resolve(
+    session: Session, *, cmd_id: str, outcome: str, resolved_via: str, result_json: str
+) -> bool:
+    """resolver 專用的原子 resolve CAS（Task 11 修復回合 1，發現 1／codex R4-2）：`WHERE
+    resolved_at IS NULL`，寫法比照 `resolve_never_dispatched`（route 本地終結）既有範例。
+
+    **只給 resolver 呼叫**（`resolve_update_via_query_qty`/`resolve_unresolved_cancel_via_report`
+    ／`resolve_one_unresolved_*`）——resolver 與 ack path（`apply_command_ack`）可能在不同交易
+    搶著終結同一筆 ledger 列（agent 模式 unknown-resolver 與遲到 ack 的真實跨交易競態；
+    Task 11 之後又多了 watchdog 週期掃描 vs. worker 終態掛載點兩個 resolver 觸發點互搶的
+    情境，見發現 2），純 ORM 屬性賦值（`_resolve`）在 Postgres READ COMMITTED 下是
+    unconditional `UPDATE ... WHERE cmd_id=?`（無視目前 `resolved_at`），會被後寫者悄悄
+    覆寫掉先寫者已經 commit 的結果、稽核欄位失真。CAS 版本：贏家（`rowcount==1`）才可以繼續
+    對 Order/quota 套用效果；輸家（另一路徑已搶先 resolve）no-op，呼叫端不得再套用任何
+    Order/quota 效果——即使那些效果本身是冪等的（`confirm_quota`/`release_quota` 都是
+    `WHERE state='reserved'` 的一次性轉移），`outcome`/`resolved_via`/`result` 這幾個純稽核
+    欄位不是冪等寫入，沒有這道 CAS 保護一樣會被錯誤覆寫。"""
+    t = AgentCommand.__table__
+    stmt = (
+        sa_update(t)
+        .where(t.c.cmd_id == cmd_id, t.c.resolved_at.is_(None))
+        .values(outcome=outcome, resolved_via=resolved_via, resolved_at=_utcnow(), result=result_json)
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    won = result.rowcount == 1
+    if won:
+        session.flush()
+    return won
+
+
 def apply_command_ack(session_factory, *, cmd_id: str, user_id: int, ack: UpCmdAck) -> AppliedOutcome:
     """agent 模式**唯一**的 UpCmdAck 效果套用入口（`agent_ws.py` 呼叫）。單一交易內完成：
 
@@ -524,13 +554,20 @@ def _apply_update(session: Session, row: AgentCommand, ack: UpCmdAck, result_jso
 # 適用集合（update／cancel 各自）一律是 `resolved_at IS NULL`——**created/sent（尚無
 # transport 回覆，`outcome IS NULL`）絕不碰**，繼續等 ack／重連重播；其明確未執行 ack
 # （expired/scope_mismatch/failstop/明確拒絕）仍依 `_apply_update`/`_apply_cancel` 既有轉移
-# 表 release delta——resolver 與 ack-path 用不相交的 `outcome` 值域天然互斥，不需要額外的
-# CAS（`outcome='unknown'` 這個值本身就只有 ack timeout 分支會寫入，見 `_apply_update`/
-# `_apply_place` 的 fail-safe 分支），resolver 落地的 `UPDATE ... WHERE resolved_at IS NULL`
-# 仍是最終防線（見 `_resolve`/呼叫端 `session.get` 之間的窗口——本檔一律先 flush 再檢查，
-# 呼叫端 watchdog 的 `_apply_*_resolution_blocking` 在同一次呼叫內完成讀-判-寫，不留窗口）。
+# 表 release delta。
+#
+# Task 11 修復回合 1（發現 1／codex R4-2）：resolver 與 ack-path「用不相交的 outcome 值域
+# 天然互斥」只在單一交易內成立——resolver 讀到適用集合（`resolved_at IS NULL`）之後、真正
+# 落地 resolve 之前，遲到 ack 完全可能在**別的交易**搶先把同一列 resolve 掉（反之亦然：
+# resolver 先贏，遲到 ack 才到），這是真實跨交易競態，光靠 outcome 值域不相交防不住。
+# resolver 的每個 resolve 寫入點因此一律經 `_cas_resolve`（`WHERE resolved_at IS NULL`）
+# 才是最終防線——輸家 no-op，不套用任何 Order/quota 效果；watchdog 的
+# `resolve_one_unresolved_*`／worker 的終態掛載點（`inbox_worker._process_order_report`，
+# 發現 2）都經同一份 CAS，兩個掛載點互搶同一筆列時也是誰先誰贏、輸家 no-op，不會重複套效果。
 
-_ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER = frozenset({"cancelled", "failed", "filled"})
+# Task 11 修復回合 1（發現 2）起改成公開名稱（原為 `_ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER`）：
+# `inbox_worker.py` 的終態掛載點也需要引用同一份終態集合，避免兩處各自定義而漂移不同步。
+ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER = frozenset({"cancelled", "failed", "filled"})
 
 
 def list_unresolved_unknown_updates(session: Session, *, user_id: int) -> list[AgentCommand]:
@@ -568,6 +605,42 @@ def list_unresolved_cancels(session: Session, *, user_id: int) -> list[AgentComm
     return list(session.exec(stmt))
 
 
+def list_unresolved_unknown_updates_for_ordno(
+    session: Session, *, user_id: int, ordno: str
+) -> list[AgentCommand]:
+    """同 `list_unresolved_unknown_updates`，額外鎖定單一委託（Task 11 修復回合 1，發現 2：
+    `inbox_worker._process_order_report` 的終態掛載點用）——Order 剛被這筆回報推進終態時，
+    只需要收斂『這張委託』的 unresolved update 列，不必像 watchdog 週期掃描那樣掃這個 user
+    名下全部委託。"""
+    stmt = (
+        select(AgentCommand)
+        .where(
+            AgentCommand.user_id == user_id,
+            AgentCommand.kind == "update",
+            AgentCommand.outcome == "unknown",
+            AgentCommand.resolved_at.is_(None),
+            AgentCommand.ordno == ordno,
+        )
+        .order_by(AgentCommand.created_at)
+    )
+    return list(session.exec(stmt))
+
+
+def list_unresolved_cancels_for_ordno(session: Session, *, user_id: int, ordno: str) -> list[AgentCommand]:
+    """同 `list_unresolved_cancels`，額外鎖定單一委託，理由同上（worker 終態掛載點用）。"""
+    stmt = (
+        select(AgentCommand)
+        .where(
+            AgentCommand.user_id == user_id,
+            AgentCommand.kind == "cancel",
+            AgentCommand.resolved_at.is_(None),
+            AgentCommand.ordno == ordno,
+        )
+        .order_by(AgentCommand.created_at)
+    )
+    return list(session.exec(stmt))
+
+
 def resolve_update_via_query_qty(
     session: Session, *, row: AgentCommand, order: Order, real_qty: int | None,
 ) -> str:
@@ -596,7 +669,10 @@ def resolve_update_via_query_qty(
         - `order.status` 非終態 → 留待下一輪（不動任何東西，watchdog 之後重跑會重新查）。
 
     回傳值供呼叫端/測試判斷實際採取的動作：`"confirmed"` / `"released"` /
-    `"conservative_confirmed"` / `"left_pending"`。"""
+    `"conservative_confirmed"` / `"left_pending"` / `"race_lost"`（Task 11 修復回合 1，
+    發現 1：CAS 輸給了另一個同時搶著 resolve 這筆列的路徑——遲到 ack，或 Task 11 發現 2
+    新增的另一個 resolver 掛載點；`_cas_resolve` 只在贏得 `WHERE resolved_at IS NULL` 這道
+    原子條件時才繼續套用 Order/quota 效果，輸家完全不觸碰 Order/quota，也不改 outcome）。"""
     reservation: QuotaReservation | None = None
     if row.reservation_id is not None:
         reservation = session.exec(
@@ -607,6 +683,9 @@ def resolve_update_via_query_qty(
     target_qty = original_qty + (reservation.qty if has_active_delta else 0)
 
     if has_active_delta and real_qty is not None and real_qty == target_qty:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="ok", resolved_via="query_qty",
+                             result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False)):
+            return "race_lost"
         payload = json.loads(row.payload)
         new_price = payload.get("price")
         price_value = Decimal(new_price) if new_price is not None else order.price
@@ -614,21 +693,21 @@ def resolve_update_via_query_qty(
             session, order, new_price=price_value, new_qty=payload["qty"],
             reservation_id=row.reservation_id,
         )
-        _resolve(row, outcome="ok", resolved_via="query_qty",
-                 result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False))
         return "confirmed"
 
     if has_active_delta and real_qty is not None and real_qty == original_qty:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="error", resolved_via="query_qty",
+                             result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False)):
+            return "race_lost"
         brepo.release_quota(session, reservation_id=row.reservation_id)
-        _resolve(row, outcome="error", resolved_via="query_qty",
-                 result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False))
         return "released"
 
-    if order.status in _ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
+    if order.status in ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="unknown", resolved_via="report",
+                             result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False)):
+            return "race_lost"
         if row.reservation_id is not None:
             brepo.confirm_quota(session, reservation_id=row.reservation_id)
-        _resolve(row, outcome="unknown", resolved_via="report",
-                 result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False))
         return "conservative_confirmed"
 
     return "left_pending"
@@ -643,9 +722,54 @@ def resolve_unresolved_cancel_via_report(session: Session, *, row: AgentCommand,
     Order（終態已經是終態，不需要也不可以再改）。
 
     `order` 未達終態時回 False（no-op，呼叫端不需要 commit）——state-based 週期掃描不依賴
-    「進入終態」的單一事件，之後重跑會再檢查一次，不會遺漏。"""
-    if order.status not in _ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
+    「進入終態」的單一事件，之後重跑會再檢查一次，不會遺漏。
+
+    Task 11 修復回合 1（發現 1）：回傳 False 還有第二種原因——CAS（`_cas_resolve`）輸給了
+    另一個同時搶著 resolve 這筆列的路徑（遲到 ack，或發現 2 新增的另一個 resolver 掛載點）。
+    兩種 False 對呼叫端的處置完全相同（no-op，不需要 commit），不需要區分。"""
+    if order.status not in ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
         return False
-    _resolve(row, outcome="unknown", resolved_via="report",
-             result_json=json.dumps({}, ensure_ascii=False))
-    return True
+    return _cas_resolve(session, cmd_id=row.cmd_id, outcome="unknown", resolved_via="report",
+                         result_json=json.dumps({}, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# 單筆 resolver 收斂（Task 11 修復回合 1，發現 2）：終態 resolver 的兩個掛載點共用同一份
+# 讀-判-寫，不各自實作一份——`watchdog.py` 的 `_apply_update_resolution_blocking`/
+# `_resolve_unresolved_cancel_cmd_blocking`（自開 session，週期掃描）與
+# `inbox_worker._process_order_report`（借用既有交易，Order 推進終態的同一交易內立即收斂）
+# 都呼叫這兩個函式；`session` 的生命週期／commit 時機一律交呼叫端決定，這裡只做
+# 讀-判-寫，不 commit。
+# ---------------------------------------------------------------------------
+
+
+def resolve_one_unresolved_update(session: Session, *, cmd_id: str, real_qty: int | None) -> bool:
+    """單筆 update-unknown-resolver 收斂：重新讀 `row`/`order`（不接受呼叫端傳入可能過期的
+    ORM 物件——`row`/`order` 一律讀取呼叫當下的最新 DB 狀態，CAS 之外再上一道防線），核心
+    比對交給 `resolve_update_via_query_qty`。回傳 True 僅代表「這次呼叫真的套用了效果」
+    （`"left_pending"`/`"race_lost"` 都算 False——後者見 `resolve_update_via_query_qty`
+    docstring）。"""
+    row = session.get(AgentCommand, cmd_id)
+    if row is None or row.resolved_at is not None:
+        return False
+    order = brepo.find_order_by_ordno(
+        session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
+    )
+    if order is None:
+        return False
+    action = resolve_update_via_query_qty(session, row=row, order=order, real_qty=real_qty)
+    return action not in ("left_pending", "race_lost")
+
+
+def resolve_one_unresolved_cancel(session: Session, *, cmd_id: str) -> bool:
+    """單筆 cancel state-based resolver 收斂，理由與讀-判-寫慣例同
+    `resolve_one_unresolved_update`。"""
+    row = session.get(AgentCommand, cmd_id)
+    if row is None or row.resolved_at is not None or row.ordno is None:
+        return False
+    order = brepo.find_order_by_ordno(
+        session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
+    )
+    if order is None:
+        return False
+    return resolve_unresolved_cancel_via_report(session, row=row, order=order)

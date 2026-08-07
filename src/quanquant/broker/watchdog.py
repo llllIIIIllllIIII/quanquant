@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 from quanquant.broker import agent_commands
 from quanquant.broker import repository as brepo
+from quanquant.broker.base import AgentCommandTimeoutError, AgentUnavailableError
 from quanquant.broker.redaction import redact_secrets
 from quanquant.db.models import AgentCommand
 
@@ -254,8 +255,17 @@ async def _reconcile_unknown_quota_agent(adapter, gateway, *, user_id: int) -> N
         )
         resolved = 0
         for cmd_id in update_cmd_ids:
-            if await _resolve_unknown_update_cmd(adapter, gateway, cmd_id):
-                resolved += 1
+            try:
+                if await _resolve_unknown_update_cmd(adapter, gateway, cmd_id):
+                    resolved += 1
+            except (AgentCommandTimeoutError, AgentUnavailableError) as exc:
+                # 發現 3（Task 11 修復回合 1）：單筆 query_qty 逾時／agent 恰好在這筆之間斷線
+                # 不得中斷整輪——只收斂到這一筆 continue，其餘 update/cancel cmd 仍照跑；這筆
+                # 留給下一輪 watchdog 重試（`resolved_at` 仍是 NULL，適用集合天然還會撈到它）。
+                log.warning(
+                    "agent watchdog（user_id=%s）query_qty cmd_id=%s 逾時/不可用，跳過本筆留待"
+                    "下一輪: %s", user_id, cmd_id, exc,
+                )
         for cmd_id in cancel_cmd_ids:
             if await asyncio.to_thread(_resolve_unresolved_cancel_cmd_blocking, adapter, cmd_id):
                 resolved += 1
@@ -295,38 +305,21 @@ def _load_unresolved_update_ordno_blocking(adapter, cmd_id: str) -> str | None:
 
 
 def _apply_update_resolution_blocking(adapter, cmd_id: str, real_qty: int | None) -> bool:
+    """薄封裝：自開 session，核心讀-判-寫交給 `agent_commands.resolve_one_unresolved_update`
+    （Task 11 修復回合 1，發現 2——與 `inbox_worker._process_order_report` 的終態掛載點共用
+    同一份邏輯，不重複實作）。"""
     with adapter._session_factory() as session:
-        row = session.get(AgentCommand, cmd_id)
-        if row is None or row.resolved_at is not None:
-            return False  # 已被別的路徑收斂（同 watchdog 上一輪/applier），no-op
-        order = brepo.find_order_by_ordno(
-            session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
-        )
-        if order is None:
-            return False
-        action = agent_commands.resolve_update_via_query_qty(
-            session, row=row, order=order, real_qty=real_qty
-        )
-        if action == "left_pending":
-            return False
-        session.add(row)
-        session.commit()
-        return True
+        applied = agent_commands.resolve_one_unresolved_update(session, cmd_id=cmd_id, real_qty=real_qty)
+        if applied:
+            session.commit()
+        return applied
 
 
 def _resolve_unresolved_cancel_cmd_blocking(adapter, cmd_id: str) -> bool:
+    """薄封裝，理由同 `_apply_update_resolution_blocking`，核心邏輯見
+    `agent_commands.resolve_one_unresolved_cancel`。"""
     with adapter._session_factory() as session:
-        row = session.get(AgentCommand, cmd_id)
-        if row is None or row.resolved_at is not None or row.ordno is None:
-            return False
-        order = brepo.find_order_by_ordno(
-            session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
-        )
-        if order is None:
-            return False
-        applied = agent_commands.resolve_unresolved_cancel_via_report(session, row=row, order=order)
-        if not applied:
-            return False
-        session.add(row)
-        session.commit()
-        return True
+        applied = agent_commands.resolve_one_unresolved_cancel(session, cmd_id=cmd_id)
+        if applied:
+            session.commit()
+        return applied

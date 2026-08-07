@@ -4,11 +4,14 @@ asyncio.Queue——QueueFull 這個攻擊面已被架構消除）逐列一交易
 Deal 重播冪等只補 processed 不重跑帳務、序列化鎖防兩協程同時改同一 BrokerPosition。"""
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
+from quanquant.broker.agent_commands import apply_command_ack, insert_command
+from quanquant.broker.agent_protocol import UpCmdAck
 from quanquant.broker.inbox_worker import (
     OrderReport,
     RawInboxDeadLetterError,
@@ -17,7 +20,15 @@ from quanquant.broker.inbox_worker import (
 )
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill
-from quanquant.db.models import AgentAccountBinding, BrokerPosition, Deal, Order, RawInbox
+from quanquant.db.models import (
+    AgentAccountBinding,
+    AgentCommand,
+    BrokerPosition,
+    Deal,
+    Order,
+    QuotaReservation,
+    RawInbox,
+)
 
 
 def _order_kwargs(**over):
@@ -508,6 +519,97 @@ def test_order_report_updates_status_via_composite_scope(session, engine):
     with Session(engine) as s:
         order = s.exec(select(Order)).first()
         assert order.status == "cancelled" and order.filled_qty == 0
+
+
+def _agent_command_row(*, cmd_id, kind, ordno, client_order_id=None, reservation_id=None,
+                        price="18500", qty=5):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    payload = {"price": price, "qty": qty, "price_type": "LMT"} if kind == "update" else {}
+    return AgentCommand(
+        cmd_id=cmd_id, user_id=1, kind=kind, broker="shioaji", account="F1", mode="sim",
+        ordno=ordno, client_order_id=client_order_id, reservation_id=reservation_id,
+        payload=json.dumps(payload), created_at=now, expires_at=now + timedelta(minutes=2),
+    )
+
+
+def test_order_report_terminal_status_resolves_agent_commands_same_transaction(session, engine):
+    """S#37 worker 路徑變體（Task 11 修復回合 1，發現 2）：agent 模式下，U1（update，
+    outcome='unknown'）與一筆尚未 ack 的 cancel 都掛在同一張委託上——這筆 order_report 把
+    Order 推進 cancelled 終態的**同一次 worker 處理**內，U1／cancel 立即收斂（終態 resolver
+    保守 confirm／report 分支），不必等 watchdog 下一個週期（預設 300s）。"""
+    _seed_order(session)  # C1: ordno=O1, broker_order_id=B1, user_id=1, status=submitted
+    with Session(engine) as s:
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-06-16", qty=3, daily_limit=20)
+        insert_command(s, cmd=_agent_command_row(
+            cmd_id="cmd-u1", kind="update", ordno="O1", client_order_id="C1",
+            reservation_id="delta-1",
+        ))
+        insert_command(s, cmd=_agent_command_row(cmd_id="cmd-cancel", kind="cancel", ordno="O1"))
+        s.commit()
+
+    # U1 timeout ack 先落地（outcome='unknown', resolved_at IS NULL）——進入適用集合；
+    # cancel cmd 保持 created/sent（從未 ack），同 watchdog 版既有測試手法。
+    outcome = apply_command_ack(
+        lambda: Session(engine), cmd_id="cmd-u1", user_id=1,
+        ack=UpCmdAck(cmd_id="cmd-u1", event_id=1, ok=False, error_kind="timeout", message="t/o"),
+    )
+    assert outcome.resolved is False and outcome.outcome == "unknown"
+
+    with Session(engine) as s:
+        # agent 模式蓋章列：user_id 非 None（同 agent_ws UpReport handler 的既有落地慣例）。
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+        )), user_id=1, account="F1", mode="sim")
+        s.commit()
+
+    worker = _worker(engine, user_id=1)
+    assert worker.process_batch_once() == 1  # 單一交易內完成：mark_order_status + 兩筆 resolver 收斂
+
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "cancelled"
+
+        u1 = s.get(AgentCommand, "cmd-u1")
+        assert u1.resolved_at is not None
+        assert u1.outcome == "unknown" and u1.resolved_via == "report"  # 終態保守 confirm 分支
+
+        cancel = s.get(AgentCommand, "cmd-cancel")
+        assert cancel.resolved_at is not None
+        assert cancel.outcome == "unknown" and cancel.resolved_via == "report"
+
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "confirmed"  # 保守 confirm，不 release
+        # guard 解除：U1/cancel 都已 resolved，換帳號不再被它們擋。
+        assert not brepo.has_unresolved_risky_commands_other_account(s, user_id=1, account="OTHER")
+
+
+def test_in_process_order_report_does_not_touch_agent_command_ledger(session, engine):
+    """Task 11 修復回合 1（發現 2）in-process 迴歸：純 in-process 回報（`row.user_id is
+    None`）把 Order 推進終態時，即使剛好有一筆未 resolved 的 AgentCommand 掛在同一個 ordno
+    上（理論上不該同時發生，純屬防禦性驗證），worker 也絕不觸碰它——新掛載點只在
+    `row.user_id is not None` 才啟動，in-process 原路徑逐位元不變。"""
+    _seed_order(session)  # C1: ordno=O1, broker_order_id=B1, user_id=1（_order_kwargs 預設）
+    with Session(engine) as s:
+        insert_command(s, cmd=_agent_command_row(cmd_id="cmd-cancel", kind="cancel", ordno="O1"))
+        s.commit()
+
+    with Session(engine) as s:
+        # in-process 呼叫端一律 user_id=None（同 `_process_deal`/既有測試慣例，
+        # 見 `stage_raw_inbox` 預設值）。
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+        )))
+        s.commit()
+
+    worker = _worker(engine)  # user_id=None（in-process 單一 worker，既有慣例）
+    assert worker.process_batch_once() == 1
+
+    with Session(engine) as s:
+        order = s.exec(select(Order)).first()
+        assert order.status == "cancelled"  # Order 本身照常推進終態，不受影響
+        cmd = s.get(AgentCommand, "cmd-cancel")
+        assert cmd.resolved_at is None  # 完全沒被碰——新掛載點沒有啟動
 
 
 def test_order_report_conflicting_dual_keys_quarantines_fail_closed(session, engine):

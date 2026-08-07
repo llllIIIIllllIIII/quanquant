@@ -13,6 +13,7 @@ from quanquant.broker import repository as brepo
 from quanquant.broker import watchdog as watchdog_module
 from quanquant.broker.agent_commands import apply_command_ack, insert_command
 from quanquant.broker.agent_protocol import UpCmdAck
+from quanquant.broker.base import AgentCommandTimeoutError
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.watchdog import run_agent_watchdog, run_order_watchdog
@@ -550,6 +551,62 @@ def test_agent_reconcile_unknown_quota_skips_created_sent_then_resolves_after_ti
         assert order.qty == 5
         assert s.exec(select(QuotaReservation).where(
             QuotaReservation.reservation_id == "delta-1")).one().state == "confirmed"
+
+
+class _FlakyTimeoutGateway:
+    """單筆 query_qty 逾時（指定的那個 ordno 拋 `AgentCommandTimeoutError`），其餘 ordno 照常
+    回傳——驗證 Task 11 修復回合 1（發現 3）：`_reconcile_unknown_quota_agent` 迴圈裡單筆
+    逾時只影響那一筆，不得中斷整輪、連累其餘 cmd 也沒被查。"""
+
+    def __init__(self, *, ready: bool = True, timeout_ordno: str, qty_by_ordno: dict) -> None:
+        self.ready = ready
+        self._timeout_ordno = timeout_ordno
+        self._qty_by_ordno = qty_by_ordno
+        self.query_calls: list[str] = []
+
+    async def query_qty(self, ordno: str):
+        self.query_calls.append(ordno)
+        if ordno == self._timeout_ordno:
+            raise AgentCommandTimeoutError(f"等待 cmd_ack 逾時（ordno={ordno}）")
+        return self._qty_by_ordno.get(ordno)
+
+
+def test_agent_reconcile_unknown_quota_single_cmd_timeout_does_not_abort_whole_round(engine):
+    """Task 11 修復回合 1（發現 3）：迴圈中單筆 query_qty 逾時（`AgentCommandTimeoutError`）
+    不得中斷整輪——這一筆留待下一輪重試（`resolved_at` 仍是 NULL），但排在它之後的其餘
+    update cmd 仍要照跑，恰一次收斂。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2)
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-timeout", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1", price="18500", qty=5)
+
+        _agent_order(s, client_order_id="C2", ordno="O2", qty=2)
+        assert brepo.reserve_quota(s, reservation_id="delta-2", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-ok", ordno="O2", client_order_id="C2",
+                          reservation_id="delta-2", price="18500", qty=5)
+        s.commit()
+    _mark_timeout(engine, "cmd-timeout")
+    _mark_timeout(engine, "cmd-ok")
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FlakyTimeoutGateway(ready=True, timeout_ordno="O1", qty_by_ordno={"O2": 5})
+
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == ["O1", "O2"]  # O1 逾時不阻擋 O2 繼續被查
+    with Session(engine) as s:
+        timeout_cmd = s.get(AgentCommand, "cmd-timeout")
+        assert timeout_cmd.resolved_at is None  # 這筆留待下一輪重試
+        ok_cmd = s.get(AgentCommand, "cmd-ok")
+        assert ok_cmd.resolved_at is not None
+        assert ok_cmd.outcome == "ok" and ok_cmd.resolved_via == "query_qty"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-2")).one().state == "confirmed"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "reserved"  # 未被亂動
 
 
 def test_agent_reconcile_unknown_quota_never_touches_place_commands(engine):
