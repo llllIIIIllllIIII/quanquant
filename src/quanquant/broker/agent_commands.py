@@ -375,24 +375,21 @@ def _ack_result_payload(ack: UpCmdAck) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def _resolve(row: AgentCommand, *, outcome: str, resolved_via: str, result_json: str) -> None:
-    row.outcome = outcome
-    row.resolved_via = resolved_via
-    row.resolved_at = _utcnow()
-    row.result = result_json
-
-
 def _cas_resolve(
     session: Session, *, cmd_id: str, outcome: str, resolved_via: str, result_json: str
 ) -> bool:
-    """resolver 專用的原子 resolve CAS（Task 11 修復回合 1，發現 1／codex R4-2）：`WHERE
+    """業務維終結寫入的唯一原子 CAS（Task 11 修復回合 1，發現 1／codex R4-2）：`WHERE
     resolved_at IS NULL`，寫法比照 `resolve_never_dispatched`（route 本地終結）既有範例。
 
-    **只給 resolver 呼叫**（`resolve_update_via_query_qty`/`resolve_unresolved_cancel_via_report`
-    ／`resolve_one_unresolved_*`）——resolver 與 ack path（`apply_command_ack`）可能在不同交易
-    搶著終結同一筆 ledger 列（agent 模式 unknown-resolver 與遲到 ack 的真實跨交易競態；
-    Task 11 之後又多了 watchdog 週期掃描 vs. worker 終態掛載點兩個 resolver 觸發點互搶的
-    情境，見發現 2），純 ORM 屬性賦值（`_resolve`）在 Postgres READ COMMITTED 下是
+    呼叫端：resolver（`resolve_update_via_query_qty`/`resolve_unresolved_cancel_via_report`
+    ／`resolve_one_unresolved_*`）**與** `apply_command_ack`（Task 11 修復回合 2，re-reviewer
+    用真實函式重現的反向競態）——兩邊可能在不同交易搶著終結同一筆 ledger 列：resolver 與
+    ack 互搶（回合 1 修好一半、回合 2 補齊另一半：ack 側原本是函式開頭 `session.get` 讀一次
+    `row.resolved_at` 就當作業務維守衛，不是原子 CAS，resolver 若剛好在 ack 的「讀」與
+    「（任何）寫」之間 commit，ack 仍會走「未 resolved」分支覆寫掉 resolver 已經落地的
+    outcome/resolved_via/Order/quota——update 情境更嚴重：可能把 resolver 保守不動的 Order
+    price/qty 覆寫成改單後的值）；watchdog 週期掃描 vs. worker 終態掛載點兩個 resolver
+    觸發點也可能互搶（發現 2）。純 ORM 屬性賦值在 Postgres READ COMMITTED 下是
     unconditional `UPDATE ... WHERE cmd_id=?`（無視目前 `resolved_at`），會被後寫者悄悄
     覆寫掉先寫者已經 commit 的結果、稽核欄位失真。CAS 版本：贏家（`rowcount==1`）才可以繼續
     對 Order/quota 套用效果；輸家（另一路徑已搶先 resolve）no-op，呼叫端不得再套用任何
@@ -418,11 +415,21 @@ def apply_command_ack(session_factory, *, cmd_id: str, user_id: int, ack: UpCmdA
     1. 存在性／ownership 檢查（不存在或屬於別的 user → 立即返回，不寫入）。
     2. transport 維 CAS——只有**第一次**看到這個 cmd_id 的 ack 才會繼續套效果（第二次/
        重複 ack 在這一步就落空，天然滿足「重複 ack no-op」，S#2）。
-    3. 業務維守衛——`resolved_at IS NOT NULL`（已被別的路徑終結，如未來的 report-based
-       cancel resolver）→ 只補 transport（上一步已做），不改 outcome、不重套效果（D4 規則
-       5：遲到 ack 遇已 resolved）。
-    4. 依 `row.kind` × `ack` 分派 D4 的 kind×outcome 轉移表，套用 Order/quota 效果並視情況
-       resolve；place 成功時額外解除該 user 的 `association_pending` quarantine。
+    3. 業務維快速路徑——函式開頭讀到的 `row.resolved_at IS NOT NULL`（已被別的路徑終結）
+       → 只補 transport（上一步已做），不改 outcome、不重套效果（D4 規則 5：遲到 ack 遇
+       已 resolved）。**這只是優化用的快照判斷，不是安全保證**——見下一步。
+    4. 依 `row.kind` × `ack` 分派 D4 的 kind×outcome 轉移表，真正的終結寫入交給
+       `_apply_effects`（Task 11 修復回合 2，re-reviewer 用真實函式重現的反向競態修復）：
+       ok／明確拒絕分支不再是「讀到 resolved_at is None 就無條件覆寫」，而是先對 `_cas_resolve`
+       （`WHERE resolved_at IS NULL`）出手——resolver 若剛好在本函式第 3 步的快照讀取之後、
+       這裡的 CAS 之前於別的交易先 commit，CAS 會如實輸掉（`_apply_effects` 回傳
+       `race_lost=True`），呼叫端據此把這次呼叫降級成跟第 3 步快速路徑相同的語意
+       （`already_resolved=True, applied=False`），並用 `session.refresh(row)` 讀回 resolver
+       已經落地的權威值回報，不觸碰 Order/quota——贏家才在同一交易套 Order/quota 效果；
+       place 成功時額外解除該 user 的 `association_pending` quarantine（同樣只在贏得 CAS 時
+       才做，`_apply_place` 內部保證）。timeout ack（`outcome='unknown'`、不 resolved）維持
+       現行為，不進這道 CAS——那個分支本來就不寫 `resolved_at`，且它是 resolver 唯一的
+       前置觸發源，不會被 resolver 搶先。
     """
     with session_factory() as session:
         row = session.get(AgentCommand, cmd_id)
@@ -443,7 +450,8 @@ def apply_command_ack(session_factory, *, cmd_id: str, user_id: int, ack: UpCmdA
         row.transport_acked_at = _utcnow()  # 讓 ORM 物件與剛才的 raw UPDATE 保持同步
 
         if row.resolved_at is not None:
-            # D4 規則 5：遲到 ack 遇已 resolved——只補 transport（上面已寫），不改 outcome。
+            # D4 規則 5：遲到 ack 遇已 resolved（第 3 步快速路徑）——只補 transport
+            # （上面已寫），不改 outcome。
             session.add(row)
             session.commit()
             return AppliedOutcome(
@@ -451,82 +459,127 @@ def apply_command_ack(session_factory, *, cmd_id: str, user_id: int, ack: UpCmdA
                 applied=False, outcome=row.outcome, resolved=True,
             )
 
-        _apply_effects(session, row, ack)
+        race_lost = _apply_effects(session, row, ack)
         session.add(row)
         session.commit()
+        if race_lost:
+            # 反向競態（Task 11 修復回合 2）：業務維 CAS 輸給了併發的 resolver——待
+            # commit 落地後重讀權威值，語意與第 3 步快速路徑（規則 5）完全相同：只補
+            # transport，不覆寫 outcome/resolved_via，不動 Order/quota。
+            session.refresh(row)
+            return AppliedOutcome(
+                found=True, user_mismatch=False, transport_won=True, already_resolved=True,
+                applied=False, outcome=row.outcome, resolved=True,
+            )
         return AppliedOutcome(
             found=True, user_mismatch=False, transport_won=True, already_resolved=False,
             applied=True, outcome=row.outcome, resolved=row.resolved_at is not None,
         )
 
 
-def _apply_effects(session: Session, row: AgentCommand, ack: UpCmdAck) -> None:
+def _apply_effects(session: Session, row: AgentCommand, ack: UpCmdAck) -> bool:
+    """回傳 `race_lost`：True＝業務維 CAS 輸給了併發的 resolver（呼叫端只能補 transport，
+    不得覆寫 outcome/resolved_via、不得套用任何 Order/quota 效果）；False＝正常路徑——
+    CAS 贏得終結（`ok`／明確拒絕分支），或 timeout ack 落 unknown 的既有 fail-safe 分支
+    （不經 CAS，維持現行為，見 `apply_command_ack` docstring 第 4 步）。"""
     result_json = _ack_result_payload(ack)
     if row.kind == "place":
-        _apply_place(session, row, ack, result_json)
+        return _apply_place(session, row, ack, result_json)
     elif row.kind == "cancel":
-        _apply_cancel(session, row, ack, result_json)
+        return _apply_cancel(session, row, ack, result_json)
     elif row.kind == "update":
-        _apply_update(session, row, ack, result_json)
+        return _apply_update(session, row, ack, result_json)
     else:  # pragma: no cover - kind 由決策段的 Literal 保證，防禦性分支
         row.outcome = "unknown"
         row.result = result_json
+        return False
 
 
-def _apply_place(session: Session, row: AgentCommand, ack: UpCmdAck, result_json: str) -> None:
+def _apply_place(session: Session, row: AgentCommand, ack: UpCmdAck, result_json: str) -> bool:
+    """回傳值同 `_apply_effects`（`race_lost`）。place 無資料庫層 resolver（結構上
+    `list_unresolved_unknown_updates`/`list_unresolved_cancels` 只認 `kind IN
+    ('update','cancel')`，`kind='place'` 永不出現在任何 resolver 適用集合），這裡的 CAS
+    call 不會真的輸——但業務維終結寫入仍統一走 `_cas_resolve`（不對 kind 特例，維持單一
+    寫入路徑，避免未來新增 place resolver 時漏補這道防線）。"""
     order = brepo.find_order_by_client_order_id(session, row.client_order_id)
     if ack.ok:
         result = ack.result or {}
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="ok", resolved_via="ack",
+                             result_json=result_json):
+            return True
         if order is not None:
             apply_place_ack(
                 session, order, ordno=result.get("ordno"), broker_order_id=result.get("broker_order_id"),
                 reservation_id=row.reservation_id,
             )
-        _resolve(row, outcome="ok", resolved_via="ack", result_json=result_json)
         # D4：applier 成功補 ordno 後解除該 user 的 association_pending quarantine，讓
         # worker 用新 ordno 重試匹配（既有 unquarantine 機制，bounded per-user）。
         # `older_than=now` 效果等同「立即解除全部符合條件的列」（同 watchdog 既有呼叫慣例，
         # 只是把 age 門檻換成 0）。
         brepo.unquarantine_stale_raw_inbox(session, older_than=_utcnow(), user_id=row.user_id)
+        session.refresh(row)  # 讓 ORM 物件與 `_cas_resolve` 的 raw UPDATE 保持同步
+        return False
     elif ack.error_kind not in _EXPLICIT_REJECT_KINDS:
-        # "timeout" 或任何未涵蓋值——fail-safe 落 acked_unknown（非終結）。
+        # "timeout" 或任何未涵蓋值——fail-safe 落 acked_unknown（非終結）。不進業務維 CAS
+        # （這個分支本來就不寫 resolved_at，維持現行為，見 `apply_command_ack` docstring）。
         if order is not None:
             apply_place_failure(session, order, reservation_id=None, status="unknown")
         row.outcome = "unknown"
         row.result = result_json
+        return False
     else:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="error", resolved_via="ack",
+                             result_json=result_json):
+            return True
         if order is not None:
             apply_place_failure(session, order, reservation_id=row.reservation_id, status="failed")
-        _resolve(row, outcome="error", resolved_via="ack", result_json=result_json)
+        session.refresh(row)
+        return False
 
 
-def _apply_cancel(session: Session, row: AgentCommand, ack: UpCmdAck, result_json: str) -> None:
+def _apply_cancel(session: Session, row: AgentCommand, ack: UpCmdAck, result_json: str) -> bool:
+    """回傳值同 `_apply_effects`（`race_lost`）。"""
     order = brepo.find_order_by_ordno(
         session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
     )
     if ack.ok:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="ok", resolved_via="ack",
+                             result_json=result_json):
+            return True
         if order is not None:
             apply_cancel_ack(session, order)
-        _resolve(row, outcome="ok", resolved_via="ack", result_json=result_json)
+        session.refresh(row)
+        return False
     elif ack.error_kind not in _EXPLICIT_REJECT_KINDS:
-        # timeout/未涵蓋值——不改 Order，不 resolved。
+        # timeout/未涵蓋值——不改 Order，不 resolved（不進業務維 CAS，維持現行為）。
         row.outcome = "unknown"
         row.result = result_json
+        return False
     else:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="error", resolved_via="ack",
+                             result_json=result_json):
+            return True
         # 明確拒絕/expired/scope_mismatch——不改 Order（交由 reconcile/回報收斂）＋audit。
+        # 只在贏得 CAS 時才記這筆 audit——輸家（resolver 已搶先終結）不代表這次 ack 真的是
+        # 「這筆列的最終處置」，不該留下誤導的稽核紀錄。
         brepo.append_audit(
             session, actor_user_id=row.user_id, mode=row.mode, action="cancel",
             payload_hash=row.cmd_id, result="rejected", rule="agent_cmd_ack",
             detail=ack.message or ack.error_kind,
         )
-        _resolve(row, outcome="error", resolved_via="ack", result_json=result_json)
+        session.refresh(row)
+        return False
 
 
-def _apply_update(session: Session, row: AgentCommand, ack: UpCmdAck, result_json: str) -> None:
+def _apply_update(session: Session, row: AgentCommand, ack: UpCmdAck, result_json: str) -> bool:
+    """回傳值同 `_apply_effects`（`race_lost`）。"""
     order = brepo.find_order_by_ordno(
         session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
     )
     if ack.ok:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="ok", resolved_via="ack",
+                             result_json=result_json):
+            return True
         payload = json.loads(row.payload)
         new_price = payload.get("price")
         if order is not None:
@@ -535,16 +588,22 @@ def _apply_update(session: Session, row: AgentCommand, ack: UpCmdAck, result_jso
                 session, order, new_price=price_value, new_qty=payload["qty"],
                 reservation_id=row.reservation_id,
             )
-        _resolve(row, outcome="ok", resolved_via="ack", result_json=result_json)
+        session.refresh(row)
+        return False
     elif ack.error_kind not in _EXPLICIT_REJECT_KINDS:
-        # timeout/未涵蓋值——不改 Order，delta 保留（D8 保護）。
+        # timeout/未涵蓋值——不改 Order，delta 保留（D8 保護，不進業務維 CAS，維持現行為）。
         row.outcome = "unknown"
         row.result = result_json
+        return False
     else:
+        if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="error", resolved_via="ack",
+                             result_json=result_json):
+            return True
         # 明確拒絕/expired/scope_mismatch——**不得標 failed**（整張單仍有效），只 release delta。
         if row.reservation_id is not None:
             brepo.release_quota(session, reservation_id=row.reservation_id)
-        _resolve(row, outcome="error", resolved_via="ack", result_json=result_json)
+        session.refresh(row)
+        return False
 
 
 # ---------------------------------------------------------------------------

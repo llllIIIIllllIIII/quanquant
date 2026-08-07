@@ -1022,6 +1022,137 @@ def test_resolve_update_via_query_qty_second_call_after_already_resolved_returns
         assert _quota_state(s2, "delta-1") == "confirmed"  # 未被重複轉移
 
 
+# ---------------------------------------------------------------------------
+# Task 11 修復回合 2（re-reviewer 用真實函式重現的反向競態）：`apply_command_ack` 業務維
+# 舊實作是函式開頭 `session.get` 讀一次 `row.resolved_at`（Python 物件判斷），不是 DB 原子
+# CAS——resolver 若剛好在 ack 的「讀」與「（任何）寫」之間，於另一個連線把同一筆列 resolve
+# 掉並 commit，ack 仍會走「未 resolved」分支，用 `_resolve`（無條件 ORM 賦值）覆寫掉
+# resolver 已經落地的 outcome/resolved_via/resolved_at，也會對 Order/quota 重套一次效果
+# （update 情境更嚴重：可能把 resolver 保守不動的 Order price/qty 覆寫成改單後的值）。
+#
+# 下面兩個測試用真正的檔案型 SQLite（獨立連線，同 `test_update_singleflight_concurrent_
+# two_writers_exactly_one_wins` 既有手法）＋monkeypatch `_mark_transport_acked`（`apply_
+# command_ack` 讀完 row 之後的第一個寫入點）注入「resolver 搶先在另一個連線完整 commit」，
+# 精確重現這個 TOCTOU 窗口——不用真執行緒也能決定式重現，因為交錯順序由注入點而非排程
+# 決定。修復後（業務維終結寫入改走 `_cas_resolve`）這兩個測試必須綠；對修復前的程式碼跑
+# 這兩個測試必須紅（見 task-11-report.md Fix round 2 附的紅燈證據）。
+# ---------------------------------------------------------------------------
+
+
+def test_apply_command_ack_loses_business_cas_race_to_concurrent_cancel_resolver(tmp_path, monkeypatch):
+    """cancel 版：resolver（`resolve_unresolved_cancel_via_report`）在 ack 讀完 row 之後、
+    任何寫入之前，於另一個連線先把這筆 cancel 指令 resolve 掉並 commit——ack 的業務維 CAS
+    必須輸，只補 transport，不得把 outcome/resolved_via 從 resolver 的 'unknown'/'report'
+    改寫成 ack 的 'ok'/'ack'。"""
+    from sqlmodel import SQLModel, create_engine
+
+    import quanquant.broker.agent_commands as ac
+
+    db_path = tmp_path / "ack_vs_resolver_cancel_race.db"
+    eng = create_engine(f"sqlite:///{db_path}", connect_args={"timeout": 30})
+    SQLModel.metadata.create_all(eng)
+
+    with Session(eng) as s:
+        _make_order(s, ordno="O1", status="submitted", qty=2)
+        cmd = _cancel_cmd(s, ordno="O1")  # 尚未收到任何 ack（created/sent）
+        cmd_id = cmd.cmd_id  # session 關閉後 ORM 物件會 expire，先取出純字串供之後使用
+
+    real_mark_transport_acked = ac._mark_transport_acked
+
+    def _racing_mark_transport_acked(sess, *, cmd_id, user_id):
+        # 模擬：ack 已經讀完 row（此刻看到 resolved_at 仍是 None）、正要做任何寫入之前，
+        # resolver 在另一個連線先把 Order 推進終態、resolve 掉這筆 cancel 指令並 commit。
+        with Session(eng) as s_resolver:
+            order = s_resolver.exec(select(Order)).one()
+            brepo.mark_order_status(s_resolver, order, status="cancelled")
+            row = s_resolver.get(AgentCommand, cmd_id)
+            won = resolve_unresolved_cancel_via_report(s_resolver, row=row, order=order)
+            s_resolver.commit()
+        assert won is True
+        return real_mark_transport_acked(sess, cmd_id=cmd_id, user_id=user_id)
+
+    monkeypatch.setattr(ac, "_mark_transport_acked", _racing_mark_transport_acked)
+
+    ack = _ok_ack(cmd_id)
+    outcome = apply_command_ack(lambda: Session(eng), cmd_id=cmd_id, user_id=1, ack=ack)
+
+    assert outcome.transport_won is True  # 這是這筆 cmd 第一次 transport ack
+    assert outcome.already_resolved is True
+    assert outcome.applied is False
+    assert outcome.outcome == "unknown"  # resolver 落地的值，不是遲到 ack 的 "ok"
+
+    with Session(eng) as s2:
+        row = s2.get(AgentCommand, cmd_id)
+        assert row.outcome == "unknown" and row.resolved_via == "report"  # 未被覆寫
+        assert row.transport_acked_at is not None  # transport 欄位仍照補
+        assert s2.exec(select(Order)).one().status == "cancelled"
+
+
+def test_apply_command_ack_loses_business_cas_race_to_concurrent_update_resolver_preserves_order(
+    tmp_path, monkeypatch
+):
+    """update 版（reviewer 指出的更嚴重情境）：這筆 update 指令從未收過任何 ack
+    （created/sent，`outcome IS NULL`）——`transport_acked_at` 一次 CAS 定終身（D4/R4-2），
+    resolver 若要跟一筆已經被 ack 過的 update cmd 競爭，第二次呼叫只會在 transport 維就
+    短路（既有 duplicate-ack no-op），根本進不到本次要修的業務維 CAS，不構成真實反向競態；
+    真正可能交錯的窗口是**這筆 cmd 唯一一次、即將贏得 transport CAS 的 ack**，對上一個直接
+    呼叫 `resolve_update_via_query_qty`（同 Task 11 回合 1 既有測試手法，不經過
+    `list_unresolved_unknown_updates` 的 `outcome='unknown'` 前置過濾——CAS 本身的正確性不能
+    只靠上層呼叫慣例保護，函式簽章也沒有這個前置要求）的 resolver：Order 先被另一筆回報
+    推進終態，resolver 因此走終態保守分支（不碰 Order price/qty，只 conservative confirm
+    保留額度）並 commit；緊接著這筆 update 唯一的『ok』ack 抵達——若業務維終結寫入不是原子
+    CAS，會把已終態 Order 的 price/qty 覆寫成改單後的值、還會重複 confirm 配額。CAS 化之後
+    ack 必須輸。"""
+    from sqlmodel import SQLModel, create_engine
+
+    import quanquant.broker.agent_commands as ac
+
+    db_path = tmp_path / "ack_vs_resolver_update_race.db"
+    eng = create_engine(f"sqlite:///{db_path}", connect_args={"timeout": 30})
+    SQLModel.metadata.create_all(eng)
+
+    with Session(eng) as s:
+        _make_order(s, ordno="O1", status="submitted", qty=2, price="21500")
+        _reserve(s, reservation_id="delta-1", qty=3)
+        cmd = _update_cmd(s, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+        cmd_id = cmd.cmd_id  # session 關閉後 ORM 物件會 expire，先取出純字串供之後使用
+
+    with Session(eng) as s:
+        order = s.exec(select(Order)).one()
+        brepo.mark_order_status(s, order, status="cancelled")  # 別的回報先推進終態
+        s.commit()
+
+    real_mark_transport_acked = ac._mark_transport_acked
+
+    def _racing_mark_transport_acked(sess, *, cmd_id, user_id):
+        with Session(eng) as s_resolver:
+            row = s_resolver.get(AgentCommand, cmd_id)
+            order = s_resolver.exec(select(Order)).one()
+            action = resolve_update_via_query_qty(s_resolver, row=row, order=order, real_qty=None)
+            s_resolver.commit()
+        assert action == "conservative_confirmed"
+        return real_mark_transport_acked(sess, cmd_id=cmd_id, user_id=user_id)
+
+    monkeypatch.setattr(ac, "_mark_transport_acked", _racing_mark_transport_acked)
+
+    late_ack = _ok_ack(cmd_id)  # 這筆指令唯一的一次 ack（真正的『其實成功』）
+    outcome = apply_command_ack(lambda: Session(eng), cmd_id=cmd_id, user_id=1, ack=late_ack)
+
+    assert outcome.transport_won is True  # 這筆 cmd 第一次也是唯一一次 transport ack
+    assert outcome.already_resolved is True
+    assert outcome.applied is False
+    assert outcome.outcome == "unknown"  # 維持 resolver 的保守結果，不被這次 ack 改成 "ok"
+
+    with Session(eng) as s2:
+        row = s2.get(AgentCommand, cmd_id)
+        assert row.outcome == "unknown" and row.resolved_via == "report"
+        assert row.transport_acked_at is not None
+        order = s2.exec(select(Order)).one()
+        assert order.status == "cancelled"
+        assert order.qty == 2 and str(order.price) == "21500"  # 未被遲到 ack 覆寫成改單後值
+        assert _quota_state(s2, "delta-1") == "confirmed"  # resolver 保守 confirm，未被重複轉移
+
+
 def test_list_unresolved_cancels_includes_created_sent_and_timeout(session, engine):
     """cancel 適用集合不像 update 那樣排除 created/sent（cancel 無 quota 效果，state-based
     掃描只看 Order 是否已終態，不需要先等 ack）。"""
