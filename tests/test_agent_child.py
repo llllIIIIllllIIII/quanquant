@@ -48,6 +48,21 @@ def test_connect_then_place_acks_and_persists_reports(tmp_path):
     t.join(timeout=5)
 
 
+# ---- Task 9（D5/I7）：callback 落 outbox 當下蓋章 account/mode，來源端不可變 ----
+
+def test_reports_stamped_with_account_and_mode_at_callback_time(tmp_path):
+    conn, t = _start_child_thread(tmp_path)
+    _rpc(conn, {"op": "connect"})
+    _rpc(conn, {"op": "place", "action": "Buy", "price": "0", "qty": 1,
+                "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
+    buf = DurableBuffer(tmp_path / "o.db")
+    rows = buf.pending()
+    assert len(rows) == 2
+    assert all(r.account == "F1" and r.mode == "sim" for r in rows)
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
+
+
 def test_cancel_unknown_maps_exception_like_production(tmp_path):
     # codex round1 fix4(b)：FakeNativeClient.cancel 對未知 ordno 原本 raise
     # TradeNotFoundError，但 production 的 native.cancel()（native.py 227-233）對同樣情況

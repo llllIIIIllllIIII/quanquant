@@ -130,7 +130,7 @@ async def test_downlink_place_dispatched_to_child_and_acked(tmp_path):
     r.ensure_child()
     task = asyncio.create_task(r.run_once())
     tr.incoming.put_nowait({"type": "place", "cmd_id": "c1", "account": "F1", "mode": "sim",
-                            "expires_at": "2026-08-07T00:00:00",
+                            "expires_at": "2099-01-01T00:00:00",
                             "native": {"action": "Buy", "price": "0", "qty": 1,
                                        "price_type": "MKT", "order_type": "IOC",
                                        "octype": "Auto"}})
@@ -149,7 +149,7 @@ async def test_child_timeout_yields_error_ack(tmp_path):
     r.ensure_child()
     task = asyncio.create_task(r.run_once())
     tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c2", "account": "F1", "mode": "sim",
-                            "expires_at": "2026-08-07T00:00:00", "ordno": "101AA1"})
+                            "expires_at": "2099-01-01T00:00:00", "ordno": "101AA1"})
     await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
     ack = next(m for m in tr.sent if m.get("type") == "cmd_ack")
     assert ack["ok"] is False and ack["error_kind"] == "timeout"
@@ -508,3 +508,146 @@ def test_child_handle_start_raises_fatal_agent_error_on_account_mismatch(tmp_pat
         child.start()
     assert "F1" in str(exc_info.value) and "F2" in str(exc_info.value)
     assert child.alive is False
+
+
+# ---------- Task 9（D11/G1 agent 側）：buffer v2＋command_ledger 執行去重 ----------
+# spec D4 agent 端①-④，順序即正確性：①ledger 命中→不重執行，確保 outbox 有未送 ack
+# （無則以存檔 result 補 append）；②scope 核對不符→scope_mismatch；③expiry 過期→
+# expired（①先於③，S#4）；④執行 native→record_execution 同交易→泵送。
+
+_FAR_FUTURE = "2099-01-01T00:00:00"
+_PAST = "2000-01-01T00:00:00"
+
+
+def _place_msg(cmd_id: str, *, account: str = "F1", mode: str = "sim",
+               expires_at: str = _FAR_FUTURE) -> dict:
+    return {"type": "place", "cmd_id": cmd_id, "account": account, "mode": mode,
+            "expires_at": expires_at,
+            "native": {"action": "Buy", "price": "0", "qty": 1, "price_type": "MKT",
+                       "order_type": "IOC", "octype": "Auto"}}
+
+
+async def test_resend_same_cmd_id_after_ack_confirmed_does_not_reexecute_native(tmp_path):
+    """S#3：重連補送指令 → agent ledger 命中不重執行、重回存檔 ack。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    msg = _place_msg("c1")
+    tr.incoming.put_nowait(msg)
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    first_ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert len(child.ops) == 1
+
+    tr.incoming.put_nowait({"type": "report_ack", "event_id": first_ack["event_id"]})
+    await _until(lambda: buf.unsent_count() == 0)  # 第一筆 ack 已被 server 收到
+
+    tr.incoming.put_nowait(msg)  # 重連補送：server 重送同一 cmd_id
+    await _until(lambda: len([m for m in tr.sent if m.get("type") == "cmd_ack"]) >= 2)
+
+    assert len(child.ops) == 1  # 沒有再打 native——ledger 命中不重執行
+    second_ack = [m for m in tr.sent if m["type"] == "cmd_ack"][-1]
+    assert second_ack["cmd_id"] == "c1" and second_ack["ok"] is True
+    assert second_ack["result"]["ordno"] == "101AA1"
+    assert second_ack["event_id"] != first_ack["event_id"]  # 補的是新一筆 outbox 列
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_scope_mismatch_command_rejected_without_calling_child(tmp_path):
+    """R1-2/S#16 agent 側：指令 account/mode 與目前登入 scope 不符 → scope_mismatch，
+    不進 native、不落 outbox（best-effort 直送，非 durable——遺失靠重送自然收斂）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait(_place_msg("c1", account="OTHER"))
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert ack["ok"] is False and ack["error_kind"] == "scope_mismatch"
+    assert child.ops == []
+    assert buf.pending() == []
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_expired_command_rejected_without_calling_child(tmp_path):
+    """S#4：過期指令 → agent 拒執行回 expired，不進 native、不落 outbox。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c1", "account": "F1", "mode": "sim",
+                            "expires_at": _PAST, "ordno": "101AA1"})
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert ack["ok"] is False and ack["error_kind"] == "expired"
+    assert child.ops == []
+    assert buf.pending() == []
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_expired_but_ledger_hit_still_resends_cached_ack_not_expired(tmp_path):
+    """S#4 關鍵順序：①先於③——已經真的執行過的指令，重送時就算附帶的 expires_at 已過期，
+    也不能被③攔下改判 expired（那會誤導 server 判 failed+release，但其實已執行過一次，
+    存檔 ack 才是唯一誠實的答案）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    msg = _place_msg("c1")
+    tr.incoming.put_nowait(msg)
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    first_ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    tr.incoming.put_nowait({"type": "report_ack", "event_id": first_ack["event_id"]})
+    await _until(lambda: buf.unsent_count() == 0)
+
+    expired_resend = dict(msg, expires_at=_PAST)
+    tr.incoming.put_nowait(expired_resend)
+    await _until(lambda: len([m for m in tr.sent if m.get("type") == "cmd_ack"]) >= 2)
+
+    assert len(child.ops) == 1  # 仍然沒有重打 native
+    second_ack = [m for m in tr.sent if m["type"] == "cmd_ack"][-1]
+    assert second_ack["ok"] is True and second_ack.get("error_kind") != "expired"
+    assert second_ack["result"]["ordno"] == "101AA1"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_update_scope_mismatch_and_expired_do_not_touch_child(tmp_path):
+    """S#21 agent 側：update 指令的 scope_mismatch／expired 分支同樣不碰 native。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "update", "cmd_id": "u1", "account": "WRONG",
+                            "mode": "sim", "expires_at": _FAR_FUTURE,
+                            "ordno": "101AA1", "qty": 2})
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack1 = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert ack1["error_kind"] == "scope_mismatch"
+
+    tr.incoming.put_nowait({"type": "update", "cmd_id": "u2", "account": "F1", "mode": "sim",
+                            "expires_at": _PAST, "ordno": "101AA1", "qty": 2})
+    await _until(lambda: len([m for m in tr.sent if m.get("type") == "cmd_ack"]) >= 2)
+    ack2 = [m for m in tr.sent if m["type"] == "cmd_ack"][-1]
+    assert ack2["error_kind"] == "expired"
+    assert child.ops == []
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pump_uses_row_stamped_account_over_session_account(tmp_path):
+    """I7 來源端蓋章：callback 落 outbox 當下已蓋的 account/mode 優先於 runner 目前
+    session 的帳號（同一 buffer 檔本受 assert_account tripwire 保護，這裡只驗證
+    _pump 的欄位來源優先序本身）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    buf.append("deal_report", {"n": 1}, account="STAMPED", mode="sim")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.reports()) >= 1)
+    assert tr.reports()[0]["account"] == "STAMPED"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)

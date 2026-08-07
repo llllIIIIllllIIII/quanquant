@@ -3,21 +3,42 @@
 - append() 由 SDK 子程序的 callback 執行緒呼叫：同步 INSERT+commit 成功才返回。
 - pending()/mark_sent() 由父程序（WS 泵）呼叫：跨程序經同一 SQLite 檔（WAL）。
 - 每次操作短連線 + busy_timeout，避免跨程序鎖競爭複雜化。
+
+Inc1 D11/D4（Task 9）：schema v2 加 outbox.account/mode/cmd_id ＋新表 command_ledger，
+support agent 端 command ledger 執行去重（① ledger 命中不重執行，見 runner.py
+`_execute_mutating_command`）。`meta['schema_version']` 標記版本；升級三情境見
+`_ensure_schema_v2`。
 """
 import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
-_SCHEMA = """
+_SCHEMA_VERSION = "2"
+
+# 冪等（IF NOT EXISTS）：新檔直接建齊；v1 乾淨升級時先 DROP TABLE outbox 再跑這段補上
+# v2 欄位；已是 v2 的檔案重跑也是 no-op。partial unique index（R2-9）：同一 cmd_id 至多
+# 一筆未送 ack（`sent_at IS NULL`），check-and-insert 之外的最後一道防線。
+_SCHEMA_V2 = """
 CREATE TABLE IF NOT EXISTS outbox (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,
   payload TEXT NOT NULL,
+  account TEXT,
+  mode TEXT,
+  cmd_id TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   sent_at TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_outbox_unsent ON outbox(id) WHERE sent_at IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS ux_outbox_cmd_unsent
+  ON outbox(cmd_id) WHERE cmd_id IS NOT NULL AND sent_at IS NULL;
+CREATE TABLE IF NOT EXISTS command_ledger (
+  cmd_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,
+  result TEXT NOT NULL,
+  executed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -25,11 +46,19 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+class RefuseStartError(RuntimeError):
+    """D11 schema 升級：偵測到舊版（v1）outbox 且仍有未送列，拒絕啟動——直接重建會把
+    尚未送達 server 的事件憑空丟掉，違反零丟單不變量。訊息附具體筆數與處置建議。"""
+
+
 @dataclass(frozen=True)
 class BufferRow:
     id: int
     kind: str
     payload: dict
+    account: str | None = None
+    mode: str | None = None
+    cmd_id: str | None = None
 
 
 class DurableBuffer:
@@ -38,31 +67,123 @@ class DurableBuffer:
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         with self._conn() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.executescript(_SCHEMA)
+            self._ensure_schema_v2(conn)
         # codex round1 fix7：outbox 累積無上限，每次開啟（含 agent 重啟）順手清一次已送達
         # 超過保留期的舊列，避免本機 sqlite 檔案無止盡長大。
         self.prune_sent()
 
+    def _ensure_schema_v2(self, conn: sqlite3.Connection) -> None:
+        """D11 三種升級情境：①無 outbox 表（全新檔）→ 直接建 v2；②有 outbox 表且
+        `meta.schema_version` 已是 '2' → no-op（idempotent 重跑 IF NOT EXISTS 亦安全）；
+        ③有 outbox 表但版本不符（v1／未知）→ 查未送列：有 → RefuseStartError 拒啟且不動
+        任何資料（操作者可退回舊版繼續送完）；無（乾淨）→ DROP 舊 outbox 後重建 v2。"""
+        has_outbox = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='outbox'"
+        ).fetchone() is not None
+        if has_outbox:
+            version = conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if version is None or version[0] != _SCHEMA_VERSION:
+                unsent = int(conn.execute(
+                    "SELECT COUNT(*) FROM outbox WHERE sent_at IS NULL"
+                ).fetchone()[0])
+                if unsent > 0:
+                    raise RefuseStartError(
+                        f"agent 暫存箱（{self._path}）是舊版格式，且尚有 {unsent} 筆"
+                        "未送出的資料，請先用舊版送完（unsent_count() 歸零）再升級，"
+                        "避免資料遺失；或人工確認可捨棄後手動清空再重啟。"
+                    )
+                conn.execute("DROP TABLE outbox")
+        conn.executescript(_SCHEMA_V2)
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (_SCHEMA_VERSION,),
+        )
+
     def _conn(self) -> sqlite3.Connection:
         return sqlite3.connect(self._path, timeout=5)
 
-    def append(self, kind: str, payload: dict) -> int:
+    def append(self, kind: str, payload: dict, *, account: str | None = None,
+               mode: str | None = None, cmd_id: str | None = None) -> int:
+        """`account`/`mode`：D5/I7 來源端蓋章——callback 落地當下就該傳入，讓事件歸屬
+        在落 outbox 那一刻凍結（不可變）；`cmd_id`：僅 command_ledger 去重的 ack 事件
+        （由 record_execution/ensure_cmd_ack_pending 呼叫）會帶，report 事件不帶。"""
         with self._conn() as conn:
-            cur = conn.execute("INSERT INTO outbox (kind, payload) VALUES (?, ?)",
-                               (kind, json.dumps(payload, ensure_ascii=False)))
+            cur = conn.execute(
+                "INSERT INTO outbox (kind, payload, account, mode, cmd_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (kind, json.dumps(payload, ensure_ascii=False), account, mode, cmd_id),
+            )
             return int(cur.lastrowid)
 
     def pending(self, limit: int = 50) -> list[BufferRow]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT id, kind, payload FROM outbox WHERE sent_at IS NULL "
-                "ORDER BY id LIMIT ?", (limit,)).fetchall()
-        return [BufferRow(id=r[0], kind=r[1], payload=json.loads(r[2])) for r in rows]
+                "SELECT id, kind, payload, account, mode, cmd_id FROM outbox "
+                "WHERE sent_at IS NULL ORDER BY id LIMIT ?", (limit,)).fetchall()
+        return [BufferRow(id=r[0], kind=r[1], payload=json.loads(r[2]),
+                          account=r[3], mode=r[4], cmd_id=r[5]) for r in rows]
 
     def mark_sent(self, event_id: int) -> None:
         with self._conn() as conn:
             conn.execute("UPDATE outbox SET sent_at = datetime('now') WHERE id = ?",
                          (event_id,))
+
+    def lookup_command(self, cmd_id: str) -> str | None:
+        """D4 agent 端①：command_ledger 命中回傳存檔的 result（JSON 字串，供呼叫端原樣
+        存回／比對，不在這裡反序列化）；未命中回 None（呼叫端需走②③④正常流程）。"""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT result FROM command_ledger WHERE cmd_id = ?", (cmd_id,)
+            ).fetchone()
+        return row[0] if row is not None else None
+
+    def _append_ack_if_absent(self, conn: sqlite3.Connection, *, cmd_id: str,
+                               result_json: str, account: str | None,
+                               mode: str | None) -> int:
+        """R2-9 check-and-insert：cmd_id 若已有未送（`sent_at IS NULL`）ack 列，直接回傳
+        該列 id，不重複 append——partial unique index（`ux_outbox_cmd_unsent`）是預期不會
+        撞到的最後一道防線，不是這裡的主要防呆手段（先查再插，行為明確不依賴例外分支）。"""
+        row = conn.execute(
+            "SELECT id FROM outbox WHERE cmd_id = ? AND sent_at IS NULL", (cmd_id,)
+        ).fetchone()
+        if row is not None:
+            return int(row[0])
+        cur = conn.execute(
+            "INSERT INTO outbox (kind, payload, account, mode, cmd_id) "
+            "VALUES ('cmd_ack', ?, ?, ?, ?)",
+            (result_json, account, mode, cmd_id),
+        )
+        return int(cur.lastrowid)
+
+    def record_execution(self, cmd_id: str, kind: str, result: dict, *,
+                          account: str | None, mode: str | None) -> int:
+        """D4 agent 端④：執行 native 後（不論成功/失敗/timeout——只要嘗試過，一律記錄，
+        確保「每筆 mutating 指令恰好收斂一次」，I6）同一 SQLite 交易寫 command_ledger
+        （`kind`＝place/cancel/update）＋ append 一筆 outbox cmd_ack 事件（check-and-insert，
+        R2-9）。回傳 ack 在 outbox 的 event_id，供呼叫端記錄／測試斷言；實際送達交給
+        `_pump` 走 outbox at-least-once（與 UpReport 共用補送機制，D4）。"""
+        result_json = json.dumps(result, ensure_ascii=False)
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO command_ledger (cmd_id, kind, result) VALUES (?, ?, ?)",
+                (cmd_id, kind, result_json),
+            )
+            return self._append_ack_if_absent(
+                conn, cmd_id=cmd_id, result_json=result_json, account=account, mode=mode
+            )
+
+    def ensure_cmd_ack_pending(self, cmd_id: str, result_json: str, *,
+                                account: str | None, mode: str | None) -> int:
+        """D4 agent 端①命中分支：確保 outbox 有該 cmd 未送的 ack（無則以存檔 result 補
+        append，同一 SQLite 交易 check-and-insert）。呼叫端應先 `lookup_command` 命中才
+        呼叫這個——`result_json` 直接沿用 lookup_command 回傳的存檔字串，不重新序列化。"""
+        with self._conn() as conn:
+            return self._append_ack_if_absent(
+                conn, cmd_id=cmd_id, result_json=result_json, account=account, mode=mode
+            )
 
     def unsent_count(self) -> int:
         with self._conn() as conn:

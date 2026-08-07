@@ -6,7 +6,8 @@ respawn。
 序列 RPC（`threading.Lock` 保護 pipe，因為 `AgentRunner._receive_loop` 用
 `asyncio.to_thread` 呼叫 `request()`，理論上可能有多執行緒同時碰 pipe——這是零丟單/
 命令不串話設計的第二層序列化；第一層是 `_receive_loop` 本身逐則 inline 處理下行訊息，
-不會同時有兩個 `_execute_command` 在跑）、ping、terminate。
+不會同時有兩個 `_execute_readonly_command`/`_execute_mutating_command` 在跑）、ping、
+terminate。
 
 `AgentRunner.run_once()` 是一次完整的 WS session 生命週期：connect → 先送 `UpLogin` →
 啟動 `_pump`/`_receive_loop`/`_heartbeat`/`_child_watchdog` 四個 task → 任一 task 例外
@@ -36,6 +37,7 @@ import logging
 import multiprocessing as mp
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import ValidationError
@@ -49,6 +51,14 @@ from quanquant.agent.native_runner import child_main
 log = logging.getLogger(__name__)
 
 _CHILD_CONNECT_TIMEOUT = 30.0   # 子程序 spawn + connect 的啟動逾時（非逐次 RPC 逾時）
+
+
+def _is_expired(expires_at: str) -> bool:
+    """`expires_at` 為 naive-UTC ISO 字串（D7）；與目前 naive-UTC 時間比較，一致換算，
+    避免 aware/naive 混用炸 TypeError。"""
+    deadline = datetime.fromisoformat(expires_at)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return now >= deadline
 
 
 class ChildFrozenError(RuntimeError):
@@ -352,16 +362,26 @@ class AgentRunner:
                 sent_at = self._inflight.get(row.id)
                 if sent_at is not None and (now - sent_at) < self._resend_after:
                     continue
-                await self._transport.send(
-                    # Inc1 D5：UpReport 必填 account/mode（回報歸屬蓋章，I7）。理想上應在
-                    # buffer.append() 當下（callback 落地那一刻）就蓋章存進 outbox 列
-                    # （D11 buffer schema 升級是後續 task），這裡先用 runner 當下的
-                    # session account/mode 作為來源——同一個 buffer 檔本就受
-                    # `assert_account` tripwire 保護，同一 session 內不會跨帳號。
-                    UpReport(event_id=row.id, kind=row.kind, account=self._account,
-                             mode=self._mode, payload=row.payload).model_dump()
-                )
+                await self._transport.send(self._to_uplink(row).model_dump())
                 self._inflight[row.id] = now
+
+    def _to_uplink(self, row: Any) -> UpReport | UpCmdAck:
+        """outbox 列有兩種：`cmd_id` 非空＝D4④執行 native 後存的 cmd_ack（record_execution/
+        ensure_cmd_ack_pending 寫入，payload＝{"ok","result","error_kind","message"}）；
+        否則是原本的 report。account/mode 優先取列上蓋章值（D5/I7 來源端蓋章、不可變）；
+        None 表示這筆是升級前/測試直呼 append() 未帶欄位的舊列，退回 runner 當下 session
+        account/mode（同一 buffer 檔受 assert_account tripwire 保護，同一 session 內不會
+        跨帳號，退回值語意等價 Inc0）。"""
+        account = row.account if row.account is not None else self._account
+        mode = row.mode if row.mode is not None else self._mode
+        if row.cmd_id is not None:
+            payload = row.payload
+            return UpCmdAck(cmd_id=row.cmd_id, event_id=row.id,
+                            ok=bool(payload.get("ok")), result=payload.get("result"),
+                            error_kind=payload.get("error_kind"),
+                            message=payload.get("message"))
+        return UpReport(event_id=row.id, kind=row.kind, account=account, mode=mode,
+                        payload=row.payload)
 
     async def _receive_loop(self) -> None:
         while True:
@@ -376,16 +396,19 @@ class AgentRunner:
                 self._inflight.pop(msg.event_id, None)
             elif isinstance(msg, DownHealth):
                 await self._transport.send(self._make_health().model_dump())
+            elif isinstance(msg, DownPlace | DownCancel | DownUpdate):
+                # Inc1 D4 agent 端①-④（順序即正確性）：inline 序列執行＝agent 端 native
+                # 序列化第一層（同一時間只有一則下行指令在跑），child pipe lock 為第二層。
+                await self._execute_mutating_command(msg)
             else:
-                # place/cancel/update/reconcile：inline 序列執行＝agent 端 native 序列化
-                # 第一層（同一時間只有一則下行指令在跑），child pipe lock 為第二層。
-                await self._execute_command(msg)
+                # reconcile（唯讀，D4：不入 ledger，只記三種 mutating op）——本 task 不改，
+                # 維持 Inc0 既有直送行為；Task 11 才切 UpQueryResult。
+                await self._execute_readonly_command(msg)
 
-    async def _execute_command(self, msg: Any) -> None:
+    async def _execute_readonly_command(self, msg: Any) -> None:
         op = _to_op(msg)
-        # Inc1 D4：UpCmdAck.event_id 是走 outbox at-least-once 的追蹤鍵（與 UpReport 共用
-        # 補送機制）。command ledger／outbox 接線是後續 task 的 runtime 範圍，這裡先給
-        # 佔位值 0（訊息合法的最小欄位傳遞），不影響本 task 的協定/dispatch 行為。
+        # reconcile 唯讀冪等，逾時下輪重試即可——不落 ledger/outbox，ack_event_id 維持
+        # Inc0 既有佔位值 0（訊息合法的最小欄位傳遞）。
         ack_event_id = 0
         try:
             reply = await asyncio.to_thread(
@@ -399,6 +422,60 @@ class AgentRunner:
                            ok=bool(reply.get("ok")), result=reply.get("result"),
                            error_kind=reply.get("error_kind"), message=reply.get("message"))
         await self._transport.send(ack.model_dump())
+
+    async def _execute_mutating_command(self, msg: Any) -> None:
+        """place/cancel/update：spec D4 agent 端①-④，順序即正確性。"""
+        cmd_id = msg.cmd_id
+
+        # ① ledger 命中 → 不重執行，確保 outbox 有該 cmd 未送 ack（無則以存檔 result 補
+        # append）。刻意排在②③之前（S#4）：已經真的執行過，就算 scope/expiry 這次看起來
+        # 不符，也不能改口——存檔結果才是唯一誠實的答案，重執行風險遠高於誤判。
+        cached = await asyncio.to_thread(self._buffer.lookup_command, cmd_id)
+        if cached is not None:
+            await asyncio.to_thread(
+                self._buffer.ensure_cmd_ack_pending, cmd_id, cached,
+                account=self._account, mode=self._mode,
+            )
+            return  # ack 交給 _pump 走 outbox at-least-once 送出，不在此直送。
+
+        # ② scope 核對（R1-2）：指令 account/mode 與目前登入 scope 不符 → scope_mismatch，
+        # 不執行。best-effort 直送（不進 outbox）——未執行 native，遺失靠重送自然收斂
+        # （resend 時 ledger 仍未命中，會重新走到這裡再判一次，結論不變）。
+        if msg.account != self._account or msg.mode != self._mode:
+            await self._transport.send(UpCmdAck(
+                cmd_id=cmd_id, event_id=0, ok=False, error_kind="scope_mismatch",
+                message=(f"指令 scope（account={msg.account}, mode={msg.mode}）與目前登入"
+                         f"（account={self._account}, mode={self._mode}）不符"),
+            ).model_dump())
+            return
+
+        # ③ expiry：過期 → expired，不執行。同樣 best-effort 直送（理由同②）。
+        if _is_expired(msg.expires_at):
+            await self._transport.send(UpCmdAck(
+                cmd_id=cmd_id, event_id=0, ok=False, error_kind="expired",
+                message="指令已過期，agent 拒絕執行",
+            ).model_dump())
+            return
+
+        # ④ 執行 native → 同一 SQLite 交易寫 command_ledger＋append ack 進 outbox → 泵送。
+        # 不論成功/明確失敗/子程序逾時，只要嘗試呼叫過 native 就一律記錄（I6：每筆
+        # mutating 指令恰好收斂一次——逾時代表「執行結果未知」，不是「未執行」，重播
+        # 風險遠高於漏 ack，同一原則見 child.request timeout 後 pipe 即被判死）。
+        op = _to_op(msg)
+        try:
+            reply = await asyncio.to_thread(
+                self._child.request, op, timeout=self._child_command_timeout
+            )
+        except TimeoutError:
+            result = {"ok": False, "result": None, "error_kind": "timeout",
+                      "message": "agent 子程序無回應"}
+        else:
+            result = {"ok": bool(reply.get("ok")), "result": reply.get("result"),
+                      "error_kind": reply.get("error_kind"), "message": reply.get("message")}
+        await asyncio.to_thread(
+            self._buffer.record_execution, cmd_id, msg.type, result,
+            account=self._account, mode=self._mode,
+        )
 
     async def _heartbeat(self) -> None:
         while True:

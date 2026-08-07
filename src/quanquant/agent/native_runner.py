@@ -41,6 +41,24 @@ def _default_native_factory(*, credentials: dict, symbol: str, mode: str,
     )
 
 
+class _AccountBox:
+    """account 只有 connect 成功後才知道，但 `on_raw` callback 在 native client 建構時
+    （connect 之前）就要註冊完畢——用一個可變容器讓 wrapper 延遲讀取，connect 成功時才
+    填值（Task 9 D5/I7：callback 落 outbox 當下蓋章 account/mode，來源端不可變）。"""
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value: str | None = None
+
+
+def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox):
+    """把 `buffer.append` 包一層，補上 D5/I7 要求的 account/mode 蓋章——SDK callback
+    只給 (kind, payload)，account 從 `account_box`（connect 成功後才填）動態讀取。"""
+    def _on_raw(kind: str, payload: dict) -> int:
+        return buffer.append(kind, payload, account=account_box.value, mode=mode)
+    return _on_raw
+
+
 def _dispatch(native, op: dict) -> dict:
     kind = op["op"]
 
@@ -98,8 +116,10 @@ def child_main(
 
     # (g) mode!="sim" 時不建 native client（防禦層 3）——所有 op 一律回 mode_mismatch。
     native = None
+    account_box = _AccountBox()  # connect 成功後才填值，見 _wrap_on_raw docstring。
     if mode == "sim":
-        native = factory(credentials=credentials, symbol=symbol, mode=mode, on_raw=buffer.append)
+        native = factory(credentials=credentials, symbol=symbol, mode=mode,
+                         on_raw=_wrap_on_raw(buffer, mode=mode, account_box=account_box))
 
     while True:
         op = conn.recv()
@@ -140,6 +160,11 @@ def child_main(
                 # ChildHandle.start() 靠這個欄位判斷要 raise FatalAgentError（停止重試），
                 # 而不是把它當一般連線失敗、任由 run_forever 無限 backoff 重打券商登入。
                 reply = {"ok": False, "error_kind": "account_mismatch", "message": str(exc)}
+            else:
+                # Task 9 D5/I7：帳號確認通過才填 account_box——之後任何 callback 落地的
+                # report 都會蓋上這個帳號；mismatch 分支刻意不填（子程序即將被
+                # ChildHandle.start() terminate，不該有機會用錯帳號蓋章）。
+                account_box.value = reply["account"]
 
         reply["rpc_id"] = op.get("rpc_id")
         conn.send(reply)
