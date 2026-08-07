@@ -572,6 +572,21 @@ def has_unresolved_risky_commands_other_account(
     return session.exec(stmt).first() is not None
 
 
+def has_unresolved_update_command(session: Session, *, client_order_id: str) -> bool:
+    """Task 8：`ShioajiAdapter.update` 的 ledger insert 撞到 `uq_agent_cmd_update_singleflight`
+    partial unique index 後，用這個查詢確認撞的正是這個單飛鍵（同一 `client_order_id` 已有
+    一筆 `kind='update' AND resolved_at IS NULL` 的列）——確認命中才轉「前一筆改單結果未定」
+    的友善訊息，查無則代表 IntegrityError 另有原因（如 cmd_id 這種天文數字機率的 uuid4
+    碰撞），呼叫端應原樣拋出（codex R6-3：精確辨認單飛 index，不可把所有 IntegrityError
+    都吞成同一句話）。"""
+    stmt = select(AgentCommand.cmd_id).where(
+        AgentCommand.client_order_id == client_order_id,
+        AgentCommand.kind == "update",
+        AgentCommand.resolved_at.is_(None),
+    ).limit(1)
+    return session.exec(stmt).first() is not None
+
+
 # ---- Deal（fill 去重帳本） ----
 
 def _find_deal(

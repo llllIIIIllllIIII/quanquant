@@ -25,6 +25,7 @@ from pydantic import ValidationError
 
 from quanquant.auth.agent_tokens import validate_token
 from quanquant.broker import repository as brepo
+from quanquant.broker.agent_commands import apply_command_ack
 from quanquant.broker.agent_protocol import (
     DownReportAck, UpCmdAck, UpHealth, UpLogin, UpReport, parse_uplink,
 )
@@ -163,6 +164,35 @@ async def agent_ws(websocket: WebSocket) -> None:
                         DownReportAck(event_id=msg.event_id).model_dump()
                     )
             elif isinstance(msg, UpCmdAck):
+                # Task 8（D4/G1）：applier 是唯一效果套用入口，且必須在 `channel.resolve_ack`
+                # 之前完整 commit——route 端 `AgentChannel.request()` 的 future 才不會在效果
+                # 落地前就把控制權還給呼叫端（brief 規則 7：route 讀已落庫結果渲染回應）。
+                # 與 UpReport 分支共用 `inbox_lock`：`has_unresolved_risky_commands_other_
+                # account`（UpLogin guard）查的正是這張表的 resolved_at，序列化在同一顆鎖
+                # 內避免與換帳號判定之間出現 TOCTOU（同 UpReport 分支既有理由）。
+                async with channel.inbox_lock:
+                    outcome = await asyncio.to_thread(
+                        apply_command_ack, session_factory, cmd_id=msg.cmd_id,
+                        user_id=agent_user_id, ack=msg,
+                    )
+                if outcome.user_mismatch:
+                    # R1-5：cmd_id 存在但屬於別的 user——拒絕＋告警，完全不觸碰、不 ack。
+                    log.warning(
+                        "agent WS：cmd_ack user 不符（cmd_id=%s，連線 user_id=%s），忽略",
+                        msg.cmd_id, agent_user_id,
+                    )
+                    ops = getattr(state, "ops_alerter", None)
+                    if ops is not None:
+                        ops.emit(
+                            "agent_cmd_ack_user_mismatch", "cmd_ack user 不符",
+                            detail=f"cmd_id={msg.cmd_id} user_id={agent_user_id}", severity="warn",
+                        )
+                    continue
+                if not outcome.found:
+                    # 查無此 cmd_id——可能是舊連線 generation 的殘留重送、或 client 端 bug。
+                    # 無效果可套，`channel.resolve_ack` 對沒有對應 pending future 的 cmd_id
+                    # 本就是安全 no-op（見 AgentChannel.resolve_ack），僅記 log 供觀測。
+                    log.warning("agent WS：查無 cmd_id=%s 的 agent_commands 列，忽略", msg.cmd_id)
                 channel.resolve_ack(msg)
             elif isinstance(msg, UpHealth):
                 channel.note_heartbeat()

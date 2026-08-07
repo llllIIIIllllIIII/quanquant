@@ -140,7 +140,7 @@ async def test_gateway_place_maps_ack_fields_and_serializes_price_as_str():
     ch = _StubChannel(ack=UpCmdAck(cmd_id="x", event_id=1, ok=True,
                                    result={"ordno": "101AA1", "broker_order_id": "101AA1"}))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
-    assert await gw.place(_req()) == {"ordno": "101AA1", "broker_order_id": "101AA1"}
+    assert await gw.place(_req(), cmd_id="x") == {"ordno": "101AA1", "broker_order_id": "101AA1"}
     assert ch.sent[0]["native"]["price"] == "21500"
 
 
@@ -149,7 +149,7 @@ async def test_gateway_trade_not_found_raises_typed():
                                    error_kind="trade_not_found", result={"ordno": "NOPE"}))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
     with pytest.raises(TradeNotFoundError):
-        await gw.cancel("NOPE")
+        await gw.cancel("NOPE", cmd_id="x")
 
 
 async def test_gateway_error_message_preserves_broker_code_for_classification():
@@ -157,7 +157,7 @@ async def test_gateway_error_message_preserves_broker_code_for_classification():
                                    message="code: 406 Please sign F002 first"))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
     with pytest.raises(OrderError) as ei:
-        await gw.place(_req())
+        await gw.place(_req(), cmd_id="x")
     assert _classify_place_failure(ei.value) == "failed"
 
 
@@ -170,5 +170,5 @@ async def test_gateway_timeout_error_kind_raises_typed_and_classified_unknown():
                                    message="agent 子程序無回應"))
     gw = AgentNativeGateway(ch, timeout_seconds=1)
     with pytest.raises(AgentCommandTimeoutError) as ei:
-        await gw.place(_req())
+        await gw.place(_req(), cmd_id="x")
     assert _classify_place_failure(ei.value) == "unknown"

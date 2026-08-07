@@ -17,6 +17,8 @@ import pytest
 from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
+from quanquant.broker.agent_commands import apply_command_ack
+from quanquant.broker.agent_protocol import UpCmdAck
 from quanquant.broker.base import (
     AgentCommandTimeoutError,
     AgentUnavailableError,
@@ -28,7 +30,7 @@ from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter, _classify_place_failure
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import OrderRequest
-from quanquant.db.models import Order, QuotaReservation, RawInbox
+from quanquant.db.models import AgentCommand, Order, QuotaReservation, RawInbox
 
 
 def test_agent_unavailable_classified_failed():
@@ -62,18 +64,18 @@ class _FakeGateway:
         self.raise_exc = None
         self.snapshot = ([], None)
 
-    async def place(self, req):
+    async def place(self, req, *, cmd_id=None):
         self.place_calls.append(req)
         if self.raise_exc:
             raise self.raise_exc
         return self.result
 
-    async def cancel(self, ordno):
+    async def cancel(self, ordno, *, cmd_id=None):
         self.cancel_calls.append(ordno)
         if self.raise_exc:
             raise self.raise_exc
 
-    async def update(self, ordno, *, price, qty, price_type=None):
+    async def update(self, ordno, *, price, qty, price_type=None, cmd_id=None):
         if self.raise_exc:
             raise self.raise_exc
 
@@ -301,13 +303,20 @@ async def test_remote_update_offline_fails_fast_no_new_reservation(engine):
 
 
 async def test_remote_update_timeout_marks_unknown_keeps_quota(engine):
+    """Task 8（D4 kind×outcome 轉移表）行為變更，明確flag：spec v8 D4 表格「update | timeout
+    | acked_unknown | **不改** | delta 保留」——Inc0 舊版對「結果不明」一律 `mark_order_status
+    (unknown)`，但 update 是對一張**已經有效**委託的修改，把整張 Order 標成 unknown 會誤導
+    （委託本身其實還健在，只是這次改單的結果不確定）；Inc1 導入 ledger 後，這個不確定性改由
+    `agent_commands` 列的 outcome='unknown'（未 resolved）承載，不再需要污染 Order.status。
+    place 沒有這個問題（timeout 前 Order 本來就沒有『上一個有效狀態』可以保留），維持
+    「timeout → unknown」不變（見 test_remote_place_timeout_unknown_and_quota_reserved）。"""
     gw = _FakeGateway()
     a, ack = await _placed_order(engine, gw, _guard(engine))
     gw.raise_exc = AgentCommandTimeoutError("逾時")
     with pytest.raises(AgentCommandTimeoutError):
         await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
     with Session(engine) as s:
-        assert s.exec(select(Order)).one().status == "unknown"
+        assert s.exec(select(Order)).one().status == "submitted"  # 不改（新語意，見上方說明）
         rows = list(s.exec(select(QuotaReservation)))
         update_row = next(r for r in rows if r.reservation_id != ack.client_order_id)
         assert update_row.state == "reserved"  # 結果不明，watchdog reconcile 前不擅自 release
@@ -333,6 +342,126 @@ async def test_remote_update_unavailable_releases_delta_quota(engine):
         rows = list(s.exec(select(QuotaReservation)))
         update_row = next(r for r in rows if r.reservation_id != ack.client_order_id)
         assert update_row.state == "released"  # 明確判定失敗，立即釋放 delta 配額
+
+
+# ---- Task 8：G1 command ledger 全鏈整合（真正經過 ShioajiAdapter 決策段建立的 ledger 列，
+# 不是 test_agent_commands.py 那樣手工建構——驗證 insert_command/mark_timeout_observed 真的
+# 接線到 place()/update()，而不只是 agent_commands.py 模組本身正確） ----
+
+
+def _find_cmd(engine, *, client_order_id: str, kind: str) -> AgentCommand:
+    with Session(engine) as s:
+        stmt = select(AgentCommand).where(
+            AgentCommand.client_order_id == client_order_id, AgentCommand.kind == kind
+        )
+        return s.exec(stmt).one()
+
+
+async def test_place_timeout_then_late_ack_converges_full_chain(engine):
+    """S#1 全鏈收斂，經真正的 ShioajiAdapter：route 逾時（AgentCommandTimeoutError）先把
+    Order 標 unknown、`mark_timeout_observed` 贏得 CAS；隨後模擬 late ack（透過
+    `apply_command_ack`，即 agent_ws.py 的 UpCmdAck handler 實際呼叫的同一函式）補上 ordno，
+    Order 收斂為 submitted、配額 confirmed、ledger 列 resolved。"""
+    gw = _FakeGateway()
+    gw.raise_exc = AgentCommandTimeoutError("ack 逾時")
+    guard = _guard(engine)
+    a = _adapter(engine, gw, guard)
+    a._agent_user_id = 1
+
+    with pytest.raises(AgentCommandTimeoutError):
+        await a.place(_req(), actor_user_id=1)
+
+    cmd = _find_cmd(engine, client_order_id="c-1", kind="place")
+    assert cmd.transport_acked_at is None and cmd.timeout_observed_at is not None
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "unknown"
+
+    ack = UpCmdAck(cmd_id=cmd.cmd_id, event_id=1, ok=True,
+                   result={"ordno": "101AA1", "broker_order_id": "101AA1"})
+    outcome = apply_command_ack(lambda: Session(engine), cmd_id=cmd.cmd_id, user_id=1, ack=ack)
+    assert outcome.applied and outcome.outcome == "ok"
+
+    with Session(engine) as s:
+        order = s.exec(select(Order)).one()
+        assert order.status == "submitted" and order.ordno == "101AA1"
+        assert s.exec(select(QuotaReservation)).one().state == "confirmed"
+
+
+async def test_place_never_dispatched_locally_resolves_ledger(engine):
+    """AgentUnavailableError（`_send_gate`/`channel.request` 的 ready 檢查落空，指令從未
+    送達 agent）——route 本地終結 ledger（`resolve_never_dispatched`），Order failed＋
+    quota released，且 ledger 不再是永遠 unresolved 的孤兒列。"""
+    gw = _FakeGateway()
+    gw.raise_exc = AgentUnavailableError("斷線")
+    a = _adapter(engine, gw, _guard(engine))
+    a._agent_user_id = 1
+    with pytest.raises(AgentUnavailableError):
+        await a.place(_req(), actor_user_id=1)
+
+    cmd = _find_cmd(engine, client_order_id="c-1", kind="place")
+    assert cmd.resolved_at is not None and cmd.resolved_via == "local" and cmd.outcome == "error"
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "failed"
+        assert s.exec(select(QuotaReservation)).one().state == "released"
+
+
+async def test_update_singleflight_rejects_second_unresolved_update(engine):
+    """R5-2/R6-1：同一張 Order 已有一筆未 resolved 的 update ledger 列時，第二筆改單在
+    decision 段插 ledger 就撞 `uq_agent_cmd_update_singleflight`，轉友善訊息「前一筆改單
+    結果未定」，且第二筆的 ledger 列**不會**落地（`agent_commands` 只有第一筆）。
+
+    已知落差（見 `agent_commands.py` 模組頂部說明／task-8-report.md）：`RiskGuard.
+    check_update` 內部會自行 commit 它建立的 delta `QuotaReservation`，這個 commit 早於
+    ledger insert 撞鍵，因此撞鍵後的 `session.rollback()` 救不回它——第二次嘗試會留下一筆
+    孤兒 `reserved`（未 confirm、未 release，日終跨日自然歸零，不會被誤算進已用配額；
+    watchdog/人工其後可用『查無對應 ledger 列』辨識並清理）。這裡精確驗證這個已知結果，
+    不假裝它不存在。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    a._agent_user_id = 1
+    gw.raise_exc = AgentCommandTimeoutError("逾時")  # 第一筆改單卡在 unresolved
+    with pytest.raises(AgentCommandTimeoutError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
+
+    with Session(engine) as s:
+        cmds_before = len(list(s.exec(select(AgentCommand))))
+
+    gw.raise_exc = None
+    with pytest.raises(OrderError, match="前一筆改單結果未定"):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=5)
+
+    with Session(engine) as s:
+        # ledger 沒有第二筆（singleflight 真正擋下的是這個——未來重連補送/watchdog 只看
+        # agent_commands，孤兒 reservation 不會被誤判成「有一筆待收斂的指令」）。
+        assert len(list(s.exec(select(AgentCommand)))) == cmds_before
+        rows = list(s.exec(select(QuotaReservation)))
+        orphan = next(r for r in rows if r.qty == 4)
+        assert orphan.state == "reserved"  # 已知落差：check_update 自己的 commit 救不回
+
+
+async def test_update_late_ack_converges_price_qty_and_confirms_delta(engine):
+    """update 版 late-ack 全鏈：route 逾時→unknown-ledger（不改 Order，delta 保留）→ late ack
+    透過 apply_command_ack 補寫 price/qty、confirm delta、Order 回到 submitted。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    a._agent_user_id = 1
+    gw.raise_exc = AgentCommandTimeoutError("逾時")
+    with pytest.raises(AgentCommandTimeoutError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
+
+    cmd = _find_cmd(engine, client_order_id=ack.client_order_id, kind="update")
+    assert cmd.resolved_at is None and cmd.reservation_id is not None
+
+    late_ack = UpCmdAck(cmd_id=cmd.cmd_id, event_id=1, ok=True)
+    outcome = apply_command_ack(lambda: Session(engine), cmd_id=cmd.cmd_id, user_id=1, ack=late_ack)
+    assert outcome.applied and outcome.outcome == "ok"
+
+    with Session(engine) as s:
+        order = s.exec(select(Order)).one()
+        assert order.qty == 3 and order.status == "submitted"
+        rows = list(s.exec(select(QuotaReservation)))
+        update_row = next(r for r in rows if r.reservation_id != ack.client_order_id)
+        assert update_row.state == "confirmed"
 
 
 async def test_remote_reconcile_stages_payloads_and_returns_count(engine):

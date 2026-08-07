@@ -88,14 +88,14 @@ class _FakeGateway:
         self.snapshot = ([], None)
         self.result = {"ordno": "O1", "broker_order_id": "B1"}
 
-    async def place(self, req):
+    async def place(self, req, *, cmd_id=None):
         self.place_calls.append(req)
         return self.result
 
-    async def cancel(self, ordno):
+    async def cancel(self, ordno, *, cmd_id=None):
         pass
 
-    async def update(self, ordno, *, price, qty, price_type=None):
+    async def update(self, ordno, *, price, qty, price_type=None, cmd_id=None):
         pass
 
     async def trades_snapshot(self, after):
@@ -125,7 +125,8 @@ def _make_slot(engine, *, user_id: int, account: str, guard: RiskGuard, gw_ready
     adapter = ShioajiAdapter(api_key="", secret_key="", ca_path=None, ca_passwd=None,
                              person_id=None, symbol="TXF", mode="sim",
                              session_factory=lambda: Session(engine), supervisor=supervisor,
-                             risk_guard=guard, sim_fee_per_lot=Decimal("20"), remote_gateway=gw)
+                             risk_guard=guard, sim_fee_per_lot=Decimal("20"), remote_gateway=gw,
+                             agent_user_id=user_id)
     adapter.account = account
     state = OrderSessionState()
     state.mark_ready()

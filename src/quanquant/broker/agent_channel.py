@@ -117,9 +117,14 @@ class AgentNativeGateway:
     def ready(self) -> bool:
         return self._channel.ready
 
-    async def place(self, req: OrderRequest) -> dict:
+    async def place(self, req: OrderRequest, *, cmd_id: str) -> dict:
+        # Inc1 D4/Task 8：`cmd_id` 由呼叫端（ShioajiAdapter 決策段）提供——必須與該指令已經
+        # 送前持久化的 `agent_commands` 列同一個 cmd_id，UpCmdAck 的兩維 CAS applier
+        # （`agent_commands.apply_command_ack`）才能用 cmd_id 命中同一列。不再自行
+        # `uuid.uuid4()`（Inc0 舊行為：ledger 尚不存在時 gateway 自己決定 id 即可，Task 8
+        # 之後 id 的權威來源改成 ledger）。
         cmd = DownPlace(
-            cmd_id=uuid.uuid4().hex, account=self._channel.account, mode="sim",
+            cmd_id=cmd_id, account=self._channel.account, mode="sim",
             expires_at=_default_expires_at(),
             native=PlaceNative(action=req.action, price=str(req.price), qty=req.qty,
                                price_type=req.price_type, order_type=req.order_type,
@@ -130,14 +135,16 @@ class AgentNativeGateway:
         result = self._unwrap(ack)
         return {"ordno": result.get("ordno"), "broker_order_id": result.get("broker_order_id")}
 
-    async def cancel(self, ordno: str) -> None:
-        cmd = DownCancel(cmd_id=uuid.uuid4().hex, account=self._channel.account, mode="sim",
+    async def cancel(self, ordno: str, *, cmd_id: str) -> None:
+        cmd = DownCancel(cmd_id=cmd_id, account=self._channel.account, mode="sim",
                          expires_at=_default_expires_at(), ordno=ordno)
         self._unwrap(await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id,
                                                  timeout=self._timeout))
 
-    async def update(self, ordno: str, *, price, qty: int, price_type: str | None = None) -> None:
-        cmd = DownUpdate(cmd_id=uuid.uuid4().hex, account=self._channel.account, mode="sim",
+    async def update(
+        self, ordno: str, *, price, qty: int, price_type: str | None = None, cmd_id: str
+    ) -> None:
+        cmd = DownUpdate(cmd_id=cmd_id, account=self._channel.account, mode="sim",
                          expires_at=_default_expires_at(), ordno=ordno,
                          price=(str(price) if price is not None else None),
                          qty=qty, price_type=price_type)
