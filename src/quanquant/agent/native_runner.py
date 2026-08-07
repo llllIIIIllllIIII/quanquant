@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import threading
+import uuid
 from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
@@ -140,7 +141,20 @@ def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail:
     也會在呼叫本函式之前搶先 trip 一次，這裡重複 trip 不影響正確性，只是防禦性地確保
     「即使有其他呼叫路徑漏了搶先 trip，這裡仍第一手補上」。sentinel/IPC 通知各自吞例外
     （本身失敗不能讓呼叫端更難排錯，仍靠子程序心跳凍結偵測——issue #203 既有防線——當
-    最後防線）。"""
+    最後防線）。
+
+    R7-2（HIGH，codex 終審 round7）：每次呼叫都產生一個全新、獨一無二的 fault_token
+    （uuid4 hex，只要求「跟上一次/下一次不同」，equality 比對即足夠支撐 `AgentRunner.
+    _recover()` 的偵測需求，不需要跨程序協調也不需要嚴格遞增）隨 sentinel 一起寫入。
+    理由：舊版固定寫 epoch=-1 這個字面值，`_recover()` 若拿它跟自己記得的舊值做
+    exact-match 比對，會因為「每次故障都寫同一個 -1」而永遠判定「沒有變化」——這正是
+    R5-b 記載過的舊卡死模式（見 buffer.py write_sentinel/runner.py _recover 兩處
+    docstring）。改用每次呼叫都不同的 token，`_recover()` 才能可靠分辨「這是同一筆故障」
+    還是「child 死前最後一刻又落地了一筆全新的故障」（dying-gasp）。同一次故障事件如果
+    經過多個呼叫路徑重複觸發本函式，每次仍會拿到不同的 token——這是刻意的，child 端不
+    需要、也沒有能力判斷「這是重複通知還是新故障」，這個判斷交給父程序端的 before/after
+    比對。"""
+    fault_token = uuid.uuid4().hex
     if latch is not None:
         latch.trip()
     log.error("callback 主寫入落地失敗，觸發 G2 fail-stop latch: %s", detail)
@@ -149,8 +163,8 @@ def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail:
         # 父程序收到 IPC 通知後會用自己遞增後的權威值覆寫這個 sentinel（見 runner.py
         # AgentRunner._latch）；即使父程序來不及覆寫就再次崩潰，sentinel 存在本身已經
         # 足以讓下次啟動視為 latch（durable 的定義只看「存在與否」，不依賴這裡的 epoch
-        # 值精確與否）。
-        buffer.write_sentinel(epoch=-1, detail=detail)
+        # 值精確與否）。fault_token（R7-2）：這次呼叫的唯一 nonce，見上方 docstring。
+        buffer.write_sentinel(epoch=-1, detail=detail, fault_token=fault_token)
     except Exception:
         log.error("sentinel 寫入也失敗，僅能靠 IPC 通知父程序（若 IPC 也失敗，"
                   "父程序仍會靠子程序心跳凍結偵測——issue #203 既有防線——察覺異常）")

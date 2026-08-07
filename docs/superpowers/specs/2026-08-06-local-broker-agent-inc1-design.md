@@ -420,3 +420,45 @@ worker 誤殺新 session 的 child；terminate 失敗或驗不死＝保留 latch
 `done` set 可能同時收攏多個例外時的確定性選擇優先序（`FatalAgentError`＞
 `SessionRestartRequested`＞其他）。詳細推演與測試清單見
 `.superpowers/sdd/codex-final-fixes-report.md` Round 6 fixes 段。
+
+**round7 修正（R7-1/R7-2，codex 終審 round7，HIGH）**：round6 的 N6-1「同步 terminate
+child 並驗證已死」本身有兩個殘餘縫。
+
+R7-1：`ChildHandle.terminate()` 的驗死檢查沒有真正生效——`kill()`+`join(timeout=5)` 後
+舊版無條件把 `self._process` 設 `None`，`join` 逾時（「這 5 秒內沒等到它退出」）被誤當成
+「確認死亡」，讓 `alive` 屬性此後永遠回報 `False`，即使底層進程其實仍在跑。`_recover()`
+靠 `self._child.alive` 做的二次確認因此形同虛設——不管子程序真死沒死，`terminate()`
+都回報「已死」。修法：`terminate()` 在 `kill()`+`join(5s)` 後明確檢查
+`process.is_alive()`——仍活著就保留 `self._process`/`self._conn`（不清狀態），回傳
+`False`；`_recover()` 既有的 `if self._child.alive:` 檢查因此開始正確生效，不需要另外
+改動判斷邏輯本身。
+
+R7-2：N6-1 只驗證「child 已確認死亡」，沒有驗證「child 死之前，這段 terminate 窗口內有沒有
+又落地一筆全新的故障」（dying-gasp）——latch 之後 child 進程仍然活著，SDK callback 執行緒
+不受本地 latch（`ChildFailstopLatch`）攔阻自己的落地路徑（那只擋 `_dispatch` 呼叫 native
+mutating op 前的窗口，不擋 callback 本身），unrelated 的 SDK push（如未結案委託的成交
+回報）仍可能觸發一次全新的落地失敗，寫入一筆帶新 `detail`／舊版固定 `epoch=-1` 佔位值的
+新 sentinel——這筆新故障可能恰好卡在 `_recover()` 已判定要 terminate、但 `kill()`/`join()`
+真正生效之間的窄窗。舊版一旦驗到死亡就無條件清 sentinel／解 latch，這筆新故障的訊號會這樣
+悄悄消失——reconcile 快照補不回（只有 order_id/seqno/status，落 order_report，無 deal
+明細）、degraded JSONL 也沒有自動 reinjection，不可接受。修法：
+1. `write_sentinel`（`buffer.py`）新增選填 `fault_token` 欄位；`_trigger_failstop_latch`
+   （`native_runner.py`）每次呼叫都產生一個全新 `uuid4().hex` 唯一 nonce 隨 sentinel 寫入
+   ——不是舊版那種每次故障都寫同一個字面 `epoch=-1` 的固定值（那個寫法本身就是 R5-b
+   記載過的舊卡死模式：exact-match 比對永遠判定「沒有變化」）。
+2. `_recover()` 在 terminate **之前**先讀一次 sentinel 記下 `before_token`；child 確認
+   死亡之後**重讀**一次記下 `after_token`。`after_token == before_token`（含兩者皆為
+   `None`——沒有 sentinel、或舊格式 sentinel 沒有這個欄位，向後相容）才走既有持久化／
+   清除／解 latch 流程；不同則保留 sentinel／保持 latch（`_health_epoch` 記憶體內
+   +=1），child 已確認死亡故仍 `raise SessionRestartRequested` 結束 session——下一個
+   session 重新 `_load_persisted_health()` 會讀到保留的 sentinel，繼續回報
+   `status="failstop"`，等下一輪（沒有任何 in-flight terminate 競態的）recovery 對這筆
+   保留下來的故障重試。
+
+明確澄清（避免未來誤讀）：**reconcile 不是 deal recovery**——`native.trades_snapshot()`
+只回傳 order-level 的 order_id/seqno/status，落 `order_report`，沒有成交（deal）明細；
+**degraded JSONL 需人工重灌**——退化寫入路徑（`_try_degraded_write`）純檔案 append-only，
+沒有自動 reinjection 機制，任何只落在退化檔的事件都需要操作者事後人工介入重新灌回。§4/§5
+描述 reconcile／degraded JSONL 之處均不得再以「reconcile 會補回」或「degraded 檔會自動
+救回」的描述理解——兩者只是事後救援線索，不是自動收斂機制。詳細推演與測試清單見
+`.superpowers/sdd/codex-final-fixes-report.md` Round 7 fixes 段。

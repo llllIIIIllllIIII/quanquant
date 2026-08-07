@@ -313,17 +313,23 @@ async def test_ensure_child_respawns_when_alive_but_account_lost(tmp_path):
 # request()/ping() 一律直接 fail，不再碰這條不可信的 pipe，交給 ensure_child() respawn。
 
 class _FakeProcess:
-    def __init__(self, alive: bool = True):
+    def __init__(self, alive: bool = True, refuse_kill: bool = False):
         self._alive = alive
         self.killed = False
         self.joined = False
+        # R7-1（HIGH，codex 終審 round7）：模擬「kill()+join(timeout=5) 後 process 仍然
+        # 存活」——`refuse_kill=True` 時 `kill()` 不翻轉 `_alive`，讓 `terminate()` 的
+        # `is_alive()` 驗證真的驗到「還活著」，用來測 join-timeout 路徑。預設 False，
+        # 既有測試（`kill()` 即視為死亡）行為不變。
+        self._refuse_kill = refuse_kill
 
     def is_alive(self) -> bool:
         return self._alive
 
     def kill(self) -> None:
         self.killed = True
-        self._alive = False
+        if not self._refuse_kill:
+            self._alive = False
 
     def join(self, timeout=None) -> None:
         self.joined = True
@@ -682,6 +688,74 @@ def test_terminate_generation_mismatch_after_concurrent_respawn_is_noop_for_new_
     assert new_conn.closed is False       # 新 conn 也沒被碰
     assert child.alive is True            # 新 child 仍正常存活
     assert old_process.killed is False    # 舊 process 也沒被碰（呼叫從頭到尾都卡在等鎖）
+
+
+# ---------- R7-1（HIGH，codex 終審 round7）：terminate() 沒有真正 verify-dead——舊版
+# kill()+join(timeout=5) 後未檢查 process.is_alive() 就無條件把 self._process 設 None，
+# 讓 alive 屬性此後永遠回報 False（即使底層真的還活著），_recover() 靠 alive 做的二次確認
+# 因此形同虛設。----------
+
+
+def test_terminate_returns_false_and_keeps_handle_when_process_refuses_to_die(tmp_path):
+    """真 `ChildHandle.terminate()` 的 join-timeout 路徑：kill()+join(timeout=5) 後
+    `process.is_alive()` 仍回 True（用 `_FakeProcess(refuse_kill=True)` 精確控制，不依賴
+    真的能製造出一個吃 SIGKILL 不死的程序）——terminate() 必須回傳 False、**不清**
+    `self._process`（handle 保留），`child.alive` 也必須誠實回報 True，不能因為呼叫過
+    terminate() 就被錯誤地永遠判定成「已死」。"""
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(refuse_kill=True), _FakeConn()
+    child._process, child._conn = process, conn
+
+    result = child.terminate()
+
+    assert result is False
+    assert process.killed is True        # kill() 確實被呼叫過
+    assert process.joined is True        # join() 也確實被呼叫過
+    assert child._process is process     # R7-1 核心：handle 未被清掉
+    assert child._conn is conn           # conn 同樣未被清掉（不確認死亡就不清任何資源）
+    assert child.alive is True           # 誠實反映「其實還活著」，不是誤報 False
+
+
+def test_terminate_returns_true_and_clears_handle_when_process_actually_dies(tmp_path):
+    """回歸：process 正常死亡（`_FakeProcess()` 預設行為）時，terminate() 仍必須回傳
+    True 並清掉 handle——R7-1 的修法只在「驗不死」時保留狀態，不影響既有的正常成功路徑。"""
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = process, conn
+
+    result = child.terminate()
+
+    assert result is True
+    assert child._process is None
+    assert child._conn is None
+    assert child.alive is False
+
+
+async def test_recover_with_real_child_handle_keeps_latch_when_process_refuses_to_die(
+    tmp_path,
+):
+    """R7-1 整合驗證：用真 `ChildHandle`（不是抽象 `_FakeChild`）接上 `refuse_kill=True`
+    的假 process，證明修好的 `terminate()`（join 後真的檢查 is_alive）與既有 `_recover()`
+    的『child.alive 二次確認』邏輯組合起來，確實能在 kill/join 沒有真正生效時保留
+    latch/sentinel，不會被舊版「terminate 之後一律視為已死」的誤判放行清除。"""
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(refuse_kill=True), _FakeConn()
+    child._process, child._conn = process, conn
+    child._generation = 1
+
+    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r._latched = True
+    r._latch_detail = "boom"
+    r._health_epoch = 1
+    buf.write_sentinel(epoch=1, detail="boom")
+
+    await r._recover()   # probe 會過（buf 本身健康）；terminate 會被呼叫，但驗不死
+
+    assert r._latched is True
+    assert buf.has_sentinel()
+    assert buf.get_health_epoch() == 0   # 完全沒有持久化
+    assert child.alive is True           # handle 仍保留，誠實反映還活著
 
 
 async def test_cancelled_terminate_worker_late_arrival_after_respawn_is_discarded(tmp_path):

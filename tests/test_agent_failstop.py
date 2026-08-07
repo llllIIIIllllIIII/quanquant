@@ -57,6 +57,28 @@ def test_sentinel_write_read_clear_roundtrip(tmp_path):
     assert not buf.has_sentinel()
 
 
+# ---- R7-2（HIGH，codex 終審 round7）：sentinel 加 fault_token（唯一 nonce）欄位，供
+# AgentRunner._recover() 在 terminate 前後比對、偵測 dying-gasp（見 runner.py _recover
+# docstring）----
+
+
+def test_write_sentinel_with_fault_token_roundtrips(tmp_path):
+    buf = DurableBuffer(tmp_path / "o.db")
+    buf.write_sentinel(epoch=1, detail="x", fault_token="tok-1")
+    assert buf.read_sentinel() == {"epoch": 1, "detail": "x", "fault_token": "tok-1"}
+
+
+def test_write_sentinel_without_fault_token_omits_key_backward_compat(tmp_path):
+    """不傳 `fault_token`（既有呼叫端——`AgentRunner._latch` 的父程序端覆寫、以及本檔
+    其他既有測試）——JSON 內完全不寫這個鍵（不是寫入字面 `null`），維持既有測試對
+    `read_sentinel()` 的精確 dict 比對逐位元組相容，`.get("fault_token")` 讀到的自然是
+    `None`。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    buf.write_sentinel(epoch=1, detail="x")
+    assert buf.read_sentinel() == {"epoch": 1, "detail": "x"}
+    assert buf.read_sentinel().get("fault_token") is None
+
+
 def test_sentinel_path_is_outside_sqlite_buffer_file(tmp_path):
     """G2①：sentinel 是 buffer 之外的獨立檔案——不是 SQLite 的一部分，buffer 檔案本身損毀
     也不影響它的存在。"""
@@ -201,6 +223,49 @@ def test_wrap_on_raw_double_failure_without_failstop_conn_still_writes_sentinel(
     with pytest.raises(RuntimeError):
         on_raw("deal_report", {"n": 1})
     assert buf.has_sentinel()
+
+
+# ---- R7-2（HIGH，codex 終審 round7）：_trigger_failstop_latch 每次呼叫都寫入一個全新、
+# 獨一無二的 fault_token（不是舊版固定字面 epoch=-1 那種永遠不變的值）----
+
+
+def test_trigger_failstop_latch_writes_unique_fault_token_each_call(tmp_path):
+    """每次呼叫都必須拿到不同的 fault_token——這是 `AgentRunner._recover()` 用 before/
+    after 比對偵測 dying-gasp 的前提（若每次都寫同一個值，等於重演 R5-b 記載過的
+    `epoch=-1` 字面比較舊卡死模式）。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    latch = nr.ChildFailstopLatch()
+
+    nr._trigger_failstop_latch(buf, None, latch, "detail1")
+    token1 = buf.read_sentinel()["fault_token"]
+    assert token1  # 非空字串
+
+    nr._trigger_failstop_latch(buf, None, latch, "detail2")
+    token2 = buf.read_sentinel()["fault_token"]
+
+    assert token1 != token2
+
+
+def test_wrap_on_raw_double_failure_sentinel_carries_fault_token(tmp_path, monkeypatch):
+    """G2①/R7-2 核心路徑（雙寫皆失敗）：sentinel 內容必須帶上 fault_token，不是只有
+    epoch/detail。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    monkeypatch.setattr(
+        buf, "append", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("primary boom"))
+    )
+    monkeypatch.setattr(
+        nr, "_try_degraded_write",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("degraded boom")),
+    )
+    account_box = nr._AccountBox()
+    account_box.value = "F1"
+    on_raw = nr._wrap_on_raw(buf, mode="sim", account_box=account_box)
+
+    with pytest.raises(RuntimeError):
+        on_raw("deal_report", {"n": 1})
+
+    sentinel = buf.read_sentinel()
+    assert sentinel["fault_token"]
 
 
 # ===========================================================================
@@ -611,16 +676,33 @@ async def test_recover_keeps_latch_when_child_refuses_to_die_after_terminate(tmp
     await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_child_dying_gasp_write_happens_before_clear_never_races_replace_unlink(
+async def test_child_dying_gasp_new_fault_token_preserved_not_cleared_new_session_still_failstop(
     tmp_path, monkeypatch,
 ):
-    """N6-1：明確測 replace（child 落地失敗時的 `write_sentinel`）→ unlink（recovery 的
-    `clear_sentinel`）順序——即使 child 在真正被 kill 前的最後一刻又落地一次新 sentinel
-    （模擬 trip 剛好卡在 terminate 生效前），`clear_sentinel()` 只在 `child.alive` 驗證
-    為 False 之後才會被呼叫，這次「死前最後一次 write」必然嚴格發生在 clear 之前
-    （happens-before，不再是 Round5 版本那種「child 可能還活著、寫入與清除可能併發」的
-    真正 TOCTOU）。用共用的呼叫順序記錄斷言：write 恆先於 clear，不會顛倒也不會交錯；
-    recovery 最終仍正常收斂（session-restart 成功，sentinel 乾淨清除）。"""
+    """R7-2（HIGH，codex 終審 round7）：取代 Round6 版本的
+    `test_child_dying_gasp_write_happens_before_clear_never_races_replace_unlink`。
+
+    Round6 版本只驗證「write 恆先於 clear」的 happens-before 排序（N6-1：`clear_sentinel`
+    只在 `child.alive` 驗證為 False 之後才會被呼叫，child 死前最後一次 write 必然先於
+    它），並假設只要滿足這個排序就能安全清除——codex round7 指出這個假設本身不安全：
+    happens-before 只保證不是檔案系統層級的 TOCTOU，不保證這筆「死前最後一次寫入」的
+    **內容**沒有攜帶一筆全新、從未被處理過的故障（例如 unrelated 的 SDK push callback
+    在 latch 之後仍可能觸發，見 `_recover()` docstring 的「dying-gasp」情境）。若無條件
+    清除，這筆新故障的訊號會悄悄消失：reconcile 快照補不回成交明細，degraded JSONL 也
+    沒有自動 reinjection。
+
+    這裡把「child 死前最後一刻又寫入」模擬成**只發生一次**（用 `fired` 旗標控制，只在第一
+    次 `terminate()` 呼叫時注入）——代表一個真實世界只發生一次的新故障事件，不是每次
+    terminate 都會重演（否則不切實際地讓 recovery 永遠卡住）。驗證：
+      1. 第一輪 recovery（terminate 前後 sentinel fault_token 改變）：child 仍確認死亡
+         （N6-1 不受影響），但 sentinel／latch 必須被保留，不清除、不解 latch。
+      2. 保留期間 session 仍會結束（第二筆 login 出現）——新 session 重新
+         `_load_persisted_health()` 讀到保留的 sentinel，繼續回報 `status="failstop"`
+         （不會因為 child 已死就誤報 ok）。
+      3. 第二輪 recovery（新 session 的新 child，這次 terminate 前後 token 不再變化）：
+         正常收斂，sentinel 清除、latch 解除、第三筆 login。
+      4. write 恆先於 clear 的 happens-before 性質依然成立（N6-1 沒有被推翻），只是這次
+         clear 發生在下一個 session 的 recovery，不是同一輪。"""
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
 
@@ -628,6 +710,7 @@ async def test_child_dying_gasp_write_happens_before_clear_never_races_replace_u
     original_write = buf.write_sentinel
     original_clear = buf.clear_sentinel
     original_terminate = child.terminate
+    fired = {"done": False}
 
     def _tracked_write(*a, **k):
         order.append("write")
@@ -638,9 +721,12 @@ async def test_child_dying_gasp_write_happens_before_clear_never_races_replace_u
         return original_clear(*a, **k)
 
     def _dying_gasp_terminate(*a, **k):
-        # 模擬 child 在真正被 kill 前的最後一刻又寫入一次新 sentinel（trip 剛好卡在
-        # terminate 生效前）——這次寫入必須先於下面 recovery 的 clear_sentinel 完成。
-        buf.write_sentinel(epoch=-1, detail="child 死前最後一刻的新故障")
+        # 只在第一次 terminate 呼叫時模擬「child 死前最後一刻又落地一次新故障」——真實
+        # 世界裡這是一次性事件，不會每次 terminate 都重演。
+        if not fired["done"]:
+            fired["done"] = True
+            buf.write_sentinel(epoch=-1, detail="child 死前最後一刻的新故障",
+                                fault_token="dying-gasp-token-1")
         return original_terminate(*a, **k)
 
     monkeypatch.setattr(buf, "write_sentinel", _tracked_write)
@@ -654,11 +740,35 @@ async def test_child_dying_gasp_write_happens_before_clear_never_races_replace_u
     child.push_failstop("boom")
     await _until(lambda: r._latched)
 
+    # 第一輪 recovery：child 確認死亡（respawn 過一次）、session 結束（第二筆 login），
+    # 但 dying-gasp 新故障必須讓 sentinel/latch 被保留。
     await _until(lambda: child.starts == starts_before + 1, timeout=3)
-    await _until(lambda: not r._latched, timeout=3)
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2, timeout=3)
+    assert r._latched is True                      # 沒有被誤判恢復
+    assert buf.has_sentinel()                       # sentinel 沒被清掉
+    preserved = buf.read_sentinel()
+    assert preserved["fault_token"] == "dying-gasp-token-1"
+    assert preserved["detail"] == "child 死前最後一刻的新故障"
+    second_login_index = [i for i, m in enumerate(tr.sent) if m["type"] == "login"][1]
 
-    assert order == ["write", "write", "clear"]   # 恆定 happens-before，不是併發
-    assert not buf.has_sentinel()                 # recovery 正常收斂，session-restart 成功
+    # 第二輪 recovery（新 session 的新 child，這次 terminate 前後 token 不再變化）：正常
+    # 收斂，sentinel 清除、latch 解除、第三筆 login。用「訊息索引區間」而非「等長度變化」
+    # 斷言——第二輪 recovery 在測試設定下可能跑得很快，用長度快照/輪詢容易漏看中間那一筆
+    # 健康訊框（race），索引區間不受輪詢時序影響。
+    await _until(lambda: not r._latched, timeout=3)
+    assert not buf.has_sentinel()
+    assert buf.get_health_epoch() == 0
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 3, timeout=3)
+    third_login_index = [i for i, m in enumerate(tr.sent) if m["type"] == "login"][2]
+
+    # 新 session（第二筆 login 之後、第三筆 login 之前）必須至少送過一次 failstop 健康
+    # 訊框——不會因為 child 已死就誤報 ok。
+    between = tr.sent[second_login_index:third_login_index]
+    assert any(m.get("type") == "health" and m.get("status") == "failstop" for m in between)
+
+    assert order == ["write", "write", "clear"]   # write 恆先於 clear（N6-1 happens-before
+                                                    # 仍然成立），只是這次 clear 發生在
+                                                    # 下一個 session 的 recovery，不是同一輪
 
     r.stop()
     task.cancel()
@@ -785,7 +895,14 @@ async def test_epoch_negative_one_sentinel_on_restart_can_still_recover(tmp_path
     （因為這次故障的正確 epoch 從未真正持久化過，`max(-1, 0) == 0`）。round4 的
     exact-match compare-and-clear 會拿這個舊值（0）去比對磁碟上的 `-1`，永遠不相等，
     永久卡在 persist_only 重驗迴圈清不掉 sentinel。round5 移除比對後，只要 probe 通過就
-    能正常持久化＋清除＋結束 session，不再卡死。"""
+    能正常持久化＋清除＋結束 session，不再卡死。
+
+    R7-2（HIGH，codex 終審 round7）順帶驗證：這裡手工寫的 sentinel 沒有 `fault_token`
+    欄位（模擬 R7-2 上線前寫入的舊格式檔案）——`_recover()` terminate 前後兩次讀到的
+    `fault_token` 都是 `None`（`.get()` 缺鍵回 None），視為「沒有變化」，不會被新增的
+    dying-gasp 偵測邏輯誤判成故障改變而卡住不清（load 相容，不是又一次 `epoch=-1` 字面
+    比較的死結）——這支測試本身就是 R7-2 向後相容的回歸證據，另見
+    `test_recover_treats_legacy_sentinel_without_fault_token_as_unchanged`。"""
     path = tmp_path / "o.db"
     pre = DurableBuffer(path)
     pre.write_sentinel(epoch=-1, detail="child 落地失敗、父程序尚未覆寫真正 epoch 就崩潰")
@@ -806,6 +923,31 @@ async def test_epoch_negative_one_sentinel_on_restart_can_still_recover(tmp_path
     fresh = DurableBuffer(path)
     assert not fresh.has_sentinel()
     assert fresh.get_health_epoch() == 0
+
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recover_treats_legacy_sentinel_without_fault_token_as_unchanged(tmp_path):
+    """R7-2 測試③（load 相容）：舊版（R7-2 之前）sentinel 檔沒有 `fault_token` 欄位——
+    `_recover()` terminate 前後兩次讀取都拿不到這個欄位（`.get()` 回 None），視為『沒有
+    變化』，不會被新增的 dying-gasp 偵測邏輯誤判成故障改變而卡住不清。這裡不涉及任何
+    `epoch=-1` 佔位值（那是另一支測試 `test_epoch_negative_one_sentinel_on_restart_
+    can_still_recover` 的既有覆蓋範圍），單純驗證『沒有 fault_token 鍵』本身不會讓新邏輯
+    誤判。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    buf.write_sentinel(epoch=1, detail="舊版 sentinel，無 fault_token 欄位")
+    r = _runner(tr, child, buf)
+    assert r._latched is True
+
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2, timeout=3)
+    assert not r._latched
+    assert not buf.has_sentinel()
+    assert buf.get_health_epoch() == 1
 
     r.stop()
     task.cancel()
