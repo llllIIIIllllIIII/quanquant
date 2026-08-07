@@ -80,10 +80,17 @@ class ChildFailstopLatch:
         return self._event.is_set()
 
 
-def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail: str) -> None:
+def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail: str, *,
+                             generation: int = 0) -> None:
     """C4/C5（HIGH，codex 終審）共用：callback 主寫入失敗（不論退化寫入是否成功）觸發的
     latch 動作——trip child 本地 thread-safe latch（C4，供 `_dispatch` 呼叫 native 前再檢查）
     ＋寫 sentinel（durable，buffer 之外路徑）＋經專用 IPC channel（R2-8）通知父程序。
+
+    R3-3（MEDIUM，codex 終審 round3）：`generation`（`child_main` 啟動時由
+    `ChildHandle.start()` 傳入，代表父程序目前認定的「這是第幾代 child」）隨 notice 一併
+    送出——respawn 換代之後，父程序（`AgentRunner._failstop_watchdog`）比對通知裡的
+    generation 與自己目前的 `ChildHandle.generation`，不符（舊 child 臨終前排進 pipe、
+    respawn 完成後才被取出的過期通知）就丟棄，避免誤 latch 目前健康的新 child。
 
     N1（HIGH，codex 終審 round2）：`latch.trip()` 必須是**第一個動作**，排在任何 I/O
     （sentinel fsync／IPC send）之前——`trip()` 只是設一個 `threading.Event`，純記憶體、
@@ -110,7 +117,7 @@ def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail:
                   "父程序仍會靠子程序心跳凍結偵測——issue #203 既有防線——察覺異常）")
     if failstop_conn is not None:
         try:
-            failstop_conn.send({"type": "failstop", "detail": detail})
+            failstop_conn.send({"type": "failstop", "detail": detail, "generation": generation})
         except Exception:
             log.error("failstop IPC 通知也失敗——callback 執行緒已無法對外示警")
 
@@ -148,7 +155,8 @@ def _try_degraded_write(buffer: DurableBuffer, kind: str, payload: dict, *,
 
 
 def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox,
-                  failstop_conn=None, latch: "ChildFailstopLatch | None" = None):
+                  failstop_conn=None, latch: "ChildFailstopLatch | None" = None,
+                  generation: int = 0):
     """把 `buffer.append` 包一層，補上 D5/I7 要求的 account/mode 蓋章——SDK callback
     只給 (kind, payload)，account 從 `account_box`（connect 成功後才填）動態讀取。
 
@@ -193,14 +201,15 @@ def _wrap_on_raw(buffer: DurableBuffer, *, mode: str, account_box: _AccountBox,
                 detail = (
                     f"buffer 落地失敗（主寫入: {primary_exc}；退化寫入: {degraded_exc}）"
                 )
-                _trigger_failstop_latch(buffer, failstop_conn, latch, detail)
+                _trigger_failstop_latch(buffer, failstop_conn, latch, detail,
+                                         generation=generation)
                 raise
             detail = (
                 f"buffer 主寫入失敗（{primary_exc}），已改寫入退化檔供人工救援："
                 f"{_degraded_write_path(buffer)}（純檔案 append-only、非 SQLite，不會被"
                 "agent outbox 自動送達 server，需人工介入重新灌回或補送）"
             )
-            _trigger_failstop_latch(buffer, failstop_conn, latch, detail)
+            _trigger_failstop_latch(buffer, failstop_conn, latch, detail, generation=generation)
             return -1  # 退化寫入成功：沒有 SQLite row id 可回，呼叫端本就不依賴它
     return _on_raw
 
@@ -255,7 +264,11 @@ def _dispatch(native, op: dict, *, latch: "ChildFailstopLatch | None" = None) ->
         return {"ok": True, "result": {"qty": qty}}
 
     if kind == "ping":
-        return {"ok": True}
+        # R3-2（HIGH，codex 終審 round3）：帶上 child 本地 latch 是否已 tripped——舊版
+        # ping 一律回 ok=True，recovery 用它做「respawn 後新 child 真的可用」的獨立確認時
+        # 完全看不出新 child 是否在 connect 後、清 sentinel 前又故障一次（假 healthy 縫，
+        # 見 `AgentRunner._respawn_child`）。
+        return {"ok": True, "latched": bool(latch.tripped) if latch is not None else False}
 
     if kind == "shutdown":
         native.close()
@@ -273,13 +286,17 @@ def child_main(
     buffer_path: str,
     native_factory: Callable[..., Any] | None = None,
     failstop_conn=None,
+    generation: int = 0,
 ) -> None:
     """conn: multiprocessing.Connection（子端，既有 RPC pipe）。
     credentials={"api_key","secret_key"}。`failstop_conn`（Inc1 D9/G2①，Task 12）：獨立於
     `conn` 之外的專用單向 IPC channel（R2-8，`ChildHandle.start()` 用 `ctx.Pipe(duplex=False)`
     建立、只送 callback 落地雙寫失敗的通知）——留 `None` 預設值以相容尚未接線這條 channel 的
     既有呼叫端（測試/舊呼叫），此時退化寫入也失敗只會寫 sentinel，不會有 IPC 通知（父程序仍
-    可能靠既有子程序心跳凍結偵測——#203 防線——間接察覺異常，但不是即時的）。"""
+    可能靠既有子程序心跳凍結偵測——#203 防線——間接察覺異常，但不是即時的）。`generation`
+    （R3-3，codex 終審 round3）：`ChildHandle.start()` 傳入的目前世代編號，原樣蓋章進
+    failstop 通知（見 `_wrap_on_raw`/`_trigger_failstop_latch`），供父程序核對通知是否過期
+    （respawn 換代後才被取出的舊 child 殘留通知），留 `0` 預設值相容既有呼叫端。"""
     factory = native_factory or _default_native_factory
     secrets = [v for v in credentials.values() if v]
     buffer = DurableBuffer(buffer_path)
@@ -291,7 +308,8 @@ def child_main(
     if mode == "sim":
         native = factory(credentials=credentials, symbol=symbol, mode=mode,
                          on_raw=_wrap_on_raw(buffer, mode=mode, account_box=account_box,
-                                              failstop_conn=failstop_conn, latch=latch))
+                                              failstop_conn=failstop_conn, latch=latch,
+                                              generation=generation))
 
     while True:
         op = conn.recv()

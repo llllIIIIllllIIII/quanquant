@@ -529,6 +529,89 @@ def test_lock_rechecks_poisoned_before_touching_conn(tmp_path):
     assert conn.sent == []       # 從未碰過 conn
 
 
+# ---------- R3-1（HIGH，codex 終審 round3）：lifecycle generation fencing——recovery
+# respawn（terminate 舊 child、start 新 child）與併發中仍在等舊 pipe 回覆的 RPC（watchdog
+# ping、唯讀指令，皆經 asyncio.to_thread）之間，舊版完全無互斥：respawn 可能被舊 RPC
+# 逾時後的 _poison() 誤殺；asyncio.to_thread 取消後遲到的 worker 也可能誤碰新 child 的
+# conn。修法：start/terminate/_rpc/poll_failstop 共用同一把 threading.RLock，且每筆 RPC
+# 在進入鎖之前先捕捉當下的 generation，拿到鎖之後重新核對，不符即丟棄。----------
+
+def test_generation_mismatch_after_concurrent_respawn_discards_stale_rpc_without_touching_new_child(
+    tmp_path,
+):
+    """barrier/事件精確控制「舊 RPC 遲到 vs 新 child」不互殺：一個 RPC 呼叫在捕捉
+    generation=1 之後、真正拿到鎖之前，若併發的 respawn（模擬 terminate 舊 child、start
+    新 child）已經搶先換代——這筆呼叫拿到鎖後必須發現過期，直接丟棄，完全不碰新一代的
+    process/conn（不誤殺、不誤送），也不會碰舊 conn（它從未真正送出過）。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬「respawn 正在進行中」，佔住鎖
+    results: dict[str, Exception] = {}
+
+    def _stale_caller():
+        try:
+            child.request({"op": "ping"}, timeout=1)
+        except TimeoutError as exc:
+            results["exc"] = exc
+
+    t = threading.Thread(target=_stale_caller)
+    t.start()
+    time.sleep(0.1)   # 讓呼叫端跑過「捕捉 generation=1」，卡在等鎖
+
+    # respawn 在鎖內完成：換上新一代 process/conn（terminate 舊的、start 新的都要拿同一把
+    # 鎖，所以這裡直接模擬「respawn 已完成」的最終狀態）。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()   # 放行——過期呼叫這才拿得到鎖
+
+    t.join(timeout=2)
+    assert isinstance(results.get("exc"), TimeoutError)
+    assert new_conn.sent == []            # 完全沒碰新 conn
+    assert new_process.killed is False    # 新 child 沒有被誤殺（_poison 也沒被觸發到它）
+    assert old_conn.sent == []            # 舊 conn 也沒被碰（呼叫從頭到尾都卡在等鎖）
+
+
+async def test_cancelled_to_thread_worker_late_arrival_after_respawn_is_discarded(tmp_path):
+    """`asyncio.to_thread` 的取消不會真的停止底層執行緒——呼叫端（watchdog）已經放棄
+    等待，但那個 worker thread 仍在背景跑，直到它真的走完（可能卡在等respawn 持有的鎖）。
+    這支測試證明：即使這個「孤兒」worker 是在 respawn 完成之後才真正拿到鎖執行到
+    `_rpc()` 的核對段，generation 比對仍能攔下它，不會把它的（遲到的）執行結果套用到
+    新 child 身上——新 conn 沒被送過任何東西、新 process 沒被殺、`child.alive` 仍正常
+    反映新 child 存活。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬 respawn 正在進行、佔住鎖
+
+    async def _orphan_ping():
+        return await asyncio.to_thread(child.request, {"op": "ping"}, timeout=5)
+
+    task = asyncio.create_task(_orphan_ping())
+    await asyncio.sleep(0.05)   # 讓底層 thread pool worker 真的排進去、卡在 acquire()
+
+    task.cancel()   # 呼叫端取消——底層 thread 不受影響，仍在背景卡著等鎖
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # respawn 完成：換上新一代 process/conn，放鎖——孤兒 worker 這才拿得到鎖。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()
+
+    await asyncio.sleep(0.2)   # 給孤兒 worker 執行緒時間跑完（它會發現 generation 不符、丟棄）
+
+    assert new_conn.sent == []          # 孤兒呼叫完全沒碰到新 conn
+    assert new_process.killed is False  # 也沒有被誤殺
+    assert child.alive is True          # 新 child 仍正常存活
+
+
 # ---------- codex round2 fix4：帳號不符 → fatal 停止，不進 run_forever 的無限 backoff
 # 重試迴圈（每輪重試都是一次真的券商登入，會燒 Shioaji 每日 1000 次配額）----------
 

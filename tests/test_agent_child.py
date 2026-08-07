@@ -6,6 +6,8 @@ import multiprocessing as mp
 import threading
 from decimal import Decimal
 
+import pytest
+
 import quanquant.agent.native_runner as nr
 from quanquant.agent.buffer import DurableBuffer
 from quanquant.agent.native_runner import ChildFailstopLatch, _dispatch, child_main
@@ -184,6 +186,114 @@ def test_dispatch_ignores_latch_for_readonly_ops(tmp_path):
 
     reply = _dispatch(native, {"op": "ping"}, latch=latch)
     assert reply["ok"] is True
+
+
+# ---- R3-2（HIGH，codex 終審 round3）：ping 回傳帶上 child 本地 latch 狀態——recovery
+# 用來確認「respawn 後的新 child 是否又立即 latch」，光是 ok=True 不足以支撐這個判斷 ----
+
+
+def test_dispatch_ping_reports_latched_true_when_child_latch_tripped(tmp_path):
+    buf = DurableBuffer(tmp_path / "o.db")
+    latch = ChildFailstopLatch()
+    latch.trip()
+    native = fake_native_factory(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                                 mode="sim", on_raw=buf.append)
+    native.connect()
+
+    reply = _dispatch(native, {"op": "ping"}, latch=latch)
+    assert reply["ok"] is True and reply["latched"] is True
+
+
+def test_dispatch_ping_reports_latched_false_when_child_latch_not_tripped(tmp_path):
+    buf = DurableBuffer(tmp_path / "o.db")
+    latch = ChildFailstopLatch()
+    native = fake_native_factory(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                                 mode="sim", on_raw=buf.append)
+    native.connect()
+
+    reply = _dispatch(native, {"op": "ping"}, latch=latch)
+    assert reply["ok"] is True and reply["latched"] is False
+
+
+def test_dispatch_ping_reports_latched_false_when_no_latch_supplied(tmp_path):
+    """相容尚未接線 latch 的呼叫端（latch=None，預設值）——不 raise，回 latched=False。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    native = fake_native_factory(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                                 mode="sim", on_raw=buf.append)
+    native.connect()
+
+    reply = _dispatch(native, {"op": "ping"})
+    assert reply["ok"] is True and reply["latched"] is False
+
+
+# ---- R3-3（MEDIUM，codex 終審 round3）：failstop IPC 通知帶上送出當下的 child
+# generation——respawn 換代後，父程序靠這個欄位丟棄舊 child 的過期通知，不誤 latch 目前
+# 這一代健康的 child ----
+
+
+def test_trigger_failstop_latch_notice_carries_generation(tmp_path):
+    buf = DurableBuffer(tmp_path / "o.db")
+    parent_conn, child_conn = mp.Pipe()
+    latch = ChildFailstopLatch()
+
+    nr._trigger_failstop_latch(buf, child_conn, latch, "detail", generation=3)
+
+    assert parent_conn.poll(2)
+    notice = parent_conn.recv()
+    assert notice == {"type": "failstop", "detail": "detail", "generation": 3}
+
+
+def test_trigger_failstop_latch_notice_generation_defaults_to_zero(tmp_path):
+    """相容尚未傳入 generation 的既有呼叫端——預設 0，不 raise。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    parent_conn, child_conn = mp.Pipe()
+    latch = ChildFailstopLatch()
+
+    nr._trigger_failstop_latch(buf, child_conn, latch, "detail")
+
+    notice = parent_conn.recv()
+    assert notice["generation"] == 0
+
+
+def test_wrap_on_raw_double_failure_notice_carries_generation(tmp_path, monkeypatch):
+    buf = DurableBuffer(tmp_path / "o.db")
+    monkeypatch.setattr(
+        buf, "append", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("primary boom"))
+    )
+    monkeypatch.setattr(
+        nr, "_try_degraded_write",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("degraded boom")),
+    )
+    account_box = nr._AccountBox()
+    account_box.value = "F1"
+    parent_conn, child_conn = mp.Pipe()
+    on_raw = nr._wrap_on_raw(buf, mode="sim", account_box=account_box, failstop_conn=child_conn,
+                              generation=7)
+
+    with pytest.raises(RuntimeError, match="degraded boom"):
+        on_raw("deal_report", {"n": 1})
+
+    notice = parent_conn.recv()
+    assert notice["generation"] == 7
+
+
+def test_child_main_ping_carries_generation_from_start_kwarg(tmp_path):
+    """`child_main` 的 `generation` kwarg（由 `ChildHandle.start()` 傳入）要能一路帶到
+    `_wrap_on_raw`——這裡直接驗證 child_main 有把它原樣接住並轉交（透過真的走一次
+    connect+ping，確認迴圈沒有因為多了這個 kwarg 而炸開）。"""
+    parent_conn, child_conn = mp.Pipe()
+    t = threading.Thread(
+        target=child_main, args=(child_conn,),
+        kwargs=dict(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                    mode="sim", buffer_path=str(tmp_path / "o.db"),
+                    native_factory=fake_native_factory, generation=9),
+        daemon=True)
+    t.start()
+    _rpc(parent_conn, {"op": "connect"})
+    reply = _rpc(parent_conn, {"op": "ping"})
+    assert reply["ok"] is True and reply["latched"] is False
+    _rpc(parent_conn, {"op": "shutdown"})
+    t.join(timeout=5)
 
 
 def test_child_main_rejects_mutating_op_after_dual_write_failure_trips_latch(tmp_path, monkeypatch):

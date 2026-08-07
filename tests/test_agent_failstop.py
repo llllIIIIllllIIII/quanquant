@@ -359,13 +359,25 @@ class _FakeChild:
     def __init__(self):
         self.alive = False
         self.starts = 0
+        self.generation = 0
         self.ops: list[dict] = []
         self.ping_ok = True
+        # R3-2（codex 終審 round3）：respawn 後確認用的 ping_detail 額外回報「新 child 是
+        # 否又立即 latch」——測試預設 False（respawn 乾淨成功），個別測試可設 True 模擬
+        # 新 child 在 connect 後、清 sentinel 前又故障一次的假 healthy 縫。
+        self.respawn_latched = False
         self.request_exc = None
+        # R3-4（codex 終審 round3）：respawn 專屬 backoff／staged recovery 測試用——
+        # >0 時 start() 連續丟例外（模擬 respawn 失敗），每呼叫一次遞減。
+        self.fail_starts_remaining = 0
         self._failstop_queue: list[dict] = []
 
     def start(self):
         self.starts += 1
+        if self.fail_starts_remaining > 0:
+            self.fail_starts_remaining -= 1
+            raise RuntimeError("模擬 respawn 失敗")
+        self.generation += 1
         self.alive = True
         return "F1"
 
@@ -378,6 +390,11 @@ class _FakeChild:
     def ping(self, *, timeout):
         return self.ping_ok
 
+    def ping_detail(self, *, timeout):
+        if not self.ping_ok:
+            return {"ok": False, "latched": None}
+        return {"ok": True, "latched": self.respawn_latched}
+
     def terminate(self):
         self.alive = False
 
@@ -386,8 +403,9 @@ class _FakeChild:
             return self._failstop_queue.pop(0)
         return None
 
-    def push_failstop(self, detail: str = "boom") -> None:
-        self._failstop_queue.append({"type": "failstop", "detail": detail})
+    def push_failstop(self, detail: str = "boom", generation: int | None = None) -> None:
+        gen = generation if generation is not None else self.generation
+        self._failstop_queue.append({"type": "failstop", "detail": detail, "generation": gen})
 
 
 async def _until(cond, timeout=3.0):
@@ -403,6 +421,12 @@ def _runner(tr, child, buf, **overrides):
         child_command_timeout=0.5, heartbeat_interval=30, child_ping_interval=30,
         child_ping_timeout=5, backoff_base=0.01, backoff_max=0.05,
         recovery_probe_interval=0.03, failstop_poll_timeout=0.02,
+        # R3-4：respawn 專屬 backoff 的 class 預設值是 5s/300s（避免正式環境每 5 秒真登入
+        # 一次）——測試預設縮小到跟 recovery_probe_interval 同一數量級，讓 recovery 測試
+        # 不必依賴「系統開機時間已經超過 5 秒」這種隱性、脆弱的前提（`time.monotonic()`
+        # 在部分平台是量測開機時間，不是行程啟動時間）。要測 backoff 本身遞增/重設行為的
+        # 測試會用 overrides 明確覆寫回較大的值。
+        respawn_backoff_base=0.01, respawn_backoff_max=0.05,
     )
     kwargs.update(overrides)
     return AgentRunner(**kwargs)
@@ -627,6 +651,232 @@ async def test_recover_stays_latched_when_sentinel_clear_fails(tmp_path, monkeyp
     assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
     assert buf.get_health_epoch() == 1  # epoch 已經真的持久化（先 epoch 後 sentinel 的順序）
     assert buf.has_sentinel()  # sentinel 清除失敗，仍在
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+# ===========================================================================
+# R3-2（HIGH，codex 終審 round3）：recovery ping 必須查 child latch，不能只看 ok=True——
+# 否則新 child 在 connect 後、清 sentinel 前又 latch 時，會被誤判成 healthy。
+# ===========================================================================
+
+
+async def test_recover_stays_latched_when_respawned_child_immediately_relatches(tmp_path):
+    """respawn 本身（terminate/start/帳號核對）都成功，但確認用的 `ping_detail()` 回報新
+    child 本地 latch 已經又 tripped（模擬新 child 在 connect 後、清 sentinel 前又故障一次）
+    ——不能清 sentinel／翻 healthy，必須保留 latch，交下一輪重試，且沒有任何
+    `status="ok"`（epoch=1）的健康訊框送出。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    child.respawn_latched = True  # 模擬新 child 連上、確認 ping 前又立即 latch
+    await asyncio.sleep(0.15)
+    assert r._latched is True
+    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
+    assert buf.has_sentinel()
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recover_succeeds_once_respawned_child_latch_clears(tmp_path):
+    """反過來驗證正路：一開始 respawn 後又立即 latch（保留 latch），之後（模擬人工排除
+    根因）新一輪 respawn 不再 latch——recovery 應該能正常完成，不會被卡死。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+    child.respawn_latched = True
+
+    await _until(lambda: child.starts >= 2, timeout=3)  # 至少 respawn 過一次（仍卡在 latch）
+    assert r._latched is True
+
+    child.respawn_latched = False  # 根因排除：下一輪 respawn 就不會又 latch
+    await _until(lambda: not r._latched, timeout=3)
+    assert buf.get_health_epoch() == r._health_epoch == 1
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+# ===========================================================================
+# R3-3（MEDIUM，codex 終審 round3）：failstop notice 帶 child generation——respawn 換代後
+# 才被取出的舊 notice 不得誤 latch 目前健康的新 child。
+# ===========================================================================
+
+
+async def test_stale_generation_failstop_notice_does_not_latch_current_child(tmp_path):
+    """模擬「舊 child 臨終前排進 pipe、respawn 完成後才被取出」的過期通知（generation=0，
+    早於目前 `ensure_child()` 建立的第 1 代）——`_failstop_watchdog` 必須丟棄，完全不誤
+    latch 目前這一代健康的 child。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()   # child.generation 現在是 1
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("舊 child 的過期通知", generation=0)
+    await asyncio.sleep(0.15)
+    assert r._latched is False
+    assert not buf.has_sentinel()
+    assert not any(h["status"] == "failstop" for h in tr.healths())
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_current_generation_failstop_notice_still_latches(tmp_path):
+    """反面對照：generation 相符（目前這一代 child 真的送出的通知）仍必須正常 latch——
+    R3-3 的修法不能連正常路徑都一起擋掉。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()   # child.generation 現在是 1
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("目前這一代的真實故障", generation=1)
+    await _until(lambda: r._latched)
+    assert buf.has_sentinel()
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+# ===========================================================================
+# R3-4（HIGH，codex 終審 round3）：respawn-login-quota——respawn 專屬 backoff＋jitter＋
+# 上限；FatalAgentError 不得被吞；staged recovery 不重登入；respawn 後帳號不符即 fatal。
+# ===========================================================================
+
+
+async def test_respawn_backoff_grows_on_consecutive_failures_and_resets_on_success(tmp_path):
+    """連續 respawn 失敗（模擬 child.start() 一直炸）——respawn 專屬 backoff 必須遞增
+    （封頂），且在系統開機時間之類的雜訊之外，用 `_respawn_backoff_history` 直接觀察序列
+    形狀（比照既有 session backoff 測試手法）。respawn 一旦成功，backoff 立刻重設回
+    base。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
+                respawn_backoff_base=0.05, respawn_backoff_max=0.3)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    child.fail_starts_remaining = 2   # 前兩次 respawn（start()）失敗
+    await _until(lambda: len(r._respawn_backoff_history) >= 2, timeout=5)
+    first, second = r._respawn_backoff_history[0], r._respawn_backoff_history[1]
+    assert first == pytest.approx(0.05)
+    assert second > first             # 確實遞增
+    assert r._latched is True         # 還沒恢復（前兩次都失敗）
+
+    await _until(lambda: not r._latched, timeout=5)   # 第三次成功
+    assert r._respawn_backoff == pytest.approx(0.05)  # 成功後重設回 base
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_respawn_fatal_agent_error_stops_run_forever_without_retry(tmp_path):
+    """respawn 途中遇到帳號不符（`FatalAgentError`）——不得被 `_respawn_child()`/
+    `_recover()` 的既有 `except Exception` 吞掉，必須原樣往外拋，一路傳到
+    `run_forever()` 既有的 fatal 處置（停止、不重試）。`child.starts` 驗證只嘗試過一次
+    respawn 就停止，沒有落入無限重試迴圈。"""
+    from quanquant.agent.runner import FatalAgentError
+
+    class _FatalOnRespawnChild(_FakeChild):
+        def start(self):
+            self.starts += 1
+            if self.starts == 1:
+                self.generation += 1
+                self.alive = True
+                return "F1"
+            raise FatalAgentError("agent 帳號不符（respawn 途中偵測）")
+
+    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
+    child = _FatalOnRespawnChild()
+    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
+                respawn_backoff_base=0.01, respawn_backoff_max=0.05)
+
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: len(tr.healths()) >= 1)
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    with pytest.raises(FatalAgentError):
+        await asyncio.wait_for(task, timeout=5)
+    assert child.starts == 2   # 初始 start() 一次＋respawn 觸發 fatal 那一次，沒有再重試
+
+
+async def test_respawn_account_mismatch_is_fatal_not_silently_accepted(tmp_path):
+    """respawn 後新 child 回報的帳號與 session 目前綁定的帳號不符——不得靜默改
+    `self._account` 繼續回報 healthy，必須 fatal 停止（一路傳到 `run_forever`）。"""
+    from quanquant.agent.runner import FatalAgentError
+
+    class _AccountSwitchChild(_FakeChild):
+        def start(self):
+            self.starts += 1
+            self.generation += 1
+            self.alive = True
+            return "F1" if self.starts == 1 else "F2"   # respawn 拿到不同帳號
+
+    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
+    child = _AccountSwitchChild()
+    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
+                respawn_backoff_base=0.01, respawn_backoff_max=0.05)
+
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: len(tr.healths()) >= 1)
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    with pytest.raises(FatalAgentError):
+        await asyncio.wait_for(task, timeout=5)
+    assert r._account == "F1"   # 沒有被靜默改成 F2
+
+
+async def test_staged_recovery_persist_only_does_not_respawn_again(tmp_path, monkeypatch):
+    """respawn＋ping_detail 都已經成功，但接下來的 epoch 持久化失敗——記
+    `_respawn_stage="persist_only"`，之後多輪 `_recovery_prober` 只重試持久化，
+    **不再呼叫 `_respawn_child()`（不再登入）**。持久化恢復正常後，完全恢復也沒有多
+    respawn 一次。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
+                respawn_backoff_base=0.01, respawn_backoff_max=0.05)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    monkeypatch.setattr(
+        buf, "set_health_epoch",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("epoch persist boom"))
+    )
+    await _until(lambda: r._respawn_stage == "persist_only", timeout=3)
+    starts_after_respawn = child.starts
+    assert starts_after_respawn >= 2   # 真的 respawn 過一次（ensure_child 的初始 1 次 + 這次）
+
+    await asyncio.sleep(0.15)   # 讓多輪 _recovery_prober 跑過，持久化持續失敗重試
+    assert child.starts == starts_after_respawn   # 沒有再次 respawn／重新登入
+    assert r._latched is True
+
+    monkeypatch.undo()   # 持久化恢復正常
+    await _until(lambda: not r._latched, timeout=3)
+    assert child.starts == starts_after_respawn   # 完全恢復也沒有多 respawn 一次
+    assert r._respawn_stage is None
 
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)

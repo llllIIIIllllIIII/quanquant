@@ -35,6 +35,7 @@ event_id」，不需要額外的崩潰偵測邏輯。
 import asyncio
 import logging
 import multiprocessing as mp
+import random
 import threading
 import time
 from datetime import datetime, timezone
@@ -76,7 +77,7 @@ class FatalAgentError(RuntimeError):
 
 
 class ChildHandle:
-    """SDK 子程序的擁有者：spawn(spawn ctx)、序列 RPC（threading.Lock）、ping、terminate。
+    """SDK 子程序的擁有者：spawn(spawn ctx)、序列 RPC（threading.RLock）、ping、terminate。
 
     pipe 失同步防線（codex round1 fix1，BLOCKER）：危險情境是 place 逾時後，之後 child
     才姍姍來遲把 reply 送出——若 pipe 被下一個 ping/place 重用，會把這筆遲到 reply 讀走，
@@ -88,6 +89,25 @@ class ChildHandle:
         pipe 判死（`_poisoned=True`）並 terminate 子程序——之後任何 request()/ping() 都
         不再嘗試碰這條已經不可信的 pipe，直接 fail；`alive` 隨之回 False，交給
         `AgentRunner.ensure_child()` respawn 一條全新的子程序 + pipe。
+
+    R3-1（HIGH，codex 終審 round3）：lifecycle generation fencing——舊版 `start()`/
+    `terminate()` 在鎖外直接替換 `self._process`/`self._conn`，與併發中的 RPC（watchdog
+    ping、唯讀指令，皆經 `asyncio.to_thread`）完全無互斥。危險情境：recovery 觸發的
+    respawn（`terminate()`+`start()`）與一個仍在等待舊 pipe 回覆的 RPC 併發時——舊 RPC
+    逾時後呼叫 `_poison()`→`terminate()`，若這時 respawn 已經把 process/conn 換成新
+    child，會把新 child 錯殺；`asyncio.to_thread` 的呼叫端就算被取消，底層 thread pool
+    worker 仍會跑完，遲到的執行緒若在 respawn 之後才真正碰到 conn，可能誤送/誤讀新 child
+    的 pipe。修法：
+
+    - 所有會碰 `_process`/`_conn`/`_poisoned`（含 failstop 專用 conn）的操作
+      （`start`/`terminate`/`_rpc`/`poll_failstop`）都經同一把 `threading.RLock`
+      （可重入——`start()` 內部會呼叫 `_rpc()` 做 connect，`_poison()` 也會呼叫
+      `terminate()`）序列化：respawn 全程與任何 RPC 互斥，兩者不會半途交錯。
+    - `_generation`（int，每次 `start()` 成功替換 process/conn 前 +1）：呼叫端
+      （`request()`/`poll_failstop()`）在**進入鎖之前**捕捉當下的 generation，代表「這次
+      呼叫意圖操作的是哪一代 child」；真正碰 conn 前（`_rpc()` 拿到鎖之後）重新核對，不符
+      （代表這段等鎖期間 respawn 已經換代）就直接視為過期丟棄（`TimeoutError`），完全不
+      觸碰新一代的 process/conn，也不會誤 poison 新 child。
     """
 
     def __init__(self, *, credentials: dict, symbol: str, mode: str, buffer_path: str,
@@ -97,74 +117,102 @@ class ChildHandle:
         self._mode = mode
         self._buffer_path = buffer_path
         self._native_factory = native_factory
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._process: mp.process.BaseProcess | None = None
         self._conn = None
         self._rpc_seq = 0
         self._poisoned = False
+        self._generation = 0
         # Inc1 D9/G2①（Task 12）：獨立於 RPC pipe 之外的專用單向 IPC channel（R2-8）——
         # child 只用來送 callback 落地雙寫失敗的通知，父程序（AgentRunner._failstop_watchdog）
         # 是唯一消費端。`ctx.Pipe(duplex=False)` 回傳 (recv-only, send-only) 兩端。
         self._failstop_parent_conn = None
         self._failstop_child_conn = None
 
+    @property
+    def generation(self) -> int:
+        """R3-1/R3-3：目前 child 世代——每次 `start()` 成功替換 process/conn 前 +1。
+        `AgentRunner._failstop_watchdog` 用它核對 failstop 通知（notice 本身也帶著送出當下
+        的 generation，見 native_runner.py）是不是屬於「目前這一代」，過期的（舊 child
+        respawn 前排進 pipe、之後才被取出）一律丟棄，不誤 latch 目前健康的新 child。"""
+        return self._generation
+
     def start(self) -> str:
-        ctx = mp.get_context("spawn")
-        parent_conn, child_conn = ctx.Pipe()
-        failstop_parent_conn, failstop_child_conn = ctx.Pipe(duplex=False)
-        process = ctx.Process(
-            target=child_main, args=(child_conn,),
-            kwargs=dict(credentials=self._credentials, symbol=self._symbol, mode=self._mode,
-                        buffer_path=self._buffer_path, native_factory=self._native_factory,
-                        failstop_conn=failstop_child_conn),
-        )
-        process.start()
-        self._process = process
-        self._conn = parent_conn
-        self._failstop_parent_conn = failstop_parent_conn
-        self._failstop_child_conn = failstop_child_conn
-        self._poisoned = False   # 全新 spawn 的子程序 + pipe：重置前一輪可能留下的中毒態。
-        try:
-            reply = self._rpc({"op": "connect"}, timeout=_CHILD_CONNECT_TIMEOUT)
-        except Exception as exc:
-            # _rpc 逾時/pipe 異常時可能已經 poison→terminate 過（self._process 已是
-            # None）；用 None 檢查讓這裡的清理對兩種狀態都安全，不重複 kill 一個 None。
-            if self._process is not None:
-                self._process.kill()
-                self._process.join(timeout=5)
-                self._process = None
-            if self._failstop_parent_conn is not None:
-                self._failstop_parent_conn.close()
-                self._failstop_parent_conn = None
-            if self._failstop_child_conn is not None:
-                self._failstop_child_conn.close()
-                self._failstop_child_conn = None
-            raise RuntimeError(f"agent 子程序啟動失敗: {exc}") from exc
-        if not reply.get("ok"):
-            self.terminate()
-            if reply.get("error_kind") == "account_mismatch":
-                # codex round2 fix4：帳號與 outbox 綁定的帳號不符——這不是暫時性連線問題，
-                # 重試也沒用。raise FatalAgentError（而非 RuntimeError）讓 run_forever 的
-                # 例外鏈識別出「不可重試」，直接停止，不落入 backoff 無限重連（每輪都真的
-                # 燒一次 Shioaji 登入配額）。訊息帶處置指引，交給操作者人工介入。
-                raise FatalAgentError(
-                    f"agent 帳號不符，拒絕啟動（{reply.get('message')}）——請清空這個 outbox"
-                    f"（{self._buffer_path}）改用原帳號重啟，或改用原帳號登入；若確認要放棄"
-                    "舊帳號未送達的回報，需人工確認後手動刪除 buffer 檔再重啟。"
-                )
-            raise RuntimeError(f"agent 子程序 connect 失敗: {reply}")
-        return reply["account"]
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            ctx = mp.get_context("spawn")
+            parent_conn, child_conn = ctx.Pipe()
+            failstop_parent_conn, failstop_child_conn = ctx.Pipe(duplex=False)
+            process = ctx.Process(
+                target=child_main, args=(child_conn,),
+                kwargs=dict(credentials=self._credentials, symbol=self._symbol, mode=self._mode,
+                            buffer_path=self._buffer_path, native_factory=self._native_factory,
+                            failstop_conn=failstop_child_conn, generation=generation),
+            )
+            process.start()
+            self._process = process
+            self._conn = parent_conn
+            self._failstop_parent_conn = failstop_parent_conn
+            self._failstop_child_conn = failstop_child_conn
+            self._poisoned = False   # 全新 spawn 的子程序 + pipe：重置前一輪可能留下的中毒態。
+            try:
+                reply = self._rpc({"op": "connect"}, timeout=_CHILD_CONNECT_TIMEOUT,
+                                   generation=generation)
+            except Exception as exc:
+                # _rpc 逾時/pipe 異常時可能已經 poison→terminate 過（self._process 已是
+                # None）；用 None 檢查讓這裡的清理對兩種狀態都安全，不重複 kill 一個 None。
+                if self._process is not None:
+                    self._process.kill()
+                    self._process.join(timeout=5)
+                    self._process = None
+                if self._failstop_parent_conn is not None:
+                    self._failstop_parent_conn.close()
+                    self._failstop_parent_conn = None
+                if self._failstop_child_conn is not None:
+                    self._failstop_child_conn.close()
+                    self._failstop_child_conn = None
+                raise RuntimeError(f"agent 子程序啟動失敗: {exc}") from exc
+            if not reply.get("ok"):
+                self.terminate()
+                if reply.get("error_kind") == "account_mismatch":
+                    # codex round2 fix4：帳號與 outbox 綁定的帳號不符——這不是暫時性連線問題，
+                    # 重試也沒用。raise FatalAgentError（而非 RuntimeError）讓 run_forever 的
+                    # 例外鏈識別出「不可重試」，直接停止，不落入 backoff 無限重連（每輪都真的
+                    # 燒一次 Shioaji 登入配額）。訊息帶處置指引，交給操作者人工介入。
+                    raise FatalAgentError(
+                        f"agent 帳號不符，拒絕啟動（{reply.get('message')}）——請清空這個 outbox"
+                        f"（{self._buffer_path}）改用原帳號重啟，或改用原帳號登入；若確認要放棄"
+                        "舊帳號未送達的回報，需人工確認後手動刪除 buffer 檔再重啟。"
+                    )
+                raise RuntimeError(f"agent 子程序 connect 失敗: {reply}")
+            return reply["account"]
 
     def request(self, op: dict, *, timeout: float) -> dict:
-        return self._rpc(op, timeout=timeout)
+        # R3-1：在進入鎖（可能因為併發 respawn 而卡住）之前，先捕捉「這次呼叫意圖操作的
+        # generation」——`_rpc()` 拿到鎖之後會重新核對，若這段等待期間 respawn 已經換代，
+        # 就地丟棄，不誤觸新一代的 conn。
+        return self._rpc(op, timeout=timeout, generation=self._generation)
 
-    def _rpc(self, op: dict, *, timeout: float) -> dict:
+    def _rpc(self, op: dict, *, timeout: float, generation: int | None = None) -> dict:
+        if generation is None:
+            generation = self._generation
         if self._poisoned:
             raise TimeoutError(
                 f"agent 子程序 pipe 已判死（前次逾時遺留遲到回覆風險），拒絕重用"
                 f"（op={op.get('op')}）"
             )
         with self._lock:
+            # R3-1：鎖內第一件事就是重新核對 generation——若呼叫端捕捉 generation 之後、
+            # 拿到這把鎖之前，respawn 已經換代（terminate 舊 child、start 新 child 都要拿
+            # 同一把鎖，只有在這裡放行後才可能發生），這筆呼叫就是「過期意圖」：直接丟棄，
+            # 完全不碰 self._process/self._conn（那已經是新一代的），也不會誤把新 conn
+            # poison 掉。
+            if generation != self._generation:
+                raise TimeoutError(
+                    f"agent 子程序已被 respawn（generation {generation} 已被取代為 "
+                    f"{self._generation}），丟棄過期 RPC（op={op.get('op')}）"
+                )
             # codex round2 fix3(b)：鎖外剛才通過的 poisoned 檢查可能已經過期——若這則
             # request 卡在等鎖的期間，前一個持鎖的 RPC 在鎖內把 pipe 判死了，這裡拿到鎖後
             # 必須重新檢查一次，才能在真的碰 conn（send/poll/recv）之前攔下，不讓併發等待者
@@ -175,6 +223,14 @@ class ChildHandle:
                     f"（op={op.get('op')}）"
                 )
             conn = self._conn
+            if conn is None:
+                # R3-1：respawn（terminate()+start()）若被拆成兩次獨立呼叫，中間有極短的
+                # 「目前無 child」窗口（generation 尚未 bump，仍與這筆呼叫捕捉的相同）——
+                # 沒有 conn 可用，等同暫時不可用，走既有 TimeoutError 語意，不讓
+                # `None.send()` 炸出未經處理的 AttributeError。
+                raise TimeoutError(
+                    f"agent 子程序目前不可用（respawn 進行中），丟棄（op={op.get('op')}）"
+                )
             self._rpc_seq += 1
             rpc_id = self._rpc_seq
             try:
@@ -217,6 +273,10 @@ class ChildHandle:
                 return reply
 
     def _poison(self) -> None:
+        # 呼叫時機必然在 `_rpc()` 自己持有的鎖內（同執行緒、RLock 可重入）——這段期間
+        # generation 不可能被其他執行緒改變（想改也要搶同一把鎖），因此這裡毒化/terminate
+        # 的必然是呼叫端一開始核對過、目前仍然 current 的那一代 process/conn，不會誤殺
+        # 併發中已經換上的新 child（R3-1）。
         self._poisoned = True
         self.terminate()
 
@@ -227,39 +287,65 @@ class ChildHandle:
             return False
         return bool(reply.get("ok"))
 
+    def ping_detail(self, *, timeout: float) -> dict:
+        """R3-2（HIGH，codex 終審 round3）：`ping()` 只回 bool，不足以支撐 recovery 判斷
+        「新 child 是否又立即 latch」。回傳完整資訊：`ok`（存活/有回覆）、`latched`
+        （native_runner 端 `ChildFailstopLatch.tripped`，見 `_dispatch` 的 ping 分支）；
+        逾時/pipe 異常時 `ok=False, latched=None`（None 代表拿不到，呼叫端一律當成不安全
+        處理，不得視為「未 latch」而放行）。"""
+        try:
+            reply = self.request({"op": "ping"}, timeout=timeout)
+        except TimeoutError:
+            return {"ok": False, "latched": None}
+        return {"ok": bool(reply.get("ok")), "latched": bool(reply.get("latched", False))}
+
     def terminate(self) -> None:
-        if self._process is not None:
-            self._process.kill()
-            self._process.join(timeout=5)
-            self._process = None
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
-        if self._failstop_parent_conn is not None:
-            self._failstop_parent_conn.close()
-            self._failstop_parent_conn = None
-        if self._failstop_child_conn is not None:
-            self._failstop_child_conn.close()
-            self._failstop_child_conn = None
+        with self._lock:
+            if self._process is not None:
+                self._process.kill()
+                self._process.join(timeout=5)
+                self._process = None
+            if self._conn is not None:
+                self._conn.close()
+                self._conn = None
+            if self._failstop_parent_conn is not None:
+                self._failstop_parent_conn.close()
+                self._failstop_parent_conn = None
+            if self._failstop_child_conn is not None:
+                self._failstop_child_conn.close()
+                self._failstop_child_conn = None
 
     def poll_failstop(self, timeout: float = 0.0) -> dict | None:
         """G2①：（阻塞式，呼叫端須經 `asyncio.to_thread`）輪詢 child 的 failstop 專用
         channel——與 RPC pipe（`_conn`）完全獨立，不受 rpc_id 比對/poison 邏輯影響。回傳
         None 代表這次逾時內沒有新通知；channel 已關閉/不存在時同樣回 None（不 raise，呼叫端
-        `AgentRunner._failstop_watchdog` 是個無窮迴圈，不該被單次 poll 的例外打斷）。"""
-        conn = self._failstop_parent_conn
+        `AgentRunner._failstop_watchdog` 是個無窮迴圈，不該被單次 poll 的例外打斷）。
+
+        R3-1：只用鎖短暫保護「捕捉 (generation, conn) 這對快照」——不是整段阻塞的
+        `conn.poll(timeout)` 都持鎖（那樣會跟 place/cancel/update 的 RPC 搶鎖，拖慢下單
+        延遲）。阻塞等待結束、真的收到通知後，再核對一次 generation：若這段等待期間
+        respawn 已經換代，代表剛剛讀到的是舊 conn 遺留的通知，丟棄不回傳（R3-3 在 notice
+        payload 內另外也帶 generation 做第二層防線，見 `AgentRunner._failstop_watchdog`）。
+        """
+        with self._lock:
+            generation = self._generation
+            conn = self._failstop_parent_conn
         if conn is None:
             return None
         try:
-            if conn.poll(timeout):
-                return conn.recv()
+            if not conn.poll(timeout):
+                return None
+            notice = conn.recv()
         except (EOFError, OSError):
             return None
-        return None
+        if generation != self._generation:
+            return None
+        return notice
 
     @property
     def alive(self) -> bool:
-        return (not self._poisoned) and self._process is not None and self._process.is_alive()
+        with self._lock:
+            return (not self._poisoned) and self._process is not None and self._process.is_alive()
 
 
 def _to_op(msg: Any) -> dict:
@@ -289,7 +375,9 @@ class AgentRunner:
                  backoff_base: float = 1.0, backoff_max: float = 60.0,
                  stable_session_seconds: float = 30.0,
                  recovery_probe_interval: float = 5.0,
-                 failstop_poll_timeout: float = 1.0) -> None:
+                 failstop_poll_timeout: float = 1.0,
+                 respawn_backoff_base: float = 5.0,
+                 respawn_backoff_max: float = 300.0) -> None:
         self._transport = transport
         self._buffer = buffer
         self._child = child
@@ -321,6 +409,17 @@ class AgentRunner:
         self._latch_detail: str | None = None
         self._health_epoch = 0
         self._health_queue: asyncio.Queue = asyncio.Queue()
+        # R3-4（HIGH，codex 終審 round3）：respawn（＝一次真的 Shioaji 登入）專屬的獨立
+        # backoff——與 storage probe 呼叫頻率（`recovery_probe_interval`）、session 重連
+        # backoff（`_backoff_base`/`_backoff_max`）都無關，避免「每次便宜的 probe 通過就真
+        # 登入一次」在 recovery_probe_interval 這麼短的週期下燒光每日登入配額。
+        self._respawn_backoff_base = respawn_backoff_base
+        self._respawn_backoff_max = respawn_backoff_max
+        self._respawn_backoff = respawn_backoff_base
+        self._last_respawn_attempt = 0.0
+        self._respawn_backoff_history: list[float] = []
+        self._respawn_stage: str | None = None  # None｜"persist_only"（respawn 已成功，
+        # 只剩 epoch/sentinel 持久化待完成——下一輪只重試持久化，不再 respawn/登入）
         self._load_persisted_health()
 
     def _load_persisted_health(self) -> None:
@@ -352,12 +451,17 @@ class AgentRunner:
         當下卡在一個緩慢/卡住的 `transport.send()`，也不會拖住這裡，因為 sender 只在
         「重驗」那一小段（純記憶體讀取）才持有這把鎖，實際送出永遠在鎖外（見
         `_health_sender`）。latch 完成後把新 epoch 推進健康佇列，交給單一序列化 sender
-        擇機送出（不在這裡直接送）。"""
+        擇機送出（不在這裡直接送）。
+
+        R3-4：新一輪故障一律重置 `_respawn_stage`——若沿用上一輪（可能是另一個 child 世代）
+        留下的 `"persist_only"` 標記，下一次 `_recover()` 會誤以為「respawn 已經做過了，
+        這次只需要重試持久化」而跳過真正需要的 respawn。"""
         async with self._recovery_lock:
             self._latched = True
             self._latch_detail = detail
             self._health_epoch += 1
             epoch = self._health_epoch
+            self._respawn_stage = None
             await asyncio.to_thread(self._buffer.write_sentinel, epoch=epoch, detail=detail)
         self._health_queue.put_nowait(epoch)
 
@@ -368,45 +472,84 @@ class AgentRunner:
         只解除 parent 這邊的 `_latched`，child 內部的本地 latch 依然 tripped，`_dispatch`
         會永久對 mutating op 回 failstop——parent 卻已經回報 healthy，形成假 healthy。
 
+        R3-4④（HIGH，codex 終審 round3）：respawn 拿回的帳號若與這個 session 目前綁定的
+        `self._account` 不符——不是「暫時性連線問題」，是需要人工介入的異常（例如憑證/
+        帳號設定被動過手腳）；絕不能靜默改 `self._account` 繼續回報 healthy，直接
+        `FatalAgentError`（下方 `except Exception` 只吞非 fatal 例外，不會誤攔）。
+
         terminate 舊 child → respawn（沿用 `ChildHandle.start()`，內部已含一次 connect
-        RPC）→ 額外 ping 一次做「新 child 真的可用」的獨立確認（不只信任 start() 內部的
-        connect 沒 raise）。respawn/ping 任一步失敗：記錯、回 False，呼叫端（`_recover`）
-        據此保留 latch、不持久化任何狀態，交下一輪 `_recovery_prober` 重試——不留下「parent
-        以為恢復了、child 其實沒換成功」的中間態。成功才更新 `self._account`（respawn 用
-        同一組憑證，理論上拿回同一個帳號，但仍以這次 `start()` 的回傳值為準，不假設）。"""
+        RPC）→ 帳號核對 → R3-2：額外用 `ping_detail()`（而非 `ping()`）做「新 child 真的
+        可用、而且沒有立刻又 latch」的獨立確認——`ping()` 只回 bool，不足以擋住「新 child
+        在 connect 後、清 sentinel 前又故障一次」的假 healthy 縫（`ok=True` 但
+        `latched=True` 時，一樣視為不可用）。respawn/帳號核對(fatal 除外)/ping_detail 任一
+        步失敗：記錯、回 False，呼叫端（`_recover`）據此保留 latch、不持久化任何狀態，交
+        下一輪 `_recovery_prober` 依 respawn 專屬 backoff（R3-4①②）重試——不留下「parent
+        以為恢復了、child 其實沒換成功／又立刻壞掉」的中間態。成功才更新 `self._account`。
+        """
         try:
             await asyncio.to_thread(self._child.terminate)
             account = await asyncio.to_thread(self._child.start)
+        except FatalAgentError:
+            # R3-4①：帳號不符等不可重試錯誤——絕不能被下面的 `except Exception` 吞掉、
+            # 落入 respawn backoff 的無限重試迴圈（每輪都是一次真的 Shioaji 登入）。原樣
+            # 往外拋，交給 `_recover()`/`_recovery_prober` 一路傳到 `run_forever` 的既有
+            # FatalAgentError 處置（停止、不重試）。
+            raise
         except Exception:
             log.exception("G2④ recovery：child respawn 失敗，保持 latch，留給下一輪重試")
             return False
+        if self._account and account != self._account:
+            raise FatalAgentError(
+                f"agent respawn 後新 child 回報的帳號（{account}）與目前 session 綁定帳號"
+                f"（{self._account}）不符——拒絕靜默切換帳號繼續回報 healthy，需人工介入"
+            )
         try:
-            ok = await asyncio.to_thread(self._child.ping, timeout=self._child_ping_timeout)
+            detail = await asyncio.to_thread(
+                self._child.ping_detail, timeout=self._child_ping_timeout
+            )
         except Exception:
             log.exception("G2④ recovery：respawn 後 ping 例外，保持 latch，留給下一輪重試")
             return False
-        if not ok:
+        if not detail.get("ok"):
             log.error("G2④ recovery：respawn 後 ping 失敗，保持 latch，留給下一輪重試")
+            return False
+        if detail.get("latched"):
+            # R3-2（HIGH，codex 終審 round3）：新 child 在 connect 後、清 sentinel 前又
+            # latch——若這裡只看 ok=True 就放行，會清掉 sentinel、回報 healthy，但新 child
+            # 其實已經又故障一次（假 healthy）。
+            log.error(
+                "G2④ recovery：respawn 後新 child 立即又 latch，保持 latch，留給下一輪重試"
+            )
             return False
         self._account = account
         return True
 
     async def _recover(self) -> None:
-        """G2④/⑤/⑦：解除條件＝storage probe（對同一 buffer 寫入→commit→讀回）通過。
+        """G2④/⑤/⑦：解除條件＝storage probe（對同一 buffer 寫入→commit→讀回）通過，
+        respawn（含新 child 沒有立刻又 latch 的確認）成功，且 epoch/sentinel 持久化成功。
         `_recovery_lock` 內完成「probe→respawn child→清 latch/sentinel→取 (epoch,status)
         snapshot」的本機原子轉移——鎖本身的互斥已保證探針通過的當下不會有新的 `_latch()`
         正在進行中（沒有『探針期間又壞了但沒被發現』的競態：新故障必須等到這把鎖釋放才能
         真正 latch，屆時 epoch 會再 +1，語意上等價於『先恢復又立即重新故障』，不違反任何
         不變量）。`await transport.send` 永遠在鎖釋放之後才發生（經 `_health_sender`，不在
-        這裡）。respawn 本身雖然耗時（可能是一次真的券商登入），但刻意仍在鎖內完成——若
-        鎖外放行，respawn 期間若又有一次新的 `_latch()`（也要拿同一把鎖）會被卡住等待，
-        而非兩者交錯出「respawn 完成、latch 卻已經是更新一輪故障」的錯誤 snapshot。
+        這裡）。
 
-        N2（HIGH，codex 終審 round2）：probe 通過後，**必須先成功 respawn＋ping 確認新
-        child 可用，才能持久化 epoch／清 sentinel／翻 `_latched=False`**——理由見
-        `_respawn_child` docstring：child 本地 latch 無 rearm，不換 process 就沒有安全的
-        方式讓它恢復放行 mutating 呼叫。respawn 失敗直接 return（不動任何 durable 狀態，
-        保留 latch），與下面 C3 的持久化失敗分支同一套「任一步失敗就整段不生效」原則。
+        R3-4（HIGH，codex 終審 round3）：respawn 本身是一次真的 Shioaji 登入——`_recover()`
+        被 `_recovery_prober` 以固定 `recovery_probe_interval`（預設 5s，只用來做便宜的
+        storage probe）反覆呼叫；若每次 probe 通過就無條件 respawn，形同每 5 秒真登入
+        一次，最快 83 分鐘燒光每日 1000 次額度。拆成三段修法：
+          ① respawn 專屬 backoff（`_respawn_backoff`）——獨立於 storage probe 的呼叫頻率、
+             也獨立於 session 重連用的 `backoff`（`run_forever`）：只有距上次「真的嘗試
+             respawn」超過 `_respawn_backoff` 秒才會再打一次；失敗則指數倍增＋jitter
+             （封頂 `_respawn_backoff_max`），respawn 成功即重設回 `_respawn_backoff_base`。
+             respawn 全程仍在鎖內完成，理由同舊版（避免 respawn 期間又一次 `_latch()`
+             與這裡交錯出錯誤 snapshot）。
+          ② staged recovery：respawn＋ping_detail 已經成功，但接下來的 epoch/sentinel
+             持久化失敗——記 `_respawn_stage = "persist_only"`，下一輪（即使還在
+             latched）**只重試持久化，不再呼叫 `_respawn_child()`**（不再登入）。
+          ③ `_respawn_child()` 可能原樣拋出 `FatalAgentError`（帳號不符等）——這裡刻意不
+             攔截，讓它一路往外拋給 `run_forever` 的既有 fatal 處置（停止、不重試）；
+             `async with` 仍會正確釋放鎖。
 
         C3（HIGH，codex 終審）修復：`_latched` 翻 False 必須排在兩個 durable 持久化步驟
         （寫 epoch、清 sentinel）**之後**、且兩者皆成功才翻——舊版先翻 `_latched=False` 再做
@@ -417,15 +560,30 @@ class AgentRunner:
         正確重新載入 latch，且 `_load_persisted_health` 取 `max(sentinel.epoch, buffer
         meta)` 保證不會用到落後的舊 epoch；反過來若先清 sentinel 才寫 epoch、epoch 寫失敗，
         下次啟動會誤判「未 latch」且 epoch 讀到過舊的值。任一步失敗：保留 latch、記錯，
-        不動 `_health_epoch`、不推進健康佇列，留給下一輪 `_recovery_prober` 重試。"""
+        不動 `_health_epoch`，`_respawn_stage` 維持 `"persist_only"`，留給下一輪
+        `_recovery_prober` 只重試持久化（不再 respawn/登入）。"""
         async with self._recovery_lock:
             if not self._latched:
                 return
             ok = await asyncio.to_thread(self._buffer.probe)
             if not ok:
                 return
-            if not await self._respawn_child():
-                return
+            if self._respawn_stage != "persist_only":
+                now = time.monotonic()
+                if now - self._last_respawn_attempt < self._respawn_backoff:
+                    return  # 還沒到下一次允許 respawn（真登入）的時間點，留給下一輪重試
+                self._last_respawn_attempt = now
+                self._respawn_backoff_history.append(self._respawn_backoff)
+                respawned = await self._respawn_child()
+                if not respawned:
+                    self._respawn_backoff = min(
+                        self._respawn_backoff * 2
+                        + random.uniform(0, self._respawn_backoff_base),
+                        self._respawn_backoff_max,
+                    )
+                    return
+                self._respawn_backoff = self._respawn_backoff_base
+                self._respawn_stage = "persist_only"
             epoch = self._health_epoch
             try:
                 await asyncio.to_thread(self._buffer.set_health_epoch, epoch)
@@ -433,11 +591,12 @@ class AgentRunner:
             except Exception:
                 log.exception(
                     "G2④ recover 持久化步驟失敗（epoch 寫入／sentinel 清除），保持 latch，"
-                    "留給下一輪 _recovery_prober 重試"
+                    "留給下一輪 _recovery_prober 只重試持久化（respawn 階段已完成，不再登入）"
                 )
                 return
             self._latched = False
             self._latch_detail = None
+            self._respawn_stage = None
         self._health_queue.put_nowait(epoch)
 
     async def _reject_failstop(self, cmd_id: str) -> None:
@@ -710,14 +869,32 @@ class AgentRunner:
         docstring）。`ChildHandle.poll_failstop` 是阻塞呼叫，搬到 thread 執行，逾時內沒有
         通知就回 None、迴圈繼續。`getattr` 容錯（比照 `broker/watchdog.py::_probe_healthy`
         既有慣例）：不支援這個介面的 child（測試替身／未來精簡實作）直接讓這個 task 正常
-        結束，不拋例外把整個 `run_once` 拖垮——等價於「這個 child 永遠不會回報 failstop」。"""
+        結束，不拋例外把整個 `run_once` 拖垮——等價於「這個 child 永遠不會回報 failstop」。
+
+        R3-3（MEDIUM，codex 終審 round3）：notice 帶著送出當下的 child generation（見
+        native_runner.py `_trigger_failstop_latch`）——respawn 換代之後，若這裡才取出一則
+        屬於「舊 generation」的通知（例如舊 child 臨終前排進 failstop pipe，respawn 過程中
+        `ChildHandle.poll_failstop` 卡在鎖外等待，直到 respawn 完成才拿到鎖讀出；R3-1 的
+        generation 核對已經先擋掉這條路徑的大多數情況，這裡是第二層防線，防禦任何其他管道
+        漏進來的過期通知），一律丟棄，不誤 latch 目前這一代健康的 child（額外的
+        respawn/relogin 循環）。"""
         poll = getattr(self._child, "poll_failstop", None)
         if poll is None:
             return
         while True:
             notice = await asyncio.to_thread(poll, self._failstop_poll_timeout)
-            if notice is not None:
-                await self._latch(notice.get("detail") or "child 回報 buffer 落地失敗")
+            if notice is None:
+                continue
+            current_generation = getattr(self._child, "generation", None)
+            notice_generation = notice.get("generation")
+            if current_generation is not None and notice_generation != current_generation:
+                log.warning(
+                    "agent 收到過期 generation 的 failstop 通知（notice_generation=%r，"
+                    "目前 generation=%r），丟棄，避免誤 latch 目前這一代 child",
+                    notice_generation, current_generation,
+                )
+                continue
+            await self._latch(notice.get("detail") or "child 回報 buffer 落地失敗")
 
     async def _recovery_prober(self) -> None:
         """G2④：latch 期間週期性嘗試 storage probe，通過就呼叫 `_recover()` 解除 latch。
