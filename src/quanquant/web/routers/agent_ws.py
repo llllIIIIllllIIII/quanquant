@@ -25,7 +25,7 @@ from pydantic import ValidationError
 
 from quanquant.auth.agent_tokens import validate_token
 from quanquant.broker import repository as brepo
-from quanquant.broker.agent_commands import apply_command_ack
+from quanquant.broker.agent_commands import apply_command_ack, prepare_replay
 from quanquant.broker.agent_protocol import (
     DownReportAck, UpCmdAck, UpHealth, UpLogin, UpReport, parse_uplink,
 )
@@ -135,6 +135,18 @@ async def agent_ws(websocket: WebSocket) -> None:
                         break
                     channel.mark_logged_in(msg.account)
                     adapter.account = msg.account
+                    # Task 10（D4 重連補送，限同 scope）：四步 guard 全過、mark_logged_in
+                    # 後，立刻查詢＋直送這個 user 在**這次登入綁定帳號**下尚未 transport ack
+                    # 也尚未 resolved 的指令（agent 端 ledger 去重收斂，見 Task 9）——他帳號
+                    # 的指令永不下行（`prepare_replay` 的 account 過濾）。用這條連線的
+                    # `websocket.send_json` 直接送（fire-and-resend，不經
+                    # `AgentChannel.request` 等待 ack），仍在 `inbox_lock` 內完成，確保補送
+                    # 一定發生在下面 `_reconcile_after_login` 排程之前。
+                    replay_cmds = await asyncio.to_thread(
+                        prepare_replay, session_factory, user_id=agent_user_id, account=msg.account,
+                    )
+                    for down in replay_cmds:
+                        await websocket.send_json(down)
                 order_state.mark_ready()
                 if hub is not None:
                     hub.publish()

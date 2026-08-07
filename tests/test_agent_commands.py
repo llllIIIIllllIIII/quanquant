@@ -9,6 +9,7 @@
   - 雙模式契約：四個純函式的效果與既有 in-process 寫回語意逐位元相同。
 """
 import json
+import threading
 from datetime import datetime, timedelta
 
 import pytest
@@ -23,9 +24,12 @@ from quanquant.broker.agent_commands import (
     apply_place_failure,
     apply_update_ack,
     insert_command,
+    list_unresolved_for_replay,
     mark_timeout_observed,
     new_command,
+    prepare_replay,
     resolve_never_dispatched,
+    to_downlink_dict,
 )
 from quanquant.broker.agent_protocol import UpCmdAck
 from quanquant.db.models import AgentCommand, Order, QuotaReservation, RawInbox
@@ -566,3 +570,196 @@ def test_apply_update_ack_matches_inprocess_semantics(session, engine):
         o = s2.exec(select(Order)).one()
         assert o.qty == 4 and str(o.price) == "21700" and o.status == "submitted"
         assert _quota_state(s2, "delta-1") == "confirmed"
+
+
+# ---------------------------------------------------------------------------
+# Task 10：重連補送（限同 scope；D4）—— list_unresolved_for_replay / to_downlink_dict /
+# prepare_replay（S#3/5/16）
+# ---------------------------------------------------------------------------
+
+
+def _cmd_row(*, cmd_id, kind="cancel", user_id=1, account=ACCOUNT, ordno="O1",
+             client_order_id=None, reservation_id=None, payload="{}",
+             created_at=datetime(2026, 8, 7, 9, 0), expires_at=datetime(2099, 1, 1),
+             transport_acked_at=None, outcome=None, resolved_via=None, resolved_at=None) -> AgentCommand:
+    return AgentCommand(
+        cmd_id=cmd_id, user_id=user_id, kind=kind, broker=BROKER, account=account, mode=MODE,
+        ordno=ordno, client_order_id=client_order_id, reservation_id=reservation_id,
+        payload=payload, created_at=created_at, expires_at=expires_at,
+        transport_acked_at=transport_acked_at, outcome=outcome, resolved_via=resolved_via,
+        resolved_at=resolved_at,
+    )
+
+
+def test_list_unresolved_for_replay_filters_by_user_and_account(session):
+    """R1-2：只掃這個 user、這次登入綁定帳號的未 transport-ack/未 resolved 指令——別的 user、
+    或同一個 user 名下別的帳號（換帳號後的舊帳號殘留），一律不下行（S#16）。"""
+    matching = _cmd_row(cmd_id="cmd-match", ordno="O1")
+    other_account = _cmd_row(cmd_id="cmd-other-acct", account="OTHER", ordno="O2")
+    other_user = _cmd_row(cmd_id="cmd-other-user", user_id=2, ordno="O3")
+    for c in (matching, other_account, other_user):
+        insert_command(session, cmd=c)
+    session.commit()
+
+    rows = list_unresolved_for_replay(session, user_id=1, account=ACCOUNT)
+    assert [r.cmd_id for r in rows] == ["cmd-match"]
+
+
+def test_list_unresolved_for_replay_excludes_transport_acked_or_resolved(session):
+    """`outcome='unknown'` 天然被 `transport_acked_at IS NULL` 排除（timeout ack 已寫過
+    transport_acked_at）；已 resolved（如 report 先收斂的 cancel）同樣不重播——只剩『從未
+    收到任何 ack』的列。"""
+    acked = _cmd_row(cmd_id="cmd-acked", ordno="O1", transport_acked_at=datetime(2026, 8, 7, 9, 5))
+    resolved = _cmd_row(cmd_id="cmd-resolved", ordno="O2", outcome="unknown",
+                        resolved_via="report", resolved_at=datetime(2026, 8, 7, 9, 6))
+    pending = _cmd_row(cmd_id="cmd-pending", ordno="O3")
+    for c in (acked, resolved, pending):
+        insert_command(session, cmd=c)
+    session.commit()
+
+    rows = list_unresolved_for_replay(session, user_id=1, account=ACCOUNT)
+    assert [r.cmd_id for r in rows] == ["cmd-pending"]
+
+
+def test_list_unresolved_for_replay_includes_already_expired_command_server_does_not_auto_resolve(session, engine):
+    """S#5：server 不自主過期——`expires_at` 早已過去、但仍 `resolved_at IS NULL` 的指令，
+    重連補送查詢仍照常回傳（是否過期只由 agent 收到重播後自行判斷），且這個查詢本身完全不
+    改寫 outcome/resolved_at（server 沒有任何背景工作單方面判死這筆指令；配額跨 trading_day
+    歸零由既有 `quota_used_today` 的 trading_day 過濾天然成立，不需要另外測）。"""
+    cmd = _cmd_row(cmd_id="cmd-expired", kind="place", ordno=None, client_order_id="c-expired",
+                   payload=json.dumps({"action": "Buy", "price": "21500", "qty": 1,
+                                        "price_type": "LMT", "order_type": "ROD", "octype": "Auto"}),
+                   created_at=datetime(2020, 1, 1, 9, 0), expires_at=datetime(2020, 1, 1, 9, 2))
+    insert_command(session, cmd=cmd)
+    session.commit()
+
+    rows = list_unresolved_for_replay(session, user_id=1, account=ACCOUNT)
+    assert [r.cmd_id for r in rows] == ["cmd-expired"]
+
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, "cmd-expired")
+        assert row.resolved_at is None and row.outcome is None  # 沒有背景工作判死它
+
+
+def test_to_downlink_dict_reconstructs_place_cancel_update():
+    place = _cmd_row(cmd_id="cmd-p", kind="place", ordno=None, client_order_id="c-p",
+                     payload=json.dumps({"action": "Buy", "price": "21500", "qty": 1,
+                                          "price_type": "LMT", "order_type": "ROD", "octype": "Auto"}),
+                     expires_at=datetime(2026, 8, 7, 9, 2))
+    assert to_downlink_dict(place) == {
+        "type": "place", "cmd_id": "cmd-p", "account": ACCOUNT, "mode": MODE,
+        "expires_at": "2026-08-07T09:02:00",
+        "native": {"action": "Buy", "price": "21500", "qty": 1, "price_type": "LMT",
+                   "order_type": "ROD", "octype": "Auto"},
+    }
+
+    cancel = _cmd_row(cmd_id="cmd-c", kind="cancel", ordno="O1", expires_at=datetime(2026, 8, 7, 9, 3))
+    assert to_downlink_dict(cancel) == {
+        "type": "cancel", "cmd_id": "cmd-c", "account": ACCOUNT, "mode": MODE,
+        "expires_at": "2026-08-07T09:03:00", "ordno": "O1",
+    }
+
+    update = _cmd_row(cmd_id="cmd-u", kind="update", ordno="O2", client_order_id="c-u",
+                      payload=json.dumps({"price": "21600", "qty": 2, "price_type": "LMT"}),
+                      expires_at=datetime(2026, 8, 7, 9, 4))
+    assert to_downlink_dict(update) == {
+        "type": "update", "cmd_id": "cmd-u", "account": ACCOUNT, "mode": MODE,
+        "expires_at": "2026-08-07T09:04:00", "ordno": "O2", "price": "21600", "qty": 2,
+        "price_type": "LMT",
+    }
+
+
+def test_prepare_replay_orders_by_created_at_and_marks_sent_at(session, engine):
+    place = _cmd_row(cmd_id="cmd-p", kind="place", ordno=None, client_order_id="c-p",
+                     payload=json.dumps({"action": "Buy", "price": "21500", "qty": 1,
+                                          "price_type": "LMT", "order_type": "ROD", "octype": "Auto"}),
+                     created_at=datetime(2026, 8, 7, 9, 0))
+    cancel = _cmd_row(cmd_id="cmd-c", kind="cancel", ordno="O1", created_at=datetime(2026, 8, 7, 9, 1))
+    update = _cmd_row(cmd_id="cmd-u", kind="update", ordno="O2", client_order_id="c-u",
+                      payload=json.dumps({"price": "21600", "qty": 2, "price_type": "LMT"}),
+                      created_at=datetime(2026, 8, 7, 9, 2))
+    for c in (update, place, cancel):  # 故意亂序 insert，驗證回傳仍按 created_at 排序
+        insert_command(session, cmd=c)
+    session.commit()
+
+    dicts = prepare_replay(lambda: Session(engine), user_id=1, account=ACCOUNT)
+    assert [d["cmd_id"] for d in dicts] == ["cmd-p", "cmd-c", "cmd-u"]
+    assert dicts[0]["type"] == "place" and dicts[1]["type"] == "cancel" and dicts[2]["type"] == "update"
+
+    with Session(engine) as s2:
+        for cmd_id in ("cmd-p", "cmd-c", "cmd-u"):
+            assert s2.get(AgentCommand, cmd_id).sent_at is not None
+
+
+def test_prepare_replay_empty_when_nothing_unresolved(engine):
+    assert prepare_replay(lambda: Session(engine), user_id=1, account=ACCOUNT) == []
+
+
+# ---------------------------------------------------------------------------
+# Task 10：R5-2/R6-1（S#36/38）—— update 單飛在真並發下恰一成功
+# ---------------------------------------------------------------------------
+
+
+def test_update_singleflight_concurrent_two_writers_exactly_one_wins(tmp_path):
+    """兩個獨立執行緒＋獨立連線，對同一個 `client_order_id` 同時嘗試插入
+    `kind='update' AND resolved_at IS NULL` 的 ledger 列——`uq_agent_cmd_update_singleflight`
+    partial unique index 必須恰讓一個成功，另一個撞 `IntegrityError`；鏡射
+    `shioaji_adapter.update()` 決策段的實際 try/except 寫法（同
+    `test_has_unresolved_update_command_false_for_unrelated_integrity_error` 既有手法：直接在
+    測試裡重演 route 的 insert→except IntegrityError→`has_unresolved_update_command` 精確
+    辨認流程，而非經過完整 adapter/RiskGuard）。
+
+    用 `threading.Barrier` 讓兩執行緒盡量同時打 insert，驗證的是這個 partial unique index
+    在**真正的執行緒級競爭**下（非序列呼叫）仍然成立——比 Task 8 既有的
+    `test_update_singleflight_rejects_second_unresolved_update`（序列：第一筆先完全結束才打
+    第二筆）多驗一層時序保證。改用檔案 SQLite（獨立連線）而非 in-memory：StaticPool 共用
+    單一底層連線會讓兩執行緒同時 flush 產生與本測試無關的 identity-map 交錯錯誤（比照
+    `tests/test_risk_guard.py::test_cas_quota_blocks_one_of_two_concurrent_places` 既有理由）。
+
+    Postgres 方言：`uq_agent_cmd_update_singleflight` 這個 partial unique index 的 DDL 已在
+    `tests/test_agent_models.py::test_agent_command_update_singleflight_index_compiles_on_
+    both_dialects` 驗證兩方言編譯等價；本機無 Postgres 服務可跑執行期測試，而唯一鍵語意在
+    兩方言下皆是 DB 強制（非 best-effort、非僅 sqlite 特有行為），故 SQLite 執行期真並發＋
+    兩方言 DDL 編譯等價已足以涵蓋 R5-2 的並發保證，不偽造一個本機不存在的 Postgres 服務。
+    """
+    from sqlmodel import SQLModel, create_engine
+
+    db_path = tmp_path / "update_singleflight_concurrency.db"
+    eng = create_engine(f"sqlite:///{db_path}", connect_args={"timeout": 30})
+    SQLModel.metadata.create_all(eng)
+
+    with Session(eng) as s:
+        _make_order(s, client_order_id="c-race", ordno="O-RACE")
+
+    results: list[tuple[str, str]] = []
+    barrier = threading.Barrier(2)
+
+    def _attempt(cmd_id: str) -> None:
+        with Session(eng) as s:
+            cmd = AgentCommand(
+                cmd_id=cmd_id, user_id=1, kind="update", broker=BROKER, account=ACCOUNT, mode=MODE,
+                client_order_id="c-race", ordno="O-RACE",
+                payload=json.dumps({"price": "21600", "qty": 2, "price_type": "LMT"}),
+                created_at=datetime(2026, 8, 7, 9, 0), expires_at=datetime(2099, 1, 1),
+            )
+            barrier.wait(timeout=5)
+            try:
+                insert_command(s, cmd=cmd)
+                s.commit()
+                results.append(("ok", cmd_id))
+            except IntegrityError:
+                s.rollback()
+                hit = brepo.has_unresolved_update_command(s, client_order_id="c-race")
+                results.append(("rejected" if hit else "unexpected_integrity_error", cmd_id))
+
+    t1 = threading.Thread(target=_attempt, args=("cmd-race-1",))
+    t2 = threading.Thread(target=_attempt, args=("cmd-race-2",))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert sorted(r[0] for r in results) == ["ok", "rejected"]
+    with Session(eng) as s:
+        rows = list(s.exec(select(AgentCommand).where(AgentCommand.kind == "update")))
+        assert len(rows) == 1  # 只有贏家真的落地

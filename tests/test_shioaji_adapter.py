@@ -500,6 +500,37 @@ def test_update_raises_clear_error_and_releases_delta_quota_when_no_matching_tra
         assert update_row.state == "released"  # 確定沒生效，delta 配額立即釋放
 
 
+def test_update_rejects_order_without_ordno_in_process_mode_too(engine):
+    """Task 10（R6-1/S#38）：ordno IS NULL 的 admission 檢查不限 remote_gateway 存在與否——
+    in-process 模式同樣適用（沒有 ordno 就沒有對象可改，語意上與是否走 agent 通道無關）。
+    直接造一張 broker_order_id 已知、但 ordno 仍是 NULL 的委託（模擬 place 尚未取得 ordno
+    的中間態），確認 update() 在碰 RiskGuard.check_update／native 呼叫之前就已經拒絕。
+
+    刻意帶真正的 `RiskGuard`（而非 `_adapter(engine)` 預設的 `risk_guard=None`）：若沒有這道
+    admission 檢查，`check_update` 判定口數增加會先建立一筆 delta `QuotaReservation`，之後才
+    在 native 層（`_find_trade_by_ordno` 找不到 id=None 的委託）以 `TradeNotFoundError` 收尾
+    ——那樣雖然最終也會 raise，但已經留下一筆孤兒保留列；這裡驗證的正是「不建立任何
+    reservation」，不能靠 risk_guard=None 的弱版本掩蓋掉這個差異。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="c-noord", request_hash="H", user_id=1, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-06-16",
+        )
+        order.broker_order_id = "B-NOORD"
+        s.add(order)
+        s.commit()
+
+    with pytest.raises(OrderError, match="ordno"):
+        asyncio.run(adapter.update("B-NOORD", actor_user_id=1, qty=5))
+    assert adapter._api.placed == []  # native 完全沒被呼叫
+    with Session(engine) as s:
+        assert s.exec(select(QuotaReservation)).all() == []  # 沒有留下任何孤兒保留列
+
+
 def test_find_trade_by_ordno_matches_order_id_not_broker_ordno_field(engine):
     """bug A 回歸：實測 payload（權威）——`order.id`=`order.seqno`="101CB7"（我方存的
     ordno/broker_order_id 關聯鍵），`order.ordno`="001CB9"（交易所委託書號，另一個不同

@@ -41,10 +41,10 @@ from decimal import Decimal
 from typing import Literal
 
 from sqlalchemy import update as sa_update
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
-from quanquant.broker.agent_protocol import UpCmdAck
+from quanquant.broker.agent_protocol import DownCancel, DownPlace, DownUpdate, PlaceNative, UpCmdAck
 from quanquant.db.models import AgentCommand, Order
 
 # spec D4/D7 §7：設定鍵 `agent_command_expiry_seconds`（預設 120）留 Task 10 才接線到
@@ -174,6 +174,92 @@ def resolve_never_dispatched(session: Session, *, cmd_id: str, message: str) -> 
     if resolved:
         session.flush()
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# 重連補送（限同 scope；D4／Task 10）
+# ---------------------------------------------------------------------------
+
+
+def list_unresolved_for_replay(session: Session, *, user_id: int, account: str) -> list[AgentCommand]:
+    """UpLogin 接受、`mark_logged_in` 後查詢這個 user 在**這次登入綁定帳號**下，尚未
+    transport ack 也尚未 resolved 的指令，按 `created_at` 序回傳供重新下行（agent 端 ledger
+    去重負責收斂，見 Task 9）。
+
+    - `outcome='unknown'` 天然被 `transport_acked_at IS NULL` 排除——timeout ack 已經在
+      `_mark_transport_acked` 寫過 transport_acked_at，這裡只會看到「從未收到任何 ack」的
+      列（route 本地 `mark_timeout_observed` 只寫 `timeout_observed_at`，不影響這個過濾）。
+    - `account=<本次綁定帳號>` 是唯一的 scope 過濾（codex R1-2）：**他帳號的未 transport-ack
+      指令永不下行到不同帳號的 session**，即使同一個 user 換帳號重連也一樣。
+    - 刻意不濾 `expires_at`——**server 不自主過期**（見模組底部 `to_downlink_dict`
+      docstring），是否過期只由 agent 收到重播後自行判斷。
+    """
+    stmt = (
+        select(AgentCommand)
+        .where(
+            AgentCommand.user_id == user_id,
+            AgentCommand.account == account,
+            AgentCommand.transport_acked_at.is_(None),
+            AgentCommand.resolved_at.is_(None),
+        )
+        .order_by(AgentCommand.created_at)
+    )
+    return list(session.exec(stmt))
+
+
+def to_downlink_dict(cmd: AgentCommand) -> dict:
+    """把一筆 ledger 列還原成可重送的下行指令 dict（`websocket.send_json` 可直接吃，比照
+    `AgentNativeGateway` 平常組 `DownPlace/DownCancel/DownUpdate` 後 `.model_dump()` 的既有
+    慣例）。`expires_at` 沿用**原始**建立時凍結的值，不因重送而延長——**server 不自主過期**
+    未 ack 的指令（agent 才知道有沒有執行過；server 單方面判死會把『已在券商成交的單』記成
+    failed＋錯誤退配額，見 spec D4「過期語意」）：過期只由 agent 收到重播後自行檢查
+    `expires_at`、拒絕執行時回報 `error_kind='expired'`。"""
+    expires_at = cmd.expires_at.isoformat()
+    if cmd.kind == "place":
+        payload = json.loads(cmd.payload)
+        return DownPlace(
+            cmd_id=cmd.cmd_id, account=cmd.account, mode=cmd.mode, expires_at=expires_at,
+            native=PlaceNative(**payload),
+        ).model_dump()
+    if cmd.kind == "cancel":
+        return DownCancel(
+            cmd_id=cmd.cmd_id, account=cmd.account, mode=cmd.mode, expires_at=expires_at,
+            ordno=cmd.ordno,
+        ).model_dump()
+    if cmd.kind == "update":
+        payload = json.loads(cmd.payload)
+        return DownUpdate(
+            cmd_id=cmd.cmd_id, account=cmd.account, mode=cmd.mode, expires_at=expires_at,
+            ordno=cmd.ordno, price=payload.get("price"), qty=payload["qty"],
+            price_type=payload.get("price_type"),
+        ).model_dump()
+    raise ValueError(f"unknown AgentCommand.kind={cmd.kind!r}")  # pragma: no cover - kind 由決策段 Literal 保證
+
+
+def mark_resent(session: Session, *, cmd_id: str) -> None:
+    """重連補送時記錄『這筆指令剛剛又送出去一次』。只 flush，不 commit（呼叫端決定交易邊界，
+    同本檔其餘寫入函式的既有慣例）——與 `list_unresolved_for_replay` 的查詢在同一個呼叫端
+    交易內完成，之間不夾雜其他 DB 寫入，`sent_at` 因此不會被中途的其他操作腐化。"""
+    t = AgentCommand.__table__
+    stmt = sa_update(t).where(t.c.cmd_id == cmd_id).values(sent_at=_utcnow())
+    session.exec(stmt)  # type: ignore[call-overload]
+    session.flush()
+
+
+def prepare_replay(session_factory, *, user_id: int, account: str) -> list[dict]:
+    """`agent_ws.py` 的 UpLogin 分支用 `asyncio.to_thread` 呼叫一次：查詢＋標記 sent_at＋
+    還原下行 dict，全部包在同一個交易內完成，回傳按 `created_at` 序排列、可直接
+    `await websocket.send_json(...)` 的 dict 清單。呼叫端在 `channel.mark_logged_in` 之後、
+    `_reconcile_after_login` 觸發之前呼叫（D4：補送完成後才觸發 login reconcile）；補送本身
+    用該連線的 WS 直接 send（不經 `AgentChannel.request` 等待——這些是 fire-and-resend，
+    ack 由 agent 端 ledger 去重＋server 端兩維 CAS applier 冪等吸收）。"""
+    with session_factory() as session:
+        rows = list_unresolved_for_replay(session, user_id=user_id, account=account)
+        dicts = [to_downlink_dict(row) for row in rows]
+        for row in rows:
+            mark_resent(session, cmd_id=row.cmd_id)
+        session.commit()
+        return dicts
 
 
 # ---------------------------------------------------------------------------

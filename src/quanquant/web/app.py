@@ -288,6 +288,9 @@ async def _start_agent_channel_subsystem(
             # _persist_raw 落地的 RawInbox.user_id 恆為 None，per-slot RawInboxWorker（WHERE
             # user_id=slot.user_id）永遠認領不到，資料孤兒化（Task 7 docstring 早已宣稱會傳，
             # 但實際程式碼漏掉，見 task-8-report.md「已知落差」#4，本次補上）。
+            agent_command_expiry_seconds=settings.agent_command_expiry_seconds,  # Task 10：
+            # 沒有這行 ShioajiAdapter 會退回模組層預設常數（120，與設定預設值恰好相同，但
+            # 不會隨部署端調整設定而改變），見 config.py 該欄位註解。
         )
         session_state = OrderSessionState()
         session_state.mark_disabled("agent 未連線")     # 等這個 user 的 agent 上線

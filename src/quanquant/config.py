@@ -93,6 +93,15 @@ class Settings(BaseSettings):
     # D2：per-user DB opaque token（見 auth/agent_tokens.py）取代 Inc0 的全站靜態
     # AGENT_WS_TOKEN——WS 握手改查 DB，不再有站台層級的靜態密鑰設定。
     agent_token_ttl_days: int = 30      # agent token 預設有效天數（簽發/rotation 皆套用）
+    # D4/D7 §7（Task 10）：command ledger 送前持久化的 expires_at = created_at + 這個秒數，
+    # 過期與否只由 agent 端判斷（server 不自主過期，見 agent_commands.py 模組頂部說明）。
+    # Task 8/agent_channel.py 曾各自用同名的模組層常數（agent_commands.DEFAULT_COMMAND_
+    # EXPIRY_SECONDS / agent_channel._DEFAULT_COMMAND_EXPIRY_SECONDS）當「尚未接線到
+    # Settings 前」的預設值——這裡才是唯一真正接線到 Settings 的權威來源，
+    # `_start_agent_channel_subsystem`（web/app.py）建 slot 的 `ShioajiAdapter` 時讀這個值
+    # 傳入 `agent_command_expiry_seconds=`；那兩個模組層常數繼續保留、只作為函式簽名的
+    # 預設 fallback（未顯式傳入時），不重複定義同一個名字。
+    agent_command_expiry_seconds: int = 120
 
 
 @lru_cache(maxsize=1)

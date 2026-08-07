@@ -1,4 +1,5 @@
 import datetime as dt
+import json
 import time
 from datetime import timedelta
 from decimal import Decimal
@@ -9,12 +10,15 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 from quanquant.auth import service as auth_service
 from quanquant.auth.agent_tokens import issue_token
+from quanquant.broker import repository as brepo
 from quanquant.broker.agent_channel import AgentChannel
 from quanquant.broker.agent_registry import AgentRegistry, UserAgentSlot
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.config import get_settings
-from quanquant.db.models import AgentAccountBinding, AgentCommand, AgentToken, Order, RawInbox
+from quanquant.db.models import (
+    AgentAccountBinding, AgentCommand, AgentToken, Order, QuotaReservation, RawInbox,
+)
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_session
 
@@ -850,3 +854,93 @@ def test_inactive_owner_valid_token_rejected(ws_env, engine):
         with pytest.raises(WebSocketDisconnect) as exc_info:
             ws.receive_json()
     assert exc_info.value.code == 1008
+
+
+# ---- Task 10（D4 重連補送，限同 scope）：UpLogin 接受後補送尚未 transport-ack 也尚未
+# resolved 的指令；換帳號後原帳號的殘留指令不下行；補送完成才觸發 login reconcile ----
+
+
+def test_reconnect_replay_resends_unresolved_command_then_late_ack_converges(ws_env, engine):
+    """S#3/D4 端到端：place timeout（斷線前從未收到任何 ack，ledger 列 transport_acked_at/
+    resolved_at 皆 None，Order 已被 route 逾時 fail-safe 標成 unknown、quota 仍 reserved，
+    同 test_agent_commands.py 既有 late-ack 情境）→ 斷線 → 用同一帳號重新登入 → server 補送
+    這筆指令（直送、非經 AgentChannel.request 等待）→ late ack 抵達 → 兩維 CAS applier 收斂
+    Order/quota/ledger（agent 端自己的 ledger 去重已由 Task 9 覆蓋，這裡驗證的是 server 端
+    補送本身：查詢命中＋直送＋sent_at 更新＋收到 ack 後正確收斂）。"""
+    owner_id = ws_env.state.agent_test_owner_id
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)
+    # ws1 已斷線（with 區塊結束觸發 channel.detach()）。直接在 DB 造一筆代表「送出去但斷線前
+    # 從未收到任何 ack」的 place ledger 列。
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="c-replay-1", request_hash="H", user_id=owner_id, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("21500"), price_type="LMT", order_type="ROD", octype="Auto",
+            trading_day="2026-08-07",
+        )
+        order.status = "unknown"
+        s.add(order)
+        brepo.reserve_quota(s, reservation_id="c-replay-1", user_id=owner_id, mode="sim",
+                            trading_day="2026-08-07", qty=1, daily_limit=100)
+        s.add(AgentCommand(
+            cmd_id="cmd-replay-1", user_id=owner_id, kind="place", broker="shioaji",
+            account="F1", mode="sim", client_order_id="c-replay-1", reservation_id="c-replay-1",
+            payload=json.dumps({"action": "Buy", "price": "21500", "qty": 1, "price_type": "LMT",
+                                 "order_type": "ROD", "octype": "Auto"}),
+            created_at=dt.datetime(2026, 8, 7, 9, 0), expires_at=dt.datetime(2099, 1, 1),
+        ))
+        s.commit()
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
+        ws2.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        replayed = ws2.receive_json()
+        assert replayed["type"] == "place" and replayed["cmd_id"] == "cmd-replay-1"
+        assert replayed["native"]["price"] == "21500"
+
+        ws2.send_json({"type": "cmd_ack", "cmd_id": "cmd-replay-1", "event_id": 1, "ok": True,
+                      "result": {"ordno": "101AA1", "broker_order_id": "101AA1"}})
+        assert _wait(lambda: any(a.cmd_id == "cmd-replay-1" for a in _slot(ws_env).channel.acks))
+
+    with Session(engine) as s:
+        o = s.exec(select(Order).where(Order.client_order_id == "c-replay-1")).one()
+        assert o.status == "submitted" and o.ordno == "101AA1"
+        cmd_row = s.get(AgentCommand, "cmd-replay-1")
+        assert cmd_row.resolved_at is not None and cmd_row.sent_at is not None
+        rows = list(s.exec(select(QuotaReservation).where(QuotaReservation.reservation_id == "c-replay-1")))
+        assert rows[0].state == "confirmed"
+
+
+def test_reconnect_replay_does_not_resend_other_account_commands_after_switch(ws_env, engine):
+    """R1-2/S#16：換帳號後，重連補送只掃**這次登入綁定帳號**的未 transport-ack 指令——原
+    帳號（即使仍是同一個 user）殘留的未 resolved 指令不下行到新帳號的 session。用 cancel
+    （非曝險，R3-1 #29 不擋換帳號 guard）模擬「原帳號還有未終結指令、但換帳號本身被允許」的
+    情境：換帳號後立刻送一筆 report，若補送真的發生，補送的下行指令會先於 report_ack 抵達；
+    這裡驗證收到的第一則訊息就是 report_ack，證明沒有夾帶任何補送。"""
+    owner_id = ws_env.state.agent_test_owner_id
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws1:
+        ws1.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)
+
+    with Session(engine) as s:
+        s.add(AgentCommand(
+            cmd_id="cmd-old-1", user_id=owner_id, kind="cancel", broker="shioaji",
+            account="F1", mode="sim", ordno="O-OLD", payload="{}",
+            created_at=dt.datetime(2026, 8, 7, 9, 0), expires_at=dt.datetime(2099, 1, 1),
+        ))
+        s.commit()
+
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws2:
+        ws2.send_json({"type": "login", "account": "F2", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)  # 換帳號被允許（cancel 不擋 guard）
+        ws2.send_json({"type": "report", "event_id": 42, "kind": "deal_report",
+                      "account": "F2", "mode": "sim", "payload": {}})
+        first = ws2.receive_json()
+        assert first == {"type": "report_ack", "event_id": 42}  # 不是補送的 cancel 指令
+
+    with Session(engine) as s:
+        cmd_row = s.get(AgentCommand, "cmd-old-1")
+        assert cmd_row.sent_at is None and cmd_row.transport_acked_at is None  # 完全沒被碰

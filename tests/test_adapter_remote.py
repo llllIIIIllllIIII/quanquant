@@ -10,7 +10,7 @@
 server，native 呼叫改經 `_NativeGatewayLike` gateway 下行；Tier0 硬化語意（配額/失敗分類/kill
 switch）必須跨網路後原樣保存，見任務簡報行為矩陣。
 """
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -475,3 +475,53 @@ async def test_remote_reconcile_stages_payloads_and_returns_count(engine):
     with Session(engine) as s:
         rows = s.exec(select(RawInbox)).all()
         assert len(rows) == 1 and rows[0].kind == "order_report"
+
+
+# ---- Task 10：D4/R6-1 update admission（ordno IS NULL 拒絕）＋ agent_command_expiry_seconds
+# 接線 ----
+
+
+async def test_update_rejects_order_without_ordno_no_reservation_no_ledger(engine):
+    """R6-1（S#38）：`DownUpdate` 協定的 `ordno` 是非空必填欄位——這張委託尚未取得券商流水號
+    （例如 place 還在 unknown/等 ack 的中間態）時，admission 在建立 reservation/ledger 之前
+    就直接拒絕，不進 DB 決策段：不建 QuotaReservation、不寫 agent_commands，也不呼叫
+    gateway.update（否則會撞 `gw.raise_exc`）。"""
+    gw = _FakeGateway()
+    gw.raise_exc = RuntimeError("update 不該被呼叫——admission 應該在更早就拒絕")
+    a = _adapter(engine, gw, _guard(engine))
+    a._agent_user_id = 1
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="c-noord", request_hash="H", user_id=1, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("21500"), price_type="LMT", order_type="ROD", octype="Auto",
+            trading_day="2026-08-07",
+        )
+        order.broker_order_id = "B-NOORD"  # 已知 broker_order_id，但 ordno 仍是 NULL
+        s.add(order)
+        s.commit()
+
+    with pytest.raises(OrderError, match="ordno"):
+        await a.update("B-NOORD", actor_user_id=1, qty=5)
+
+    with Session(engine) as s:
+        assert s.exec(select(AgentCommand)).all() == []
+        assert s.exec(select(QuotaReservation)).all() == []
+    assert gw.place_calls == [] and gw.cancel_calls == []
+
+
+async def test_place_uses_configured_agent_command_expiry_seconds(engine):
+    """config.py `agent_command_expiry_seconds` 真的接線到 `new_command(...)`——不是只讀
+    `agent_commands.DEFAULT_COMMAND_EXPIRY_SECONDS` 這個模組層常數字面值。"""
+    gw = _FakeGateway()
+    a = ShioajiAdapter(
+        api_key="", secret_key="", ca_path=None, ca_passwd=None, person_id=None,
+        symbol="TXF", mode="sim", session_factory=lambda: Session(engine),
+        supervisor=BrokerSupervisor(), risk_guard=_guard(engine),
+        sim_fee_per_lot=Decimal("20"), remote_gateway=gw,
+        agent_command_expiry_seconds=45,
+    )
+    a.account = "F1"
+    await a.place(_req(), actor_user_id=1)
+    cmd = _find_cmd(engine, client_order_id="c-1", kind="place")
+    assert cmd.expires_at - cmd.created_at == timedelta(seconds=45)

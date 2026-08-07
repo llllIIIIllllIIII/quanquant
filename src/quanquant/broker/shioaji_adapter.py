@@ -184,6 +184,7 @@ class ShioajiAdapter:
         ops_alerter=None,
         remote_gateway: "_NativeGatewayLike | None" = None,
         agent_user_id: int | None = None,
+        agent_command_expiry_seconds: int = agent_commands.DEFAULT_COMMAND_EXPIRY_SECONDS,
     ) -> None:
         # Inc1 D5：這個 adapter instance「屬於誰」——in-process 與目前仍是單一共享 channel 的
         # agent 模式一律不傳（None），callback/reconcile 落地的 RawInbox 蓋章 user_id=None，
@@ -214,6 +215,10 @@ class ShioajiAdapter:
         # native 呼叫（place/cancel/update/reconcile 的 trades_snapshot）改經這個 gateway
         # 下行，DB 決策/寫回/風控/冪等仍留在 adapter（server 端）不變。
         self._remote_gateway = remote_gateway
+        # Task 10：config.py `agent_command_expiry_seconds`（預設 120，唯一接線到 Settings
+        # 的權威來源，見該設定欄位註解）——`new_command(...)` 建 ledger 列時的
+        # `expires_at = created_at + 這個值`，取代 Task 8 的模組層常數字面值。
+        self._agent_command_expiry_seconds = agent_command_expiry_seconds
         self._fill_handler: Callable[[Fill], None] | None = None
         # Task 2 委派重構：所有直接碰 Shioaji SDK 的呼叫交給 native（`_api`/`_contract`/
         # `account` 三個 property 墊片委派讀寫 native 對應屬性，見下方）；`on_raw` 落地責任
@@ -547,6 +552,7 @@ class ShioajiAdapter:
                     payload={"action": req.action, "price": str(req.price), "qty": req.qty,
                              "price_type": req.price_type, "order_type": req.order_type,
                              "octype": req.octype},
+                    expiry_seconds=self._agent_command_expiry_seconds,
                 )
                 agent_commands.insert_command(session, cmd=cmd)
                 cmd_id = cmd.cmd_id
@@ -745,6 +751,7 @@ class ShioajiAdapter:
                     kind="cancel", user_id=ledger_user_id, broker=self.broker,
                     account=self.account, mode=self.mode, client_order_id=client_order_id,
                     ordno=ordno, payload={"ordno": ordno},
+                    expiry_seconds=self._agent_command_expiry_seconds,
                 )
                 agent_commands.insert_command(session, cmd=cmd)
                 cmd_id = cmd.cmd_id
@@ -808,6 +815,18 @@ class ShioajiAdapter:
             )
             if order is None:
                 raise OrderError(f"找不到委託 broker_order_id={broker_order_id!r}")
+            # Inc1 D4/R6-1（Task 10）：update admission——這張委託尚未取得券商流水號
+            # （`ordno`）就拒絕改單，且必須排在建立 reservation/ledger 之前（不進 DB 決策段、
+            # 不留任何殘影）。理由：① `DownUpdate` 協定的 `ordno` 是非空必填欄位（見
+            # agent_protocol.py），沒有 ordno 根本組不出合法的下行指令；② 沒有 ordno 代表這張
+            # 單尚未被券商確認承接（place 還在 unknown/等 ack 的中間態），改單語意上不成立。
+            # 與下面的 offline fail-fast 同一位置慣例（比照 place() 冪等 miss 之後、
+            # check_place 之前的既有寫法）；in-process 模式同樣適用——沒有 ordno 就沒有對象
+            # 可改，不限 remote_gateway 存在與否。
+            if order.ordno is None:
+                raise OrderError(
+                    f"委託尚未取得券商流水號（ordno），無法改單：broker_order_id={broker_order_id!r}"
+                )
             # Inc1 D9：offline fail-fast——`check_update` 若判定口數增加會建立 delta
             # QuotaReservation（DB 決策段的一部分），這筆保留在改單真的送不出去時還得靠
             # `_send_gate`/`_do_update` 的例外分支釋放；搬到這裡、`check_update` 之前，
@@ -862,6 +881,7 @@ class ShioajiAdapter:
                     ordno=ordno, reservation_id=reservation_id,
                     payload={"price": (str(new_price) if new_price is not None else None),
                              "qty": new_qty, "price_type": price_type},
+                    expiry_seconds=self._agent_command_expiry_seconds,
                 )
                 try:
                     agent_commands.insert_command(session, cmd=cmd)

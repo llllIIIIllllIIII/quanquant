@@ -120,6 +120,16 @@ async def test_agent_mode_happy_path_wires_state(engine, monkeypatch):
     assert len(tasks) >= 4                                  # +全域 confirm-token 清理 +孤兒掃描
 
 
+async def test_agent_mode_slot_adapter_uses_configured_command_expiry_seconds(engine, monkeypatch):
+    """Task 10：`_start_agent_channel_subsystem` 建 slot 的 `ShioajiAdapter` 必須傳
+    `agent_command_expiry_seconds=settings.agent_command_expiry_seconds`，否則會靜靜退回
+    `agent_commands.DEFAULT_COMMAND_EXPIRY_SECONDS` 這個模組層常數字面值——部署端調整設定
+    不會有任何實際效果。這裡刻意帶一個與預設值（120）不同的值，證明真的是讀設定而非常數。"""
+    app, state, tasks = await _run(_settings(agent_command_expiry_seconds=45), engine, monkeypatch)
+    slot = app.state.agent_registry.get(1)
+    assert slot.adapter._agent_command_expiry_seconds == 45
+
+
 async def test_agent_mode_slot_adapter_reconcile_stages_with_slot_user_id(engine, monkeypatch):
     """Task 8 修復（round 1）驗收：`_start_agent_channel_subsystem` 建 slot 的 `ShioajiAdapter`
     必須傳 `agent_user_id=uid`，否則 `_stage_reconcile_results`（agent 模式對帳落地路徑）用
