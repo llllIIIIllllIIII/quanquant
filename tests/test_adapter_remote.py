@@ -441,6 +441,26 @@ async def test_update_singleflight_rejects_second_unresolved_update(engine):
         assert orphan.state == "reserved"  # 已知落差：check_update 自己的 commit 救不回
 
 
+async def test_cancel_not_blocked_by_unresolved_update_singleflight(engine):
+    """Task 13 補（S#33/R4-3 後半，盤點發現原本只測了「U1 timeout → U2 被拒」，沒有測「取消
+    優先，不受單飛限制」半句）：同一張 Order 有一筆未 resolved 的 update ledger 列時，`cancel`
+    仍應正常送出——單飛規則（`uq_agent_cmd_update_singleflight`）只約束 `kind='update'`，
+    `cancel` 的 ledger insert 走不同 kind，結構上不會撞鍵；這裡直接以行為驗證，不只信任
+    schema 推論。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    a._agent_user_id = 1
+    gw.raise_exc = AgentCommandTimeoutError("逾時")  # 改單卡在 unresolved
+    with pytest.raises(AgentCommandTimeoutError):
+        await a.update(ack.broker_order_id, actor_user_id=1, qty=3)
+
+    gw.raise_exc = None
+    result = await a.cancel(ack.broker_order_id, actor_user_id=1)  # 取消不受單飛擋
+    assert result.status == "cancelled"
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "cancelled"
+
+
 async def test_update_late_ack_converges_price_qty_and_confirms_delta(engine):
     """update 版 late-ack 全鏈：route 逾時→unknown-ledger（不改 Order，delta 保留）→ late ack
     透過 apply_command_ack 補寫 price/qty、confirm delta、Order 回到 submitted。"""
