@@ -65,6 +65,17 @@ class RefuseStartError(RuntimeError):
     尚未送達 server 的事件憑空丟掉，違反零丟單不變量。訊息附具體筆數與處置建議。"""
 
 
+class SentinelUnreadableError(RuntimeError):
+    """N9-3（MEDIUM，codex 終審 round9）：sentinel 檔**存在**但讀取/解析失敗（權限錯誤、
+    內容損毀等）——語意上與「檔案根本不存在」（真的沒有 latch）完全不同，不能混為一談都
+    回傳 `None`。舊版 `read_sentinel()` 把 `OSError`/`json.JSONDecodeError` 一律吞掉回
+    `None`，呼叫端（`AgentRunner._load_persisted_health`）因此會把「讀不到」誤判成「無
+    latch」，讓一個其實還在 failstop 的 agent 上報 `status="ok"`（fail-open）。`read_
+    sentinel()` 現在只在檔案真的不存在（`FileNotFoundError`）時回 `None`；存在但讀不出來
+    一律 raise 這個例外，呼叫端必須 fail-closed（維持 latch），不得當成「無 latch」放行。
+    """
+
+
 @dataclass(frozen=True)
 class BufferRow:
     id: int
@@ -158,13 +169,26 @@ class DurableBuffer:
         os.replace(tmp, path)
 
     def read_sentinel(self) -> dict | None:
+        """N9-3：只有 `FileNotFoundError`（檔案真的不存在）代表「無 sentinel」、回傳
+        `None`——不用先 `exists()` 再 `read_text()`（那樣中間有 TOCTOU 窗口，且兩次呼叫
+        都可能各自炸出不同例外，不如直接嘗試讀取、按例外種類分流）。檔案存在但讀取失敗
+        （其他 `OSError`，例如權限錯誤）或內容解析失敗（`json.JSONDecodeError`）一律
+        raise `SentinelUnreadableError`，讓呼叫端 fail-closed，不得誤判成「無 latch」。"""
         path = self._sentinel_path()
-        if not path.exists():
-            return None
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            raw = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
             return None
+        except OSError as exc:
+            raise SentinelUnreadableError(
+                f"sentinel 檔（{path}）存在但讀取失敗（非不存在，可能是權限問題）: {exc}"
+            ) from exc
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise SentinelUnreadableError(
+                f"sentinel 檔（{path}）內容損毀，JSON 解析失敗: {exc}"
+            ) from exc
 
     def clear_sentinel(self) -> None:
         self._sentinel_path().unlink(missing_ok=True)

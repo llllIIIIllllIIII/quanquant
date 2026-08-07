@@ -53,8 +53,12 @@ class _FakeChild:
         self.terminate_calls.append(expected_generation)
         if self.terminate_exc is not None:
             raise self.terminate_exc
-        if not self.refuse_to_die:
-            self.alive = False
+        if self.refuse_to_die:
+            # N9-1: 比照真 ChildHandle.terminate() 的 False 語意——kill+join 後仍驗到
+            # 存活，呼叫端必須消費這個回傳值、不得假裝已清乾淨。
+            return False
+        self.alive = False
+        return True
 
 
 async def _until(cond, timeout=3.0):
@@ -288,6 +292,44 @@ async def test_child_watchdog_uses_ping_detail_and_treats_latched_as_frozen(tmp_
     await _until(lambda: child.starts >= 2)   # watchdog 經 ping_detail 偵測到 latch → respawn
     child.latched = False                     # 新 child（全新 process）本地未 latch
     await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2)
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_watchdog_ping_fallback_elevates_parent_latch_when_ipc_unavailable(tmp_path):
+    """N9-2（HIGH，codex 終審 round9）：本檔 `_FakeChild` 沒有 `poll_failstop`——
+    `_failstop_watchdog` 的既有 `getattr` 容錯讓那個 task 直接不啟用（見其 docstring），
+    等同模擬「sentinel 落地也可能已經壞掉、failstop IPC 通知也失敗」的雙失敗情境：child
+    本地 latch 只能靠 `_child_watchdog` 的 `ping_detail` 安全網獨立偵測到。
+
+    舊版這裡只 raise `ChildFrozenError` → respawn，父程序自己從未真正 latch——新 child
+    起來後上報 `status="ok"`，假 healthy，故障被悄悄吞掉。修法後：watchdog 見
+    `latched=True` 必須先 `await self._latch(...)`（parent in-memory latch＋epoch++＋
+    durable sentinel 補寫）才 raise，之後的 respawn／新 session 天然維持 failstop（G2
+    「session 進行中永不自動解除」的既有保證），全鏈不假 healthy。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.latched = True   # child 本地 latch 已 tripped；沒有 poll_failstop → IPC 路徑不啟用
+    r = _runner(tr, child, buf, child_ping_interval=0.05, child_ping_timeout=1)
+    task = asyncio.create_task(r.run_forever())
+
+    await _until(lambda: r._latched is True)     # ping 備援獨立偵測到 latch、提升 parent latch
+    assert buf.has_sentinel()                     # durable sentinel 補寫（不只是記憶體旗標）
+
+    await _until(lambda: child.starts >= 2)       # 既有行為不變：respawn 過
+    child.latched = False                         # 新 child（模擬全新 process）本地未 latch
+
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2)
+    await asyncio.sleep(0.1)   # 讓新 session 的健康回報有機會送出
+
+    healths = [m for m in tr.sent if m["type"] == "health"]
+    assert healths, "應至少有一筆健康回報"
+    assert healths[-1]["status"] == "failstop"     # 新 session 依然 failstop，不假 healthy
+    # 第一筆是第一個 session 的 login 觸發，latch 生效前，狀態如實是 "ok"（不是本測試要
+    # 堵的洞）；latch 生效（epoch 進位）之後的每一筆，一律不得再是 "ok"——這才是全鏈斷言：
+    # 新 child／respawn 之後不會假 healthy。
+    assert not any(h["status"] == "ok" and h["health_epoch"] >= r._health_epoch for h in healths)
+
     r.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
@@ -768,6 +810,72 @@ async def test_cancelled_terminate_worker_late_arrival_after_respawn_is_discarde
     assert new_process.killed is False  # 沒有被誤殺
     assert new_conn.closed is False
     assert child.alive is True          # 新 child 仍正常存活
+
+
+# ---------- N9-1（HIGH，codex 終審 round9）：terminate 三態在其餘生命週期路徑仍未消費＋
+# poisoned 遮蔽 alive——`process_alive`（純 process 存活，不受 poisoned 影響）與 `alive`
+# （RPC 可用，poisoned-aware）拆開後，`ensure_child()`/`start()` 連線失敗清理/
+# `run_forever()` 的 ChildFrozenError 分支都必須消費 `terminate()` 的三態回傳值，驗死失敗
+# 時一律拒絕再 start() 出第二個 child，改以明確的 fatal 錯誤停止（不得雙 child）。----------
+
+
+def test_ensure_child_refuses_second_child_when_poisoned_process_refuses_to_die(tmp_path):
+    """核心情境：child 是「poisoned=True 但底層 process 仍存活」這個狀態（例如 RPC 逾時
+    → `_poison()` → `terminate()`，但 process 拒死）——`alive` 因為 poisoned 已經回
+    False。舊版 `ensure_child()` 只在 `alive` 為 True 時才呼叫 `terminate()`，會被這個
+    False 遮蔽，誤判「本來就沒有 child」，直接 `start()` 出第二個 child——舊 process 其實
+    還活著，變成雙 child 併發碰同一個 buffer/broker 帳號。
+
+    修法後：`ensure_child()` 改用 `process_alive`（不受 poisoned 影響）判斷要不要
+    terminate；terminate 驗死失敗（`refuse_kill=True`）必須 raise `FatalAgentError`，
+    絕不呼叫 `start()`。"""
+    from quanquant.agent.runner import FatalAgentError
+
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(refuse_kill=True), _FakeConn()
+    child._process, child._conn = process, conn
+    child._poisoned = True   # RPC 判死（poison）但底層 process 拒死
+
+    assert child.alive is False           # poisoned 遮蔽：RPC 不可用
+    assert child.process_alive is True    # 但底層 process 其實還活著
+
+    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+
+    start_calls = {"n": 0}
+
+    def _fake_start():
+        start_calls["n"] += 1
+        return "F1"
+
+    child.start = _fake_start
+
+    with pytest.raises(FatalAgentError):
+        r.ensure_child()
+
+    assert start_calls["n"] == 0      # 絕不 start 第二個 child
+    assert child._process is process  # 舊 handle 原封不動保留（未被清掉、未被取代）
+    assert child._conn is conn
+
+
+async def test_run_forever_stops_fatal_when_child_frozen_and_terminate_refuses_to_die(tmp_path):
+    """`run_forever()` 的 `except ChildFrozenError:` 分支必須消費 `terminate()` 的回傳
+    值——child 驗死失敗（`refuse_to_die=True`）時不得照舊 respawn（下一輪 `ensure_child()`
+    會在舊 process 還活著時又 start() 出第二個 child），改以明確的 fatal 錯誤停止整個
+    agent 程序，需要人工處理。"""
+    from quanquant.agent.runner import FatalAgentError
+
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.ping_ok = False          # 觸發 watchdog ChildFrozenError
+    child.refuse_to_die = True     # terminate() 呼叫後回 False（驗不死）
+
+    r = _runner(tr, child, buf)
+
+    with pytest.raises(FatalAgentError):
+        await r.run_forever()
+
+    assert child.starts == 1                 # 沒有 respawn 第二個 child
+    assert child.terminate_calls == [None]    # 只被 terminate 過一次
 
 
 # ---------- Round5（codex 終審 round5 收斂）：`ChildHandle.respawn(expected_generation)`

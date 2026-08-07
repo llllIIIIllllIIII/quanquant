@@ -79,6 +79,53 @@ def test_write_sentinel_without_fault_token_omits_key_backward_compat(tmp_path):
     assert buf.read_sentinel().get("fault_token") is None
 
 
+# ---- N9-3（MEDIUM，codex 終審 round9）：sentinel 讀取失敗 fail-open——舊版 `read_
+# sentinel()` 把 OSError/JSONDecodeError 一律吞掉回 None，跟「檔案真的不存在」混為一談，
+# 呼叫端因此可能把「讀不到」誤判成「無 latch」而上報 status="ok"（fail-open）。修法：只有
+# FileNotFoundError 代表無 sentinel（回 None）；存在但讀不出來一律 raise
+# SentinelUnreadableError，呼叫端必須 fail-closed（見 test_agent_runner.py 的
+# `_load_persisted_health` 對照測試）。----
+
+
+def test_read_sentinel_missing_file_returns_none(tmp_path):
+    """回歸：真的沒有 sentinel（檔案不存在）仍必須回 None，不是 raise——這是唯一合法代表
+    「無 latch」的情況，N9-3 修法不能連這個都一起變嚴格。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    assert buf.read_sentinel() is None
+
+
+def test_read_sentinel_corrupted_json_raises_unreadable_not_none(tmp_path):
+    """sentinel 檔存在但 JSON 損毀（例如寫到一半就崩潰）——必須 raise
+    `SentinelUnreadableError`，不是靜靜回 None（那會被誤判成「無 latch」）。"""
+    from quanquant.agent.buffer import SentinelUnreadableError
+
+    buf = DurableBuffer(tmp_path / "o.db")
+    buf.write_sentinel(epoch=1, detail="x")
+    (tmp_path / "o.db.failstop").write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(SentinelUnreadableError):
+        buf.read_sentinel()
+
+
+def test_read_sentinel_os_error_raises_unreadable_not_none(tmp_path, monkeypatch):
+    """sentinel 檔存在但讀取本身失敗（模擬權限錯誤等非 FileNotFoundError 的 OSError）
+    ——同樣必須 raise `SentinelUnreadableError`，不是回 None。"""
+    from pathlib import Path
+
+    from quanquant.agent.buffer import SentinelUnreadableError
+
+    buf = DurableBuffer(tmp_path / "o.db")
+    buf.write_sentinel(epoch=1, detail="x")
+
+    def _boom(self, *, encoding=None):
+        raise PermissionError("模擬權限錯誤")
+
+    monkeypatch.setattr(Path, "read_text", _boom)
+
+    with pytest.raises(SentinelUnreadableError):
+        buf.read_sentinel()
+
+
 def test_sentinel_path_is_outside_sqlite_buffer_file(tmp_path):
     """G2①：sentinel 是 buffer 之外的獨立檔案——不是 SQLite 的一部分，buffer 檔案本身損毀
     也不影響它的存在。"""
@@ -465,12 +512,16 @@ class _FakeChild:
         return {"ok": self.ping_ok, "latched": self.latched,
                 "generation": self.generation, "fault_seq": 1 if self.latched else 0}
 
-    def terminate(self, *, expected_generation: int | None = None) -> None:
+    def terminate(self, *, expected_generation: int | None = None) -> bool:
         self.terminate_calls.append(expected_generation)
         if self.terminate_exc is not None:
             raise self.terminate_exc
-        if not self.refuse_to_die:
-            self.alive = False
+        if self.refuse_to_die:
+            # N9-1: 比照真 ChildHandle.terminate() 的 False 語意——kill+join 後仍驗到
+            # 存活，呼叫端必須消費這個回傳值、不得假裝已清乾淨。
+            return False
+        self.alive = False
+        return True
 
     def poll_failstop(self, timeout: float = 0.0):
         if self._failstop_queue:
@@ -741,6 +792,42 @@ async def test_agent_startup_loads_durable_latch_from_sentinel(tmp_path):
     task = asyncio.create_task(r.run_once())
     await _until(lambda: len(tr.healths()) >= 1)
     assert tr.healths()[0]["status"] == "failstop" and tr.healths()[0]["health_epoch"] == 7
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_corrupted_sentinel_fails_closed_keeps_latched_never_reports_ok(tmp_path):
+    """N9-3（MEDIUM，codex 終審 round9）：sentinel 檔存在但讀取/解析失敗（模擬檔案損毀）
+    ——舊版 `read_sentinel()` 把這種情況跟「真的沒有 sentinel」混為一談都回 `None`，
+    `_load_persisted_health` 因此會誤判「無 latch」，讓一個其實還在 failstop 的 agent 上報
+    `status="ok"`（fail-open，本 fix 要堵的洞）。修法後 `read_sentinel()` 存在但讀不出來
+    會 raise `SentinelUnreadableError`，`_load_persisted_health` 對此 fail-closed：維持
+    latch（epoch 退回 buffer meta，因為 sentinel 本身讀不到），不誤判為健康。
+
+    比照 `test_agent_startup_loads_durable_latch_from_sentinel`（sentinel 正常存在的
+    對照組）直測 `_load_persisted_health`／`run_once()`，不經 `_startup_recovery_probe`
+    （那是另一層，只探測 SQLite 本身是否健康、不讀 sentinel，不在本測試範圍內）。"""
+    path = tmp_path / "o.db"
+    pre = DurableBuffer(path)
+    pre.set_health_epoch(9)
+    # sentinel 檔案本身損毀（模擬權限錯誤/內容毀損）：檔案存在，但讀不出正確內容。
+    (tmp_path / "o.db.failstop").write_text("{broken", encoding="utf-8")
+
+    tr, child = _FakeTransport(), _FakeChild()
+    r = _runner(tr, child, DurableBuffer(path))
+    assert r._latched is True     # fail-closed：不是誤判為「無 latch」
+    assert r._health_epoch == 9   # epoch 退回 buffer meta（sentinel 本身讀不到）
+
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+    assert tr.healths()[0]["status"] == "failstop"
+    assert not any(h["status"] == "ok" for h in tr.healths())   # 全程沒有假 healthy
+
+    tr.incoming.put_nowait(_place_msg("c-corrupted-sentinel"))
+    await _until(lambda: len(tr.rejects()) >= 1)
+    assert child.ops == []   # native 完全沒被呼叫，agent 全程 failstop
+
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 

@@ -47,6 +47,7 @@ from quanquant.broker.agent_protocol import (
     DownReportAck, DownUpdate, UpCmdAck, UpCommandRejected, UpHealth, UpLogin, UpQueryResult,
     UpReport, parse_downlink,
 )
+from quanquant.agent.buffer import SentinelUnreadableError
 from quanquant.agent.native_runner import child_main
 
 log = logging.getLogger(__name__)
@@ -180,18 +181,20 @@ class ChildHandle:
                 reply = self._rpc({"op": "connect"}, timeout=_CHILD_CONNECT_TIMEOUT,
                                    generation=generation)
             except Exception as exc:
-                # _rpc 逾時/pipe 異常時可能已經 poison→terminate 過（self._process 已是
-                # None）；用 None 檢查讓這裡的清理對兩種狀態都安全，不重複 kill 一個 None。
-                if self._process is not None:
-                    self._process.kill()
-                    self._process.join(timeout=5)
-                    self._process = None
-                if self._failstop_parent_conn is not None:
-                    self._failstop_parent_conn.close()
-                    self._failstop_parent_conn = None
-                if self._failstop_child_conn is not None:
-                    self._failstop_child_conn.close()
-                    self._failstop_child_conn = None
+                # N9-1（HIGH，codex 終審 round9）：改走 `terminate()`（verify-dead，見其
+                # docstring）而非舊版直接 kill()+join()+無條件把 self._process 設 None——
+                # `_rpc()` 逾時/pipe 異常時可能已經 poison→terminate 過（`terminate()` 對
+                # `self._process is None` 是安全 no-op，不重複 kill）；若這裡才第一次嘗試
+                # kill 且驗死失敗（kill+join(5s) 後仍存活，極端情況），`terminate()` 會
+                # 保留 handle、回傳 False——必須消費這個回傳值：驗死失敗時不能假裝已清乾淨，
+                # 否則呼叫端（`ensure_child()`）下一輪可能誤以為可以安全 start() 出第二個
+                # child，變成雙 child 併發碰同一 buffer/broker 帳號。
+                died = self.terminate()
+                if died is False:
+                    raise RuntimeError(
+                        f"agent 子程序啟動失敗，且 terminate 未能確認其死亡（kill+join(5s) "
+                        f"後仍驗到存活，保留 handle 供人工處理，絕不可再次 start）: {exc}"
+                    ) from exc
                 raise RuntimeError(f"agent 子程序啟動失敗: {exc}") from exc
             if not reply.get("ok"):
                 self.terminate()
@@ -446,8 +449,22 @@ class ChildHandle:
 
     @property
     def alive(self) -> bool:
+        """RPC 可用（poisoned-aware）——`_poison()` 觸發後即使底層 OS process 還沒真的死
+        （見 `process_alive`），這裡也回 False：pipe 已經不可信，不該再被當成可用 child。"""
         with self._lock:
             return (not self._poisoned) and self._process is not None and self._process.is_alive()
+
+    @property
+    def process_alive(self) -> bool:
+        """N9-1（HIGH，codex 終審 round9）：純粹反映底層 OS process 是否仍在跑，**不**
+        像 `alive` 一樣受 `_poisoned` 影響——`_poison()` 只把 RPC pipe 判死（`alive` 因此
+        回 False），不代表 process 真的已經退出（唯有 `terminate()` 的 kill()+join()+
+        `is_alive()` 驗證才能確認死亡；若驗死失敗，`terminate()` 回 False 且保留 handle，
+        `self._process` 仍指向那個活著的 process）。`ensure_child()` 靠這個屬性判斷
+        「(re)start 之前是否需要先 terminate 驗死」，不會被 poisoned 狀態遮蔽掉一個其實
+        還活著的 process，避免雙 child 併發碰同一個 buffer/broker 帳號。"""
+        with self._lock:
+            return self._process is not None and self._process.is_alive()
 
 
 def _to_op(msg: Any) -> dict:
@@ -518,8 +535,28 @@ class AgentRunner:
         之外路徑，見 buffer.py write_sentinel docstring）——epoch 取 sentinel 記的值與 buffer
         meta 存的值兩者較大者（sentinel 可能記著父程序來不及覆寫的佔位值 -1，這種情況下改信
         buffer meta；buffer meta 若因為同一次故障也寫不進去，則沿用 sentinel 的值）。沒有
-        sentinel 時單純讀 buffer meta（預設 0，全新 buffer 或從未 latch 過）。"""
-        sentinel = self._buffer.read_sentinel()
+        sentinel 時單純讀 buffer meta（預設 0，全新 buffer 或從未 latch 過）。
+
+        N9-3（MEDIUM，codex 終審 round9）：`read_sentinel()` 現在區分「真的沒有 sentinel」
+        （`None`，檔案不存在）與「sentinel 存在但讀不出來」（`SentinelUnreadableError`，
+        權限錯誤／JSON 損毀）——舊版把兩者都當「無 latch」處理，可能讓一個其實還在
+        failstop 的 agent 誤上報 `status="ok"`（fail-open）。這裡 fail-closed：讀取失敗
+        一律視為仍在 latch，epoch 退回 buffer meta 記的值（sentinel 本身讀不到，唯一還能
+        信的來源），記明確錯誤 log，供操作者人工排查底層 sentinel 檔案（可能需要修復權限，
+        或確認內容損毀程度後決定要不要人工刪除重來——這裡不自動刪除，避免銷毀故障診斷
+        證據）。"""
+        try:
+            sentinel = self._buffer.read_sentinel()
+        except SentinelUnreadableError:
+            log.error(
+                "N9-3: sentinel 檔存在但讀取/解析失敗（權限錯誤或內容損毀），fail-closed"
+                "：視為仍在 failstop latch，需要人工排查底層 sentinel 檔案（buffer=%s）",
+                self._buffer.path,
+            )
+            self._latched = True
+            self._latch_detail = "sentinel 檔讀取失敗（fail-closed，需人工排查底層檔案）"
+            self._health_epoch = self._buffer.get_health_epoch()
+            return
         if sentinel is not None:
             self._latched = True
             self._latch_detail = sentinel.get("detail")
@@ -529,11 +566,34 @@ class AgentRunner:
 
     def ensure_child(self) -> None:
         """child 未活則 (re)start；child alive 但 self._account 遺失（接手他人已在跑的
-        child 的邊界情況）視同需要重啟。回傳後 self._account 必為非空。"""
+        child 的邊界情況）視同需要重啟。回傳後 self._account 必為非空。
+
+        N9-1（HIGH，codex 終審 round9）：舊版只在 `self._child.alive` 為 True 時才呼叫
+        `terminate()`——但 `alive` 是 `(not poisoned) and process.is_alive()`，`_poison()`
+        可能已經把 `alive` 打成 False（RPC pipe 判死），底層 OS process 卻仍在跑（例如
+        `_rpc()` 逾時觸發的 `terminate()` 驗死失敗，保留 handle 不變）。這種「poisoned 但
+        process 其實還活著」的狀態下，舊碼會被 `alive` 遮蔽、整段 terminate 分支直接跳過，
+        落到 `self._child.start()` 在舊 process 還沒死之前又 spawn 出第二個 child——雙
+        child 併發碰同一個 buffer/broker 帳號。
+
+        修法：一律用 `process_alive`（純 process 存活判斷，不受 poisoned 影響；`getattr`
+        容錯——非 `ChildHandle` 的測試替身沒有這個屬性時退回 `alive`，維持既有行為，比照
+        `_failstop_watchdog` 對 `poll_failstop` 的既有 `getattr` 容錯慣例）決定要不要
+        terminate；terminate 之後**消費回傳值**：`False`（kill+join(5s) 後仍驗到存活）
+        代表無法確認死亡，絕不允許在這個狀態下 start() 出第二個 child——raise
+        `FatalAgentError`，讓 `run_forever` 直接停止（不 respawn、不 backoff），需要操作者
+        人工處理殘留的 process 後才能重啟這個 agent 程序。"""
         if self._child.alive and self._account:
             return
-        if self._child.alive:
-            self._child.terminate()
+        process_alive = getattr(self._child, "process_alive", self._child.alive)
+        if process_alive:
+            died = self._child.terminate()
+            if died is False:
+                raise FatalAgentError(
+                    "agent 子程序無法終止（kill+join 逾時後仍驗到存活），拒絕啟動第二個"
+                    "child（避免雙 child 併發碰同一 buffer/broker 帳號）——請人工處理殘留"
+                    "的子程序後重啟這個 agent 程序"
+                )
         self._account = self._child.start()
 
     async def _latch(self, detail: str, *, expected_generation: int | None = None) -> None:
@@ -736,7 +796,22 @@ class AgentRunner:
                 raise
             except ChildFrozenError:
                 log.warning("agent 子程序疑似凍結（issue #203），terminate 後下一輪 respawn")
-                self._child.terminate()
+                # N9-1（HIGH，codex 終審 round9）：消費 terminate() 的回傳值——`False`
+                # （kill+join(5s) 後仍驗到存活）代表無法確認死亡，絕不能假裝乾淨後照舊
+                # respawn（下一輪 `ensure_child()` 會在舊 process 還活著時又 start() 出
+                # 第二個 child，雙 child 併發碰同一 buffer/broker 帳號）。改以明確的 fatal
+                # 錯誤停止整個 agent 程序（不 respawn、不 backoff），需要操作者人工處理。
+                died = self._child.terminate()
+                if died is False:
+                    log.error(
+                        "N9-1: child 無法終止（kill+join 逾時後仍驗到存活），拒絕 respawn，"
+                        "請人工處理"
+                    )
+                    self.stop()
+                    raise FatalAgentError(
+                        "agent 子程序無法終止，請人工處理（ChildFrozenError 後 terminate "
+                        "驗死失敗，拒絕 respawn 避免雙 child）"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -973,9 +1048,17 @@ class AgentRunner:
         （`_failstop_watchdog`）通知父程序並觸發 `_latch()`，這裡是額外一層安全網：萬一
         那條 IPC 通知本身失敗（`native_runner.py::_trigger_failstop_latch` 的
         `failstop_conn.send()` 是 best-effort、吞例外），watchdog 仍能靠 `ping_detail`
-        獨立偵測到 latch。任一情況都 raise `ChildFrozenError` 讓 `run_once` 的
-        `asyncio.wait(FIRST_EXCEPTION)` 崩出——`run_forever` 接手 terminate+respawn+
-        重新登入（既有處理，不因為觸發原因是「latched」而走不同路徑）。"""
+        獨立偵測到 latch。
+
+        N9-2（HIGH，codex 終審 round9）：`ok=False`／例外兩種情況直接 raise
+        `ChildFrozenError`，`run_forever` 接手 terminate+respawn+重新登入（既有處理，只是
+        單純的凍結，不代表資料層真的落地失敗）。但 `latched=True` 這個分支語意不同——這是
+        「sentinel＋failstop IPC 都可能已經失敗，只剩 ping 備援發現故障」的情境，若還是只
+        raise `ChildFrozenError` 讓 respawn 走既有路徑，父程序自己從未真正 latch，新 child
+        起來後會照常上報 `status="ok"`（假 healthy，故障被悄悄吞掉）。這裡先
+        `await self._latch(...)` 提升成 parent latch（durable，session 進行中不會自動
+        解除）之後才 raise，respawn 後的新 session 因此天然維持在 failstop，直到操作者
+        人工重啟這個 agent 程序。"""
         while True:
             await asyncio.sleep(self._child_ping_interval)
             try:
@@ -989,7 +1072,28 @@ class AgentRunner:
             if not detail.get("ok"):
                 raise ChildFrozenError("agent 子程序 ping 逾時/失敗，疑似凍結（issue #203）")
             if detail.get("latched"):
+                # N9-2（HIGH，codex 終審 round9）：這裡本身就是 failstop IPC 通知失敗的
+                # 安全網（見上）——舊版只 raise ChildFrozenError 讓 run_forever 走既有
+                # respawn 路徑，父程序自己從未真正 latch（`self._latched` 仍是 False）。
+                # respawn 出的新 child 起來後，`AgentRunner` 完全不知道舊 child 曾經 latch
+                # 過，會照常上報 status="ok"——假 healthy：sentinel/IPC 都失敗、只剩這道
+                # ping 備援發現故障，但故障本身沒有被記錄下來，操作者看到的儀表板仍是綠的。
+                #
+                # 修法：先以這個 generation `await self._latch(...)`（確立 parent
+                # in-memory latch＋epoch++＋durable sentinel 補寫，見其 docstring——不會
+                # await 任何網路 I/O，不拖住這個 watchdog 迴圈），latch 完成之後才 raise
+                # ChildFrozenError。之後的 respawn／新 session 因此天然處於 failstop——
+                # `self._latched` session 進行中永不自動解除（G2 手動重啟恢復的既有保證），
+                # native 呼叫前的 latch gate 繼續拒絕 mutating 指令，health sender 繼續
+                # 回報 status="failstop"，直到操作者人工重啟這個 agent 程序。
+                await self._latch(
+                    "watchdog ping_detail 偵測到 child 本地 latch 已 tripped（sentinel/"
+                    f"failstop IPC 通知可能雙失敗，fault_seq={detail.get('fault_seq')}）",
+                    expected_generation=detail.get("generation"),
+                )
                 raise ChildFrozenError(
-                    "agent 子程序回報本地 latch 已 tripped（N6 watchdog 安全網，"
-                    "failstop IPC 通知可能失敗），視為不健康，terminate 後下一輪 respawn"
+                    "agent 子程序回報本地 latch 已 tripped（N9-2 watchdog 安全網，"
+                    "sentinel/failstop IPC 通知可能雙失敗），已提升為 parent latch，"
+                    "視為不健康，terminate 後下一輪 respawn（respawn 後仍維持 failstop，"
+                    "需人工重啟這個 agent 程序才能恢復）"
                 )
