@@ -884,6 +884,75 @@ def test_resolve_update_via_query_qty_terminal_ambiguous_conservative_confirms(s
         assert _quota_state(s2, "delta-1") == "confirmed"  # 保守 confirm，不 release
 
 
+# ---------------------------------------------------------------------------
+# C6（MEDIUM，codex 終審）：減量 update（無 delta reservation）target 修法——舊版誤用
+# `order.qty + reservation.qty` 當 target，二分判定分支被 `has_active_delta`（減量恆
+# False，`RiskGuard.check_update` 只在增量時才 reserve）綁死，永遠落到 left_pending，
+# 永久卡住 update 單飛鎖。修復後：target 直接取 `row.payload["qty"]`。
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_update_via_query_qty_decrement_without_reservation_confirms_on_target_match(
+    session, engine
+):
+    """減量 update（`reservation_id=None`）改單其實生效：`real_qty` 命中減量後目標值
+    （4）→ confirmed，寫回 Order 新 qty。"""
+    _make_order(session, ordno="O1", status="submitted", qty=6)
+    cmd = _update_cmd(session, ordno="O1", reservation_id=None, price="21600", qty=4)  # 減量
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=4)
+        s2.commit()
+    assert action == "confirmed"
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.resolved_at is not None
+        assert row.outcome == "ok" and row.resolved_via == "query_qty"
+        order = s2.exec(select(Order)).one()
+        assert order.qty == 4 and str(order.price) == "21600"
+
+
+def test_resolve_update_via_query_qty_decrement_without_reservation_releases_on_no_effect(
+    session, engine
+):
+    """減量 update 未生效（`real_qty` 仍是改單前原值 6）→ error/released 分支；沒有
+    reservation 可 release（`row.reservation_id is None`），不誤放 None 進
+    `release_quota`（呼叫端 guard，不是 release_quota 內部判斷）。"""
+    _make_order(session, ordno="O1", status="submitted", qty=6)
+    cmd = _update_cmd(session, ordno="O1", reservation_id=None, price="21600", qty=4)  # 減量
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=6)  # 仍是原值
+        s2.commit()
+    assert action == "released"
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.resolved_at is not None
+        assert row.outcome == "error" and row.resolved_via == "query_qty"
+        assert s2.exec(select(Order)).one().qty == 6  # 未被改寫
+
+
+def test_resolve_update_via_query_qty_price_only_no_qty_change_stays_undeterminable(session, engine):
+    """邊界：純改價（target==original，qty 不變）——`real_qty` 在「生效」與「未生效」兩種
+    情境下會是同一個值，無法用口數判斷，仍要落到終態/`left_pending`（不因為 C6 修復而
+    誤判為可判斷）。"""
+    _make_order(session, ordno="O1", status="submitted", qty=6)
+    cmd = _update_cmd(session, ordno="O1", reservation_id=None, price="21600", qty=6)  # 純改價
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=6)
+        s2.commit()
+    assert action == "left_pending"  # 非終態、口數不變 → 無法判斷，維持既有保守行為
+    with Session(engine) as s2:
+        assert s2.get(AgentCommand, cmd.cmd_id).resolved_at is None
+
+
 def test_resolve_unresolved_cancel_via_report_on_terminal_order(session, engine):
     """S#34/R4-4：cancel unknown × Order filled → resolve(outcome=unknown, via=report)，
     無 quota 效果、不改寫 Order。"""

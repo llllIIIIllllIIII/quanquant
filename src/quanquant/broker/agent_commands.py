@@ -45,7 +45,7 @@ from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
 from quanquant.broker.agent_protocol import DownCancel, DownPlace, DownUpdate, PlaceNative, UpCmdAck
-from quanquant.db.models import AgentCommand, Order, QuotaReservation
+from quanquant.db.models import AgentCommand, Order
 
 # spec D4/D7 §7：設定鍵 `agent_command_expiry_seconds`（預設 120）留 Task 10 才接線到
 # Settings——本 task 先用常數（`agent_channel.py` 既有的 `_DEFAULT_COMMAND_EXPIRY_SECONDS`
@@ -735,34 +735,47 @@ def resolve_update_via_query_qty(
     `"conservative_confirmed"` / `"left_pending"` / `"race_lost"`（Task 11 修復回合 1，
     發現 1：CAS 輸給了另一個同時搶著 resolve 這筆列的路徑——遲到 ack，或 Task 11 發現 2
     新增的另一個 resolver 掛載點；`_cas_resolve` 只在贏得 `WHERE resolved_at IS NULL` 這道
-    原子條件時才繼續套用 Order/quota 效果，輸家完全不觸碰 Order/quota，也不改 outcome）。"""
-    reservation: QuotaReservation | None = None
-    if row.reservation_id is not None:
-        reservation = session.exec(
-            select(QuotaReservation).where(QuotaReservation.reservation_id == row.reservation_id)
-        ).first()
-    has_active_delta = reservation is not None and reservation.state == "reserved"
-    original_qty = order.qty
-    target_qty = original_qty + (reservation.qty if has_active_delta else 0)
+    原子條件時才繼續套用 Order/quota 效果，輸家完全不觸碰 Order/quota，也不改 outcome）。
 
-    if has_active_delta and real_qty is not None and real_qty == target_qty:
+    C6（MEDIUM，codex 終審）修復：`target_qty` 改直接取 `row.payload["qty"]`（這筆 update
+    指令送出時真正要求的目標口數），不再用 `order.qty + reservation.qty` 推算——舊版把
+    「是否可判斷」與「是否有 delta 保留列」（`has_active_delta`）綁死，減量 update（`new_qty
+    < order.qty`）或純改價（`new_qty == order.qty`）本就不會建立 delta 保留列
+    （`RiskGuard.check_update` 只在增量時 reserve，見該檔說明），這兩種情況下
+    `has_active_delta` 恆為 False，二分判定分支永遠被跳過、只能落到終態 resolver 或
+    `left_pending`——減量 update 若委託遲遲不進終態，這筆 ledger 列會永遠卡在
+    `left_pending`，永久占著 update 單飛鎖（`uq_agent_cmd_update_singleflight`），擋死
+    這張委託後續所有改單。修復後：只要 `target_qty != original_qty`（口數真的有變化，
+    不論增減）就可判斷——`real_qty == target_qty` → 生效，`real_qty == original_qty` →
+    未生效；純改價（`target_qty == original_qty`，口數不變）維持「不可判斷」——`real_qty`
+    在兩種情境下會是同一個值，無法用口數區分改單是否生效，落到終態 resolver/
+    `left_pending`（未改變）。quota confirm/release 仍依 `row.reservation_id is not None`
+    判斷（是否真的有 delta 保留列可操作），不再依賴 `has_active_delta`——`confirm_quota`/
+    `release_quota` 本身是 `WHERE state='reserved'` 的原子一次性轉移，對非 reserved 狀態
+    的列一律安全 no-op，不需要呼叫端先自行判斷 state。"""
+    original_qty = order.qty
+    payload = json.loads(row.payload)
+    target_qty = payload["qty"]
+    determinable = target_qty != original_qty  # False＝純改價，口數不變，無法用口數判斷
+
+    if determinable and real_qty is not None and real_qty == target_qty:
         if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="ok", resolved_via="query_qty",
                              result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False)):
             return "race_lost"
-        payload = json.loads(row.payload)
         new_price = payload.get("price")
         price_value = Decimal(new_price) if new_price is not None else order.price
         apply_update_ack(
-            session, order, new_price=price_value, new_qty=payload["qty"],
+            session, order, new_price=price_value, new_qty=target_qty,
             reservation_id=row.reservation_id,
         )
         return "confirmed"
 
-    if has_active_delta and real_qty is not None and real_qty == original_qty:
+    if determinable and real_qty is not None and real_qty == original_qty:
         if not _cas_resolve(session, cmd_id=row.cmd_id, outcome="error", resolved_via="query_qty",
                              result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False)):
             return "race_lost"
-        brepo.release_quota(session, reservation_id=row.reservation_id)
+        if row.reservation_id is not None:
+            brepo.release_quota(session, reservation_id=row.reservation_id)
         return "released"
 
     if order.status in ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
