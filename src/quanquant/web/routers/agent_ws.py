@@ -36,6 +36,13 @@ from quanquant.db.models import User
 log = logging.getLogger(__name__)
 router = APIRouter()
 
+# Task 13（Task 12 審查必修）：UpHealth 的 `detail` 是 agent 端自己機器上的原始例外字串
+# （可能夾帶英文例外類名、agent 本機檔案路徑），不是「已知秘密值」——`redaction.py` 的
+# redact_secrets 只抹已知秘密子字串，不足以擋這種任意內容。orders 頁 badge 是一般 owner
+# 使用者看得到的 UI，不是維運限定的 /healthz，因此**不原樣顯示**，一律換成固定的繁體
+# 通用訊息；原始 detail 只寫進 log／OpsAlerter（維運頻道）供除錯。
+_AGENT_FAILSTOP_USER_MESSAGE = "agent 儲存故障，交易已停止"
+
 
 def _authenticate(session_factory, risk_guard, raw_token: str) -> int | None:
     """同步 DB 工作（呼叫端須用 `asyncio.to_thread` 包起來，receive 迴圈鐵律：絕不 inline
@@ -258,7 +265,11 @@ async def agent_ws(websocket: WebSocket) -> None:
                     if msg.status == "ok":
                         order_state.mark_ready()
                     else:
-                        order_state.mark_unhealthy(msg.detail or "agent failstop latch 生效")
+                        if msg.detail:
+                            log.warning(
+                                "agent failstop detail user_id=%s: %s", agent_user_id, msg.detail
+                            )
+                        order_state.mark_unhealthy(_AGENT_FAILSTOP_USER_MESSAGE)
                     if hub is not None:
                         hub.publish()
                     ops = getattr(state, "ops_alerter", None)

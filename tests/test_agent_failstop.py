@@ -29,6 +29,7 @@ from quanquant.agent.buffer import DurableBuffer
 from quanquant.agent.runner import AgentRunner
 from quanquant.auth import service as auth_service
 from quanquant.auth.agent_tokens import issue_token
+from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker import repository as brepo
 from quanquant.broker.agent_channel import AgentChannel
 from quanquant.broker.agent_registry import AgentRegistry, UserAgentSlot, run_health_lease_watchdog
@@ -792,3 +793,37 @@ def test_disconnect_and_failstop_transitions_do_not_spam_connect_disconnect_aler
         assert _wait(lambda: _slot(ws_env).session_state.ready)
     assert _wait(lambda: _slot(ws_env).session_state.disabled)  # 斷線
     assert ws_env.state.ops_alerter.failstop_calls == []  # 連線/斷線本身不告警
+
+
+def test_failstop_detail_not_leaked_to_agent_status_badge(ws_env, monkeypatch):
+    """Task 12 審查必修（Task 13 落地）：`UpHealth.detail` 是 agent 端本機的原始例外字串
+    （可能夾帶英文例外類名/agent 本機檔案路徑），orders 頁 badge 是一般 owner 使用者都看得到
+    的 UI（不是維運限定的 /healthz）——不得原樣顯示，只能顯示固定的繁體通用訊息；原始 detail
+    只能進 log，不得外洩內部路徑/英文例外字串。"""
+    monkeypatch.setenv("ORDER_CHANNEL", "agent")
+    get_settings.cache_clear()
+    owner_id = ws_env.state.agent_test_owner_id
+    client = TestClient(ws_env)
+    try:
+        with client.websocket_connect(
+            "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+        ) as ws:
+            ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2,
+                         "health_epoch": 0})
+            ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
+            assert _wait(lambda: _slot(ws_env).session_state.ready)
+
+            raw_detail = "Traceback: FileNotFoundError: /Users/henry/.secret/o.db.failstop"
+            ws.send_json({"type": "health", "status": "failstop", "health_epoch": 1,
+                         "detail": raw_detail})
+            assert _wait(lambda: _slot(ws_env).session_state.ready is False)
+
+            client.cookies.set(SESSION_COOKIE, sign_session(owner_id, 0))
+            badge = client.get("/orders/agent-status").text
+            assert "agent 儲存故障，交易已停止" in badge
+            assert raw_detail not in badge
+            assert "FileNotFoundError" not in badge
+            assert "/Users/henry" not in badge
+    finally:
+        get_settings.cache_clear()
+
