@@ -761,6 +761,19 @@ class ShioajiAdapter:
                 raise AuthorizationError("非委託所有人不得取消")
             order_id, ordno, client_order_id = order.id, order.ordno, order.client_order_id
 
+            # N3（MEDIUM，codex 終審 round2）：cancel 的 ledger insert 前加嚴格 readiness
+            # fail-fast——舊版完全沒查 admission_ready 就建 ledger 列，`_do_cancel` 只查寬鬆
+            # 的 `ready`（連線存活＋已登入，不含健康狀態），pending_health/failstop/lease
+            # 過期三態下仍會建出一筆從一開始就注定被拒絕的 AgentCommand（且送到 gateway 的
+            # wire call 才在 `_do_cancel` 被擋下，比 place/update 的「不建任何 DB 決策列」
+            # 慢了一拍）。這裡改與 place()/update() 的 offline fail-fast 同一位置慣例——
+            # `admission_ready` 為 False 就直接拒絕、連 ledger 都不建。**注意**：這裡擋的是
+            # 連線健康狀態，不是 kill switch——cancel 不受 kill switch 影響的既有語意
+            # （spec 明文）完全不動，`_send_gate`（kill switch 檢查的唯一位置）本就不會被
+            # cancel 呼叫。
+            if self._remote_gateway is not None and not self._remote_gateway.admission_ready:
+                raise OrderError("agent 未連線，無法取消")
+
             # Inc1 D4（G1）：agent 模式送前持久化——cancel 無 quota 效果，`reservation_id`
             # 留 None（D4 轉移表：cancel 一律「無」quota 效果）。cancel 決策段本身不像
             # place/update 那樣有 risk_guard 內部 commit 的落差，這裡是真正「同一交易」。
@@ -788,6 +801,13 @@ class ShioajiAdapter:
             # （Task 6：remote 模式下用 gateway.ready 取代 `_api is None`，同 `_send_gate`
             # 的 remote/in-process 分流方式，但取消單本身不經過 `_classify_place_failure`/
             # release_quota 那條路——這裡刻意用 OrderError 而非 AgentUnavailableError）。
+            # N3（MEDIUM，codex 終審 round2）：改查嚴格的 `admission_ready`（同上面 ledger
+            # insert 前那道 fail-fast 用同一個判準）——舊版查寬鬆的 `ready`（連線存活＋已
+            # 登入，不含健康狀態），pending_health/failstop/lease 過期三態下 `ready` 仍可能
+            # 是 True，讓這第二層縱深防禦形同虛設。與上面 ledger insert 前的檢查同屬一次
+            # cancel 呼叫內的縱深防禦（第一層擋大多數情境、不建 ledger；這裡是鎖內、native
+            # 呼叫前的最後防線，擋「ledger 建立後、native 呼叫前才轉為不健康」的窗口）——
+            # 依然不是 kill switch，取消不受 kill switch 影響的語意不變。
             # Task 8：cancel 的 D4 轉移表除了 ok 以外一律「不改 Order」——不論是 agent
             # 明確拒絕（ack 衍生例外，已由 applier 處理）、逾時、還是這裡「從未送達 agent」
             # 的 offline 例外，都不需要 route 自己做任何本地 Order/ledger 寫回，例外原樣
@@ -795,7 +815,7 @@ class ShioajiAdapter:
             # 需要解 ledger——即使 ledger 永遠 unresolved，也只是不會被重連補送機制撿走
             # 重播，語意仍安全：cancel 意圖本就該在下次重連時重新嘗試，見 spec D4）。
             if self._remote_gateway is not None:
-                if not self._remote_gateway.ready:
+                if not self._remote_gateway.admission_ready:
                     raise OrderError("agent 未連線")
                 # C9：`expires_at` 傳 ledger 建立當下凍結的值（見 place() 同名參數說明）。
                 await self._remote_gateway.cancel(

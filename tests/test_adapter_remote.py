@@ -394,6 +394,108 @@ async def test_remote_cancel_trade_not_found_propagates(engine):
         assert s.exec(select(Order)).one().status == "submitted"
 
 
+# ---------------------------------------------------------------------------
+# N3（MEDIUM，codex 終審 round2）：cancel 的 ledger insert 前必須加嚴格 readiness
+# fail-fast——舊版完全不查 `admission_ready` 就建 `AgentCommand`，`_do_cancel` 只查寬鬆的
+# `ready`（連線存活＋已登入，不含健康狀態）。pending_health/failstop/lease 過期三態下要
+# 一律不建 ledger、不碰 gateway（`AgentChannel._send` 從未被呼叫）——手法比照上面 C2 的
+# `_real_channel_adapter`/`_no_decision_rows`：用真的 `AgentChannel`（不是 `_FakeGateway`
+# 那種只會鏡射 bool 的替身）才測得到健康狀態機本身。另外驗證這次修法只擋健康狀態、不動
+# 「取消不受 kill switch 影響」的既有語意（spec 明文）。
+# ---------------------------------------------------------------------------
+
+
+def _spy_channel():
+    """回傳 (channel, calls)：`calls` 記錄每一次經 `channel.request()` 真正送出的下行
+    訊息——用來斷言 fail-fast 是否真的攔在「碰 gateway」之前，而不只是最後拋例外前才擋。"""
+    calls: list[dict] = []
+
+    async def _send(msg):
+        calls.append(msg)
+
+    channel = AgentChannel()
+    channel.attach(_send)
+    return channel, calls
+
+
+async def _agent_command_count(engine) -> int:
+    with Session(engine) as s:
+        return len(list(s.exec(select(AgentCommand))))
+
+
+async def test_remote_cancel_blocked_no_ledger_no_wire_call_when_pending_health(engine):
+    """N3 三態之一：剛登入、本 session 尚未收過任何被接受的 `UpHealth(ok)`。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    cmd_count_before = await _agent_command_count(engine)
+
+    channel, calls = _spy_channel()
+    channel.mark_logged_in("F1")  # pending_health：未 note_health
+    a._remote_gateway = AgentNativeGateway(channel, timeout_seconds=1)
+
+    with pytest.raises(OrderError, match="agent 未連線"):
+        await a.cancel(ack.broker_order_id, actor_user_id=1)
+    assert calls == []  # 從未真正碰 gateway（不是建了 ledger 才在 _do_cancel 被擋）
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"  # 委託狀態不變
+    assert await _agent_command_count(engine) == cmd_count_before  # 沒建新 ledger 列
+
+
+async def test_remote_cancel_blocked_no_ledger_no_wire_call_when_failstop(engine):
+    """N3 三態之二：agent 已回報 `status="failstop"`。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    cmd_count_before = await _agent_command_count(engine)
+
+    channel, calls = _spy_channel()
+    channel.mark_logged_in("F1")
+    channel.note_health(status="ok", health_epoch=0)
+    channel.note_health(status="failstop", health_epoch=1)
+    a._remote_gateway = AgentNativeGateway(channel, timeout_seconds=1)
+
+    with pytest.raises(OrderError):
+        await a.cancel(ack.broker_order_id, actor_user_id=1)
+    assert calls == []
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"
+    assert await _agent_command_count(engine) == cmd_count_before
+
+
+async def test_remote_cancel_blocked_no_ledger_no_wire_call_when_lease_expired(engine):
+    """N3 三態之三：曾經 admission_ready，但 server 端 heartbeat lease 過期。"""
+    gw = _FakeGateway()
+    a, ack = await _placed_order(engine, gw, _guard(engine))
+    cmd_count_before = await _agent_command_count(engine)
+
+    channel, calls = _spy_channel()
+    channel.mark_logged_in("F1")
+    channel.note_health(status="ok", health_epoch=0)
+    channel.mark_lease_expired()
+    a._remote_gateway = AgentNativeGateway(channel, timeout_seconds=1)
+
+    with pytest.raises(OrderError):
+        await a.cancel(ack.broker_order_id, actor_user_id=1)
+    assert calls == []
+    with Session(engine) as s:
+        assert s.exec(select(Order)).one().status == "submitted"
+    assert await _agent_command_count(engine) == cmd_count_before
+
+
+async def test_remote_cancel_succeeds_when_healthy_even_with_kill_switch_on(engine):
+    """N3 注意事項：這次修法只擋健康狀態，不是新增 kill switch 檢查——健康
+    （`admission_ready=True`）時，即使全站/個人 kill switch 已開，cancel 仍必須照常成功
+    （spec 明文：取消不受 kill switch 影響，`cancel()`/`_do_cancel()` 本就不呼叫
+    `_send_gate`，這裡驗證新加的 readiness 檢查沒有意外耦合到 kill switch 語意）。"""
+    gw = _FakeGateway()
+    guard = _guard(engine)
+    a, ack = await _placed_order(engine, gw, guard)
+    guard.set_kill_switch(True, scope="global", actor_user_id=1)
+
+    result = await a.cancel(ack.broker_order_id, actor_user_id=1)
+    assert result.status == "cancelled"
+    assert gw.cancel_calls == ["101AA1"]
+
+
 async def test_remote_update_offline_fails_fast_no_new_reservation(engine):
     """Task 7（D9）：`gateway.ready=False` 時改單必須在 `check_update` 之前就被拒絕——
     `check_update` 若判定口數增加會建立 delta QuotaReservation（DB 決策段的一部分），offline
