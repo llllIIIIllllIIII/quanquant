@@ -361,13 +361,52 @@ class AgentRunner:
             await asyncio.to_thread(self._buffer.write_sentinel, epoch=epoch, detail=detail)
         self._health_queue.put_nowait(epoch)
 
+    async def _respawn_child(self) -> bool:
+        """N2（HIGH，codex 終審 round2）：`_recover()` 的必要步驟——`ChildFailstopLatch`
+        （native_runner.py）在 child 進程內無 rearm、永久單向 trip，唯一能讓它重置的方式是
+        把整個 child process 換掉（新 process＝新的 Python 物件圖＝全新 latch）。若 recovery
+        只解除 parent 這邊的 `_latched`，child 內部的本地 latch 依然 tripped，`_dispatch`
+        會永久對 mutating op 回 failstop——parent 卻已經回報 healthy，形成假 healthy。
+
+        terminate 舊 child → respawn（沿用 `ChildHandle.start()`，內部已含一次 connect
+        RPC）→ 額外 ping 一次做「新 child 真的可用」的獨立確認（不只信任 start() 內部的
+        connect 沒 raise）。respawn/ping 任一步失敗：記錯、回 False，呼叫端（`_recover`）
+        據此保留 latch、不持久化任何狀態，交下一輪 `_recovery_prober` 重試——不留下「parent
+        以為恢復了、child 其實沒換成功」的中間態。成功才更新 `self._account`（respawn 用
+        同一組憑證，理論上拿回同一個帳號，但仍以這次 `start()` 的回傳值為準，不假設）。"""
+        try:
+            await asyncio.to_thread(self._child.terminate)
+            account = await asyncio.to_thread(self._child.start)
+        except Exception:
+            log.exception("G2④ recovery：child respawn 失敗，保持 latch，留給下一輪重試")
+            return False
+        try:
+            ok = await asyncio.to_thread(self._child.ping, timeout=self._child_ping_timeout)
+        except Exception:
+            log.exception("G2④ recovery：respawn 後 ping 例外，保持 latch，留給下一輪重試")
+            return False
+        if not ok:
+            log.error("G2④ recovery：respawn 後 ping 失敗，保持 latch，留給下一輪重試")
+            return False
+        self._account = account
+        return True
+
     async def _recover(self) -> None:
         """G2④/⑤/⑦：解除條件＝storage probe（對同一 buffer 寫入→commit→讀回）通過。
-        `_recovery_lock` 內完成「probe→清 latch/sentinel→取 (epoch,status) snapshot」的
-        本機原子轉移——鎖本身的互斥已保證探針通過的當下不會有新的 `_latch()` 正在進行中
-        （沒有『探針期間又壞了但沒被發現』的競態：新故障必須等到這把鎖釋放才能真正 latch，
-        屆時 epoch 會再 +1，語意上等價於『先恢復又立即重新故障』，不違反任何不變量）。
-        `await transport.send` 永遠在鎖釋放之後才發生（經 `_health_sender`，不在這裡）。
+        `_recovery_lock` 內完成「probe→respawn child→清 latch/sentinel→取 (epoch,status)
+        snapshot」的本機原子轉移——鎖本身的互斥已保證探針通過的當下不會有新的 `_latch()`
+        正在進行中（沒有『探針期間又壞了但沒被發現』的競態：新故障必須等到這把鎖釋放才能
+        真正 latch，屆時 epoch 會再 +1，語意上等價於『先恢復又立即重新故障』，不違反任何
+        不變量）。`await transport.send` 永遠在鎖釋放之後才發生（經 `_health_sender`，不在
+        這裡）。respawn 本身雖然耗時（可能是一次真的券商登入），但刻意仍在鎖內完成——若
+        鎖外放行，respawn 期間若又有一次新的 `_latch()`（也要拿同一把鎖）會被卡住等待，
+        而非兩者交錯出「respawn 完成、latch 卻已經是更新一輪故障」的錯誤 snapshot。
+
+        N2（HIGH，codex 終審 round2）：probe 通過後，**必須先成功 respawn＋ping 確認新
+        child 可用，才能持久化 epoch／清 sentinel／翻 `_latched=False`**——理由見
+        `_respawn_child` docstring：child 本地 latch 無 rearm，不換 process 就沒有安全的
+        方式讓它恢復放行 mutating 呼叫。respawn 失敗直接 return（不動任何 durable 狀態，
+        保留 latch），與下面 C3 的持久化失敗分支同一套「任一步失敗就整段不生效」原則。
 
         C3（HIGH，codex 終審）修復：`_latched` 翻 False 必須排在兩個 durable 持久化步驟
         （寫 epoch、清 sentinel）**之後**、且兩者皆成功才翻——舊版先翻 `_latched=False` 再做
@@ -384,6 +423,8 @@ class AgentRunner:
                 return
             ok = await asyncio.to_thread(self._buffer.probe)
             if not ok:
+                return
+            if not await self._respawn_child():
                 return
             epoch = self._health_epoch
             try:

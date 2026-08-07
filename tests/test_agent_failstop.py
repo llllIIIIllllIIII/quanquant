@@ -518,6 +518,61 @@ async def test_recover_after_probe_passes_restores_ok_clears_sentinel_sets_epoch
     await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_recover_respawns_child_and_new_mutating_op_executes_after_recovery(tmp_path):
+    """N2（HIGH，codex 終審 round2）：`ChildFailstopLatch`（native_runner.py）在 child 進程內
+    無 rearm、永久單向 trip——recovery 若只翻 parent 的 `_latched=False`，child 內部的本地
+    latch 依然 tripped，之後任何 mutating RPC 送到 child 仍會被 `_dispatch` 擋下回
+    failstop，形成「parent 回報 healthy，交易卻永久失敗」的假 healthy。驗證：probe 通過後
+    recovery 必須真的把 child 換掉（`starts` 計數增加＝可觀察的「舊 child 物件被換掉」訊號）
+    ，且換掉之後的新 mutating 指令能正常執行、拿到 ok 的 cmd_ack（不是被本地 latch 擋下）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    starts_before_recovery = child.starts
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    await _until(lambda: not r._latched, timeout=3)  # probe 通過→respawn 成功→ping 確認過
+    assert child.starts == starts_before_recovery + 1  # 真的重啟過一次 child（respawn）
+
+    tr.incoming.put_nowait(_place_msg("c-after-recover"))
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert ack["ok"] is True  # 新 child（全新本地 latch）正常放行，不是被舊 latch 擋下
+    assert any(op.get("op") == "place" for op in child.ops)
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recover_stays_latched_when_child_respawn_ping_fails(tmp_path):
+    """N2：probe 通過，但 respawn 後用來確認新 child 真的可用的 ping 失敗——不能就地翻
+    `_latched=False`（新 child 未必真的可用，parent 卻已經對外回報 healthy）。保留 latch，
+    交下一輪 `_recovery_prober` 重試，且不送出任何 `status="ok"` 的健康訊框、sentinel 仍在
+    （C3 的順序保證延伸：respawn 這一步失敗，等同持久化步驟失敗，整段不生效）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    child.ping_ok = False  # respawn 本身（terminate/start）仍會成功，但確認 ping 會失敗
+
+    await asyncio.sleep(0.15)  # 讓至少一輪 _recovery_prober 跑過（probe 過、respawn 後 ping 敗）
+    assert r._latched is True
+    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
+    assert buf.has_sentinel()  # 沒被清掉，下次啟動仍會正確載入 latch
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_recover_stays_latched_when_epoch_persist_fails(tmp_path, monkeypatch):
     """C3（HIGH，codex 終審）：`_recover()` 的兩個持久化步驟（先 epoch、後 sentinel）任一
     失敗都必須保留 latch、不送 ok——舊版先翻 `_latched=False` 才做持久化，部分失敗會讓
