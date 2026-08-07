@@ -8,12 +8,23 @@
 
 rotation 語意（每 user 同時只有一枚有效 token）：`issue_token` 簽發新枚前，把該 user
 「目前仍有效」（`revoked_at IS NULL`）的舊列全部標 `revoked_at=now`——已經撤銷過的列維持
-原本的撤銷時間不動（不重寫歷史），實務上這個集合任何時刻最多只有一列（不變量本身保證）。
+原本的撤銷時間不動（不重寫歷史）。
+
+C10（LOW，codex 終審）：這個不變量過去**只**靠應用層「先 revoke 再 insert」維持——併發
+rotation（同一 user 兩個請求幾乎同時呼叫 `issue_token`）下，兩邊都可能在對方尚未 commit
+前讀到「目前無 active row」，各自 insert 一筆，DB 端（`token_hash unique` 之外）沒有任何
+約束擋下，會產生兩枚同時有效的 token。修復雙管齊下：(1) `db/models.py` 加
+`uq_agent_tokens_active_per_user` partial unique index（`user_id WHERE revoked_at IS
+NULL`），DB 層強制恰一筆；(2) 這裡撞鍵安全重試一次——輸家 `IntegrityError` 後重讀 active
+rows（此刻贏家的新 token 已可見）、把它也 revoke 掉、再 insert 自己這枚，語意等同「最後
+commit 的呼叫者贏得 rotation」（rotation 本就是主觀上的「最新一次操作生效」，不是需要
+公平排序的資源分配）。
 """
 import hashlib
 import secrets
 from datetime import timedelta
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from quanquant.db.models import AgentToken, _utcnow
@@ -24,25 +35,36 @@ def _hash(raw: str) -> str:
 
 
 def issue_token(session: Session, *, user_id: int, ttl_days: int) -> str:
-    """簽發（或 rotation）agent token：回傳明文（只有這一次），DB 只存 hash。"""
-    now = _utcnow()
-    active_rows = session.exec(
-        select(AgentToken).where(
-            AgentToken.user_id == user_id,
-            AgentToken.revoked_at.is_(None),
+    """簽發（或 rotation）agent token：回傳明文（只有這一次），DB 只存 hash。撞
+    `uq_agent_tokens_active_per_user`（併發 rotation 輸家）安全重試一次，見模組頂部 C10
+    說明；重試仍撞鍵（理論上不該發生——重試前已把當下所有 active row 一併 revoke）就原樣
+    往外拋，不無限重試。"""
+    for attempt in range(2):
+        now = _utcnow()
+        active_rows = session.exec(
+            select(AgentToken).where(
+                AgentToken.user_id == user_id,
+                AgentToken.revoked_at.is_(None),
+            )
+        ).all()
+        for row in active_rows:
+            row.revoked_at = now
+            session.add(row)
+        raw = secrets.token_urlsafe(32)
+        token = AgentToken(
+            user_id=user_id, token_hash=_hash(raw), expires_at=now + timedelta(days=ttl_days),
         )
-    ).all()
-    for row in active_rows:
-        row.revoked_at = now
-        session.add(row)
-    raw = secrets.token_urlsafe(32)
-    token = AgentToken(
-        user_id=user_id, token_hash=_hash(raw), expires_at=now + timedelta(days=ttl_days),
-    )
-    session.add(token)
-    session.commit()
-    session.refresh(token)
-    return raw
+        session.add(token)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            if attempt == 1:
+                raise
+            continue
+        session.refresh(token)
+        return raw
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def validate_token(session: Session, *, raw: str) -> AgentToken | None:

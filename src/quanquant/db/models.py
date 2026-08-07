@@ -507,9 +507,27 @@ class AgentToken(SQLModel, table=True):
     只在簽發當下顯示一次，DB 只存 `token_hash`（sha256），可即時單獨撤銷、TTL 可長
     （涵蓋無人值守重連，預設 30 天，見設定 `agent_token_ttl_days`）。每 user 同時只有一枚
     有效 token——簽發新枚即 revoke 舊枚（rotation 語意最簡）。握手：連線帶 `x-agent-token`
-    → sha256 → 查表（未過期、未撤銷）→ 綁 `user_id`（見 spec D2 握手流程）。"""
+    → sha256 → 查表（未過期、未撤銷）→ 綁 `user_id`（見 spec D2 握手流程）。
+
+    C10（LOW，codex 終審）：`uq_agent_tokens_active_per_user` partial unique index——
+    `user_id WHERE revoked_at IS NULL` 恰一筆，DB 層強制「每 user 同時只有一枚有效
+    token」這個不變量（舊版只靠 `agent_tokens.issue_token` 應用層先 revoke 再 insert，
+    併發 rotation 下兩個呼叫都讀到「無 active row」時會各自 insert 一筆，DB 端沒有任何
+    約束擋下，產生兩枚同時有效的 token）。寫法比照 `AgentCommand.
+    uq_agent_cmd_update_singleflight`／`BrokerPosition.uq_broker_positions_active_scope`
+    既有雙方言 partial unique index 範式（`sqlite_where`/`postgresql_where`，見
+    `models.py` 上方兩處）。"""
 
     __tablename__ = "agent_tokens"
+    __table_args__ = (
+        Index(
+            "uq_agent_tokens_active_per_user",
+            "user_id",
+            unique=True,
+            sqlite_where=text("revoked_at IS NULL"),
+            postgresql_where=text("revoked_at IS NULL"),
+        ),
+    )
 
     id: int | None = Field(default=None, primary_key=True)
     user_id: int = Field(index=True)

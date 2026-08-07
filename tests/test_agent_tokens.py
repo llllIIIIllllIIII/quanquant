@@ -1,4 +1,6 @@
 import datetime as dt
+import hashlib
+import threading
 from datetime import timedelta
 
 from sqlmodel import Session, select
@@ -111,6 +113,56 @@ def test_rotation_does_not_affect_other_users_tokens(engine):
         assert validate_token(s, raw=raw_a) is None
     with Session(engine) as s:
         assert validate_token(s, raw=raw_b) is not None
+
+
+# ---- C10（LOW，codex 終審）：併發 rotation 撞
+# `uq_agent_tokens_active_per_user`——`issue_token` 撞鍵安全重試一次，最終仍恰一枚有效
+# token。----
+
+
+def test_issue_token_concurrent_rotation_retries_and_leaves_exactly_one_active(tmp_path):
+    """真雙連線＋`threading.Barrier` 逼近併發 rotation——兩個獨立 session 幾乎同時對同一個
+    user 呼叫 `issue_token()`，`uq_agent_tokens_active_per_user` partial unique index 讓
+    其中一個在 commit 時撞鍵，`issue_token` 內建的撞鍵安全重試（重讀 active rows、把贏家
+    的新 token 也一併 revoke、再 insert 自己這枚）必須讓最終結果恰有一枚有效 token（不是
+    兩枚，也不是撞鍵後就地放棄拋出例外）。改用檔案 SQLite（獨立連線）而非 in-memory：
+    StaticPool 共用單一底層連線會讓兩執行緒同時 flush 產生與本測試無關的 identity-map
+    交錯錯誤（比照 `test_agent_commands.py::test_update_singleflight_concurrent_two_
+    writers_exactly_one_wins` 既有理由）。"""
+    from sqlmodel import SQLModel, create_engine
+
+    db_path = tmp_path / "token_rotation_concurrency.db"
+    eng = create_engine(f"sqlite:///{db_path}", connect_args={"timeout": 30})
+    SQLModel.metadata.create_all(eng)
+
+    with Session(eng) as s:
+        user = auth_service.create_user(s, "concurrent-owner", "pw", role="admin")
+        user_id = user.id
+
+    results: list[str] = []
+    barrier = threading.Barrier(2)
+
+    def _attempt() -> None:
+        with Session(eng) as s:
+            barrier.wait(timeout=5)
+            raw = issue_token(s, user_id=user_id, ttl_days=30)
+            results.append(raw)
+
+    t1 = threading.Thread(target=_attempt)
+    t2 = threading.Thread(target=_attempt)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert len(results) == 2 and results[0] != results[1]  # 兩次呼叫都成功回傳、各自不同明文
+    with Session(eng) as s:
+        active = s.exec(
+            select(AgentToken).where(AgentToken.user_id == user_id, AgentToken.revoked_at.is_(None))
+        ).all()
+        assert len(active) == 1  # 恰一枚有效——沒有因為併發撞鍵而留下兩枚同時有效的 token
+        active_hash = active[0].token_hash
+        assert active_hash in {hashlib.sha256(r.encode("utf-8")).hexdigest() for r in results}
 
 
 def test_get_active_token_returns_latest_non_revoked(engine):

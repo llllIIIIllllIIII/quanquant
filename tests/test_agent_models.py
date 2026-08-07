@@ -51,6 +51,56 @@ def test_agent_token_hash_unique(session):
         session.commit()
 
 
+# ---- C10（LOW，codex 終審）：uq_agent_tokens_active_per_user——每 user 同時只能有一枚
+# revoked_at IS NULL 的有效 token（partial unique index，DB 層強制，不再只靠應用層先
+# revoke 再 insert）。----
+
+
+def test_agent_tokens_active_per_user_index_blocks_second_active_token(session):
+    """兩枚 `revoked_at IS NULL` 的 token 給同一個 user_id → 撞
+    `uq_agent_tokens_active_per_user`。"""
+    session.add(AgentToken(user_id=1, token_hash="t1", expires_at=dt.datetime(2026, 9, 6, 12, 0)))
+    session.commit()
+    session.add(AgentToken(user_id=1, token_hash="t2", expires_at=dt.datetime(2026, 9, 6, 12, 0)))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_agent_tokens_active_per_user_index_allows_second_after_first_revoked(session):
+    """第一枚被 revoke 之後（`revoked_at` 非 NULL），同一 user 再簽發第二枚不再撞鍵——
+    partial index 的 `WHERE revoked_at IS NULL` 只約束「目前有效」的集合。"""
+    tok1 = AgentToken(user_id=1, token_hash="t1", expires_at=dt.datetime(2026, 9, 6, 12, 0))
+    session.add(tok1)
+    session.commit()
+
+    tok1.revoked_at = dt.datetime(2026, 8, 7, 12, 0)
+    session.add(tok1)
+    session.commit()
+
+    session.add(AgentToken(user_id=1, token_hash="t2", expires_at=dt.datetime(2026, 9, 6, 12, 0)))
+    session.commit()  # 不應拋錯
+    rows = list(session.exec(select(AgentToken).where(AgentToken.user_id == 1)))
+    assert len(rows) == 2
+
+
+def test_agent_tokens_active_per_user_index_allows_different_users(session):
+    """不同 user_id 各自一枚有效 token 不衝突（partial index 是 per-user 而非全域唯一）。"""
+    session.add(AgentToken(user_id=1, token_hash="t1", expires_at=dt.datetime(2026, 9, 6, 12, 0)))
+    session.commit()
+    session.add(AgentToken(user_id=2, token_hash="t2", expires_at=dt.datetime(2026, 9, 6, 12, 0)))
+    session.commit()  # 不應拋錯
+
+
+def test_agent_tokens_active_per_user_index_compiles_on_both_dialects():
+    idx = next(
+        i for i in AgentToken.__table__.indexes if i.name == "uq_agent_tokens_active_per_user"
+    )
+    for dialect in (sqlite.dialect(), postgresql.dialect()):
+        ddl = str(CreateIndex(idx).compile(dialect=dialect))
+        assert "UNIQUE" in ddl.upper()
+        assert "revoked_at IS NULL" in ddl
+
+
 # ---- AgentCommand（D4：G1 command ledger）----
 
 def test_agent_command_round_trip_defaults(session):
