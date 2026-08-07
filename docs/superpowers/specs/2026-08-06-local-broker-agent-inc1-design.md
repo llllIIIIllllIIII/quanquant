@@ -1,7 +1,7 @@
 # 本機 Broker Agent — Increment 1（多人 simtrade）— 設計文件
 
 **日期**：2026-08-06
-**狀態**：設計 v7 — **codex 第 7 輪 APPROVE（無異議；G1、重定義後的 G2、G3 全閉合）**；七輪共 33 項發現全數修訂（標 codex R1-n～R6-n）→ 待使用者拍板決策 D1-D11 → writing-plans
+**狀態**：設計 v8 — codex 第 7 輪 APPROVE 後，**2026-08-07 使用者拍板完成**：D3 改兩層 kill switch（per-user＋全站總閘）、D7 硬升 v2、D9 healthz 語意變更通過、其餘照案 → D3 delta 經 codex 聚焦覆核 → writing-plans
 **前置**：Inc0 已完結併入 main（merge 5282c13，樹=9f9e23e，770 pytest 綠，人工 sim 實測全過）
 **相關文件**：`docs/superpowers/specs/2026-08-04-local-broker-agent-design.md`（總體設計）、`docs/superpowers/handoffs/2026-08-06-local-broker-agent-inc1-handoff.md`（交接）
 **範圍鐵則**：仍鎖 sim（協定/CLI/server/child 四層不開 real）；in-process 單人路徑不能壞；本期只到設計 spec 收斂，不寫實作計畫、不動碼。
@@ -87,12 +87,14 @@ per-user 隔離單位＝**UserAgentSlot**；跨 user 完全無共享可變 runti
 - 握手：`x-agent-token` → sha256 → 查表（未過期、未撤銷）→ 載 User 驗 `is_active` ＋ owner 白名單 → 綁 `user_id` → 取 registry slot → detach/attach（Inc0 generation 機制不變）。任一步失敗 close(1008)。
 - **`AGENT_WS_TOKEN` 靜態密鑰整個移除**（正式環境未部署、無存量 agent，不留 break-glass 後門）。
 
-### D3 kill switch scope — 採用：維持單一全域開關（偏離 handoff 草圖的「RiskGuard per-user 實例化」，明列給使用者拍板）
+### D3 kill switch scope — ✅ 使用者拍板（2026-08-07）：兩層＝per-user 開關＋保留全站總閘
 
-- 選項 a）RiskGuard per-user 實例＝per-user kill switch。
-- 選項 b）**維持單一共享 RiskGuard＋全域 kill switch**。
-- **理由**：盤點證實 RiskGuard 除 `_kill_switch` 外全是無狀態政策＋DB per-user 計數，拆實例沒有其他正確性收益。kill switch 是急煞車，「一鍵停全站」才是事故時要的語意；使用者想停自己＝關掉自己的 agent（天然存在）。在正確性壓力最大的 increment 裡不動安全機制的形狀。翻閘者記 audit（現有 audit 機制）。
-- 若使用者要 per-user 開關，改採 a＋另設 admin 全域閘（複雜度↑，Inc1 不推薦）。
+- 選項曾為 a）per-user／b）全站單一；原建議 b，**使用者拍板改採 a＋保留全站**。
+- **形狀**：RiskGuard 維持單一共享實例（盤點證實其餘狀態為無狀態政策＋DB per-user 計數，不需拆實例）；kill switch 狀態改為 `KillSwitchState`＝`global_on: bool`＋`per_user: dict[user_id, bool]`（in-memory，`order_kill_switch_initial` 初始化全站閘）。判定：`blocked(uid) = global_on OR per_user.get(uid, False)`。
+- **兩層 gate 語意不變（I3）**：admission（`check_place`/`check_update`）與 `_send_gate` 第二層都改查 `blocked(user_id)`；取消單仍不受 kill switch（沿用既有語意）。
+- **權限與 UI**：per-user 開關＝owner 只能翻**自己的**（server 端強制，非前端隱藏）；全站總閘＝沿用 Tier0 語意、任一 owner 可翻（火警拉桿原則），翻閘者記 audit。UI：orders 頁兩顆開關「我的急停」＋「全站急停」，各自顯示狀態與最後翻閘者。
+- **route**：`POST /orders/kill-switch` 加 `scope` 參數（`self`｜`global`）。
+- in-process 模式：單一 owner 下 `blocked()` 行為與現行單一 bool 等價，既有測試語意不變。
 
 ### D4 command ledger 放置與粒度（G1）— 採用：server 新表 `agent_commands` ＋ agent 端 buffer 加 `command_ledger` 表；只記三種 mutating op
 
@@ -158,7 +160,7 @@ per-user 隔離單位＝**UserAgentSlot**；跨 user 完全無共享可變 runti
 ### D9 offline 處理、UI、healthz — 採用：per-user badge＋token 管理段＋healthz 語意改「子系統就緒即 ready」
 
 - **offline 擋新單**：place/cancel/update route 先查 slot `session_state.ready`，未 ready 直接回「你的 agent 未連線」錯誤（fail-fast，不進 DB 決策段不動配額）；`_send_gate` 第二層 unavailable→failed＋退配額語意保留（縱深不變）。
-- **UI**：orders 頁 badge 改讀自己 slot 的狀態（`orders_agent_status` route per-user 化）；新增「Agent token」管理段（owner-only）：簽發（明文顯示一次）、rotation（發新廢舊）、顯示 last_used_at/expires_at。kill switch 控制照舊（全域，owner-only）。
+- **UI**：orders 頁 badge 改讀自己 slot 的狀態（`orders_agent_status` route per-user 化）；新增「Agent token」管理段（owner-only）：簽發（明文顯示一次）、rotation（發新廢舊）、顯示 last_used_at/expires_at。kill switch 控制改兩顆（D3 拍板）：「我的急停」（只能翻自己）＋「全站急停」（任一 owner 可翻），皆 owner-only＋audit。
 - **healthz**：agent 模式下「有 user 的 agent offline」是常態（使用者關筆電），**不得**觸發 503。語意改為：wiring 完成即 ready（200），per-user 連線狀態只進 UI 與 `orders_agent_status`，不進 healthz 判定。in-process 模式 healthz 判定不變。此為語意變更，明列拍板。
 - **G2 fail-stop 狀態機（codex R1-3，跨程序完整鏈）**：①SDK child 的 callback 落地失敗（含退化寫入亦失敗）→ 經 IPC 通知父程序＋寫**獨立 sentinel 檔**（不依賴已壞的 buffer）→ 父程序 latch `failstop`（durable，重啟仍在效，直到探針通過）；②latch 期間父程序**在每次 native 呼叫前檢查**，拒絕 place/cancel/update——failstop ack 走 best-effort **直送 WS**（不經可能已壞的 outbox），送不出就斷線交給 lease 判定；③server 端 **heartbeat lease**（新設定 `agent_health_lease_seconds`，預設 90）：超過 lease 未收到 `UpHealth(status="ok")` → slot 標 not-ready 擋新單，**WS 連線存活不等於健康**；④解除條件＝storage probe 通過（對同一 buffer 寫入→commit→讀回）才准回報 `status="ok"`；⑤**健康狀態單調性（codex R2-3/R3-2）**：agent 持久化 `health_epoch`，latch failstop 時 +1；**generation 不進 payload**——server 由連線 handler 以自己的 `my_generation` 對「該連線收到的所有訊息」fencing（沿用 Inc0 模型，agent 無需知道 server generation）；**UpLogin 宣告當前 `health_epoch` 作為本 session 基準**（buffer 重建歸零由重宣告吸收、不會永久拒收），server per-session 追蹤已見最大 epoch——failstop 立即生效，**epoch 較小的 ok 一律忽略**，recovery ok 必須引用當前 failstop epoch；⑥ **UpLogin 後 slot 進 `pending_health`**，由目前連線收到有效 ok 才 ready（廢除「登入即 ready」）；⑦ agent 端 recovery lock **只包本機原子轉移**（probe 通過→確認無更新失敗→清 latch/sentinel→取 (epoch,status) snapshot），**釋放 lock 後才 await WS send（codex R3-3）**——failstop latch／epoch++ 永不被網路 I/O 阻塞；⑧**health 出隊契約與 G2 安全語意界定（codex R4-1/R5-1）**：health frame 由**單一序列化 sender** 依序送出，每 frame 出隊前在 recovery lock 下重驗 (epoch,status,latch)、失效即丟棄（減少 stale frame；**已交付 wire 的 frame 無法撤回**）。因此 G2 語意明訂為三條可實現保證：(a) **權威安全點在 agent**——latch 後 native gate 立即拒絕一切 mutating 指令，server 短暫樂觀 ready **絕不會變成 native 執行**（下行指令到 agent 一律先過 latch 檢查）；(b) server ready 是**容許傳播延遲的樂觀值**——收到 failstop、斷線、lease 過期三者任一立即 not-ready；(c) **單調性**——server 一旦見過較大 epoch，較舊 ok 永不恢復 ready。「server 在本機失敗瞬間絕不短暫 ready」在非同步網路下不可實現，不以有限個 ok 假裝達成（不採兩-ok 規則）。per-user UI/route gate 全程反映 failstop；全域 /healthz 維持 200。failstop 期間拒新指令走 volatile `UpCommandRejected`（見 D7，codex R2-5）。
 - **OpsAlerter**：新增事件＝agent failstop 上報（G2）、scope 驗證失敗 quarantine（R1-5）；連線/斷線不告警（常態雜訊）。quarantine/漂移告警照舊。
@@ -183,7 +185,7 @@ per-user 隔離單位＝**UserAgentSlot**；跨 user 完全無共享可變 runti
 |---|---|---|
 | I1 | 零丟單（callback 落地才返回） | 不變：agent outbox 同步落地＋at-least-once＋Deal 去重。**新增**：落地失敗 → G2 fail-stop，禁止假 healthy。 |
 | I2 | native 單一序列化 | 不變：agent 端單實例本地鎖。server 端序列化縮為 per-user supervisor 鎖（跨 user 本無共享 native）。 |
-| I3 | kill switch 雙層 gate | 不變：RiskGuard admission＋`_send_gate` 下行前。全域開關（D3）。 |
+| I3 | kill switch 雙層 gate | 不變：RiskGuard admission＋`_send_gate` 下行前。開關為兩層（per-user＋全站總閘，D3）：`blocked(uid)=global OR per_user`。 |
 | I4 | commit 後才 ack | 不變，且**擴展到 cmd_ack**：server applier CAS 落庫成功才回 DownReportAck。 |
 | I5 | 配額/confirm token/audit 全留 server | 不變。 |
 | I6（新） | **每筆 mutating 指令恰好收斂一次**：送前持久化（同交易）→ agent ledger 去重 → ack at-least-once → server「CAS＋效果」同一交易至多套用一次；timeout 與 ack 以同一 ledger 列 CAS 決勝負、晚到方不得覆蓋 → ∴ 效果恰好一次（executed-but-unrecorded 毫秒窗口除外，明列殘留） | D4 |
@@ -235,6 +237,7 @@ per-user 隔離單位＝**UserAgentSlot**；跨 user 完全無共享可變 runti
 37. R5-3：U1 unknown → cancel 成功 → Order 從 list_trades 消失 → 終態 resolver 收斂 U1（無法判斷時保守 confirm 不 release）＋換帳號 guard 解除。
 38. R6-1：`ordno IS NULL` 的 Order 改單被 admission 拒絕（不建 reservation/ledger）；兩並發 update 撞 client_order_id 單飛 index → 恰一成功、輸家 rollback。
 39. R6-2：終態 report 先到、update 仍 created/sent → resolver 不碰；隨後 expired/failstop/明確拒絕 ack → release delta；只有 transport_acked＋outcome=unknown 者由終態 resolver 保守 confirm。
+40. D3 兩層 kill switch：A 開自己的急停 → A 新單被擋、B 不受影響；全站閘開 → 全員被擋；`scope=self` 無法影響他人（server 端強制）；取消單不受兩層開關影響；in-process 單 owner 行為與現行等價。
 
 ---
 
@@ -270,3 +273,81 @@ per-user 隔離單位＝**UserAgentSlot**；跨 user 完全無共享可變 runti
 - **Round 5（2026-08-07）：REVISE**——R4-2/R4-4 RESOLVED、R4-1/R4-3 PARTIAL。新發現 3 BLOCKER：R5-1 已上 wire 的舊 ok 無法撤回（兩-ok 規則不成立）→ **重定義 G2 為可實現語意**（權威安全點在 agent latch、server ready 是容許傳播延遲的樂觀值、epoch 單調）；R5-2 單飛缺 DB 線性化點 → partial unique index 強制；R5-3 cancel 使 unresolved update 失去 query_qty 關聯 → 終態 resolver（無法判斷時保守 confirm）。**v6 已全數修訂納入**，標 `codex R5-n`。
 - **Round 6（2026-08-07）：REVISE（G2 閉合）**——R5-1 RESOLVED（含 R4-1/R3-3/R2-3/R1-3 全鏈 RESOLVED，G2 依重定義語意閉合）。剩 2 BLOCKER：R6-1 單飛 index 用 nullable ordno 互斥失效 → 改鍵 `client_order_id`＋admission 拒無 ordno 的 Order；R6-2 終態 resolver 會搶先明確未執行 ack 造成不可逆錯誤 confirm → 適用集合限縮為 transport_acked＋outcome=unknown。＋1 LOW 實作期（R6-3 IntegrityError 精確辨認）。**v7 已全數修訂納入**，標 `codex R6-n`。
 - **Round 7（2026-08-07）：APPROVE**——R6-1/R6-2 覆核皆 RESOLVED、無新發現；G1、重定義後的 G2、G3 全部閉合，多人隔離與 in-process 零變更維持成立。設計收斂完成。
+- **2026-08-07 使用者拍板**：D3 改兩層（per-user 開關＋保留全站總閘，v8 已更新）；D7 硬升 v2、D9 healthz 語意變更照案通過；其餘 8 條照預設方案（D2 TTL 30 天/單枚/移除舊密鑰、D4 配額保留至當日收盤、D8 保守 confirm、D10 一人一帳號先綁先贏等）。設計定案 → writing-plans。
+
+---
+
+## 10. 實作實現註記（2026-08-08）
+
+Task 1-13 實作期間，審查（codex／人工）已裁定接受下列與本 spec 字面描述的既裁決偏離；本節
+只記錄「實際落地是什麼、為何被接受」，**不改動上方 §1-9 的既有文字**。完整過程見
+`.superpowers/sdd/progress.md`（Inc1 段）與各自的 `task-N-report.md`。
+
+**(a) D9 offline fail-fast 落在 adapter 層，而非 route 層（Task 7 裁決）**
+
+§4 D9 原描述「place/cancel/update route 先查 slot `session_state.ready`，未 ready 直接回
+『你的 agent 未連線』錯誤」讀起來像是 route 層的前置檢查。實作改為在 **adapter 層**
+（`ShioajiAdapter`）判斷離線：`gateway.ready` 與 `session_state.ready` 同步翻轉，adapter 的
+place/cancel/update 決策段一律先讀 `gateway.ready`，未就緒才 fail-fast。理由：Inc0 既有的
+冪等重放不變量（同一 `client_order_id` 重送不重建、離線時仍能查中既有 Order 並回既有結果）
+是建立在「離線判斷本就在 adapter 決策段內」這個既有結構上——若搬到 route 層先擋，會在
+「查得到既有冪等結果」與「offline 擋新單」之間造成優先序衝突，需要額外邏輯才能兩全。改在
+adapter 層判斷，讓三條路徑（place/cancel/update）都證實了「不進 DB 決策段就不動配額＋明確
+錯誤」這個 D9 原意仍然成立，且完全不動 Inc0 既有的冪等重放路徑。§4 D9 的措辭因此可理解為
+「效果落在 adapter 層」而非逐字的 route 層前置檢查。
+
+**(b) D4 place/update 的 ledger insert 與決策段是兩個緊鄰無 I/O 的小交易，而非嚴格同一次
+commit（Task 8 裁決）**
+
+§4 D4 描述「ledger insert 與該指令的 DB 決策段**同一交易**」。實作發現 `RiskGuard.
+check_place`/`check_update`（Task 7 既有程式，Task 8 未改動範圍）內部會自行
+`session.commit()`，因此當 risk_guard 存在時，`insert_command` 無法真的併入同一次 SQL
+COMMIT，只能是緊接在決策段 commit 之後、中間不含任何 `await`/I/O 的**獨立小交易**。殘留的
+crash 窗口（決策段已 commit、ledger insert 尚未 commit 就崩潰）與 §8 第 1 點「
+executed-but-unrecorded 窗口」同量級（純同步 Python 語句間的行程崩潰機率），且有明確出口
+可收斂：孤兒委託掃描（`_scan_orphan_orders_once`，開機時跑一次）會把「決策段已落地但無
+ledger 列」的孤兒委託列出供人工核對；重連補送（`list_unresolved_for_replay`）查詢也涵蓋
+這個窗口——已落 ledger 的指令會被正常收斂，真正遺失 ledger 列的極端情況維持既有的孤兒可見
+但不動配額語意，不會超賣。此偏離已交 codex 終審確認，接受為 Inc1 落地形態。
+
+**(c) `resolved_via` 增列 `'local'`（Task 8 裁決）**
+
+§4 D4／`db/models.py::AgentCommand` docstring 原列舉 `resolved_via` 的四個值
+（`'ack'|'query_qty'|'report'|'manual'`）未涵蓋「route 完全沒有經過任何與 agent 的
+round-trip，就在本地判定這筆指令確定不會有任何 ack」的情境——例如第二層 `_send_gate`
+攔下的 kill switch、或 `AgentUnavailableError`（agent 未連線）。實作新增第五個值
+`'local'`（`broker/agent_commands.py::resolve_never_dispatched`），語意是「route 本地終結，
+未下發即決」，與 `'manual'`（人工 ops 事後介入既有 unknown 委託）刻意區分、不共用同一個值，
+維持稽核可讀性。`db/models.py` 的兩條 CHECK constraint（`ck_agent_commands_resolved_
+requires_via`／`ck_agent_commands_ack_requires_transport_ack`）不限制 `resolved_via` 的
+列舉值本身（只驗證「resolved 必須帶 via」與「via=ack 必須帶 transport_acked_at」兩個組合
+規則），故此新增值不需要 migration、與既有 CHECK 相容。
+
+**(d) 終態 resolver 雙掛載點（worker 同交易＋watchdog 掃描）已依 spec 落地（Task 11）**
+
+§4 D4「unknown-resolver」段落描述的終態 resolver（Order 進入終態時收斂該 Order 名下
+`resolved_at IS NULL AND transport_acked_at IS NOT NULL AND outcome='unknown'` 的 update／
+state-based 掃描收斂 cancel）依 spec 字面落地在兩個掛載點：①`inbox_worker.
+_process_order_report` 在 Order 被回報推進終態的**同一交易**內立即呼叫
+`resolve_one_unresolved_update`/`resolve_one_unresolved_cancel`（即時掛載點）；②per-slot
+watchdog（`watchdog._reconcile_unknown_quota_agent`）週期性用
+`list_unresolved_unknown_updates`/`list_unresolved_cancels` 做 state-based 全量掃描（兜底
+掛載點，涵蓋①錯過或尚未觸發的殘留）。兩個掛載點共用同一份 `resolve_update_via_query_qty`／
+`resolve_unresolved_cancel_via_report`（`broker/agent_commands.py`），一律經 `_cas_resolve`
+（`WHERE resolved_at IS NULL`）互斥，誰先贏誰生效，輸家 no-op——與 §4/§6 S#29/S#37 的測試
+重點逐條對應，無偏離，此處僅記錄「確實依 spec 落地」供交接查核。
+
+**(e) 兩維 CAS 在 ack applier 側也以原子 UPDATE 落地（Task 11 修復回合 2 裁決）**
+
+§4 D4「server 冪等收斂（late-ack applier）」段落描述業務維 CAS 是收斂的唯一防線，但實作
+第一輪（Task 11 修復回合 1）只在 resolver 側（watchdog／worker 掛載點）補上 `_cas_resolve`
+原子 CAS，`apply_command_ack`（ack applier）側仍是「函式開頭讀一次 `resolved_at` 判斷是否
+已終結」的非原子讀-判-寫——re-reviewer 用真實函式重現了反向競態：resolver 恰好在 applier
+的「讀」與「（任何）寫」之間於別的交易 commit，applier 仍會覆寫掉 resolver 已落地的
+outcome/resolved_via/Order/quota 效果（update 情境尤其嚴重，可能把 resolver 保守不動的
+price/qty 覆寫成改單後的值）。修復回合 2 把 ack applier 的終結寫入也改走同一個
+`_cas_resolve`（`WHERE resolved_at IS NULL` 的原子 `UPDATE`）：贏家才套用 Order/quota 效果，
+輸家（`race_lost=True`）降級為「只補 transport_acked_at、不改 outcome、不重套效果」，與
+「遲到 ack 遇已 resolved」的既有規則 5 語意一致。至此兩維 CAS 在 resolver 與 applier 兩側
+都是原子 UPDATE，雙向 last-writer-wins 的競態閉合（re-reviewer 獨立驗證 route 層 re-apply
+亦 safe by construction），完整落地 §5 不變量表 I6「同一交易至多套用一次」的字面保證。

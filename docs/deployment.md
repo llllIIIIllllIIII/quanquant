@@ -191,6 +191,70 @@ git grep -nE "SHIOAJI_(TRADE_)?(API_KEY|SECRET_KEY)\s*=\s*['\"][A-Za-z0-9]" -- .
 ```
 確認除 `.env`（已在 `.gitignore`）外沒有其他檔案硬編碼真實金鑰樣式。
 
+### 10.6 Agent 模式（Increment 1，多人 simtrade）
+
+`ORDER_CHANNEL=agent` 時，Shioaji I/O 交給每位使用者自己電腦上跑的 `quanquant-agent`
+（經 `/ws/agent` 上下行），中央網站只做風控/冪等/配額決策；`ORDER_CHANNEL=inprocess`
+（預設）維持 Increment 0 之前的單機直連，行為完全不變。
+
+**新設定（3 枚，`src/quanquant/config.py`）**：
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `AGENT_TOKEN_TTL_DAYS` | `30` | agent WS 連線 token 的預設有效天數；簽發／rotation 皆套用此值 |
+| `AGENT_COMMAND_EXPIRY_SECONDS` | `120` | server 端 command ledger 每筆下行指令的 `expires_at = created_at + 這個秒數`；**server 不自主過期**，只有 agent 收到重播後自行判斷是否已過期才回拒，見下方「已知營運行為」 |
+| `AGENT_HEALTH_LEASE_SECONDS` | `90` | server heartbeat lease：超過這個秒數沒收到某使用者 agent 的 `UpHealth(status="ok")`，該使用者的 slot 標 not-ready 擋新單（WS 連線存活不等於健康） |
+
+**`AGENT_WS_TOKEN` 已移除**：Increment 0 的全站靜態密鑰整個刪除，改為每位使用者在 orders
+頁自行簽發 per-user DB opaque token（明文只顯示一次，DB 只存 hash，可個別撤銷／輪替）。
+舊版 `.env` 若仍留著 `AGENT_WS_TOKEN=...`，該值不再被讀取，可直接刪除。
+
+**healthz 語意變更（重要）**：agent 模式下，`/healthz` 的 `order_subsystem` 反映的是「下單
+子系統本身有沒有配線成功」（服務啟動時一次性判定），**不再**跟著任一位使用者的個別 agent
+連線狀態切換 200/503——某位使用者的 agent 離線（如關筆電）是常態，不觸發 503。若要看
+**個別使用者**的 agent 連線／健康狀態，改看：
+  - orders 頁的連線 badge（🟢 agent 已連線 / 🔴 agent 未連線）——每位使用者只看得到自己的；
+  - agent 儲存故障（G2 fail-stop latch）時，badge 會顯示固定訊息「agent 儲存故障，交易已
+    停止」；
+  - 若設定了 `OPS_TELEGRAM_BOT_TOKEN`/`OPS_TELEGRAM_CHAT_ID`，agent 進入／解除 fail-stop
+    會各推一則營運告警（連線/斷線本身不告警，只有健康語意真的轉換時才推）。
+  - `in-process` 模式（`ORDER_CHANNEL=inprocess`）healthz 判定完全不變（未 ready 仍 503）。
+
+**多人啟用步驟**：
+
+1. `.env` 設定 `ORDER_CHANNEL=agent`、`ORDER_MODE=sim`（Increment 1 仍鎖 sim，不支援
+   `real`）、`ORDER_OWNER_USER_IDS=<uid1>,<uid2>,...`（逗號分隔，每個 uid 對應一個既有
+   QuanQuant 帳號——先用 `quanquant-user list` 查 id）。
+2. 依固定三步部署／或本機 `uv run quanquant-web` 啟動——啟動時會自動：
+   - 對每個 owner uid 各建一個獨立的 `UserAgentSlot`（各自的連線／風控狀態／背景 worker，
+     互不影響，見 `docs/superpowers/specs/2026-08-06-local-broker-agent-inc1-design.md`
+     架構總覽）；
+   - 對既有 `orders` 資料做帳號↔使用者綁定 backfill——若同一個永豐帳號歷史上曾被多個
+     使用者下過單（正常情況下不會發生），下單子系統會**拒絕啟動**（fail closed，其餘
+     行情/日誌等功能仍正常），需人工核對 `orders`/`agent_account_bindings` 兩表裁決後才能
+     繼續，見該 spec 決策 D10。
+   - Postgres 環境：`raw_inbox` 會經既有 `ensure_columns` 機制自動補上 `user_id`/
+     `account`/`mode`/`quarantine_reason` 四個 nullable 欄位；`agent_tokens`/
+     `agent_commands`/`agent_account_bindings` 三張新表經 `create_all` 自動建立，無需手動
+     migration（比照 10.4 的既有慣例，首次啟用前仍建議照 10.4 的流程對一次真實 Postgres
+     smoke，尤其這次多了 `agent_commands` 的兩條 partial unique index）。
+3. 每位使用者各自登入網站（自己的帳號），到 `/orders` 頁「Agent Token」段按「產生 Agent
+   Token」，複製明文 token（只顯示這一次）。
+4. 每位使用者各自在自己電腦上跑 `quanquant-agent`（`uv run quanquant-agent`），依提示輸入
+   剛才複製的 token 與自己的永豐 simtrade API Key/Secret（憑證 session-only，不落地、不進
+   log）；也可用環境變數 `QQ_AGENT_TOKEN`/`QQ_AGENT_API_KEY`/`QQ_AGENT_SECRET_KEY` 免互動
+   輸入。**一個永豐帳號只能綁定一位使用者**（先綁先贏，見 D10）。
+5. 回 orders 頁確認 badge 轉綠（🟢 agent 已連線）即完成。
+
+**已知營運行為（非故障，操作者需知悉）**：
+- `place` 逾時／agent 斷線導致的 unknown 委託，其配額保留**永不自動釋放**（只有券商端明確
+  拒絕、或事後人工核對後才會釋放）——配額按交易日計，跨日自然歸零；長期掛著的 unknown
+  place 委託需要人工終結，見人工測試流程文件的「place unknown 人工終結程序」。
+- 兩層 kill switch：orders 頁「我的急停」只擋操作者自己的新單；「全站急停」擋全部使用者
+  （沿用 Tier0「任一 owner 皆可翻」的火警拉桿語意）；兩者皆不擋取消單。
+- 本機既有 `quanquant.db` 若殘留 Increment 0 時代（`agent` 通道尚未支援 per-user scope 前）
+  的 `raw_inbox` quarantine 列，啟用多人前建議先清理，避免混淆——SQL 見人工測試流程文件。
+
 ## 帳戶系統部署（首次啟用）
 
 依序執行：
