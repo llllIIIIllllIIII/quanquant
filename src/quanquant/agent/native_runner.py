@@ -90,6 +90,13 @@ def _dispatch(native, op: dict) -> dict:
             "payloads": payloads, "newest": newest.isoformat() if newest else None,
         }}
 
+    if kind == "query_qty":
+        # G3/D8：等價 shioaji_adapter._query_order_qty_blocking——查詢券商目前對這筆委託
+        # 回報的口數，供 server 端 per-slot watchdog 比對改前/改後值收斂 unknown。查無
+        # （已從 list_trades() 目前清單消失，如已完全結案）回 qty=None，不猜測。
+        qty = native.query_order_qty(op["ordno"])
+        return {"ok": True, "result": {"qty": qty}}
+
     if kind == "ping":
         return {"ok": True}
 

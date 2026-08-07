@@ -10,7 +10,8 @@ from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 
 from quanquant.broker.agent_protocol import (
-    DownCancel, DownPlace, DownReconcile, DownUpdate, PlaceNative, UpCmdAck,
+    DownCancel, DownPlace, DownQueryQty, DownReconcile, DownUpdate, PlaceNative, UpCmdAck,
+    UpQueryResult,
 )
 from quanquant.broker.base import (
     AgentCommandTimeoutError, AgentUnavailableError, OrderError, TradeNotFoundError,
@@ -88,7 +89,16 @@ class AgentChannel:
         if fut is not None and not fut.done():
             fut.set_result(ack)
 
-    async def request(self, cmd: dict, *, cmd_id: str, timeout: float) -> UpCmdAck:
+    def resolve_query_result(self, msg: UpQueryResult) -> None:
+        """Task 11（D7 R1-7）：volatile UpQueryResult 專用——reconcile 快照與 query_qty
+        結果共用同一個 `_pending` 等待表（`request()` 本就與訊息型別無關，只認 cmd_id）。
+        沒有對應 pending future 的 cmd_id（舊連線殘留重送/agent 端 bug）是安全 no-op，同
+        `resolve_ack` 既有慣例。"""
+        fut = self._pending.pop(msg.cmd_id, None)
+        if fut is not None and not fut.done():
+            fut.set_result(msg)
+
+    async def request(self, cmd: dict, *, cmd_id: str, timeout: float) -> UpCmdAck | UpQueryResult:
         if not self.ready:
             raise AgentUnavailableError("agent 未連線或未登入")
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -152,12 +162,24 @@ class AgentNativeGateway:
                                                  timeout=self._timeout))
 
     async def trades_snapshot(self, after: "datetime | None") -> tuple[list[dict], "datetime | None"]:
+        # Task 11（D7）：reconcile 是唯讀指令，改走 volatile UpQueryResult（不再經 UpCmdAck）
+        # ——`channel.request()` 對訊息型別無關，逾時一樣拋 AgentCommandTimeoutError（既有
+        # 呼叫端 `_reconcile_inner` 沒有 try/except，例外原樣往上拋，行為與改動前一致）。
         cmd = DownReconcile(cmd_id=uuid.uuid4().hex, mode="sim",
                             after=(after.isoformat() if after is not None else None))
-        result = self._unwrap(await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id,
-                                                          timeout=self._timeout))
+        reply = await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id, timeout=self._timeout)
+        result = reply.result
         newest = result.get("newest")
         return result.get("payloads", []), (datetime.fromisoformat(newest) if newest else None)
+
+    async def query_qty(self, ordno: str) -> int | None:
+        """G3/D8：per-slot watchdog 用來比對改前/改後口數收斂 unknown（`DownQueryQty` 下行，
+        `UpQueryResult` 回覆，唯讀不入 ledger，同 `trades_snapshot`）。查無（委託已結案、
+        不在 agent 端 `list_trades()` 目前清單）回 None，呼叫端（`agent_commands` resolver）
+        視為無法判斷、不猜測——與 in-process `_query_order_qty_blocking` 語意等價。"""
+        cmd = DownQueryQty(cmd_id=uuid.uuid4().hex, ordno=ordno, mode="sim")
+        reply = await self._channel.request(cmd.model_dump(), cmd_id=cmd.cmd_id, timeout=self._timeout)
+        return reply.result.get("qty")
 
     @staticmethod
     def _unwrap(ack: UpCmdAck) -> dict:

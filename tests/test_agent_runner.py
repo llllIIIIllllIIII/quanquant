@@ -157,6 +157,69 @@ async def test_child_timeout_yields_error_ack(tmp_path):
     await asyncio.gather(task, return_exceptions=True)
 
 
+# ---- Task 11（G3/D8）：DownQueryQty＋reconcile 改回 volatile UpQueryResult ----
+
+
+async def test_downlink_query_qty_dispatched_to_child_and_returns_query_result(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request = lambda op, *, timeout: {"ok": True, "result": {"qty": 7}}
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "query_qty", "cmd_id": "q1", "ordno": "101AA1", "mode": "sim"})
+    await _until(lambda: any(m.get("type") == "query_result" for m in tr.sent))
+    reply = next(m for m in tr.sent if m.get("type") == "query_result")
+    assert reply["cmd_id"] == "q1" and reply["result"] == {"qty": 7}
+    assert "event_id" not in reply  # volatile：不進 outbox，無 event_id（D7）
+    assert not any(m.get("type") == "cmd_ack" for m in tr.sent)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_downlink_reconcile_now_returns_query_result_not_cmd_ack(tmp_path):
+    """Task 11：reconcile 從 Inc0 的 UpCmdAck 切到 volatile UpQueryResult（D4/D7）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request = lambda op, *, timeout: {"ok": True, "result": {"payloads": [], "newest": None}}
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "reconcile", "cmd_id": "r1", "mode": "sim", "after": None})
+    await _until(lambda: any(m.get("type") == "query_result" for m in tr.sent))
+    reply = next(m for m in tr.sent if m.get("type") == "query_result")
+    assert reply["cmd_id"] == "r1" and reply["result"] == {"payloads": [], "newest": None}
+    assert not any(m.get("type") == "cmd_ack" for m in tr.sent)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_readonly_command_failure_sends_no_reply(tmp_path):
+    """唯讀冪等：child 執行失敗一律不回覆（server 端自然逾時，下輪重試），不猜測失敗原因
+    ——UpQueryResult 刻意沒有錯誤欄位可攜帶（D7 R1-7）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request = lambda op, *, timeout: {"ok": False, "error_kind": "exception", "message": "boom"}
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "query_qty", "cmd_id": "q2", "ordno": "101AA1", "mode": "sim"})
+    await asyncio.sleep(0.15)
+    assert not any(m.get("cmd_id") == "q2" for m in tr.sent)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_readonly_command_child_timeout_sends_no_reply(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request_exc = TimeoutError()
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "query_qty", "cmd_id": "q3", "ordno": "101AA1", "mode": "sim"})
+    await asyncio.sleep(0.15)
+    assert not any(m.get("cmd_id") == "q3" for m in tr.sent)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 def test_real_child_handle_spawn_roundtrip(tmp_path):
     """ChildHandle 對真 spawn 子程序的 smoke（fake native factory）。"""
     from quanquant.agent.runner import ChildHandle

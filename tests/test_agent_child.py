@@ -269,3 +269,28 @@ def test_reconcile_op_reply_shape(tmp_path):
     assert reply2["ok"] is True and reply2["result"] == {"payloads": [], "newest": None}
     _rpc(conn, {"op": "shutdown"})
     t.join(timeout=5)
+
+
+# ---- Task 11（G3/D8）：query_qty op，等價 shioaji_adapter._query_order_qty_blocking ----
+
+
+def test_query_qty_op_returns_current_qty(tmp_path):
+    conn, t = _start_child_thread(tmp_path)
+    _rpc(conn, {"op": "connect"})
+    place_reply = _rpc(conn, {"op": "place", "action": "Buy", "price": "0", "qty": 3,
+                              "price_type": "MKT", "order_type": "IOC", "octype": "Auto"})
+    ordno = place_reply["result"]["ordno"]
+    reply = _rpc(conn, {"op": "query_qty", "ordno": ordno})
+    assert reply["ok"] is True and reply["result"] == {"qty": 3}
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)
+
+
+def test_query_qty_op_returns_none_when_order_not_found(tmp_path):
+    """委託已從券商目前清單消失（如已完全結案/從未存在）——回 qty=None，不猜測。"""
+    conn, t = _start_child_thread(tmp_path)
+    _rpc(conn, {"op": "connect"})
+    reply = _rpc(conn, {"op": "query_qty", "ordno": "NOPE"})
+    assert reply["ok"] is True and reply["result"] == {"qty": None}
+    _rpc(conn, {"op": "shutdown"})
+    t.join(timeout=5)

@@ -24,11 +24,15 @@ from quanquant.broker.agent_commands import (
     apply_place_failure,
     apply_update_ack,
     insert_command,
+    list_unresolved_cancels,
     list_unresolved_for_replay,
+    list_unresolved_unknown_updates,
     mark_timeout_observed,
     new_command,
     prepare_replay,
     resolve_never_dispatched,
+    resolve_unresolved_cancel_via_report,
+    resolve_update_via_query_qty,
     to_downlink_dict,
 )
 from quanquant.broker.agent_protocol import UpCmdAck
@@ -763,3 +767,182 @@ def test_update_singleflight_concurrent_two_writers_exactly_one_wins(tmp_path):
     with Session(eng) as s:
         rows = list(s.exec(select(AgentCommand).where(AgentCommand.kind == "update")))
         assert len(rows) == 1  # 只有贏家真的落地
+
+
+# ---------------------------------------------------------------------------
+# Task 11（G3）：unknown-resolver 純函式（S#7/29/34/39）
+# ---------------------------------------------------------------------------
+
+
+def _mark_unknown_via_timeout(session: Session, engine, cmd: AgentCommand) -> None:
+    """走既有 `apply_command_ack` 的 timeout 分支，讓這筆指令進入 unknown-resolver 的
+    適用集合（`outcome='unknown'`, `resolved_at IS NULL`）——不手動改欄位，確保跟正式收斂
+    路徑走的是同一套 transport CAS。"""
+    outcome = apply_command_ack(lambda: Session(engine), cmd_id=cmd.cmd_id, user_id=1,
+                                 ack=_err_ack(cmd.cmd_id, error_kind="timeout"))
+    assert outcome.resolved is False and outcome.outcome == "unknown"
+
+
+def test_list_unresolved_unknown_updates_excludes_created_sent(session, engine):
+    """S#7：created/sent（尚未收到任何 ack，`outcome IS NULL`）不在適用集合內——resolver
+    的收尾前置：watchdog 對這種列一律跳過本輪，不 confirm/不 release。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    with Session(engine) as s2:
+        assert list_unresolved_unknown_updates(s2, user_id=1) == []
+
+
+def test_list_unresolved_unknown_updates_includes_after_timeout(session, engine):
+    """S#7 後半：timeout ack 落地（`outcome='unknown'`）後才進入適用集合。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    cmd = _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        rows = list_unresolved_unknown_updates(s2, user_id=1)
+        assert [r.cmd_id for r in rows] == [cmd.cmd_id]
+
+
+def test_resolve_update_via_query_qty_confirms_on_target_match(session, engine):
+    """S#7/S#29：query_qty 兩分支之一——改後值 → confirm＋寫 Order 新 price/qty。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    cmd = _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=5)
+        s2.commit()
+    assert action == "confirmed"
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.resolved_at is not None
+        assert row.outcome == "ok" and row.resolved_via == "query_qty"
+        order = s2.exec(select(Order)).one()
+        assert order.qty == 5 and str(order.price) == "21600"
+        assert _quota_state(s2, "delta-1") == "confirmed"
+
+
+def test_resolve_update_via_query_qty_releases_on_original_match(session, engine):
+    """S#7/S#29：query_qty 兩分支之二——改單前原值 → release，Order 不被改寫。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    cmd = _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=2)
+        s2.commit()
+    assert action == "released"
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.resolved_at is not None
+        assert row.outcome == "error" and row.resolved_via == "query_qty"
+        assert s2.exec(select(Order)).one().qty == 2  # 未被改寫
+        assert _quota_state(s2, "delta-1") == "released"
+
+
+def test_resolve_update_via_query_qty_ambiguous_non_terminal_left_pending(session, engine):
+    """S#29：既非改單前也非改單後的口數，Order 也還沒進終態 → 留待下一輪，不猜測。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    cmd = _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=99)
+        s2.commit()
+    assert action == "left_pending"
+    with Session(engine) as s2:
+        assert s2.get(AgentCommand, cmd.cmd_id).resolved_at is None
+        assert _quota_state(s2, "delta-1") == "reserved"
+
+
+def test_resolve_update_via_query_qty_terminal_ambiguous_conservative_confirms(session, engine):
+    """S#37/R5-3/R6-2：Order 已終態、real_qty 查無（None，委託已結案）→ 無法判斷 → 終態
+    resolver 保守 confirm、不 release，且不改寫 Order price/qty（不知道真正執行了什麼）。"""
+    _make_order(session, ordno="O1", status="cancelled", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    cmd = _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        action = resolve_update_via_query_qty(s2, row=row, order=order, real_qty=None)
+        s2.commit()
+    assert action == "conservative_confirmed"
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.resolved_at is not None
+        assert row.outcome == "unknown" and row.resolved_via == "report"
+        order = s2.exec(select(Order)).one()
+        assert order.status == "cancelled" and order.qty == 2  # Order 內容不被亂寫
+        assert _quota_state(s2, "delta-1") == "confirmed"  # 保守 confirm，不 release
+
+
+def test_resolve_unresolved_cancel_via_report_on_terminal_order(session, engine):
+    """S#34/R4-4：cancel unknown × Order filled → resolve(outcome=unknown, via=report)，
+    無 quota 效果、不改寫 Order。"""
+    _make_order(session, ordno="O1", status="filled", qty=2)
+    cmd = _cancel_cmd(session, ordno="O1")
+    _mark_unknown_via_timeout(session, engine, cmd)
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        applied = resolve_unresolved_cancel_via_report(s2, row=row, order=order)
+        s2.commit()
+    assert applied is True
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        assert row.resolved_at is not None
+        assert row.outcome == "unknown" and row.resolved_via == "report"
+        assert s2.exec(select(Order)).one().status == "filled"  # 不改寫
+
+
+def test_resolve_unresolved_cancel_via_report_noop_when_order_not_terminal(session, engine):
+    """state-based 掃描：Order 還沒到終態 → no-op，之後重跑再檢查一次（不依賴單一事件）。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    cmd = _cancel_cmd(session, ordno="O1")
+    with Session(engine) as s2:
+        row = s2.get(AgentCommand, cmd.cmd_id)
+        order = s2.exec(select(Order)).one()
+        applied = resolve_unresolved_cancel_via_report(s2, row=row, order=order)
+    assert applied is False
+    with Session(engine) as s2:
+        assert s2.get(AgentCommand, cmd.cmd_id).resolved_at is None
+
+
+def test_list_unresolved_cancels_includes_created_sent_and_timeout(session, engine):
+    """cancel 適用集合不像 update 那樣排除 created/sent（cancel 無 quota 效果，state-based
+    掃描只看 Order 是否已終態，不需要先等 ack）。"""
+    _make_order(session, ordno="O1", status="submitted", qty=1)
+    cmd = _cancel_cmd(session, ordno="O1")
+    with Session(engine) as s2:
+        assert [r.cmd_id for r in list_unresolved_cancels(s2, user_id=1)] == [cmd.cmd_id]
+
+
+def test_terminal_order_before_ack_does_not_block_subsequent_explicit_reject_release(session, engine):
+    """S#39/R6-2：終態 report 先到、update 仍 created/sent → resolver 不碰（不在適用集合）；
+    隨後收到明確拒絕 ack 仍正常 release delta，Order 終態不被腐化。"""
+    _make_order(session, ordno="O1", status="submitted", qty=2)
+    _reserve(session, reservation_id="delta-1", qty=3)
+    cmd = _update_cmd(session, ordno="O1", reservation_id="delta-1", price="21600", qty=5)
+    # Order 先進終態（例如同時有一筆 cancel 被回報接受）——這筆 update 指令本身仍是
+    # created/sent（outcome IS NULL），resolver 完全不該碰它。
+    with Session(engine) as s2:
+        order = s2.exec(select(Order)).one()
+        order.status = "cancelled"
+        s2.add(order)
+        s2.commit()
+    with Session(engine) as s2:
+        assert list_unresolved_unknown_updates(s2, user_id=1) == []  # 不在適用集合
+    outcome = apply_command_ack(lambda: Session(engine), cmd_id=cmd.cmd_id, user_id=1,
+                                 ack=_err_ack(cmd.cmd_id, error_kind="expired"))
+    assert outcome.resolved and outcome.outcome == "error"
+    with Session(engine) as s2:
+        assert _quota_state(s2, "delta-1") == "released"
+        assert s2.exec(select(Order)).one().status == "cancelled"  # 終態不被腐化，只 release

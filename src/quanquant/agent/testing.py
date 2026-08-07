@@ -76,6 +76,12 @@ class FakeNativeClient:
     def trades_snapshot(self, after) -> tuple[list, None]:
         return [], None
 
+    def query_order_qty(self, ordno: str) -> "int | None":
+        """G3/D8（Task 11）：等價 `ShioajiNativeClient.query_order_qty`——查無（已從
+        `self._orders` 消失，如 `cancel()` 刪除）回 None。"""
+        order = self._orders.get(ordno)
+        return order["qty"] if order is not None else None
+
 
 def fake_native_factory(*, credentials, symbol, mode, on_raw):
     return FakeNativeClient(credentials=credentials, symbol=symbol, mode=mode, on_raw=on_raw)

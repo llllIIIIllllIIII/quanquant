@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
-from quanquant.broker.agent_protocol import UpCmdAck
+from quanquant.broker.agent_protocol import UpCmdAck, UpQueryResult
 from quanquant.broker.base import (
     AgentCommandTimeoutError, AgentUnavailableError, OrderError, TradeNotFoundError,
 )
@@ -172,3 +172,60 @@ async def test_gateway_timeout_error_kind_raises_typed_and_classified_unknown():
     with pytest.raises(AgentCommandTimeoutError) as ei:
         await gw.place(_req(), cmd_id="x")
     assert _classify_place_failure(ei.value) == "unknown"
+
+
+# ---- Task 11（G3/D8）：query_qty＋reconcile 改走 volatile UpQueryResult ----
+
+
+async def test_resolve_query_result_resolves_pending_future():
+    ch, _ = _ready_channel()
+    task = asyncio.create_task(ch.request({"type": "query_qty", "cmd_id": "q1"},
+                                          cmd_id="q1", timeout=1))
+    await asyncio.sleep(0)
+    ch.resolve_query_result(UpQueryResult(cmd_id="q1", result={"qty": 5}))
+    reply = await task
+    assert isinstance(reply, UpQueryResult) and reply.result == {"qty": 5}
+
+
+def test_resolve_query_result_unknown_cmd_id_is_noop():
+    ch = AgentChannel()
+    ch.resolve_query_result(UpQueryResult(cmd_id="ghost", result={}))  # 不 raise
+
+
+async def test_gateway_query_qty_returns_qty_from_query_result():
+    class _QueryStubChannel(_StubChannel):
+        async def request(self, cmd, *, cmd_id, timeout):
+            self.sent.append(cmd)
+            return UpQueryResult(cmd_id=cmd_id, result={"qty": 7})
+
+    gw = AgentNativeGateway(_QueryStubChannel(), timeout_seconds=1)
+    assert await gw.query_qty("101AA1") == 7
+    assert gw._channel.sent[0]["type"] == "query_qty" and gw._channel.sent[0]["ordno"] == "101AA1"
+
+
+async def test_gateway_query_qty_returns_none_when_not_found():
+    class _QueryStubChannel(_StubChannel):
+        async def request(self, cmd, *, cmd_id, timeout):
+            return UpQueryResult(cmd_id=cmd_id, result={"qty": None})
+
+    gw = AgentNativeGateway(_QueryStubChannel(), timeout_seconds=1)
+    assert await gw.query_qty("NOPE") is None
+
+
+async def test_gateway_query_qty_propagates_timeout():
+    ch = _ready_channel()[0]
+    gw = AgentNativeGateway(ch, timeout_seconds=0.01)
+    with pytest.raises(AgentCommandTimeoutError):
+        await gw.query_qty("101AA1")
+
+
+async def test_gateway_trades_snapshot_uses_query_result_not_cmd_ack():
+    class _ReconcileStubChannel(_StubChannel):
+        async def request(self, cmd, *, cmd_id, timeout):
+            self.sent.append(cmd)
+            return UpQueryResult(cmd_id=cmd_id, result={"payloads": [{"a": 1}], "newest": None})
+
+    gw = AgentNativeGateway(_ReconcileStubChannel(), timeout_seconds=1)
+    payloads, newest = await gw.trades_snapshot(None)
+    assert payloads == [{"a": 1}] and newest is None
+    assert gw._channel.sent[0]["type"] == "reconcile"

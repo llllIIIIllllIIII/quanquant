@@ -43,8 +43,9 @@ from typing import Any
 from pydantic import ValidationError
 
 from quanquant.broker.agent_protocol import (
-    PROTOCOL_VERSION, DownCancel, DownHealth, DownPlace, DownReconcile, DownReportAck,
-    DownUpdate, UpCmdAck, UpHealth, UpLogin, UpReport, parse_downlink,
+    PROTOCOL_VERSION, DownCancel, DownHealth, DownPlace, DownQueryQty, DownReconcile,
+    DownReportAck, DownUpdate, UpCmdAck, UpHealth, UpLogin, UpQueryResult, UpReport,
+    parse_downlink,
 )
 from quanquant.agent.native_runner import child_main
 
@@ -237,6 +238,10 @@ def _to_op(msg: Any) -> dict:
                 "price_type": msg.price_type}
     if isinstance(msg, DownReconcile):
         return {"op": "reconcile", "after": msg.after}
+    if isinstance(msg, DownQueryQty):
+        # G3/D8（Task 2 審查發現的缺口，本 task 補上）：DownQueryQty 是唯讀指令，
+        # 與 DownReconcile 走同一條 _execute_readonly_command 路徑（回 UpQueryResult）。
+        return {"op": "query_qty", "ordno": msg.ordno}
     raise ValueError(f"未知下行指令: {msg!r}")
 
 
@@ -401,27 +406,31 @@ class AgentRunner:
                 # 序列化第一層（同一時間只有一則下行指令在跑），child pipe lock 為第二層。
                 await self._execute_mutating_command(msg)
             else:
-                # reconcile（唯讀，D4：不入 ledger，只記三種 mutating op）——本 task 不改，
-                # 維持 Inc0 既有直送行為；Task 11 才切 UpQueryResult。
+                # reconcile／query_qty（唯讀，D4：不入 ledger，只記三種 mutating op）——
+                # Task 11（D7/D8）：改回 volatile UpQueryResult（無 event_id、不進 outbox、
+                # 不觸發 DownReportAck），reconcile 快照與 query_qty 結果共用同一條路徑。
                 await self._execute_readonly_command(msg)
 
     async def _execute_readonly_command(self, msg: Any) -> None:
+        """reconcile／query_qty 共用：唯讀冪等，失敗（子程序逾時或執行例外）一律不回覆，
+        讓 server 端的 `channel.request()` 自然逾時（`AgentCommandTimeoutError`）——下一輪
+        watchdog/reconcile 重試即可，不猜測失敗原因、不需要 UpQueryResult 攜帶錯誤欄位
+        （D7：UpQueryResult 只有 `result` 一個欄位，就是刻意的最小介面）。"""
         op = _to_op(msg)
-        # reconcile 唯讀冪等，逾時下輪重試即可——不落 ledger/outbox，ack_event_id 維持
-        # Inc0 既有佔位值 0（訊息合法的最小欄位傳遞）。
-        ack_event_id = 0
         try:
             reply = await asyncio.to_thread(
                 self._child.request, op, timeout=self._child_command_timeout
             )
         except TimeoutError:
-            ack = UpCmdAck(cmd_id=msg.cmd_id, event_id=ack_event_id, ok=False,
-                           error_kind="timeout", message="agent 子程序無回應")
-        else:
-            ack = UpCmdAck(cmd_id=msg.cmd_id, event_id=ack_event_id,
-                           ok=bool(reply.get("ok")), result=reply.get("result"),
-                           error_kind=reply.get("error_kind"), message=reply.get("message"))
-        await self._transport.send(ack.model_dump())
+            log.warning("agent 唯讀指令 %s 逾時，不回覆（server 端自然逾時，下輪重試）", msg.type)
+            return
+        if not reply.get("ok"):
+            log.warning("agent 唯讀指令 %s 執行失敗，不回覆（server 端自然逾時，下輪重試）：%s",
+                        msg.type, reply.get("message"))
+            return
+        await self._transport.send(
+            UpQueryResult(cmd_id=msg.cmd_id, result=reply.get("result") or {}).model_dump()
+        )
 
     async def _execute_mutating_command(self, msg: Any) -> None:
         """place/cancel/update：spec D4 agent 端①-④，順序即正確性。"""

@@ -309,6 +309,7 @@ async def _start_agent_channel_subsystem(
         slot.tasks.append(asyncio.create_task(run_agent_watchdog(
             adapter, user_id=uid,
             unquarantine_after_seconds=settings.order_unquarantine_after_seconds,
+            gateway=gateway,  # Task 11（G3/D8）：query_qty round-trip 收斂 unknown update/cancel
         )))
         registry.add(slot)
         inbox_workers.append(slot_inbox_worker)

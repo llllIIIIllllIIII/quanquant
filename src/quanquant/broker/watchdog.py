@@ -28,8 +28,10 @@ import logging
 import time
 from datetime import datetime, timedelta, timezone
 
+from quanquant.broker import agent_commands
 from quanquant.broker import repository as brepo
 from quanquant.broker.redaction import redact_secrets
+from quanquant.db.models import AgentCommand
 
 log = logging.getLogger(__name__)
 
@@ -121,18 +123,21 @@ async def run_order_watchdog(
                 )
 
 
-async def run_agent_watchdog(adapter, *, user_id: int, unquarantine_after_seconds: float) -> None:
-    """agent 通道模式的精簡 watchdog：只做 DB-only 背景工作。Inc1 D6/D9：per-slot 跑一份
-    （lifespan 對每個 owner 各起一個 task），`user_id` 是這個 slot 的 owner——
-    quarantine 解除嚴格 scope 到這個 user（`unquarantine_stale_raw_inbox` 的
+async def run_agent_watchdog(
+    adapter, *, user_id: int, unquarantine_after_seconds: float, gateway=None,
+) -> None:
+    """agent 通道模式的精簡 watchdog：只做 DB-only 背景工作（+G3 的 query_qty round-trip）。
+    Inc1 D6/D9：per-slot 跑一份（lifespan 對每個 owner 各起一個 task），`user_id` 是這個
+    slot 的 owner——quarantine 解除嚴格 scope 到這個 user（`unquarantine_stale_raw_inbox` 的
     `RawInbox.user_id == user_id` 精確比對＋既有 reason=association_pending 篩選，見
     repository.py），不會誤解除/誤重試其他 user 的殘留，跨 user 完全互不影響（I8）。
 
-    連線/重連/健康是 agent 端與 WS 端點的責任；`_reconcile_unknown_quota`
-    需要 native 查詢，Increment 0 在 agent 模式停用（保守後果：unknown 委託的
-    配額維持保留、不會超賣），Increment 1 以下行 query_qty 指令補回（Task 11）。
-    supervisor.lock 在 agent 模式背後沒有 native → 即決策 5 的「獨立 server 鎖」，且
-    Task 7 起這顆鎖是每個 slot 各自一份，A 卡住不會佔用 B 的鎖。
+    連線/重連/健康是 agent 端與 WS 端點的責任。`gateway`（Task 11）是這個 slot 的
+    `AgentNativeGateway`：`_reconcile_unknown_quota_agent` 用它下行 `DownQueryQty` 收斂
+    update unknown-resolver；`gateway=None`（呼叫端未接線，理論上不應該發生於正式部署，
+    只是防禦性容錯）時整段 G3 收斂略過，維持 Inc0 保守後果（unknown 委託的配額維持保留、
+    不會超賣）。supervisor.lock 在 agent 模式背後沒有 native → 即決策 5 的「獨立 server
+    鎖」，且 Task 7 起這顆鎖是每個 slot 各自一份，A 卡住不會佔用 B 的鎖。
     """
     while True:
         await asyncio.sleep(unquarantine_after_seconds)
@@ -142,6 +147,15 @@ async def run_agent_watchdog(adapter, *, user_id: int, unquarantine_after_second
             raise
         except Exception:
             log.exception("agent watchdog：retry_quarantined 失敗（user_id=%s）", user_id)
+
+        if gateway is None:
+            continue
+        try:
+            await _reconcile_unknown_quota_agent(adapter, gateway, user_id=user_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("agent watchdog：unknown quota resolver 失敗（user_id=%s）", user_id)
 
 
 async def _retry_quarantined(adapter, older_than_seconds: float, *, user_id: int | None = None) -> None:
@@ -204,3 +218,115 @@ def _reconcile_unknown_quota_blocking(adapter, grace_seconds: float) -> None:
         session.commit()
         if resolved:
             log.info("watchdog 判定 %d 筆送單/改單結果不明的委託（或其保留列）完成配額收尾", resolved)
+
+
+# ---------------------------------------------------------------------------
+# agent 模式 G3 unknown-resolver（D8，Task 11）
+# ---------------------------------------------------------------------------
+#
+# in-process 版（上面 `_reconcile_unknown_quota_blocking`）鍵在 `Order.status == "unknown"`
+# 直接同步查 native；agent 模式沒有本機 native 可查（server 端這個 adapter instance 的
+# `_native` 只是佔位 stub，真正的 Shioaji 連線在使用者本機的 agent 子程序），必須改鍵在
+# `agent_commands` ledger 列（`resolved_at IS NULL`）並經 `gateway.query_qty()` 下行
+# `DownQueryQty` 才能問到真實口數——這是兩套邏輯刻意分開、不共用同一個 blocking 函式的
+# 原因（spec D8「in-process 模式行為不變」，agent 版邏輯只掛 agent watchdog）。
+#
+# place 的 outcome=unknown 且無 broker ID（D4/D8）：resolver 一律不碰、永不自動 release——
+# 下面兩個查詢（`list_unresolved_unknown_updates`/`list_unresolved_cancels`）只認
+# `kind IN ('update','cancel')`，`kind='place'` 的列天生不會出現在任何一個結果集裡，place
+# 因此以「結構上不可能被觸碰」的方式滿足這條規則，不需要額外的排除判斷。
+
+
+async def _reconcile_unknown_quota_agent(adapter, gateway, *, user_id: int) -> None:
+    """per-slot watchdog 週期跑：slot 未 ready（agent 未連線/未登入）直接跳過本輪——沒有
+    gateway 可查詢，硬查只會製造逾時噪音，且 D8 收尾前置規則本就要求「未 resolved 就不
+    confirm/不 release」，跳過本輪不會有任何錯誤收尾風險。`adapter.supervisor.lock` 持鎖
+    範圍涵蓋整輪（DB 查詢＋query_qty round-trip＋DB 寫回），與既有 in-process
+    `_reconcile_unknown_quota`／agent 模式 `_retry_quarantined` 用同一顆鎖序列化這個 slot
+    的背景工作一致（per-slot 各自一份，I8 不受影響；這顆鎖背後在 agent 模式沒有 native
+    呼叫，不會與 WS 收訊迴圈的 `channel.resolve_query_result` 產生死鎖——見 module 頂部
+    `run_agent_watchdog` docstring）。"""
+    if not gateway.ready:
+        return
+    async with adapter.supervisor.lock:
+        update_cmd_ids, cancel_cmd_ids = await asyncio.to_thread(
+            _list_unknown_resolver_cmd_ids_blocking, adapter, user_id
+        )
+        resolved = 0
+        for cmd_id in update_cmd_ids:
+            if await _resolve_unknown_update_cmd(adapter, gateway, cmd_id):
+                resolved += 1
+        for cmd_id in cancel_cmd_ids:
+            if await asyncio.to_thread(_resolve_unresolved_cancel_cmd_blocking, adapter, cmd_id):
+                resolved += 1
+        if resolved:
+            log.info(
+                "agent watchdog（user_id=%s）G3 unknown-resolver 完成 %d 筆收斂", user_id, resolved,
+            )
+
+
+def _list_unknown_resolver_cmd_ids_blocking(adapter, user_id: int) -> tuple[list[str], list[str]]:
+    with adapter._session_factory() as session:
+        updates = agent_commands.list_unresolved_unknown_updates(session, user_id=user_id)
+        cancels = agent_commands.list_unresolved_cancels(session, user_id=user_id)
+        return [r.cmd_id for r in updates], [r.cmd_id for r in cancels]
+
+
+async def _resolve_unknown_update_cmd(adapter, gateway, cmd_id: str) -> bool:
+    """update unknown-resolver 一列的完整處理：先讀 ordno（不含鎖外副作用的快速查詢）→
+    `await gateway.query_qty(ordno)`（唯一離開本機的 I/O）→ 帶著查詢結果重新進 DB 交易做
+    讀-判-寫（`resolve_update_via_query_qty` 是核心比對，見 agent_commands.py）。ordno 前後
+    兩次各自開獨立 session/交易——`gateway.query_qty` 是 await 邊界，不能讓一個 SQLAlchemy
+    Session 橫跨這段（ORM session 不是 async-safe 的長生命週期物件，同檔其餘函式一貫的
+    『開 session→做完→關閉』慣例）。"""
+    ordno = await asyncio.to_thread(_load_unresolved_update_ordno_blocking, adapter, cmd_id)
+    if ordno is None:
+        return False  # 已被別的路徑收斂（applier 搶先/row 消失），或列本身沒有 ordno（防禦性）
+    real_qty = await gateway.query_qty(ordno)
+    return await asyncio.to_thread(_apply_update_resolution_blocking, adapter, cmd_id, real_qty)
+
+
+def _load_unresolved_update_ordno_blocking(adapter, cmd_id: str) -> str | None:
+    with adapter._session_factory() as session:
+        row = session.get(AgentCommand, cmd_id)
+        if row is None or row.resolved_at is not None or row.ordno is None:
+            return None
+        return row.ordno
+
+
+def _apply_update_resolution_blocking(adapter, cmd_id: str, real_qty: int | None) -> bool:
+    with adapter._session_factory() as session:
+        row = session.get(AgentCommand, cmd_id)
+        if row is None or row.resolved_at is not None:
+            return False  # 已被別的路徑收斂（同 watchdog 上一輪/applier），no-op
+        order = brepo.find_order_by_ordno(
+            session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
+        )
+        if order is None:
+            return False
+        action = agent_commands.resolve_update_via_query_qty(
+            session, row=row, order=order, real_qty=real_qty
+        )
+        if action == "left_pending":
+            return False
+        session.add(row)
+        session.commit()
+        return True
+
+
+def _resolve_unresolved_cancel_cmd_blocking(adapter, cmd_id: str) -> bool:
+    with adapter._session_factory() as session:
+        row = session.get(AgentCommand, cmd_id)
+        if row is None or row.resolved_at is not None or row.ordno is None:
+            return False
+        order = brepo.find_order_by_ordno(
+            session, broker=row.broker, account=row.account, mode=row.mode, ordno=row.ordno
+        )
+        if order is None:
+            return False
+        applied = agent_commands.resolve_unresolved_cancel_via_report(session, row=row, order=order)
+        if not applied:
+            return False
+        session.add(row)
+        session.commit()
+        return True

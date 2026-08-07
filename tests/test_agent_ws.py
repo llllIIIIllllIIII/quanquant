@@ -45,9 +45,13 @@ class _SpyChannel(AgentChannel):
     def __init__(self):
         super().__init__()
         self.acks = []
+        self.query_results = []
     def resolve_ack(self, ack):
         self.acks.append(ack)
         super().resolve_ack(ack)
+    def resolve_query_result(self, msg):
+        self.query_results.append(msg)
+        super().resolve_query_result(msg)
 
 
 class _FakeRiskGuard:
@@ -240,6 +244,21 @@ def test_cmd_ack_routed_to_channel(ws_env):
                      "result": {}})
         assert _wait(lambda: len(_slot(ws_env).channel.acks) == 1)
         assert _slot(ws_env).channel.acks[0].cmd_id == "c9"
+
+
+def test_query_result_routed_to_channel_and_no_report_ack_sent(ws_env):
+    """Task 11（D7 R1-7）：UpQueryResult 只 resolve pending future，不進 outbox 補送機制、
+    不觸發 DownReportAck——連線不必先登入（同 cmd_ack 分支既有行為，query_result 本身無
+    user/scope 相依的效果套用）。"""
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "query_result", "cmd_id": "q9", "result": {"qty": 5}})
+        assert _wait(lambda: len(_slot(ws_env).channel.query_results) == 1)
+        assert _slot(ws_env).channel.query_results[0].cmd_id == "q9"
+        assert _slot(ws_env).channel.query_results[0].result == {"qty": 5}
+        # 沒有任何 DownReportAck 被送回（volatile，不是 durable event）。
+        ws.send_json({"type": "cmd_ack", "cmd_id": "sentinel", "event_id": 1, "ok": True, "result": {}})
+        assert _wait(lambda: len(_slot(ws_env).channel.acks) == 1)  # 確認連線仍活著、可繼續處理
 
 
 def test_login_reconcile_not_inline_receive_loop_stays_responsive(ws_env, engine):

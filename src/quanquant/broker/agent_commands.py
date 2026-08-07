@@ -45,7 +45,7 @@ from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
 from quanquant.broker.agent_protocol import DownCancel, DownPlace, DownUpdate, PlaceNative, UpCmdAck
-from quanquant.db.models import AgentCommand, Order
+from quanquant.db.models import AgentCommand, Order, QuotaReservation
 
 # spec D4/D7 §7：設定鍵 `agent_command_expiry_seconds`（預設 120）留 Task 10 才接線到
 # Settings——本 task 先用常數（`agent_channel.py` 既有的 `_DEFAULT_COMMAND_EXPIRY_SECONDS`
@@ -515,3 +515,137 @@ def _apply_update(session: Session, row: AgentCommand, ack: UpCmdAck, result_jso
         if row.reservation_id is not None:
             brepo.release_quota(session, reservation_id=row.reservation_id)
         _resolve(row, outcome="error", resolved_via="ack", result_json=result_json)
+
+
+# ---------------------------------------------------------------------------
+# G3 unknown-resolver（D4 unknown-resolver bullet＋D8，Task 11）
+# ---------------------------------------------------------------------------
+#
+# 適用集合（update／cancel 各自）一律是 `resolved_at IS NULL`——**created/sent（尚無
+# transport 回覆，`outcome IS NULL`）絕不碰**，繼續等 ack／重連重播；其明確未執行 ack
+# （expired/scope_mismatch/failstop/明確拒絕）仍依 `_apply_update`/`_apply_cancel` 既有轉移
+# 表 release delta——resolver 與 ack-path 用不相交的 `outcome` 值域天然互斥，不需要額外的
+# CAS（`outcome='unknown'` 這個值本身就只有 ack timeout 分支會寫入，見 `_apply_update`/
+# `_apply_place` 的 fail-safe 分支），resolver 落地的 `UPDATE ... WHERE resolved_at IS NULL`
+# 仍是最終防線（見 `_resolve`/呼叫端 `session.get` 之間的窗口——本檔一律先 flush 再檢查，
+# 呼叫端 watchdog 的 `_apply_*_resolution_blocking` 在同一次呼叫內完成讀-判-寫，不留窗口）。
+
+_ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER = frozenset({"cancelled", "failed", "filled"})
+
+
+def list_unresolved_unknown_updates(session: Session, *, user_id: int) -> list[AgentCommand]:
+    """update unknown-resolver 的適用集合（D4）：`kind='update' AND outcome='unknown' AND
+    resolved_at IS NULL`——`outcome='unknown'` 只可能由 `_apply_update` 的 timeout/未涵蓋值
+    fail-safe 分支寫入，結構上已蘊含 `transport_acked_at IS NOT NULL`（never-acked 的
+    created/sent 列 `outcome` 恆為 NULL，不會出現在這個查詢），不需要額外過濾。"""
+    stmt = (
+        select(AgentCommand)
+        .where(
+            AgentCommand.user_id == user_id,
+            AgentCommand.kind == "update",
+            AgentCommand.outcome == "unknown",
+            AgentCommand.resolved_at.is_(None),
+        )
+        .order_by(AgentCommand.created_at)
+    )
+    return list(session.exec(stmt))
+
+
+def list_unresolved_cancels(session: Session, *, user_id: int) -> list[AgentCommand]:
+    """cancel 的 state-based resolver 掃描集合（D4）：`kind='cancel' AND resolved_at IS
+    NULL`——涵蓋 timeout（outcome='unknown'）與尚未收到任何 ack 的 created/sent 列（cancel
+    無 quota 效果，不需要像 update 一樣嚴格排除 created/sent；Order 進終態就足以誠實收斂
+    「回報已終結曝險、指令本身效果不可知」，見 `resolve_unresolved_cancel_via_report`）。"""
+    stmt = (
+        select(AgentCommand)
+        .where(
+            AgentCommand.user_id == user_id,
+            AgentCommand.kind == "cancel",
+            AgentCommand.resolved_at.is_(None),
+        )
+        .order_by(AgentCommand.created_at)
+    )
+    return list(session.exec(stmt))
+
+
+def resolve_update_via_query_qty(
+    session: Session, *, row: AgentCommand, order: Order, real_qty: int | None,
+) -> str:
+    """update unknown-resolver 的核心比對（D4/D8），供 watchdog（`_reconcile_unknown_quota_
+    agent`）在同一交易內呼叫。`real_qty` 由呼叫端先 `await gateway.query_qty(row.ordno)`
+    取得（本函式純同步、不碰 native/網路）。呼叫端責任：`row` 必須屬於這個 user、
+    `row.kind == 'update'`、`row.outcome == 'unknown'`、`row.resolved_at is None`（見
+    `list_unresolved_unknown_updates`），`order` 是依 `row.ordno` 複合 scope 查到的同一張委託。
+
+    三／四分支（R3-1 主場景＋R5-3/R6-2 終態收尾）：
+      - **只在這筆 update 仍有一筆 `state='reserved'` 的 delta 保留列時**才做二分判定
+        （同 in-process `_reconcile_unknown_quota_blocking` 既有精神：`qty` 減量/純改價的
+        update 本就不建立保留列，`target_qty` 若沒有 delta 會與 `original_qty` 相同、無法
+        用口數區分「改單生效」與「改單沒生效」兩種情境，寧可不猜——落到下面的終態/留待
+        下一輪分支）：
+        - `real_qty == 改後目標值`（`order.qty + delta`）→ 改單其實生效：resolve(ok,
+          via=query_qty)＋原子寫 Order 新 price/qty＋confirm delta。
+        - `real_qty == 改單前原值`（`order.qty`，unknown 分支未覆寫）→ 改單其實沒生效：
+          resolve(error, via=query_qty)＋release delta。
+      - 其餘（含 `real_qty is None`、沒有可比對的 delta 保留列、或口數兩者皆不符）：
+        - `order.status` 已終態（cancelled/failed/filled）→ **終態 resolver**（R5-3/R6-2）：
+          無法判斷最終 qty，resolve(unknown, via=report)＋delta **保守 confirm、不
+          release**（低估可能已執行的增量比高估危險；沒有保留列時這一步是 no-op，但仍要
+          resolve 這筆 ledger 列本身，避免永久卡住 update 單飛鎖），不改寫 Order price/qty
+          （不知道真正執行了什麼，不可亂寫）。
+        - `order.status` 非終態 → 留待下一輪（不動任何東西，watchdog 之後重跑會重新查）。
+
+    回傳值供呼叫端/測試判斷實際採取的動作：`"confirmed"` / `"released"` /
+    `"conservative_confirmed"` / `"left_pending"`。"""
+    reservation: QuotaReservation | None = None
+    if row.reservation_id is not None:
+        reservation = session.exec(
+            select(QuotaReservation).where(QuotaReservation.reservation_id == row.reservation_id)
+        ).first()
+    has_active_delta = reservation is not None and reservation.state == "reserved"
+    original_qty = order.qty
+    target_qty = original_qty + (reservation.qty if has_active_delta else 0)
+
+    if has_active_delta and real_qty is not None and real_qty == target_qty:
+        payload = json.loads(row.payload)
+        new_price = payload.get("price")
+        price_value = Decimal(new_price) if new_price is not None else order.price
+        apply_update_ack(
+            session, order, new_price=price_value, new_qty=payload["qty"],
+            reservation_id=row.reservation_id,
+        )
+        _resolve(row, outcome="ok", resolved_via="query_qty",
+                 result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False))
+        return "confirmed"
+
+    if has_active_delta and real_qty is not None and real_qty == original_qty:
+        brepo.release_quota(session, reservation_id=row.reservation_id)
+        _resolve(row, outcome="error", resolved_via="query_qty",
+                 result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False))
+        return "released"
+
+    if order.status in _ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
+        if row.reservation_id is not None:
+            brepo.confirm_quota(session, reservation_id=row.reservation_id)
+        _resolve(row, outcome="unknown", resolved_via="report",
+                 result_json=json.dumps({"real_qty": real_qty}, ensure_ascii=False))
+        return "conservative_confirmed"
+
+    return "left_pending"
+
+
+def resolve_unresolved_cancel_via_report(session: Session, *, row: AgentCommand, order: Order) -> bool:
+    """cancel 的 state-based resolver（D4 R4-4）：`order` 已進終態（cancelled/failed/
+    filled）時，同一交易把這筆尚未 resolved 的 cancel 指令收斂為「回報已終結曝險、指令本身
+    效果不可知」的誠實紀錄——`outcome='unknown'` 但 `resolved_at` 非 NULL（**`resolved` 唯一
+    由 `resolved_at` 定義**，見 `AgentCommand` docstring；這是 cancel 專屬合法的
+    unknown-且-resolved 組合）。cancel 無 quota 效果，不觸碰任何 QuotaReservation；也不改寫
+    Order（終態已經是終態，不需要也不可以再改）。
+
+    `order` 未達終態時回 False（no-op，呼叫端不需要 commit）——state-based 週期掃描不依賴
+    「進入終態」的單一事件，之後重跑會再檢查一次，不會遺漏。"""
+    if order.status not in _ORDER_TERMINAL_FOR_UNKNOWN_RESOLVER:
+        return False
+    _resolve(row, outcome="unknown", resolved_via="report",
+             result_json=json.dumps({}, ensure_ascii=False))
+    return True

@@ -27,7 +27,7 @@ from quanquant.auth.agent_tokens import validate_token
 from quanquant.broker import repository as brepo
 from quanquant.broker.agent_commands import apply_command_ack, prepare_replay
 from quanquant.broker.agent_protocol import (
-    DownReportAck, UpCmdAck, UpHealth, UpLogin, UpReport, parse_uplink,
+    DownReportAck, UpCmdAck, UpHealth, UpLogin, UpQueryResult, UpReport, parse_uplink,
 )
 from quanquant.broker.inbox_worker import commit_raw_callback
 from quanquant.db.models import User
@@ -206,6 +206,10 @@ async def agent_ws(websocket: WebSocket) -> None:
                     # 本就是安全 no-op（見 AgentChannel.resolve_ack），僅記 log 供觀測。
                     log.warning("agent WS：查無 cmd_id=%s 的 agent_commands 列，忽略", msg.cmd_id)
                 channel.resolve_ack(msg)
+            elif isinstance(msg, UpQueryResult):
+                # Task 11（D7 R1-7）：volatile——只 resolve 這個 slot 的 pending future
+                # （reconcile 快照／query_qty），不進 outbox 補送機制、不回 DownReportAck。
+                channel.resolve_query_result(msg)
             elif isinstance(msg, UpHealth):
                 channel.note_heartbeat()
     except WebSocketDisconnect:
