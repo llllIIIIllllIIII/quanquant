@@ -519,6 +519,79 @@ def test_agent_reconcile_unknown_quota_skips_when_gateway_not_ready(engine):
         assert s.get(AgentCommand, "cmd-1").resolved_at is None
 
 
+# ---------------------------------------------------------------------------
+# C7（MEDIUM，codex 終審）：watchdog 入口不能把「純 DB、不需要 gateway round-trip」的終態
+# resolver 也一併跳過——舊版 `if not gateway.ready: return` 連 cancel/終態 update 都擋，
+# agent 永不回連時這些其實已經能靠純 DB 狀態誠實收斂的 ledger 列會永遠卡著。
+# ---------------------------------------------------------------------------
+
+
+def test_agent_reconcile_unknown_quota_terminal_update_resolves_even_when_gateway_not_ready(engine):
+    """C7：U1（update）unknown、Order 已因為 cancel 進終態——即使 gateway 未 ready（agent
+    永不回連），watchdog 仍要能把這種純 DB 可判定的 update ledger 列收斂掉（終態保守
+    confirm 分支不需要 query_qty），不永久卡住 update 單飛鎖/換帳號 guard。鏡射既有
+    `test_agent_reconcile_unknown_quota_terminal_resolver_conservative_confirm_and_guard_
+    release`，唯一差異是 `gateway.ready=False`。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2, status="submitted")
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-u1", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1", price="18500", qty=5)
+        s.commit()
+    _mark_timeout(engine, "cmd-u1")  # U1: outcome=unknown, resolved_at IS NULL
+
+    with Session(engine) as s:
+        _agent_cancel_cmd(s, cmd_id="cmd-cancel", ordno="O1")
+        s.commit()
+    outcome = apply_command_ack(
+        lambda: Session(engine), cmd_id="cmd-cancel", user_id=1,
+        ack=UpCmdAck(cmd_id="cmd-cancel", event_id=2, ok=True, result={}),
+    )
+    assert outcome.applied
+    with Session(engine) as s:
+        assert brepo.find_order_by_client_order_id(s, "C1").status == "cancelled"
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=False)  # agent 永不回連
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == []  # 完全沒有嘗試 query_qty（gateway 未 ready）
+    with Session(engine) as s:
+        cmd = s.get(AgentCommand, "cmd-u1")
+        assert cmd.resolved_at is not None
+        assert cmd.outcome == "unknown" and cmd.resolved_via == "report"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "confirmed"
+
+
+def test_agent_reconcile_unknown_quota_offline_cancel_resolver_works_when_gateway_not_ready(engine):
+    """C7：cancel 的 state-based resolver（`resolve_unresolved_cancel_via_report`）純 DB
+    判定——即使 cancel 本身逾時未 ack（unresolved），只要 Order 已經靠其他管道（如報告
+    report-first）進終態，watchdog 也該能收斂，完全不受 `gateway.ready` 限制。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2, status="submitted")
+        _agent_cancel_cmd(s, cmd_id="cmd-cancel", ordno="O1")
+        s.commit()
+    _mark_timeout(engine, "cmd-cancel")  # cancel 逾時未 ack：仍 unresolved
+
+    # Order 靠其他管道（例如成交回報）進終態，不經 cancel ack 本身。
+    with Session(engine) as s:
+        order = brepo.find_order_by_client_order_id(s, "C1")
+        brepo.mark_order_status(s, order, status="filled")
+        s.commit()
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=False)
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == []
+    with Session(engine) as s:
+        cmd = s.get(AgentCommand, "cmd-cancel")
+        assert cmd.resolved_at is not None
+        assert cmd.outcome == "unknown" and cmd.resolved_via == "report"
+
+
 def test_agent_reconcile_unknown_quota_skips_created_sent_then_resolves_after_timeout(engine):
     """S#7：ledger 未終結（created/sent，outcome IS NULL）watchdog 跳過→timeout 落地
     （進入 outcome='unknown' 適用集合）後 query_qty 兩分支之一（confirm）收斂。"""

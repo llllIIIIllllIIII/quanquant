@@ -239,22 +239,40 @@ def _reconcile_unknown_quota_blocking(adapter, grace_seconds: float) -> None:
 
 
 async def _reconcile_unknown_quota_agent(adapter, gateway, *, user_id: int) -> None:
-    """per-slot watchdog 週期跑：slot 未 ready（agent 未連線/未登入）直接跳過本輪——沒有
+    """per-slot watchdog 週期跑。
+
+    C7（MEDIUM，codex 終審）修復：舊版入口一律 `if not gateway.ready: return`，把「純
+    DB、不需要 agent round-trip」的終態 resolver（cancel 的 `resolve_unresolved_cancel_
+    via_report`／update 委託已進終態的保守 confirm 分支）也一併跳過——agent 長期不回連時，
+    這些其實已經能靠純 DB 狀態誠實收斂的 ledger 列會永遠卡著不收斂。修復後：每輪一律先跑
+    離線可行的收斂（cancel 全部走純 DB 路徑；update 先以 `real_qty=None` 呼叫
+    `resolve_one_unresolved_update`——只會命中「委託已進終態」的保守 confirm 分支，`real_qty`
+    未知時其餘分支天然落到 `left_pending`，不會誤判）；只有「委託仍非終態、需要真正
+    `query_qty` round-trip 才能判斷改單是否生效」這個分支才受 `gateway.ready` 限制（沒有
     gateway 可查詢，硬查只會製造逾時噪音，且 D8 收尾前置規則本就要求「未 resolved 就不
-    confirm/不 release」，跳過本輪不會有任何錯誤收尾風險。`adapter.supervisor.lock` 持鎖
-    範圍涵蓋整輪（DB 查詢＋query_qty round-trip＋DB 寫回），與既有 in-process
+    confirm/不 release」，跳過不會有任何錯誤收尾風險）。`adapter.supervisor.lock` 持鎖範圍
+    涵蓋整輪（DB 查詢＋query_qty round-trip＋DB 寫回），與既有 in-process
     `_reconcile_unknown_quota`／agent 模式 `_retry_quarantined` 用同一顆鎖序列化這個 slot
     的背景工作一致（per-slot 各自一份，I8 不受影響；這顆鎖背後在 agent 模式沒有 native
     呼叫，不會與 WS 收訊迴圈的 `channel.resolve_query_result` 產生死鎖——見 module 頂部
     `run_agent_watchdog` docstring）。"""
-    if not gateway.ready:
-        return
     async with adapter.supervisor.lock:
         update_cmd_ids, cancel_cmd_ids = await asyncio.to_thread(
             _list_unknown_resolver_cmd_ids_blocking, adapter, user_id
         )
         resolved = 0
+        # 離線可行：cancel 一律純 DB 狀態判定（不受 gateway.ready 限制）。
+        for cmd_id in cancel_cmd_ids:
+            if await asyncio.to_thread(_resolve_unresolved_cancel_cmd_blocking, adapter, cmd_id):
+                resolved += 1
         for cmd_id in update_cmd_ids:
+            # 先試離線收斂（real_qty=None）——只會命中委託已進終態的保守 confirm 分支；
+            # 非終態委託在這一步天然回 False（left_pending），不動任何東西。
+            if await asyncio.to_thread(_apply_update_resolution_blocking, adapter, cmd_id, None):
+                resolved += 1
+                continue
+            if not gateway.ready:
+                continue
             try:
                 if await _resolve_unknown_update_cmd(adapter, gateway, cmd_id):
                     resolved += 1
@@ -266,9 +284,6 @@ async def _reconcile_unknown_quota_agent(adapter, gateway, *, user_id: int) -> N
                     "agent watchdog（user_id=%s）query_qty cmd_id=%s 逾時/不可用，跳過本筆留待"
                     "下一輪: %s", user_id, cmd_id, exc,
                 )
-        for cmd_id in cancel_cmd_ids:
-            if await asyncio.to_thread(_resolve_unresolved_cancel_cmd_blocking, adapter, cmd_id):
-                resolved += 1
         if resolved:
             log.info(
                 "agent watchdog（user_id=%s）G3 unknown-resolver 完成 %d 筆收斂", user_id, resolved,
