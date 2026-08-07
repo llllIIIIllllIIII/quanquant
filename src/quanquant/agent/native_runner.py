@@ -97,9 +97,26 @@ class ChildFailstopLatch:
         ping，是不是跟之前觀察到的同一個故障狀態」。latch 在單一 child 進程內無 rearm，
         因此對單一 child 而言這個值只會是 0（從未 trip）或 1（已 trip）——語意上等價於
         `tripped` 這個 bool，這裡額外暴露成獨立欄位是為了讓 ping reply 的形狀更明確、
-        也讓未來若 latch 改為可 rearm 時不必再改協議欄位。"""
+        也讓未來若 latch 改為可 rearm 時不必再改協議欄位。單獨呼叫這個 property 時，
+        `ping` 的 `_dispatch` 分支改用 `snapshot()`（見其 docstring）取代「先呼叫
+        `tripped`、再呼叫 `fault_seq`」的兩次獨立呼叫，這裡仍保留給只需要單一欄位的
+        呼叫端（目前沒有，留作介面完整性）。"""
         with self._seq_lock:
             return self._fault_seq
+
+    def snapshot(self) -> tuple[bool, int]:
+        """Round5 點修（codex 終審 round5）：`ping` 過去用兩次獨立呼叫組出
+        `(tripped, fault_seq)`——`tripped` 走 `Event.is_set()`（無鎖，property 本身）、
+        `fault_seq` 另外進 `_seq_lock`——兩次讀取之間若 `trip()` 剛好插進來（callback
+        執行緒與 `child_main` 主迴圈本就是不同執行緒），會讓 ping reply 帶出「tripped=
+        False 卻 fault_seq=1」這種不該自然發生、但確實可觀測到的不一致快照——recovery
+        端（`runner.py::AgentRunner._recover`）拿它核對故障狀態時可能被誤導（例如誤判
+        『這次重驗看到的還是舊故障』或反過來看漏新故障）。改成單一鎖內一次讀齊兩個欄位：
+        `trip()` 本身也是同一把 `_seq_lock` 內完成 test-and-set＋遞增，讀寫共用一把鎖天然
+        互斥，保證這裡回傳的兩個值永遠對應同一個時間點的狀態，不會有「一半新一半舊」的
+        中間態。`_dispatch()` 的 `ping` 分支改呼叫這個方法取代原本的兩次獨立呼叫。"""
+        with self._seq_lock:
+            return self._event.is_set(), self._fault_seq
 
 
 def _trigger_failstop_latch(buffer: DurableBuffer, failstop_conn, latch, detail: str, *,
@@ -288,16 +305,22 @@ def _dispatch(native, op: dict, *, latch: "ChildFailstopLatch | None" = None,
 
     if kind == "ping":
         # R3-2（HIGH，codex 終審 round3）：帶上 child 本地 latch 是否已 tripped——舊版
-        # ping 一律回 ok=True，recovery 用它做「respawn 後新 child 真的可用」的獨立確認時
-        # 完全看不出新 child 是否在 connect 後、清 sentinel 前又故障一次（假 healthy 縫，
-        # 見 `AgentRunner._respawn_child`）。
+        # ping 一律回 ok=True，recovery 用它做「新 child 真的可用」的獨立確認時完全看不出
+        # child 是否在 connect 後又故障一次（假 healthy 縫）。
         # R4-b（HIGH，codex 終審 round4）：額外帶上 `generation`（child_main 啟動時蓋章的
-        # 世代）與 `fault_seq`（本地 latch 的單調故障序號）——recovery 在「清 sentinel 前
-        # 原子重驗」時可核對這兩個值是否與先前觀察到的一致，不只看 `latched` 這個瞬時
-        # bool（見 runner.py `AgentRunner._recover` docstring）。
-        return {"ok": True, "latched": bool(latch.tripped) if latch is not None else False,
-                "generation": generation,
-                "fault_seq": latch.fault_seq if latch is not None else 0}
+        # 世代）與 `fault_seq`（本地 latch 的單調故障序號）——recovery 可核對這兩個值是否
+        # 與先前觀察到的一致，不只看 `latched` 這個瞬時 bool（見 runner.py
+        # `AgentRunner._recover` docstring）。
+        # Round5 點修（codex 終審 round5）：`(latched, fault_seq)` 改用 `ChildFailstopLatch.
+        # snapshot()` 單一鎖內一次讀齊——不再是「先讀 tripped（無鎖）、再讀 fault_seq
+        # （另外進鎖）」的兩次獨立呼叫，避免兩次讀取之間夾著一次 `trip()` 造成的不一致
+        # 快照（見 `snapshot()` docstring）。
+        if latch is not None:
+            latched, fault_seq = latch.snapshot()
+        else:
+            latched, fault_seq = False, 0
+        return {"ok": True, "latched": bool(latched), "generation": generation,
+                "fault_seq": fault_seq}
 
     if kind == "shutdown":
         native.close()

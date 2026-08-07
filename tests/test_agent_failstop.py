@@ -17,7 +17,6 @@ import datetime as dt
 import json
 import multiprocessing as mp
 import sqlite3
-import threading
 import time
 from decimal import Decimal
 
@@ -357,27 +356,23 @@ class _FakeTransport:
 
 
 class _FakeChild:
+    """Round5：不再提供 `.respawn()`/`ping_detail()` 的假體專屬語意——recovery 不再原地
+    換血 child（見 runner.py `AgentRunner._recover`/`SessionRestartRequested` docstring），
+    `ensure_child()`（唯一 spawner）只需要 `start()`/`terminate()`/`alive`；`ping()` 供
+    `_child_watchdog` 凍結偵測；`poll_failstop()`/`push_failstop()` 供 `_failstop_watchdog`
+    模擬 child 落地失敗通知。"""
+
     def __init__(self):
         self.alive = False
         self.starts = 0
         self.generation = 0
         self.ops: list[dict] = []
         self.ping_ok = True
-        # R3-2（codex 終審 round3）：respawn 後確認用的 ping_detail 額外回報「新 child 是
-        # 否又立即 latch」——測試預設 False（respawn 乾淨成功），個別測試可設 True 模擬
-        # 新 child 在 connect 後、清 sentinel 前又故障一次的假 healthy 縫。
-        self.respawn_latched = False
         self.request_exc = None
-        # R3-4（codex 終審 round3）：respawn 專屬 backoff／staged recovery 測試用——
-        # >0 時 start() 連續丟例外（模擬 respawn 失敗），每呼叫一次遞減。
-        self.fail_starts_remaining = 0
         self._failstop_queue: list[dict] = []
 
     def start(self):
         self.starts += 1
-        if self.fail_starts_remaining > 0:
-            self.fail_starts_remaining -= 1
-            raise RuntimeError("模擬 respawn 失敗")
         self.generation += 1
         self.alive = True
         return "F1"
@@ -391,22 +386,8 @@ class _FakeChild:
     def ping(self, *, timeout):
         return self.ping_ok
 
-    def ping_detail(self, *, timeout):
-        if not self.ping_ok:
-            return {"ok": False, "latched": None}
-        return {"ok": True, "latched": self.respawn_latched}
-
     def terminate(self):
         self.alive = False
-
-    def respawn(self, expected_generation):
-        # R4-a（codex 終審 round4）：等價於真 `ChildHandle.respawn()`——generation 不符即
-        # no-op（回 None），相符則 terminate 舊的、start 新的（沿用既有 start()，含子類別
-        # 覆寫的失敗/帳號切換行為）。
-        if expected_generation != self.generation:
-            return None
-        self.terminate()
-        return self.start()
 
     def poll_failstop(self, timeout: float = 0.0):
         if self._failstop_queue:
@@ -431,12 +412,6 @@ def _runner(tr, child, buf, **overrides):
         child_command_timeout=0.5, heartbeat_interval=30, child_ping_interval=30,
         child_ping_timeout=5, backoff_base=0.01, backoff_max=0.05,
         recovery_probe_interval=0.03, failstop_poll_timeout=0.02,
-        # R3-4：respawn 專屬 backoff 的 class 預設值是 5s/300s（避免正式環境每 5 秒真登入
-        # 一次）——測試預設縮小到跟 recovery_probe_interval 同一數量級，讓 recovery 測試
-        # 不必依賴「系統開機時間已經超過 5 秒」這種隱性、脆弱的前提（`time.monotonic()`
-        # 在部分平台是量測開機時間，不是行程啟動時間）。要測 backoff 本身遞增/重設行為的
-        # 測試會用 overrides 明確覆寫回較大的值。
-        respawn_backoff_base=0.01, respawn_backoff_max=0.05,
     )
     kwargs.update(overrides)
     return AgentRunner(**kwargs)
@@ -552,57 +527,115 @@ async def test_recover_after_probe_passes_restores_ok_clears_sentinel_sets_epoch
     await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_recover_respawns_child_and_new_mutating_op_executes_after_recovery(tmp_path):
-    """N2（HIGH，codex 終審 round2）：`ChildFailstopLatch`（native_runner.py）在 child 進程內
-    無 rearm、永久單向 trip——recovery 若只翻 parent 的 `_latched=False`，child 內部的本地
-    latch 依然 tripped，之後任何 mutating RPC 送到 child 仍會被 `_dispatch` 擋下回
-    failstop，形成「parent 回報 healthy，交易卻永久失敗」的假 healthy。驗證：probe 通過後
-    recovery 必須真的把 child 換掉（`starts` 計數增加＝可觀察的「舊 child 物件被換掉」訊號）
-    ，且換掉之後的新 mutating 指令能正常執行、拿到 ok 的 cmd_ack（不是被本地 latch 擋下）。"""
+async def test_session_restart_full_chain_recovers_and_new_child_executes_mutating_op(tmp_path):
+    """Round5（codex 終審 round5 收斂）：recovery 不再原地換血 child（取代舊版 N2/R3-2 的
+    `test_recover_respawns_child_and_new_mutating_op_executes_after_recovery`／
+    `test_recover_stays_latched_when_child_respawn_ping_fails`）——probe 通過後
+    `_recover()` 持久化 epoch/清 sentinel/解 latch，接著 terminate child 並拋出
+    `SessionRestartRequested`，整條 session 結束；`run_forever()` 既有迴圈接手：下一輪
+    `run_once()` 開頭重新 `_load_persisted_health()`＋`ensure_child()`（真的 spawn 一個新
+    child，`starts`/`generation` 前進）＋重新登入（第二筆 `login`）。新 session 的新 child
+    帶著全新本地 latch，之後送進來的 mutating 指令必須正常放行、執行、拿到 ok 的
+    cmd_ack（不是被舊 latch 擋下——舊 latch 所在的整個 child process 已經被丟棄）。"""
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
-    r.ensure_child()
-    starts_before_recovery = child.starts
-    task = asyncio.create_task(r.run_once())
+    task = asyncio.create_task(r.run_forever())
     await _until(lambda: len(tr.healths()) >= 1)
+    starts_before, generation_before = child.starts, child.generation
 
     child.push_failstop("boom")
     await _until(lambda: r._latched)
 
-    await _until(lambda: not r._latched, timeout=3)  # probe 通過→respawn 成功→ping 確認過
-    assert child.starts == starts_before_recovery + 1  # 真的重啟過一次 child（respawn）
+    # probe 通過（buf 本身完好）→ session-restart：child 被 terminate、下一輪 ensure_child
+    # 真的重新 spawn（starts/generation 前進）＋重新登入（第二筆 login）。
+    await _until(lambda: child.starts == starts_before + 1, timeout=3)
+    assert child.generation == generation_before + 1
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2, timeout=3)
+    await _until(lambda: not r._latched, timeout=3)
+    assert not buf.has_sentinel()
 
-    tr.incoming.put_nowait(_place_msg("c-after-recover"))
+    tr.incoming.put_nowait(_place_msg("c-after-restart"))
     await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
     ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
-    assert ack["ok"] is True  # 新 child（全新本地 latch）正常放行，不是被舊 latch 擋下
+    assert ack["ok"] is True  # 新 session 的新 child（全新本地 latch）正常放行
     assert any(op.get("op") == "place" for op in child.ops)
 
+    r.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_recover_stays_latched_when_child_respawn_ping_fails(tmp_path):
-    """N2：probe 通過，但 respawn 後用來確認新 child 真的可用的 ping 失敗——不能就地翻
-    `_latched=False`（新 child 未必真的可用，parent 卻已經對外回報 healthy）。保留 latch，
-    交下一輪 `_recovery_prober` 重試，且不送出任何 `status="ok"` 的健康訊框、sentinel 仍在
-    （C3 的順序保證延伸：respawn 這一步失敗，等同持久化步驟失敗，整段不生效）。"""
+async def test_new_sentinel_written_right_after_clear_is_picked_up_on_session_restart(
+    tmp_path, monkeypatch,
+):
+    """R5-b 收斂驗證的核心論點：`_recover()` 不再對清除前的 sentinel 內容做 compare-
+    and-clear（那個 exact-match 版本本身就是永久卡死 persist_only 的根因之一，見
+    `test_epoch_negative_one_sentinel_on_restart_can_still_recover`）——即使清除與
+    child 落地新故障緊貼在一起，也不需要用更複雜的機制堵死這道窄窗：因為每個新 session
+    開始都會重新 `_load_persisted_health()`。這裡直接在 `clear_sentinel()` 呼叫的瞬間
+    模擬「child 剛好在這個時間點又落地一次新故障」（比原本 epoch 更新的一次全新故障），
+    驗證新 session 一啟動就會重新被 latch（不會誤判為 healthy，新故障也沒有憑空消失）。"""
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
-    r.ensure_child()
-    task = asyncio.create_task(r.run_once())
+
+    original_clear = buf.clear_sentinel
+
+    def _clear_then_new_fault_races_in():
+        original_clear()
+        buf.write_sentinel(epoch=999, detail="race：clear 完成瞬間 child 又落地新故障")
+
+    monkeypatch.setattr(buf, "clear_sentinel", _clear_then_new_fault_races_in)
+
+    task = asyncio.create_task(r.run_forever())
     await _until(lambda: len(tr.healths()) >= 1)
 
     child.push_failstop("boom")
     await _until(lambda: r._latched)
 
-    child.ping_ok = False  # respawn 本身（terminate/start）仍會成功，但確認 ping 會失敗
+    # 舊 session 結束、下一輪 run_once() 重新 _load_persisted_health()：讀到「race 賽入」
+    # 的新 sentinel（epoch=999）而重新 latch——不會被誤判為 healthy。
+    await _until(lambda: r._latched and r._health_epoch == 999, timeout=3)
+    assert buf.has_sentinel()
+    await _until(lambda: any(
+        h["status"] == "failstop" and h["health_epoch"] == 999 for h in tr.healths()
+    ), timeout=3)
 
-    await asyncio.sleep(0.15)  # 讓至少一輪 _recovery_prober 跑過（probe 過、respawn 後 ping 敗）
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_epoch_negative_one_sentinel_on_restart_can_still_recover(tmp_path):
+    """R5-b 回歸測試：模擬「child 寫入 `epoch=-1` 佔位 sentinel（`native_runner.py
+    _trigger_failstop_latch` 的 fallback 值）後，父程序整個崩潰、還沒來得及用
+    `_latch()` 把它覆寫成真正 epoch」的中間態——新啟動的 `AgentRunner` 從這個 sentinel
+    `_load_persisted_health()` 進來時，`self._health_epoch` 沿用 buffer meta 的落後舊值
+    （因為這次故障的正確 epoch 從未真正持久化過，`max(-1, 0) == 0`）。round4 的
+    exact-match compare-and-clear 會拿這個舊值（0）去比對磁碟上的 `-1`，永遠不相等，
+    永久卡在 persist_only 重驗迴圈清不掉 sentinel。round5 移除比對後，只要 probe 通過就
+    能正常持久化＋清除＋結束 session，不再卡死。"""
+    path = tmp_path / "o.db"
+    pre = DurableBuffer(path)
+    pre.write_sentinel(epoch=-1, detail="child 落地失敗、父程序尚未覆寫真正 epoch 就崩潰")
+
+    tr, child = _FakeTransport(), _FakeChild()
+    r = _runner(tr, child, DurableBuffer(path))
     assert r._latched is True
-    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
-    assert buf.has_sentinel()  # 沒被清掉，下次啟動仍會正確載入 latch
+    assert r._health_epoch == 0  # max(-1, 0) == 0：沿用落後的 buffer meta 值
 
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: len(tr.healths()) >= 1)
+    assert tr.healths()[0]["status"] == "failstop" and tr.healths()[0]["health_epoch"] == 0
+
+    # probe 天然會過（buf 本身完好，只是 sentinel 佔位值不精確）——recovery 必須能正常
+    # 持久化＋清除＋結束 session（觀察到第二筆 login，代表 session-restart 真的發生），
+    # 不會卡死在「重驗又通過、卻清不掉 sentinel」的迴圈。
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2, timeout=3)
+    fresh = DurableBuffer(path)
+    assert not fresh.has_sentinel()
+    assert fresh.get_health_epoch() == 0
+
+    r.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -667,60 +700,6 @@ async def test_recover_stays_latched_when_sentinel_clear_fails(tmp_path, monkeyp
 
 
 # ===========================================================================
-# R3-2（HIGH，codex 終審 round3）：recovery ping 必須查 child latch，不能只看 ok=True——
-# 否則新 child 在 connect 後、清 sentinel 前又 latch 時，會被誤判成 healthy。
-# ===========================================================================
-
-
-async def test_recover_stays_latched_when_respawned_child_immediately_relatches(tmp_path):
-    """respawn 本身（terminate/start/帳號核對）都成功，但確認用的 `ping_detail()` 回報新
-    child 本地 latch 已經又 tripped（模擬新 child 在 connect 後、清 sentinel 前又故障一次）
-    ——不能清 sentinel／翻 healthy，必須保留 latch，交下一輪重試，且沒有任何
-    `status="ok"`（epoch=1）的健康訊框送出。"""
-    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
-    r = _runner(tr, child, buf)
-    r.ensure_child()
-    task = asyncio.create_task(r.run_once())
-    await _until(lambda: len(tr.healths()) >= 1)
-
-    child.push_failstop("boom")
-    await _until(lambda: r._latched)
-
-    child.respawn_latched = True  # 模擬新 child 連上、確認 ping 前又立即 latch
-    await asyncio.sleep(0.15)
-    assert r._latched is True
-    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
-    assert buf.has_sentinel()
-
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-
-async def test_recover_succeeds_once_respawned_child_latch_clears(tmp_path):
-    """反過來驗證正路：一開始 respawn 後又立即 latch（保留 latch），之後（模擬人工排除
-    根因）新一輪 respawn 不再 latch——recovery 應該能正常完成，不會被卡死。"""
-    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
-    r = _runner(tr, child, buf)
-    r.ensure_child()
-    task = asyncio.create_task(r.run_once())
-    await _until(lambda: len(tr.healths()) >= 1)
-
-    child.push_failstop("boom")
-    await _until(lambda: r._latched)
-    child.respawn_latched = True
-
-    await _until(lambda: child.starts >= 2, timeout=3)  # 至少 respawn 過一次（仍卡在 latch）
-    assert r._latched is True
-
-    child.respawn_latched = False  # 根因排除：下一輪 respawn 就不會又 latch
-    await _until(lambda: not r._latched, timeout=3)
-    assert buf.get_health_epoch() == r._health_epoch == 1
-
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-
-# ===========================================================================
 # R3-3（MEDIUM，codex 終審 round3）：failstop notice 帶 child generation——respawn 換代後
 # 才被取出的舊 notice 不得誤 latch 目前健康的新 child。
 # ===========================================================================
@@ -764,60 +743,77 @@ async def test_current_generation_failstop_notice_still_latches(tmp_path):
 
 
 # ===========================================================================
-# R3-4（HIGH，codex 終審 round3）：respawn-login-quota——respawn 專屬 backoff＋jitter＋
-# 上限；FatalAgentError 不得被吞；staged recovery 不重登入；respawn 後帳號不符即 fatal。
+# Round5（codex 終審 round5 收斂）：respawn-login-quota 的節流責任從「respawn 專屬
+# backoff」（已隨 `_respawn_child()` 移除）轉移給 `run_forever()` 既有的 session backoff——
+# `SessionRestartRequested` 一律視為非 stable，不重設 backoff。帳號不符等致命錯誤改走
+# `ensure_child()` 既有硬化 spawn 路徑（`ChildHandle.start()` 的 `assert_account`），
+# 不再是 respawn 專屬的另一套帳號比對。
 # ===========================================================================
 
 
-async def test_respawn_backoff_grows_on_consecutive_failures_and_resets_on_success(tmp_path):
-    """連續 respawn 失敗（模擬 child.start() 一直炸）——respawn 專屬 backoff 必須遞增
-    （封頂），且在系統開機時間之類的雜訊之外，用 `_respawn_backoff_history` 直接觀察序列
-    形狀（比照既有 session backoff 測試手法）。respawn 一旦成功，backoff 立刻重設回
-    base。"""
+async def test_restart_frequency_is_bounded_by_backoff_under_persistent_failure(tmp_path):
+    """R5 登入頻率推演的驗收（見報告「登入頻率推演」）：持續故障——每次 session-restart
+    後新 child 幾乎立刻又 latch——下，session-restart 的間隔必須跟隨 `run_forever()` 的
+    session backoff 遞增封頂，不會因為「這輪 session 存活時間剛好跨過
+    `stable_session_seconds`」就被誤判成穩定連線、每次都重設回 `backoff_base`（若真的
+    被誤判，`_backoff_history` 會是 [0.05, 0.05, 0.05, 0.05] 這種不遞增的序列——用極小
+    的 `stable_session_seconds` 確保任何一輪 session 的存活時間都會跨過門檻，逼出這個
+    分支的行為）。用 `_backoff_history`（run_forever 每輪 sleep 前記錄的 backoff 值，
+    既有測試手法）觀察序列形狀：單調不減、確實遞增、封頂 backoff_max。"""
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
-    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
-                respawn_backoff_base=0.05, respawn_backoff_max=0.3)
-    r.ensure_child()
-    task = asyncio.create_task(r.run_once())
-    await _until(lambda: len(tr.healths()) >= 1)
+    r = _runner(tr, child, buf, backoff_base=0.05, backoff_max=0.4,
+                recovery_probe_interval=0.02, stable_session_seconds=0.001)
+    task = asyncio.create_task(r.run_forever())
 
-    child.push_failstop("boom")
-    await _until(lambda: r._latched)
+    def _login_count():
+        return len([m for m in tr.sent if m["type"] == "login"])
 
-    child.fail_starts_remaining = 2   # 前兩次 respawn（start()）失敗
-    await _until(lambda: len(r._respawn_backoff_history) >= 2, timeout=5)
-    first, second = r._respawn_backoff_history[0], r._respawn_backoff_history[1]
-    assert first == pytest.approx(0.05)
-    assert second > first             # 確實遞增
-    assert r._latched is True         # 還沒恢復（前兩次都失敗）
+    for expected_logins in range(1, 5):
+        await _until(lambda n=expected_logins: _login_count() >= n, timeout=5)
+        await asyncio.sleep(0.02)   # 讓這一輪 session 的 _failstop_watchdog 等 task 就緒
+        child.push_failstop("持續故障")
+        await _until(lambda: r._latched, timeout=5)
+        # probe 通過（buf 本身完好）→ recover → session 結束 → 下一輪 ensure_child 帶來
+        # 下一次 login，迴圈繼續逼出下一輪故障。
 
-    await _until(lambda: not r._latched, timeout=5)   # 第三次成功
-    assert r._respawn_backoff == pytest.approx(0.05)  # 成功後重設回 base
-
+    await _until(lambda: len(r._backoff_history) >= 4, timeout=5)
+    r.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
+    history = r._backoff_history[:4]
+    assert history[0] == pytest.approx(0.05)
+    assert history == sorted(history)     # 單調不減——沒有被誤判成 stable 而重設回 base
+    assert history[-1] > history[0]       # 確實持續成長
+    assert all(h <= 0.4 + 1e-9 for h in history)   # 封頂 backoff_max
 
-async def test_respawn_fatal_agent_error_stops_run_forever_without_retry(tmp_path):
-    """respawn 途中遇到帳號不符（`FatalAgentError`）——不得被 `_respawn_child()`/
-    `_recover()` 的既有 `except Exception` 吞掉，必須原樣往外拋，一路傳到
-    `run_forever()` 既有的 fatal 處置（停止、不重試）。`child.starts` 驗證只嘗試過一次
-    respawn 就停止，沒有落入無限重試迴圈。"""
+
+async def test_fatal_account_mismatch_on_post_recovery_ensure_child_stops_without_retry(
+    tmp_path,
+):
+    """Round5 收斂驗收：recovery 觸發 session-restart 後，新 session 的 `ensure_child()`
+    走**既有硬化 spawn 路徑**（`ChildHandle.start()` 的 `assert_account` 既有 fatal，
+    真實情境見
+    `test_agent_runner.py::test_child_handle_start_raises_fatal_agent_error_on_account_mismatch`），
+    不是 respawn 專屬的另一套帳號比對（那套已隨 `_respawn_child()` 移除）。這裡用
+    `_FakeChild` 子類別模擬「重啟後第二次 `start()`」遇到帳號不符——`FatalAgentError`
+    必須原樣往外拋、停止 `run_forever()`，且 child 不殘留（`alive is False`，
+    `ChildHandle.start()` 帳號不符分支本就會先 terminate 才 raise）。"""
     from quanquant.agent.runner import FatalAgentError
 
-    class _FatalOnRespawnChild(_FakeChild):
+    class _FatalOnSecondStartChild(_FakeChild):
         def start(self):
             self.starts += 1
             if self.starts == 1:
                 self.generation += 1
                 self.alive = True
                 return "F1"
-            raise FatalAgentError("agent 帳號不符（respawn 途中偵測）")
+            self.alive = False   # ChildHandle.start() 帳號不符分支本就會先 terminate 才 raise
+            raise FatalAgentError("agent 帳號不符（既有硬化 ensure_child 路徑偵測）")
 
     tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
-    child = _FatalOnRespawnChild()
-    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
-                respawn_backoff_base=0.01, respawn_backoff_max=0.05)
+    child = _FatalOnSecondStartChild()
+    r = _runner(tr, child, buf, recovery_probe_interval=0.02)
 
     task = asyncio.create_task(r.run_forever())
     await _until(lambda: len(tr.healths()) >= 1)
@@ -826,237 +822,22 @@ async def test_respawn_fatal_agent_error_stops_run_forever_without_retry(tmp_pat
 
     with pytest.raises(FatalAgentError):
         await asyncio.wait_for(task, timeout=5)
-    assert child.starts == 2   # 初始 start() 一次＋respawn 觸發 fatal 那一次，沒有再重試
-
-
-async def test_respawn_account_mismatch_is_fatal_not_silently_accepted(tmp_path):
-    """respawn 後新 child 回報的帳號與 session 目前綁定的帳號不符——不得靜默改
-    `self._account` 繼續回報 healthy，必須 fatal 停止（一路傳到 `run_forever`）。"""
-    from quanquant.agent.runner import FatalAgentError
-
-    class _AccountSwitchChild(_FakeChild):
-        def start(self):
-            self.starts += 1
-            self.generation += 1
-            self.alive = True
-            return "F1" if self.starts == 1 else "F2"   # respawn 拿到不同帳號
-
-    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
-    child = _AccountSwitchChild()
-    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
-                respawn_backoff_base=0.01, respawn_backoff_max=0.05)
-
-    task = asyncio.create_task(r.run_forever())
-    await _until(lambda: len(tr.healths()) >= 1)
-    child.push_failstop("boom")
-    await _until(lambda: r._latched)
-
-    with pytest.raises(FatalAgentError):
-        await asyncio.wait_for(task, timeout=5)
-    assert r._account == "F1"   # 沒有被靜默改成 F2
-    # R4-d（MEDIUM，codex 終審 round4）：帳號不符的新 child 已經成功啟動、連線——raise
-    # 前必須先 terminate 掉它，不留殘留 process/登入。
-    assert child.alive is False
-
-
-async def test_staged_recovery_persist_only_does_not_respawn_again(tmp_path, monkeypatch):
-    """respawn＋ping_detail 都已經成功，但接下來的 epoch 持久化失敗——記
-    `_respawn_stage="persist_only"`，之後多輪 `_recovery_prober` 只重試持久化，
-    **不再呼叫 `_respawn_child()`（不再登入）**。持久化恢復正常後，完全恢復也沒有多
-    respawn 一次。"""
-    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
-    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
-                respawn_backoff_base=0.01, respawn_backoff_max=0.05)
-    r.ensure_child()
-    task = asyncio.create_task(r.run_once())
-    await _until(lambda: len(tr.healths()) >= 1)
-
-    child.push_failstop("boom")
-    await _until(lambda: r._latched)
-
-    monkeypatch.setattr(
-        buf, "set_health_epoch",
-        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("epoch persist boom"))
-    )
-    await _until(lambda: r._respawn_stage == "persist_only", timeout=3)
-    starts_after_respawn = child.starts
-    assert starts_after_respawn >= 2   # 真的 respawn 過一次（ensure_child 的初始 1 次 + 這次）
-
-    await asyncio.sleep(0.15)   # 讓多輪 _recovery_prober 跑過，持久化持續失敗重試
-    assert child.starts == starts_after_respawn   # 沒有再次 respawn／重新登入
-    assert r._latched is True
-
-    monkeypatch.undo()   # 持久化恢復正常
-    await _until(lambda: not r._latched, timeout=3)
-    assert child.starts == starts_after_respawn   # 完全恢復也沒有多 respawn 一次
-    assert r._respawn_stage is None
-
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    assert child.starts == 2      # 第一次 session 的 spawn ＋ 重啟後 ensure_child 的第二次
+    assert child.alive is False   # 沒有殘留 child
 
 
 # ===========================================================================
 # R4（codex 終審 round4）：round3 修復的收窄版 TOCTOU/生命週期殘餘。
+#
+# Round5 收斂後的清理：`_respawn_child()`／`ChildHandle.respawn()` 已整個移除（recovery
+# 不再原地換血 child），round4 專屬針對這兩者的四支測試（respawn 呼叫端取消後背景
+# thread 收割、respawn 過期 no-op、respawn 後清 sentinel 前重驗、persist_only 輪次重驗）
+# 隨之移除——這些危險情境的前提（一個活著的 asyncio session 內原子替換 child）在新設計
+# 下結構性不存在。`ChildHandle` 本身的 `_lock`/`_generation` fencing（R3-1，保護
+# `start()`/`terminate()`/`_rpc()`/`poll_failstop()`）不受影響，繼續在
+# `test_agent_runner.py` 驗證。`_latch()` 的 generation 二次核對（R4-c）與新故障/latch
+# 本身無關，下面這支測試繼續有效、原樣保留。
 # ===========================================================================
-
-
-async def test_respawn_child_shields_and_reaps_late_completion_after_caller_cancelled(tmp_path):
-    """R4-a（HIGH）：`_respawn_child()` 呼叫端被取消時（例如 `run_once()` 結束連帶取消
-    `_recovery_prober`），底層 `asyncio.to_thread` 開的 OS thread 已經在跑
-    `ChildHandle.respawn()` 就無法被真的中止——用 `threading.Event` 卡住假 `respawn()`，
-    證明：(a) 取消當下 `_respawn_child()` 正確拋出 `CancelledError`（不吞、不誤判恢復
-    成功）；(b) 放行卡住的背景執行緒後，它仍能安全跑完（`_reap_late_respawn` 收割，不
-    會讓例外憑空消失、也不會有任何未捕捉例外從 done callback 洩出打斷其他邏輯）。"""
-    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
-
-    class _SlowRespawnChild(_FakeChild):
-        def __init__(self):
-            super().__init__()
-            self.respawn_started = threading.Event()
-            self.respawn_release = threading.Event()
-
-        def respawn(self, expected_generation):
-            self.respawn_started.set()
-            self.respawn_release.wait(timeout=5)
-            return super().respawn(expected_generation)
-
-    child = _SlowRespawnChild()
-    r = _runner(tr, child, buf)
-    r.ensure_child()   # generation 現在是 1，starts=1
-
-    task = asyncio.create_task(r._respawn_child())
-    await _until(lambda: child.respawn_started.is_set())
-
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    # 放行卡住的背景執行緒——respawn() 這才真正跑完（呼叫端早就已經被取消、放棄等待）。
-    child.respawn_release.set()
-    await _until(lambda: child.starts >= 2, timeout=3)   # 背景執行緒確實跑完了 respawn
-    assert child.alive is True          # 新 child 正常換上，沒有因為呼叫端取消而爛尾
-    assert child.generation == 2
-
-
-async def test_respawn_stale_generation_no_op_does_not_touch_already_replaced_child(tmp_path):
-    """R4-a（HIGH）：`_respawn_child()` 捕捉 `expected_generation` 之後，底層
-    `ChildHandle.respawn()` 真正執行時目標 generation 已經被別的呼叫換過（模擬「遲到的
-    respawn」危險情境——舊版拆成兩個獨立 to_thread 呼叫時，遲到的 terminate/start 會直接
-    覆寫已經換上的新 child）——新版單一 transaction 必須整個 no-op，完全不 terminate、
-    不 start，回傳 False，且完全不動已經在跑的（更新一代的）child。"""
-    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
-
-    class _BlockingRespawnChild(_FakeChild):
-        def __init__(self):
-            super().__init__()
-            self.entered = threading.Event()
-            self.release = threading.Event()
-
-        def respawn(self, expected_generation):
-            # 卡在「已經拿到鎖、正要核對 generation」的那一刻，讓測試有機會在核對真正
-            # 執行之前，模擬另一個合法呼叫已經把 generation 換過去。
-            self.entered.set()
-            self.release.wait(timeout=5)
-            return super().respawn(expected_generation)
-
-    child = _BlockingRespawnChild()
-    r = _runner(tr, child, buf)
-    r.ensure_child()   # generation=1, starts=1
-
-    task = asyncio.create_task(r._respawn_child())
-    await _until(lambda: child.entered.is_set())   # respawn() 已經進入、正卡在 release.wait()
-
-    # 這段期間，另一個合法呼叫（例如新 session 的 ensure_child()）已經把 generation 換過去。
-    child.generation = 2
-    child.alive = True
-    starts_before = child.starts
-
-    child.release.set()   # 放行——respawn(1) 這才真正核對 generation
-
-    ok = await task
-    assert ok is False                  # 過期呼叫視為失敗，交下一輪重新對帳
-    assert child.starts == starts_before  # 完全沒有多 terminate/start 一次
-    assert child.generation == 2          # 目前這一代（合法換上的）沒有被誤動
-
-
-async def test_recover_final_reverify_ping_catches_new_fault_between_respawn_and_clear(tmp_path):
-    """R4-b（HIGH）：respawn＋ping_detail 都已成功、進入 persist_only 之後——`_recover()`
-    清 sentinel 前必須再重驗一次 child 是否仍然健康。用一個會在「第二次」被 ping 時回報
-    又 latch 的假 child，模擬「respawn 成功那一刻是健康的，但清 sentinel 前這段窗口內
-    child 又 trip 了一次」——必須保留 latch，不清 sentinel、不解 latch，且交下一輪重新
-    respawn（`_respawn_stage` 重設回 None，不是繼續卡在 persist_only 原地打轉，latch 一旦
-    trip 不會 rearm，原地重試沒有意義）。"""
-    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
-
-    class _RelatchOnSecondPingChild(_FakeChild):
-        def __init__(self):
-            super().__init__()
-            self.ping_detail_calls = 0
-
-        def ping_detail(self, *, timeout):
-            self.ping_detail_calls += 1
-            # 第一次 ping（_respawn_child 內部的快速確認）健康；第二次起（_recover 清
-            # sentinel 前的最終重驗）回報又 latch——模擬窗口內的新故障。
-            if self.ping_detail_calls == 1:
-                return {"ok": True, "latched": False}
-            return {"ok": True, "latched": True}
-
-    child = _RelatchOnSecondPingChild()
-    r = _runner(tr, child, buf, recovery_probe_interval=0.02,
-                respawn_backoff_base=0.01, respawn_backoff_max=0.05)
-    r.ensure_child()
-    task = asyncio.create_task(r.run_once())
-    await _until(lambda: len(tr.healths()) >= 1)
-
-    child.push_failstop("boom")
-    await _until(lambda: r._latched)
-
-    await asyncio.sleep(0.15)   # 讓 recover 跑過：respawn 成功 → 最終重驗發現又 latch
-    assert r._latched is True           # 保留 latch，沒有被誤判成 healthy
-    assert buf.has_sentinel()           # sentinel 沒被清掉
-    assert not any(
-        h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths()
-    )
-    assert r._respawn_stage is None     # 沒有卡在 persist_only 原地空轉（latch 無 rearm）
-    assert child.ping_detail_calls >= 2  # 確實做過「respawn 後」與「清 sentinel 前」兩次 ping
-
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-
-
-async def test_recover_persist_only_round_reverifies_child_before_persisting(tmp_path, monkeypatch):
-    """R4-b（HIGH）：舊版 `_respawn_stage == "persist_only"` 的輪次完全跳過 child 重驗，
-    直接嘗試持久化——這裡白箱直接讓 runner 進入 persist_only 狀態（模擬先前輪已經成功
-    respawn，只差持久化），並讓 child 的重驗 ping 回報「又故障了」，驗證 `_recover()`
-    必須先偵測到才中止：完全不呼叫任何持久化步驟（`set_health_epoch`/`clear_sentinel`
-    皆未被呼叫過），保留 latch，且 `_respawn_stage` 重設回 None（不留在 persist_only
-    原地空轉——child 本地 latch 無 rearm，原地重試沒有意義）。"""
-    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
-    r = _runner(tr, child, buf, respawn_backoff_base=0.01, respawn_backoff_max=0.05)
-    r.ensure_child()
-
-    await r._latch("boom")
-    assert r._latched is True
-
-    # 白箱設定：模擬「先前輪已經成功 respawn，只差持久化」的 persist_only 狀態——不必真的
-    # 先走一輪成功的 respawn，直接讓 _recover() 從 persist_only 分支開始執行。
-    r._respawn_stage = "persist_only"
-    child.respawn_latched = True   # 這一輪的重驗 ping 會回報「又故障了」
-
-    persist_calls: list[int] = []
-    clear_calls: list[int] = []
-    monkeypatch.setattr(buf, "set_health_epoch", lambda epoch: persist_calls.append(epoch))
-    monkeypatch.setattr(buf, "clear_sentinel", lambda: clear_calls.append(1))
-    starts_before = child.starts
-
-    await r._recover()
-
-    assert persist_calls == []          # 完全沒有嘗試持久化——被重驗擋在前面
-    assert clear_calls == []
-    assert r._latched is True           # 沒有因為「persist_only 跳過重驗」而誤判 healthy
-    assert buf.has_sentinel()
-    assert child.starts == starts_before   # 這一輪本身沒有立刻又 respawn（真登入）
-    assert r._respawn_stage is None     # 重驗失敗 → 重設，交下一輪重新走完整 respawn
 
 
 async def test_watchdog_notice_generation_recheck_inside_latch_lock_after_regenerate(tmp_path):

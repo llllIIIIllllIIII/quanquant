@@ -373,3 +373,27 @@ _wrap_on_raw`／`_trigger_failstop_latch`），退化寫入是否成功只影響
 後、RPC 尚未真正排程執行前」的 asyncio 排程競態窗，是①「SDK child 的 callback 落地失敗
 → 經 IPC 通知父程序」這條鏈之外，child 本地額外補的一道更即時防線，父 latch（②-⑧）續管
 sentinel/epoch/health 等跨程序協調責任不變。
+
+**(g) G2④ 解除動作（recovery）實現為 session-restart，而非原地 respawn child（codex 終審
+round5 收斂）**
+
+§4 D9「G2 fail-stop 狀態機」④「解除條件＝storage probe（對同一 buffer 寫入→commit→讀回）
+才准回報 `status="ok"`」這個**解除條件**本身不變；但 codex 終審 round3-5 對「解除條件通過
+之後的**恢復動作**該怎麼做」連續三輪發現縫（R3-4 respawn 專屬 backoff、R4-a/b/c/d
+shield/收割/重驗/帳號 fatal、R5-a 收尾未完成 account/fatal/ping 語意、R5-b sentinel
+compare-and-clear 非原子、R5-d mismatch cleanup 又是未 fenced worker）——根因是「原地
+respawn」要求在一個**活著的** asyncio session 內原子替換 child process，每加一層 fencing
+就冒出更窄的 late-worker/TOCTOU，打地鼠打不完。round5 裁決把恢復動作改為：**探針通過→
+持久化 epoch／清 sentinel→解 latch→結束整條 session（terminate child，best-effort）→
+交給 `run_forever()` 既有的 session 迴圈重啟**，新 session 走既有硬化 spawn 路徑
+（`ensure_child()`，含既有帳號不符 fatal）→重新登入→`UpLogin` 宣告新 epoch→server
+`pending_health`→heartbeat ok。原地 respawn 的專屬機制（`AgentRunner._respawn_child()`、
+`ChildHandle.respawn(expected_generation)`、`_respawn_stage`/`_respawn_backoff*`）整組
+移除；`SessionRestartRequested`（`runner.py`）是新增的內部控制流訊號，`run_forever()`
+特別處理（不當一般例外記錄、且強制不因「session 存活時間跨過 stable_session_seconds」而
+重設重連 backoff，避免持續故障下登入頻率失控——詳細推演見
+`.superpowers/sdd/codex-final-fixes-report.md` Round 5 fixes 段）。這個改動使「無 in-place
+respawn ⇒ 無 late terminate/start worker、無 mismatch cleanup fencing」（R5-a/R5-d 結構性
+消失）、「session 重啟時 `_load_persisted_health()` 重讀 durable 狀態，讓 sentinel 清除的
+TOCTOU 自然收斂」（R5-b 失去殺傷力）——D9④ 的**解除條件**文字不變，只是「解除後具體怎麼把
+系統帶回 healthy」這個實作細節從「原地換血」改為「結束並重啟 session」。

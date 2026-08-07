@@ -226,6 +226,56 @@ def test_dispatch_ping_reports_latched_false_when_no_latch_supplied(tmp_path):
     assert reply["ok"] is True and reply["latched"] is False
 
 
+# ---- Round5 點修（codex 終審 round5）：ChildFailstopLatch.snapshot() 單一鎖內一次讀齊
+# (tripped, fault_seq)——取代舊版 ping 分支「先讀 tripped（無鎖）、再讀 fault_seq（另外
+# 進鎖）」的兩次獨立呼叫，避免兩次讀取之間夾著一次 trip() 造成的不一致快照 ----
+
+
+def test_snapshot_returns_untripped_state_before_trip():
+    latch = ChildFailstopLatch()
+    assert latch.snapshot() == (False, 0)
+
+
+def test_snapshot_returns_tripped_state_and_fault_seq_after_trip():
+    latch = ChildFailstopLatch()
+    latch.trip()
+    assert latch.snapshot() == (True, 1)
+
+
+def test_snapshot_matches_tripped_and_fault_seq_properties_exactly():
+    """`snapshot()` 與既有的 `tripped`/`fault_seq` 兩個獨立 property 語意上必須完全等價
+    （只是原子性不同）——這裡驗證形狀一致，不是引入新的語意。"""
+    latch = ChildFailstopLatch()
+    assert latch.snapshot() == (latch.tripped, latch.fault_seq)
+    latch.trip()
+    assert latch.snapshot() == (latch.tripped, latch.fault_seq)
+
+
+def test_dispatch_ping_uses_snapshot_for_atomic_latched_and_fault_seq(tmp_path, monkeypatch):
+    """`_dispatch()` 的 ping 分支改呼叫 `latch.snapshot()`，不再各自獨立呼叫
+    `latch.tripped`／`latch.fault_seq`——用 monkeypatch 讓 `snapshot()` 只被呼叫一次即可
+    佐證（若還殘留舊版兩次獨立呼叫，這裡會偵測到 `tripped`/`fault_seq` property 被
+    呼叫，而不是 `snapshot()`）。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    latch = ChildFailstopLatch()
+    latch.trip()
+    native = fake_native_factory(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
+                                 mode="sim", on_raw=buf.append)
+    native.connect()
+
+    calls: list[str] = []
+    original_snapshot = latch.snapshot
+
+    def _spy_snapshot():
+        calls.append("snapshot")
+        return original_snapshot()
+
+    monkeypatch.setattr(latch, "snapshot", _spy_snapshot)
+    reply = _dispatch(native, {"op": "ping"}, latch=latch, generation=3)
+    assert reply == {"ok": True, "latched": True, "generation": 3, "fault_seq": 1}
+    assert calls == ["snapshot"]   # 恰好一次原子讀取，不是兩次獨立呼叫
+
+
 # ---- R3-3（MEDIUM，codex 終審 round3）：failstop IPC 通知帶上送出當下的 child
 # generation——respawn 換代後，父程序靠這個欄位丟棄舊 child 的過期通知，不誤 latch 目前
 # 這一代健康的 child ----

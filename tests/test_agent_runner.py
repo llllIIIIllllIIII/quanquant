@@ -612,68 +612,18 @@ async def test_cancelled_to_thread_worker_late_arrival_after_respawn_is_discarde
     assert child.alive is True          # 新 child 仍正常存活
 
 
-# ---------- R4-a（HIGH，codex 終審 round4）：`ChildHandle.respawn(expected_generation)`——
-# 把 recovery 用的 terminate+start 收成單一 generation-scoped transaction，取代舊版兩個
-# 獨立、各自可被取消的 to_thread 呼叫（遲到 terminate/遲到 start 都可能誤殺/覆寫新 child）。
+# ---------- Round5（codex 終審 round5 收斂）：`ChildHandle.respawn(expected_generation)`
+# （R4-a 加的 generation-scoped terminate+start transaction）已隨 `AgentRunner.
+# _respawn_child()` 一併移除——recovery 不再原地換血 child，改為結束整個 session、交給
+# `run_forever()`→`ensure_child()` 這條既有硬化路徑重新 spawn（見 runner.py
+# `AgentRunner._recover`/`SessionRestartRequested` docstring）。上面兩支
+# `test_generation_mismatch_after_concurrent_respawn_discards_stale_rpc_without_touching_new_child`
+# /`test_cancelled_to_thread_worker_late_arrival_after_respawn_is_discarded` 測的是
+# `start()`/`terminate()`/`_rpc()` 共用的 `_lock`＋`_generation` fencing 本身（R3-1，保護
+# 「併發 RPC vs. 任何一次 terminate+start 交替」，`ensure_child()` 本來就會呼叫這兩個
+# 方法）——這道防線保留不動，繼續有效；只有 `.respawn()` 這個方法本身連同其專屬測試被
+# 移除。
 # ----------
-
-
-def test_respawn_terminates_old_and_starts_new_atomically_when_generation_matches(tmp_path):
-    """正路：generation 相符時，respawn() 必須真的 terminate 舊 child、start 新的（真
-    spawn，比照既有 `test_child_handle_respawns_after_being_poisoned` 手法），且回傳新
-    child 的 account、generation 前進一代。"""
-    from quanquant.agent.testing import fake_native_factory
-    from quanquant.agent.runner import ChildHandle
-    child = ChildHandle(credentials={"api_key": "k", "secret_key": "s"}, symbol="TXF",
-                        mode="sim", buffer_path=str(tmp_path / "o.db"),
-                        native_factory=fake_native_factory)
-    assert child.start() == "F1"
-    old_process = child._process
-    assert child.generation == 1
-
-    account = child.respawn(1)
-    assert account == "F1"
-    assert child.generation == 2
-    assert old_process.is_alive() is False   # 舊 process 真的被 terminate
-    assert child.alive is True               # 新 process 正常存活
-    child.terminate()
-
-
-def test_respawn_noop_when_generation_advanced_while_waiting_for_lock(tmp_path):
-    """R4-a 競態測試（對應舊版「遲到的 terminate/遲到的 start」危險情境）：respawn() 呼叫端
-    捕捉 `expected_generation=1` 之後、真正拿到鎖之前，若目前 generation 已經被別的呼叫
-    （例如新 session 的 `ensure_child()`）換成 2——這筆呼叫必須整個 no-op（完全不
-    terminate、不 start），不誤殺已經換上的新 child、也不會在它之上再疊一個沒人管的重複
-    child（舊版遲到的 terminate 會誤殺新 child；遲到的 start 會覆寫 handle、洩漏新 child
-    的 process/login——新版單一 transaction 把兩者一起堵住）。"""
-    child = _bare_child_handle(tmp_path)
-    old_process, old_conn = _FakeProcess(), _FakeConn()
-    child._process, child._conn = old_process, old_conn
-    child._generation = 1
-
-    child._lock.acquire()   # 模擬鎖被佔住（respawn 呼叫端卡在等鎖）
-    results: dict[str, object] = {}
-
-    def _stale_respawn():
-        results["ret"] = child.respawn(1)
-
-    t = threading.Thread(target=_stale_respawn)
-    t.start()
-    time.sleep(0.1)   # 讓呼叫端跑過「捕捉 expected_generation=1」，卡在 lock.acquire()
-
-    # 鎖被佔住的這段期間，另一個合法呼叫（例如 ensure_child() 的 start()）已經換上新 child。
-    new_process, new_conn = _FakeProcess(), _FakeConn()
-    child._process, child._conn = new_process, new_conn
-    child._generation = 2
-    child._lock.release()
-
-    t.join(timeout=2)
-    assert results["ret"] is None         # no-op，不是新 child 的 account
-    assert new_process.killed is False    # 沒有被誤殺（沒有「遲到的 terminate」套用到它）
-    assert new_conn.closed is False
-    assert child._process is new_process  # handle 仍指向合法的新 child，沒有被覆寫
-    assert child._conn is new_conn        # 沒有「遲到的 start」疊上第三個 child
-    assert old_process.killed is False    # respawn() 完全沒碰過舊 process（不屬於它的責任）
 
 
 # ---------- codex round2 fix4：帳號不符 → fatal 停止，不進 run_forever 的無限 backoff
