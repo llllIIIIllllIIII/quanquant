@@ -27,10 +27,16 @@ class _FakeTransport:
 class _FakeChild:
     def __init__(self):
         self.ops, self.starts, self.alive = [], 0, False
+        self.generation = 0
         self.ping_ok = True
+        self.latched = False           # N6: ping_detail() 模擬 watchdog 偵測 child latch
         self.request_exc = None
+        self.terminate_exc = None      # N6-1: 模擬 recovery 同步 terminate 失敗
+        self.refuse_to_die = False     # N6-1: terminate 不炸，但 alive 驗不死
+        self.terminate_calls: list[int | None] = []   # 記錄每次呼叫的 expected_generation
     def start(self):
         self.starts += 1
+        self.generation += 1
         self.alive = True
         return "F1"
     def request(self, op, *, timeout):
@@ -40,8 +46,15 @@ class _FakeChild:
         return {"ok": True, "result": {"ordno": "101AA1", "broker_order_id": "101AA1"}}
     def ping(self, *, timeout):
         return self.ping_ok
-    def terminate(self):
-        self.alive = False
+    def ping_detail(self, *, timeout):
+        return {"ok": self.ping_ok, "latched": self.latched,
+                "generation": self.generation, "fault_seq": 1 if self.latched else 0}
+    def terminate(self, *, expected_generation: int | None = None):
+        self.terminate_calls.append(expected_generation)
+        if self.terminate_exc is not None:
+            raise self.terminate_exc
+        if not self.refuse_to_die:
+            self.alive = False
 
 
 async def _until(cond, timeout=3.0):
@@ -256,6 +269,24 @@ async def test_child_frozen_triggers_respawn_and_relogin(tmp_path):
     task = asyncio.create_task(r.run_forever())
     await _until(lambda: child.starts >= 2)       # respawn 過
     child.ping_ok = True
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2)
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_child_watchdog_uses_ping_detail_and_treats_latched_as_frozen(tmp_path):
+    """N6（順帶，codex 終審 round6）：`_child_watchdog` 改用 `ping_detail()`（不再只看
+    `ping()` 的 bool）——child 本地 latch 已 tripped（即使 `ok=True`，pipe 本身仍活著、
+    仍能正常回應）時，watchdog 仍必須視為不健康，觸發既有 `ChildFrozenError` 處理
+    （terminate 目前這個 child + 下一輪 respawn 出全新、未 latch 的 child）。這是
+    `ping_detail` 目前唯一的 production caller（解掉先前的 dead code diagnostic）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.latched = True   # pipe 本身仍活著（ok=True），但 child 本地 latch 已 tripped
+    r = _runner(tr, child, buf)
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: child.starts >= 2)   # watchdog 經 ping_detail 偵測到 latch → respawn
+    child.latched = False                     # 新 child（全新 process）本地未 latch
     await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2)
     r.stop()
     task.cancel()
@@ -612,6 +643,83 @@ async def test_cancelled_to_thread_worker_late_arrival_after_respawn_is_discarde
     assert child.alive is True          # 新 child 仍正常存活
 
 
+# ---------- N6-1（HIGH，codex 終審 round6）：`ChildHandle.terminate(expected_generation=)`
+# fencing——`AgentRunner._recover()` 同步 terminate 呼叫若被取消，底層 thread pool worker
+# 仍可能跑完、很久之後才真正拿到鎖執行到這裡；沒有 fencing 會誤殺已經換代的新 child。----
+
+def test_terminate_generation_mismatch_after_concurrent_respawn_is_noop_for_new_child(
+    tmp_path,
+):
+    """barrier/事件精確控制「舊 terminate 呼叫遲到 vs 新 child」不互殺：`_recover()` 在
+    捕捉 generation=1 之後、真正拿到鎖之前，若併發的 respawn（模擬 `ensure_child()` 的
+    terminate 舊 child、start 新 child）已經搶先換代——這筆 terminate 呼叫拿到鎖後必須
+    發現過期，直接 no-op，完全不碰新一代的 process/conn（不誤殺）。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬「respawn 正在進行中」，佔住鎖
+    results: dict[str, object] = {}
+
+    def _stale_terminate_caller():
+        results["returned"] = child.terminate(expected_generation=1)
+
+    t = threading.Thread(target=_stale_terminate_caller)
+    t.start()
+    time.sleep(0.1)   # 讓呼叫端跑過「捕捉 generation=1」，卡在等鎖
+
+    # respawn 在鎖內完成：換上新一代 process/conn（terminate 舊的、start 新的都要拿同一把
+    # 鎖，所以這裡直接模擬「respawn 已完成」的最終狀態）。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()   # 放行——過期的 terminate 呼叫這才拿得到鎖
+
+    t.join(timeout=2)
+    assert results["returned"] is None    # no-op，正常返回，不 raise
+    assert new_process.killed is False    # 新 child 沒有被誤殺
+    assert new_conn.closed is False       # 新 conn 也沒被碰
+    assert child.alive is True            # 新 child 仍正常存活
+    assert old_process.killed is False    # 舊 process 也沒被碰（呼叫從頭到尾都卡在等鎖）
+
+
+async def test_cancelled_terminate_worker_late_arrival_after_respawn_is_discarded(tmp_path):
+    """`asyncio.to_thread` 的取消不會真的停止底層執行緒——`_recover()` 的 terminate 呼叫
+    若在等鎖期間被取消（例如整條 session 因為別的例外被 `run_once()` 的 finally 收攏），
+    底層 worker thread 仍在背景跑，直到真的走完（可能卡在等 respawn 持有的鎖）。即使這個
+    「孤兒」worker 是在 respawn 完成之後才真正拿到鎖執行到 fencing 核對，generation 比對
+    仍能攔下它，不會誤殺新 session 的 child。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬 respawn 正在進行、佔住鎖
+
+    async def _orphan_terminate():
+        return await asyncio.to_thread(child.terminate, expected_generation=1)
+
+    task = asyncio.create_task(_orphan_terminate())
+    await asyncio.sleep(0.05)   # 讓底層 thread pool worker 真的排進去、卡在 acquire()
+
+    task.cancel()   # 呼叫端（模擬 _recover() 所在的 task）取消——底層 thread 不受影響
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # respawn 完成：換上新一代 process/conn，放鎖——孤兒 worker 這才拿得到鎖。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()
+
+    await asyncio.sleep(0.2)   # 給孤兒 worker 執行緒時間跑完（它會發現 generation 不符、丟棄）
+
+    assert new_process.killed is False  # 沒有被誤殺
+    assert new_conn.closed is False
+    assert child.alive is True          # 新 child 仍正常存活
+
+
 # ---------- Round5（codex 終審 round5 收斂）：`ChildHandle.respawn(expected_generation)`
 # （R4-a 加的 generation-scoped terminate+start transaction）已隨 `AgentRunner.
 # _respawn_child()` 一併移除——recovery 不再原地換血 child，改為結束整個 session、交給
@@ -668,6 +776,84 @@ def test_child_handle_start_raises_fatal_agent_error_on_account_mismatch(tmp_pat
         child.start()
     assert "F1" in str(exc_info.value) and "F2" in str(exc_info.value)
     assert child.alive is False
+
+
+# ---------- N6-3（MEDIUM，codex 終審 round6）：session 結束原因確定性優先序 ----------
+# asyncio.wait(FIRST_EXCEPTION) 的 done set 可能同時收攏多個例外——set 迭代順序不保證，
+# 「取第一個」等同碰運氣。改用 _select_session_end_exception() 依確定性優先序（
+# FatalAgentError ＞ SessionRestartRequested ＞ 其他）挑一個 raise。
+
+
+def test_select_session_end_exception_priority_order(tmp_path):
+    """直測優先序函式本身（快速、決定性，不受 asyncio 排程時序影響）：
+    FatalAgentError ＞ SessionRestartRequested ＞ 其他一般例外，兩兩/三者同框都成立。"""
+    from quanquant.agent.runner import (
+        FatalAgentError, SessionRestartRequested, _select_session_end_exception,
+    )
+
+    fatal = FatalAgentError("fatal")
+    restart = SessionRestartRequested("restart")
+    other1 = RuntimeError("other1")
+    other2 = ConnectionError("other2")
+
+    assert _select_session_end_exception([fatal]) is fatal
+    assert _select_session_end_exception([restart, fatal]) is fatal
+    assert _select_session_end_exception([fatal, restart]) is fatal
+    assert _select_session_end_exception([other1, restart]) is restart
+    assert _select_session_end_exception([restart, other1]) is restart
+    assert _select_session_end_exception([other1, other2]) is other1
+    assert _select_session_end_exception([fatal, restart, other1]) is fatal
+    assert _select_session_end_exception([other1, restart, fatal]) is fatal
+
+
+async def test_run_once_selects_fatal_over_restart_when_both_land_in_done_set(tmp_path):
+    """N6-3 整合驗證之一：兩個完全不 await 就立刻 raise 的假 task（保證都會在
+    `asyncio.wait` 判斷 `done` 之前就完成——`Task.done()`/`.exception()` 的狀態在
+    `__step()` 內同步設定，`asyncio.wait` 對 `done` 的計算發生在更後面的迭代，不看 set
+    迭代順序碰運氣）驗證確定性優先序：FatalAgentError（不可重試）必須勝出，不被同時完成
+    的 SessionRestartRequested 蓋掉。"""
+    from quanquant.agent.runner import FatalAgentError, SessionRestartRequested
+
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+
+    async def _raise_restart():
+        raise SessionRestartRequested("boom-restart")
+
+    async def _raise_fatal():
+        raise FatalAgentError("boom-fatal")
+
+    r._recovery_prober = _raise_restart
+    r._failstop_watchdog = _raise_fatal
+
+    with pytest.raises(FatalAgentError):
+        await r.run_once()
+
+
+async def test_run_once_selects_restart_over_generic_exception_when_both_land_in_done_set(
+    tmp_path,
+):
+    """N6-3 整合驗證之二（反面）：`SessionRestartRequested` 與一般 transport 例外同時
+    完成 → 受控重啟訊號必須勝出，不被一般例外蓋掉——`run_forever()` 才能正確識別
+    「recovery 已完成」，backoff 不被誤判成一般失敗而重設/亂套。"""
+    from quanquant.agent.runner import SessionRestartRequested
+
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+
+    async def _raise_restart():
+        raise SessionRestartRequested("boom-restart")
+
+    async def _raise_transport_error():
+        raise ConnectionError("transport 斷線")
+
+    r._recovery_prober = _raise_restart
+    r._pump = _raise_transport_error
+
+    with pytest.raises(SessionRestartRequested):
+        await r.run_once()
 
 
 # ---------- Task 9（D11/G1 agent 側）：buffer v2＋command_ledger 執行去重 ----------

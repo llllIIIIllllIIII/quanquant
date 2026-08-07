@@ -356,11 +356,15 @@ class _FakeTransport:
 
 
 class _FakeChild:
-    """Round5：不再提供 `.respawn()`/`ping_detail()` 的假體專屬語意——recovery 不再原地
-    換血 child（見 runner.py `AgentRunner._recover`/`SessionRestartRequested` docstring），
+    """Round5：不再提供 `.respawn()` 的假體專屬語意——recovery 不再原地換血 child（見
+    runner.py `AgentRunner._recover`/`SessionRestartRequested` docstring），
     `ensure_child()`（唯一 spawner）只需要 `start()`/`terminate()`/`alive`；`ping()` 供
-    `_child_watchdog` 凍結偵測；`poll_failstop()`/`push_failstop()` 供 `_failstop_watchdog`
-    模擬 child 落地失敗通知。"""
+    `_child_watchdog` 凍結偵測（N6 之後改用 `ping_detail()`）；`poll_failstop()`/
+    `push_failstop()` 供 `_failstop_watchdog` 模擬 child 落地失敗通知。
+
+    N6-1（codex 終審 round6）：`terminate_exc`/`refuse_to_die` 模擬 `_recover()` 步驟 2
+    「同步 terminate 並驗證已死」的兩種失敗模式；`terminate_calls` 記錄每次呼叫附帶的
+    `expected_generation`，供測試斷言 fencing 有沒有被正確傳入。"""
 
     def __init__(self):
         self.alive = False
@@ -368,7 +372,11 @@ class _FakeChild:
         self.generation = 0
         self.ops: list[dict] = []
         self.ping_ok = True
+        self.latched = False           # N6: ping_detail() 模擬 watchdog 偵測 child latch
         self.request_exc = None
+        self.terminate_exc = None
+        self.refuse_to_die = False
+        self.terminate_calls: list[int | None] = []
         self._failstop_queue: list[dict] = []
 
     def start(self):
@@ -386,8 +394,16 @@ class _FakeChild:
     def ping(self, *, timeout):
         return self.ping_ok
 
-    def terminate(self):
-        self.alive = False
+    def ping_detail(self, *, timeout):
+        return {"ok": self.ping_ok, "latched": self.latched,
+                "generation": self.generation, "fault_seq": 1 if self.latched else 0}
+
+    def terminate(self, *, expected_generation: int | None = None) -> None:
+        self.terminate_calls.append(expected_generation)
+        if self.terminate_exc is not None:
+            raise self.terminate_exc
+        if not self.refuse_to_die:
+            self.alive = False
 
     def poll_failstop(self, timeout: float = 0.0):
         if self._failstop_queue:
@@ -503,9 +519,17 @@ async def test_latch_during_ledger_replay_still_returns_cached_ack_not_rejected(
     await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_recover_after_probe_passes_restores_ok_clears_sentinel_sets_epoch(tmp_path):
-    """G2④/⑦：storage probe 通過（buf 本身完好，只是被手動 latch）→ 解除 latch、清
-    sentinel、`health_epoch` 落回 buffer meta、單一序列化 sender 回報最新 status="ok"。"""
+async def test_recover_after_probe_passes_terminates_child_clears_sentinel_ends_session(
+    tmp_path,
+):
+    """G2④/⑦／N6-1/N6-2（HIGH，codex 終審 round6）：storage probe 通過（buf 本身完好，
+    只是被手動 latch）→ 同步 terminate child 並驗證已死 → 解除 latch、清 sentinel、
+    `health_epoch` 落回 buffer meta。Round6 之後 `_recover()` 不再在這個（即將結束的）
+    session 內排任何 status="ok" 的健康訊框——`run_once()` 直接 raise
+    `SessionRestartRequested` 乾淨結束，健康改由下一個 session 宣告（見
+    `test_session_restart_full_chain_recovers_and_new_child_executes_mutating_op`）。"""
+    from quanquant.agent.runner import SessionRestartRequested
+
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
     r.ensure_child()
@@ -515,14 +539,162 @@ async def test_recover_after_probe_passes_restores_ok_clears_sentinel_sets_epoch
     child.push_failstop("boom")
     await _until(lambda: r._latched)
 
-    await _until(lambda: not r._latched, timeout=3)  # 下一輪 probe 自然通過（buf 本身完好）
+    with pytest.raises(SessionRestartRequested):
+        await asyncio.wait_for(task, timeout=3)  # 下一輪 probe 自然通過（buf 本身完好）
+
     assert not buf.has_sentinel()
     assert buf.get_health_epoch() == r._health_epoch == 1
+    assert child.alive is False   # N6-1：raise 之前必須已經同步確認 child 終止
+    assert not any(
+        h["status"] == "ok" and h["health_epoch"] == 1 for h in tr.healths()
+    )   # N6-2：這個（即將結束的）session 全程不排 ok
+
+
+# ===========================================================================
+# N6-1/N6-2（HIGH，codex 終審 round6）：先殺 writer、再清狀態；健康由新 session 宣告。
+# ===========================================================================
+
+
+async def test_recover_keeps_latch_when_terminate_raises_exception(tmp_path):
+    """N6-1：`_recover()` 步驟 2 同步 terminate child 若本身丟例外（kill/join 底層 OS
+    呼叫異常）——必須保留 latch/sentinel 原封不動，完全不繼續往下做任何持久化，也不
+    session-restart（同一個 `run_once()` 不能結束、不能送出任何 ok），留給下一輪
+    `_recovery_prober` 重試。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    child.terminate_exc = RuntimeError("kill 底層 OS 呼叫異常")
+    await asyncio.sleep(0.15)  # 讓至少一輪 _recovery_prober 跑過（probe 會過，terminate 會炸）
+
+    assert r._latched is True
+    assert buf.has_sentinel()
+    assert buf.get_health_epoch() == 0  # 完全沒有持久化（不是先 epoch 才失敗，是根本沒到那步）
+    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
+    assert len([m for m in tr.sent if m["type"] == "login"]) == 1  # 沒有 session-restart
+    assert not task.done()  # 同一個 run_once() 仍在跑，沒有被 raise 打斷
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_recover_keeps_latch_when_child_refuses_to_die_after_terminate(tmp_path):
+    """N6-1：terminate 呼叫本身沒有例外，但驗證 `child.alive` 之後仍是 True（kill/join
+    沒有真正生效，或 fencing 因故 no-op）——同樣保留 latch/sentinel，不繼續持久化、不
+    session-restart。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    child.refuse_to_die = True
+    await asyncio.sleep(0.15)
+
+    assert r._latched is True
+    assert buf.has_sentinel()
+    assert child.alive is True   # 驗不死
+    assert buf.get_health_epoch() == 0
+    assert not any(h["health_epoch"] == 1 and h["status"] == "ok" for h in tr.healths())
+    assert len([m for m in tr.sent if m["type"] == "login"]) == 1
+    assert not task.done()
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_child_dying_gasp_write_happens_before_clear_never_races_replace_unlink(
+    tmp_path, monkeypatch,
+):
+    """N6-1：明確測 replace（child 落地失敗時的 `write_sentinel`）→ unlink（recovery 的
+    `clear_sentinel`）順序——即使 child 在真正被 kill 前的最後一刻又落地一次新 sentinel
+    （模擬 trip 剛好卡在 terminate 生效前），`clear_sentinel()` 只在 `child.alive` 驗證
+    為 False 之後才會被呼叫，這次「死前最後一次 write」必然嚴格發生在 clear 之前
+    （happens-before，不再是 Round5 版本那種「child 可能還活著、寫入與清除可能併發」的
+    真正 TOCTOU）。用共用的呼叫順序記錄斷言：write 恆先於 clear，不會顛倒也不會交錯；
+    recovery 最終仍正常收斂（session-restart 成功，sentinel 乾淨清除）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+
+    order: list[str] = []
+    original_write = buf.write_sentinel
+    original_clear = buf.clear_sentinel
+    original_terminate = child.terminate
+
+    def _tracked_write(*a, **k):
+        order.append("write")
+        return original_write(*a, **k)
+
+    def _tracked_clear(*a, **k):
+        order.append("clear")
+        return original_clear(*a, **k)
+
+    def _dying_gasp_terminate(*a, **k):
+        # 模擬 child 在真正被 kill 前的最後一刻又寫入一次新 sentinel（trip 剛好卡在
+        # terminate 生效前）——這次寫入必須先於下面 recovery 的 clear_sentinel 完成。
+        buf.write_sentinel(epoch=-1, detail="child 死前最後一刻的新故障")
+        return original_terminate(*a, **k)
+
+    monkeypatch.setattr(buf, "write_sentinel", _tracked_write)
+    monkeypatch.setattr(buf, "clear_sentinel", _tracked_clear)
+    monkeypatch.setattr(child, "terminate", _dying_gasp_terminate)
+
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: len(tr.healths()) >= 1)
+    starts_before = child.starts
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+
+    await _until(lambda: child.starts == starts_before + 1, timeout=3)
+    await _until(lambda: not r._latched, timeout=3)
+
+    assert order == ["write", "write", "clear"]   # 恆定 happens-before，不是併發
+    assert not buf.has_sentinel()                 # recovery 正常收斂，session-restart 成功
+
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_old_session_never_sends_ok_between_latch_and_restart_new_session_sends_ok(
+    tmp_path,
+):
+    """N6-2：`_recover()` 不再在解 latch 後、terminate 前排一筆 ok health frame——舊
+    session 在整段「latch 之後、session-restart（第二筆 login 出現）之前」不得送出任何
+    status="ok" 的健康訊框；健康只由 restart 之後的新 session 用自己正常的
+    heartbeat/`_health_sender` 宣告。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: len(tr.healths()) >= 1)
+
+    child.push_failstop("boom")
+    await _until(lambda: r._latched)
+    latch_index = len(tr.sent)
+
+    await _until(
+        lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2, timeout=3
+    )
+    second_login_index = [i for i, m in enumerate(tr.sent) if m["type"] == "login"][1]
+
+    between = tr.sent[latch_index:second_login_index]
+    assert not any(m.get("type") == "health" and m.get("status") == "ok" for m in between)
 
     await _until(lambda: any(
-        h["status"] == "ok" and h["health_epoch"] == 1 for h in tr.healths()
-    ))
+        m.get("type") == "health" and m.get("status") == "ok"
+        for m in tr.sent[second_login_index:]
+    ), timeout=3)
 
+    r.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 

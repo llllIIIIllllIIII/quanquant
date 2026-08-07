@@ -375,7 +375,7 @@ _wrap_on_raw`／`_trigger_failstop_latch`），退化寫入是否成功只影響
 sentinel/epoch/health 等跨程序協調責任不變。
 
 **(g) G2④ 解除動作（recovery）實現為 session-restart，而非原地 respawn child（codex 終審
-round5 收斂）**
+round5 收斂；round6 修正持久化順序）**
 
 §4 D9「G2 fail-stop 狀態機」④「解除條件＝storage probe（對同一 buffer 寫入→commit→讀回）
 才准回報 `status="ok"`」這個**解除條件**本身不變；但 codex 終審 round3-5 對「解除條件通過
@@ -397,3 +397,26 @@ respawn ⇒ 無 late terminate/start worker、無 mismatch cleanup fencing」（
 消失）、「session 重啟時 `_load_persisted_health()` 重讀 durable 狀態，讓 sentinel 清除的
 TOCTOU 自然收斂」（R5-b 失去殺傷力）——D9④ 的**解除條件**文字不變，只是「解除後具體怎麼把
 系統帶回 healthy」這個實作細節從「原地換血」改為「結束並重啟 session」。
+
+**round6 修正（N6-1/N6-2，codex 終審 round6，HIGH）**：round5 版本內部的執行順序是
+「探針通過→持久化 epoch／清 sentinel→解 latch→（鎖外）排一筆 ok health frame→
+best-effort／可取消地 terminate child→raise `SessionRestartRequested`」，這個順序本身
+仍有兩個縫：①清 sentinel 時 child（sentinel 唯一 writer，`native_runner.py
+_trigger_failstop_latch`）可能還活著，`clear_sentinel()`（unlink）與 child 端可能仍在
+進行的 `write_sentinel()`（replace）之間是真正的檔案系統層級 TOCTOU；②terminate 排在解
+latch 之後、且是 best-effort/可取消的，這段期間 server 可能已經因為那筆 ok health frame
+短暫恢復 admission，但實際還在跑的可能是那個已經被判定永久故障、甚至還沒真的死透的舊
+child。round6 裁決把順序改為**先殺 writer、再清狀態；健康由新 session 宣告**：探針通過→
+**同步 terminate child 並驗證已死**（`expected_generation` fencing 防止取消後遲到的
+worker 誤殺新 session 的 child；terminate 失敗或驗不死＝保留 latch/sentinel、本輪放棄、
+交下一輪重試）→persist epoch→清 sentinel（此時 child 已確認死亡，① 的 TOCTOU 結構性
+消失）→解 latch→**不排 ok health frame**、直接 raise `SessionRestartRequested`（② 的
+提前恢復窗口消失，健康改由新 session 自己的正常 heartbeat/`_health_sender` 宣告）。
+`ChildHandle.terminate()` 新增 `expected_generation` 選填參數（沿用 R3-1 的
+`_lock`/`_generation` fencing 機制，不傳則維持既有無條件終止語意，既有呼叫端不受影響）。
+同一輪順帶修正 `_child_watchdog` 改用既有但先前無 production caller 的
+`ChildHandle.ping_detail()`（child 本地 latch 已 tripped 時即使 pipe 仍活著也視為不健康，
+是 failstop IPC 通知失敗時的安全網），以及 `run_once()` 的 `asyncio.wait(FIRST_EXCEPTION)`
+`done` set 可能同時收攏多個例外時的確定性選擇優先序（`FatalAgentError`＞
+`SessionRestartRequested`＞其他）。詳細推演與測試清單見
+`.superpowers/sdd/codex-final-fixes-report.md` Round 6 fixes 段。
