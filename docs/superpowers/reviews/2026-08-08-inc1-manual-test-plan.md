@@ -25,16 +25,16 @@
 
 ## 總覽（先勾選，詳細步驟見下方各節）
 
-| # | 情境 | 結果（PASS/FAIL/備註） |
-|---|---|---|
-| 1 | 單人 in-process 迴歸不壞 | |
-| 2 | token 簽發與 rotation | |
-| 3 | 雙使用者隔離（或替代方案） | |
-| 4 | kill switch 兩層 | |
-| 5 | 斷線收斂（unknown → 補送 → submitted/filled） | |
-| 6 | fail-stop 演練（G2） | |
-| 7 | 歷史 quarantine 清理 | |
-| 8 | place unknown 人工終結程序 | |
+| #   | 情境                                    | 結果（PASS/FAIL/備註） |
+| --- | ------------------------------------- | ---------------- |
+| 1   | 單人 in-process 迴歸不壞                    |                  |
+| 2   | token 簽發與 rotation                    |                  |
+| 3   | 雙使用者隔離（或替代方案）                         |                  |
+| 4   | kill switch 兩層                        |                  |
+| 5   | 斷線收斂（unknown → 補送 → submitted/filled） |                  |
+| 6   | fail-stop 演練（G2）                      |                  |
+| 7   | 歷史 quarantine 清理                      |                  |
+| 8   | place unknown 人工終結程序                  |                  |
 
 ---
 
