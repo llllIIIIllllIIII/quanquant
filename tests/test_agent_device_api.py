@@ -35,6 +35,30 @@ def test_initiate_rate_limited_after_burst(anon_client, monkeypatch):
     get_settings.cache_clear()
 
 
+def test_initiate_per_ip_active_cap_returns_429(anon_client, monkeypatch):
+    from quanquant.config import get_settings
+    get_settings.cache_clear()
+    monkeypatch.setenv("AGENT_DEVICE_CODE_MAX_ACTIVE_PER_IP", "2")
+    get_settings.cache_clear()
+    for _ in range(2):
+        assert _initiate(anon_client)[0].status_code == 200
+    assert _initiate(anon_client)[0].status_code == 429
+    get_settings.cache_clear()
+
+
+def test_initiate_global_active_cap_returns_429(anon_client, monkeypatch):
+    from quanquant.config import get_settings
+    get_settings.cache_clear()
+    # per-IP cap 留預設值（10，遠高於下面的 3 次呼叫）——排除 per-IP cap 干擾，確保觸發的
+    # 是全域上限而不是同 IP 上限。
+    monkeypatch.setenv("AGENT_DEVICE_CODE_MAX_ACTIVE_GLOBAL", "2")
+    get_settings.cache_clear()
+    for _ in range(2):
+        assert _initiate(anon_client)[0].status_code == 200
+    assert _initiate(anon_client)[0].status_code == 429
+    get_settings.cache_clear()
+
+
 def test_poll_unknown_device_code_returns_404(anon_client):
     resp = anon_client.post("/api/agent/device-token", json={"device_code": "nope", "code_verifier": "v"})
     assert resp.status_code == 404
