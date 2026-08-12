@@ -62,7 +62,15 @@ def build_app(state: GuiSecurityState) -> FastAPI:
     install_security_headers(app)
 
     @app.get("/bootstrap")
-    def bootstrap(secret: str, response: Response) -> Response:
+    async def bootstrap(secret: str, response: Response) -> Response:
+        # 必須是 async def：sync def 的路由函式 FastAPI 會丟進 thread-pool 執行——真
+        # OS 執行緒併發下，consume_bootstrap() 的 check-then-set（bootstrap_consumed
+        # 判斷＋寫入）沒有鎖保護，兩個併發的首請求（瀏覽器 prefetch/雙擊/防毒掃連結）
+        # 可能都通過檢查、各自發出不同 session_token，只有最後寫入的存活，另一個拿到
+        # 的 cookie 永久失效且 secret 已消費——需要重啟整個 GUI 程序才能復原。改
+        # async def 後這個路由整段（含 consume_bootstrap，內部無任何 await）在單執行緒
+        # event loop 上原子執行，不會有其他 request 插入到 check 與 set 之間，不需要
+        # 額外的鎖。
         consume_bootstrap(state, response, secret=secret)
         # 303 導到乾淨 URL（不帶 secret）。刻意沿用同一個 response 物件（而非另外
         # `return RedirectResponse(...)`）——FastAPI 對路由函式回傳「另一個」Response
