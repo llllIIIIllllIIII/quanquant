@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <title>QuanQuant Agent 狀態</title>
+  <meta http-equiv="refresh" content="1;url=/status">
+  <style>
+    body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; }
+    dt { font-weight: 700; margin-top: 0.5rem; }
+    dd { margin-left: 0; margin-bottom: 0.25rem; }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 0.25rem; background: #eee; }
+    .badge-connected { background: #d4f5d4; }
+    .badge-connecting, .badge-reconnecting { background: #fff3cd; }
+    .badge-offline, .badge-rejected { background: #eee; color: #666; }
+    .failstop-banner { background: #b00020; color: #fff; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; }
+    .failstop-banner h2 { margin-top: 0; }
+    .token-warning { color: #b06000; font-weight: 700; }
+    .banner { padding: 0.75rem 1rem; border-radius: 0.5rem; margin: 1rem 0; background: #eef; }
+    .banner-error { background: #ffe0e0; color: #b00020; }
+    section { margin: 1.5rem 0; padding-top: 1rem; border-top: 1px solid #ddd; }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .hint { color: #666; font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>Agent 狀態</h1>
+
+  {% if banner %}
+  <div class="banner {{ 'banner-error' if banner_error else '' }}">{{ banner }}</div>
+  {% endif %}
+
+  {% if snap.latched %}
+  <div class="failstop-banner">
+    <h2>⚠ FAIL-STOP：Agent 已停止下單／改單／刪單</h2>
+    <p>{{ snap.latch_detail }}</p>
+    <p>{{ failstop_guidance }}</p>
+  </div>
+  {% endif %}
+
+  <dl>
+    <dt>連線狀態</dt>
+    <dd><span class="badge badge-{{ snap.connection }}">{{ connection_label }}（{{ snap.connection }}）</span></dd>
+
+    <dt>模式</dt>
+    <dd>{{ snap.mode }}{% if snap.mode == "sim" %}（模擬單）{% endif %}</dd>
+
+    <dt>帳號</dt>
+    <dd>{{ snap.account or "（尚未登入）" }}</dd>
+
+    <dt>暫存箱（buffer）待送出</dt>
+    <dd>{{ snap.buffer_pending }} 筆</dd>
+
+    <dt>資料更新時間</dt>
+    <dd>{{ snap.updated_at }}（本頁每 1 秒自動更新）</dd>
+
+    {% if token_expires_at %}
+    <dt>裝置授權到期</dt>
+    <dd class="{{ 'token-warning' if token_expiring_soon else '' }}">
+      {{ token_expires_at }}
+      {% if token_days_left is not none %}（剩餘 {{ token_days_left }} 天）{% endif %}
+      {% if token_expiring_soon %}——即將到期，請儘快重新授權{% endif %}
+    </dd>
+    {% endif %}
+  </dl>
+
+  <section>
+    <h2>重新授權</h2>
+    <form method="post" action="/status/reauth">
+      <label>
+        <input type="checkbox" name="remember_device" {% if remember_device_auth %}checked{% endif %} disabled>
+        記住裝置授權
+      </label>
+      <p class="hint">憑證儲存功能（Task 11）尚未完成，「重新授權」暫時停用；如需重新授權，請先「停止 Agent」再重新啟動，啟動時會重新引導完成裝置授權。</p>
+      <button type="submit" disabled title="憑證儲存模組（Task 11）尚未完成">重新授權</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>清除已存憑證／刪除 profile</h2>
+    <form method="post" action="/status/clear-credential?which=token">
+      <button type="submit" disabled title="憑證儲存模組（Task 11）尚未完成">清除已存登入 token</button>
+    </form>
+    <form method="post" action="/status/clear-credential?which=broker">
+      <button type="submit" disabled title="憑證儲存模組（Task 11）尚未完成">清除已存永豐 API 憑證</button>
+    </form>
+    <p class="hint">刪除 profile 前會先確認暫存箱是否已全部送出，避免尚未送達的資料遺失。</p>
+    <form method="post" action="/status/delete-profile">
+      <button type="submit">刪除 profile（含已存憑證）</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>停止 Agent</h2>
+    <p class="hint">停止後會關閉與伺服器的連線並結束這個視窗；尚未送出的暫存箱資料下次啟動會自動補送。</p>
+    <form method="post" action="/status/stop">
+      <button type="submit">停止 Agent</button>
+    </form>
+  </section>
+</body>
+</html>

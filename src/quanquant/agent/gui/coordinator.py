@@ -37,6 +37,7 @@ from quanquant.agent.gui.security import (
     install_security_headers,
 )
 from quanquant.agent.gui.setup_routes import router as setup_router
+from quanquant.agent.gui.status_routes import router as status_router
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +63,7 @@ def build_app(state: GuiSecurityState) -> FastAPI:
     app = FastAPI(lifespan=_lifespan, openapi_url=None, docs_url=None, redoc_url=None)
     install_security_headers(app)
     app.include_router(setup_router)  # Task 9：/setup 三步精靈＋device flow 輪詢路由
+    app.include_router(status_router)  # Task 10：/status 儀表板＋停止 Agent＋fail-stop 顯示
 
     @app.get("/bootstrap")
     async def bootstrap(secret: str, response: Response) -> Response:
