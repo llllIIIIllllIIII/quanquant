@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import httpx
 from fastapi import Depends, FastAPI
 
-from quanquant.agent.gui.coordinator import attach_runner, build_app, shutdown_runner
+from quanquant.agent.gui.coordinator import attach_runner, build_app, launch_direct, shutdown_runner
 from quanquant.agent.gui.security import (
     GUI_SESSION_COOKIE,
     GuiSecurityState,
@@ -210,3 +210,100 @@ async def test_shutdown_runner_is_idempotent_across_repeated_calls():
     second = await shutdown_runner(app)
     assert first is True and second is True
     assert runner._child.terminate_calls == 2   # 兩次呼叫都安全，第二次一樣是 no-op 結果
+
+
+# ---------------------------------------------------------------------------
+# Task 13 reviewer 必修（Important）：launch_direct() 的 "rejected" 分支——之前零測試
+# 覆蓋，正是根因分析裡 race-prone 的整合點。probe_direct_connect() 本身的『立即返回，
+# 非撞 timeout』行為已在 test_agent_gui_startup_flow.py 鎖住；這裡鎖 launch_direct()
+# 收到 "rejected" 後的收尾：導向 /setup＋重新授權提示，且完全不讀 keyring token 的
+# expires_at（不信任 metadata，只信任 probe 觀察到的真實握手結果）。
+# ---------------------------------------------------------------------------
+
+class _RejectingDirectRunner:
+    """模擬真實 run_forever(stop_on_token_reject=True) 在 TokenRejectedError 分支很快
+    讓 connection 落在 "rejected"——probe_direct_connect() 的輪詢迴圈本身已有獨立測試
+    鎖住（test_agent_gui_startup_flow.py），這裡不重複驗證那段。"""
+
+    def __init__(self):
+        self.connection = "connecting"
+
+    async def snapshot(self):
+        return SimpleNamespace(connection=self.connection)
+
+    async def run_forever(self, *, stop_on_token_reject=False):
+        assert stop_on_token_reject is True  # GUI direct 路徑唯一允許停用無限重試的地方
+        self.connection = "rejected"
+
+
+class _NoExpiresAtPeekToken(dict):
+    """任何讀取 "expires_at" 這個 key 都讓測試直接失敗——鎖住『launch_direct() 不信任
+    keyring metadata，只信任 probe_direct_connect() 的真實握手結果』這條規則。"""
+
+    def __getitem__(self, key):
+        if key == "expires_at":
+            raise AssertionError("launch_direct() 不應讀取 keyring token 的 expires_at")
+        return super().__getitem__(key)
+
+    def get(self, key, default=None):
+        if key == "expires_at":
+            raise AssertionError("launch_direct() 不應讀取 keyring token 的 expires_at")
+        return super().get(key, default)
+
+
+async def test_launch_direct_rejected_branch_redirects_to_setup_and_ignores_expires_at(monkeypatch):
+    import quanquant.agent.buffer as buffer_module
+    import quanquant.agent.keyring_store as keyring_store_module
+    import quanquant.agent.runner as runner_module
+    import quanquant.agent.ws_client as ws_client_module
+
+    fake_runner = _RejectingDirectRunner()
+
+    monkeypatch.setattr(keyring_store_module, "load_token", lambda **kw: _NoExpiresAtPeekToken(
+        token="tok", expires_at="2099-01-01T00:00:00", username="alice",
+    ))
+    monkeypatch.setattr(keyring_store_module, "load_broker_credentials",
+                         lambda **kw: {"api_key": "K1", "secret_key": "S1"})
+    monkeypatch.setattr(buffer_module, "DurableBuffer", lambda path: object())
+    monkeypatch.setattr(runner_module, "ChildHandle", lambda **kw: object())
+    monkeypatch.setattr(runner_module, "AgentRunner", lambda **kw: fake_runner)
+    monkeypatch.setattr(ws_client_module, "WebsocketsTransport", lambda url, *, token: object())
+
+    app = _fake_app()
+    profile = SimpleNamespace(profile_id="1", buffer_path="/x1")
+
+    target_path, notice = await launch_direct(app, profile=profile, site_origin="https://q.example")
+
+    assert target_path == "/setup"
+    assert notice is not None and "重新授權" in notice
+    await asyncio.gather(app.state.runner_task, return_exceptions=True)  # 收尾，避免未回收例外警告
+
+
+# ---------------------------------------------------------------------------
+# Reviewer Minor 2：手動 URL 重入防呆——已有一個尚未結束的 runner 時不重新讀
+# keyring／建構第二個 AgentRunner（避免第二條 WS 連線＋背景 task 洩漏）。
+# ---------------------------------------------------------------------------
+
+async def test_launch_direct_skips_relaunch_when_runner_already_running(monkeypatch):
+    import quanquant.agent.keyring_store as keyring_store_module
+
+    def _must_not_be_called(**kwargs):
+        raise AssertionError("已有 runner 在跑時 launch_direct() 不該再讀 keyring")
+
+    monkeypatch.setattr(keyring_store_module, "load_token", _must_not_be_called)
+    monkeypatch.setattr(keyring_store_module, "load_broker_credentials", _must_not_be_called)
+
+    async def _hang():
+        await asyncio.Event().wait()
+
+    app = _fake_app()
+    app.state.agent_runner = object()
+    app.state.runner_task = asyncio.create_task(_hang())
+
+    profile = SimpleNamespace(profile_id="1", buffer_path="/x1")
+    target_path, notice = await launch_direct(app, profile=profile, site_origin="https://q.example")
+
+    assert target_path == "/status" and notice is None
+
+    app.state.runner_task.cancel()
+    await asyncio.gather(app.state.runner_task, return_exceptions=True)

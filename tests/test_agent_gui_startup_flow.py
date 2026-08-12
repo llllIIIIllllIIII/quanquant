@@ -1,8 +1,12 @@
+import time
+from types import SimpleNamespace
+
 import pytest
 
 from quanquant.agent import keyring_store, profile_registry
 from quanquant.agent.gui.startup_flow import (
-    check_legacy_buffer_conflict, reconcile_profile_after_approval, resolve_gui_startup,
+    check_legacy_buffer_conflict, probe_direct_connect, reconcile_profile_after_approval,
+    resolve_gui_startup,
 )
 
 
@@ -132,3 +136,41 @@ def test_legacy_buffer_conflict_none_when_no_legacy_file(tmp_path, monkeypatch):
     import quanquant.agent.gui.startup_flow as sf
     monkeypatch.setattr(sf, "LEGACY_DEFAULT_BUFFER", tmp_path / "nope.db")
     assert check_legacy_buffer_conflict() is None
+
+
+# ---------------------------------------------------------------------------
+# Reviewer 必修（Important）：probe_direct_connect 的 "rejected"/"connected" 分支
+# 零測試覆蓋——這正是根因分析裡 race-prone 的整合點，鎖住『一旦出現終態就立即返回，
+# 不是靠 timeout 兜底』這個行為，未來重構才不會無聲重新引入競態。
+# ---------------------------------------------------------------------------
+
+class _FlippingRunner:
+    """`snapshot()` 依序回傳 `sequence` 裡的值，最後一個值之後持續回傳同一個值
+    （模擬『後來穩定在某個終態』）。"""
+
+    def __init__(self, sequence):
+        self._sequence = sequence
+        self._calls = 0
+
+    async def snapshot(self):
+        idx = min(self._calls, len(self._sequence) - 1)
+        self._calls += 1
+        return SimpleNamespace(connection=self._sequence[idx])
+
+
+async def test_probe_direct_connect_returns_immediately_once_rejected_appears():
+    runner = _FlippingRunner(["reconnecting", "reconnecting", "rejected", "reconnecting"])
+    start = time.monotonic()
+    result = await probe_direct_connect(runner, timeout=5.0)
+    elapsed = time.monotonic() - start
+    assert result == "rejected"
+    assert elapsed < 1.0  # 遠低於 5.0s timeout——證明是輪詢中途發現終態就返回，不是撞 timeout
+
+
+async def test_probe_direct_connect_returns_immediately_once_connected_appears():
+    runner = _FlippingRunner(["connecting", "connected", "reconnecting"])
+    start = time.monotonic()
+    result = await probe_direct_connect(runner, timeout=5.0)
+    elapsed = time.monotonic() - start
+    assert result == "connected"
+    assert elapsed < 1.0

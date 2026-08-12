@@ -188,7 +188,18 @@ async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str
       `GuiStartupDecision`。
     - 其餘（`"connected"` 或短窗內未定案，純網路延遲）→ 背景連線持續跑，回傳
       `("/status", None)`。
+
+    Reviewer Minor 2：手動 URL 重入防呆——若 `app.state` 已經掛著一個尚未結束的
+    `agent_runner`/`runner_task`（例如使用者在 `/profiles` 選過一次 direct 帳號、瀏覽器
+    倒退再重送 `POST /profiles/select`；或未來任何其他呼叫端重複呼叫這裡），不重新讀
+    keyring／建構第二個 `AgentRunner`（會造成第二條 WS 連線＋第二個背景 task 洩漏，兩者
+    同時碰同一個 buffer/broker 帳號），直接沿用既有 runner，回傳 `("/status", None)`。
     """
+    existing_runner = getattr(app.state, "agent_runner", None)
+    existing_task = getattr(app.state, "runner_task", None)
+    if existing_runner is not None and existing_task is not None and not existing_task.done():
+        return "/status", None
+
     token = keyring_store.load_token(site_origin=site_origin, profile_id=profile.profile_id)
     broker = keyring_store.load_broker_credentials(site_origin=site_origin, profile_id=profile.profile_id)
     if token is None or broker is None:
@@ -217,7 +228,11 @@ async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str
         try:
             await asyncio.wait_for(task, timeout=1.0)
         except asyncio.TimeoutError:
+            # Reviewer Minor 1：cancel() 只是請求取消，task 真正完成（帶著
+            # CancelledError）還要再 await 一次才會被消費——比照 shutdown_runner()
+            # 既有慣例，避免 "Task exception was never retrieved" 警告／未回收的例外。
             task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         return "/setup", "先前記住的授權已失效（token 可能已被撤銷），請重新授權"
     return "/status", None
 
