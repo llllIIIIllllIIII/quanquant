@@ -13,9 +13,15 @@ from quanquant.agent.startup import build_parser, canonicalize_site, resolve_sta
     ("https://quant.example:8443", "https://quant.example:8443"),
     ("http://127.0.0.1:8000", "http://127.0.0.1:8000"),        # loopback 允許 http
     ("http://127.0.0.1:80", "http://127.0.0.1"),
+    ("https://[::1]:8443", "https://[::1]:8443"),               # IPv6 literal 保留括號
+    ("https://[2001:db8::1]", "https://[2001:db8::1]"),
 ])
 def test_canonicalize_site_normalizes(raw, expected):
     assert canonicalize_site(raw) == expected
+
+
+def test_ws_url_for_preserves_ipv6_brackets():
+    assert ws_url_for("https://[::1]:8443") == "wss://[::1]:8443/ws/agent"
 
 
 @pytest.mark.parametrize("raw", [
@@ -65,6 +71,12 @@ def test_gui_with_buffer_is_parser_error():
         parser.parse_args(["--gui", "--site", "https://q.example", "--buffer", "/x"])
 
 
+def test_reset_without_site_is_parser_error():
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--reset"])
+
+
 # ---- 七層優先序 ----
 
 def _args(**overrides):
@@ -103,6 +115,14 @@ def test_layer6_tty_with_site_and_no_env_trio_goes_gui():
 
 def test_layer7_fallback_headless_when_no_tty_no_site_no_env():
     plan = resolve_startup_plan(_args(), env={}, is_tty=False)
+    assert plan.headless is True
+
+
+def test_layer7_tty_without_site_falls_back_to_headless():
+    """縫隙情境（最常見）：互動式終端機、沒給 --site、env 三件套不齊——層6 要求
+    `args.site` 存在才觸發 GUI，這裡 site=None 卡不到層6，落到層7 現行 getpass
+    headless。"""
+    plan = resolve_startup_plan(_args(), env={}, is_tty=True)
     assert plan.headless is True
 
 

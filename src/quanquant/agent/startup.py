@@ -9,10 +9,9 @@
 - `build_parser()`／`resolve_startup_plan()`：CLI 七層優先序（由上而下先命中先生效，
   見 module 內 `resolve_startup_plan` docstring）。
 
-`agent/main.py` 保留自己原有（Inc0）的窄範圍 `build_parser()`（僅
-`--server`/`--mode`/`--symbol`/`--buffer`，`--server`/`--buffer` 預設沿用 env-based
-舊行為）供既有測試/外部呼叫端相容（G5 紅線：那個函式的輸出逐位不變）；`main()` 實際
-解析真正 `sys.argv` 改用這裡的 `build_parser()`（七層優先序的超集合 parser）。
+`agent/main.py` 直接重新匯出這裡的 `build_parser()`／`resolve_startup_plan()`（唯一
+parser，不再另外維護一份 Inc0 窄範圍 parser——見 reviewer 裁決，`main.py` 模組
+docstring 有完整理由）。
 """
 import argparse
 import ipaddress
@@ -66,7 +65,12 @@ def canonicalize_site(raw: str) -> str:
     if port == default_port:
         port = None
 
-    origin = f"{parts.scheme}://{host}"
+    # `parts.hostname` 回傳裸位址（IPv6 literal 不含中括號，如 "::1"）——reassemble 回
+    # origin 字串時若原本是 IPv6（host 含 ":"）必須補回 "[...]"，否則
+    # "https://::1:8443" 這種字串在 port 前完全無法分辨位址與 port 的邊界，是無效 URL
+    # 且會被後續消費者（`ws_url_for`／WS 連線）靜默帶著錯誤位址繼續跑。
+    host_literal = f"[{host}]" if ":" in host else host
+    origin = f"{parts.scheme}://{host_literal}"
     if port is not None:
         origin += f":{port}"
     return origin

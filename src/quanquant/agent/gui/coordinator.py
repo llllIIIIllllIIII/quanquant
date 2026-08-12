@@ -243,13 +243,25 @@ async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str
         return "/setup", "此帳號的 Agent 已在執行中"
 
     ws_url = _derive_ws_url(site_origin)
-    runner = AgentRunner(
-        transport=WebsocketsTransport(ws_url, token=token["token"]),
-        buffer=DurableBuffer(profile.buffer_path),
-        child=ChildHandle(credentials=broker, symbol=_DEFAULT_SYMBOL, mode="sim",
-                           buffer_path=profile.buffer_path),
-        mode="sim",
-    )
+    # Critical fix（reviewer 判定）：lock 已經 acquire，建構過程（`DurableBuffer` 可能
+    # 真的拋 `RefuseStartError`；`AgentRunner`/`ChildHandle`/`WebsocketsTransport`
+    # 同樣可能因設定異常拋例外）若不接住就洩漏 lock fd——同一個 profile 之後永遠回報
+    # 「已在執行中」，直到整個 GUI 程序重啟才會因程序結束連帶釋放。比照
+    # `setup_routes.py::setup_step3_launch` 的既有 try/except 慣例：release 後轉為
+    # 主題化提示（GUI 保持存活，不讓例外原樣往上炸協調器），不 raise。
+    try:
+        runner = AgentRunner(
+            transport=WebsocketsTransport(ws_url, token=token["token"]),
+            buffer=DurableBuffer(profile.buffer_path),
+            child=ChildHandle(credentials=broker, symbol=_DEFAULT_SYMBOL, mode="sim",
+                               buffer_path=profile.buffer_path),
+            mode="sim",
+        )
+    except Exception:
+        lock.release()
+        log.exception("launch_direct: 建構 agent runner 失敗")
+        return "/setup", "啟動失敗，請確認伺服器位址與憑證正確後重試。"
+
     app.state.agent_runner = runner
     app.state.instance_lock = lock
     task = asyncio.create_task(runner.run_forever(stop_on_token_reject=True))

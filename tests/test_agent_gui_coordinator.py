@@ -457,3 +457,43 @@ async def test_launch_direct_rejected_branch_releases_instance_lock(monkeypatch,
     probe_lock = profile_registry_module.InstanceLock(buffer_path)
     probe_lock.acquire()   # lock 已釋放，這裡不該拋 AgentAlreadyRunningError
     probe_lock.release()
+
+
+async def test_launch_direct_releases_lock_when_runner_construction_fails(monkeypatch, tmp_path):
+    """Critical fix（reviewer 判定）：`lock.acquire()` 後 `AgentRunner`/`DurableBuffer`
+    等建構若真的拋例外（例如 `DurableBuffer.__init__` 的 `RefuseStartError`），先前完全
+    沒有 try/except 包住，lock fd 會直接洩漏——同一個 profile 之後永遠回報「已在執行
+    中」，直到重啟整個 GUI 程序才會因程序結束而連帶釋放。比照
+    `test_step3_launch_releases_lock_when_runner_construction_fails`（setup_routes.py
+    那一半）鎖住同一條規則。"""
+    import quanquant.agent.buffer as buffer_module
+    from quanquant.agent import profile_registry as profile_registry_module
+    import quanquant.agent.keyring_store as keyring_store_module
+    import quanquant.agent.runner as runner_module
+    import quanquant.agent.ws_client as ws_client_module
+
+    def _boom(**kwargs):
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(keyring_store_module, "load_token", lambda **kw: {
+        "token": "tok", "expires_at": "2099-01-01T00:00:00", "username": "alice",
+    })
+    monkeypatch.setattr(keyring_store_module, "load_broker_credentials",
+                         lambda **kw: {"api_key": "K1", "secret_key": "S1"})
+    monkeypatch.setattr(buffer_module, "DurableBuffer", lambda path: object())
+    monkeypatch.setattr(runner_module, "ChildHandle", lambda **kw: object())
+    monkeypatch.setattr(runner_module, "AgentRunner", _boom)
+    monkeypatch.setattr(ws_client_module, "WebsocketsTransport", lambda url, *, token: object())
+
+    buffer_path = tmp_path / "outbox.db"
+    app = _fake_app()
+    profile = SimpleNamespace(profile_id="1", buffer_path=str(buffer_path))
+
+    target_path, notice = await launch_direct(app, profile=profile, site_origin="https://q.example")
+    assert target_path == "/setup"
+    assert notice is not None
+    assert app.state.agent_runner is None
+
+    probe_lock = profile_registry_module.InstanceLock(buffer_path)
+    probe_lock.acquire()   # 若沒釋放，這裡會拋 AgentAlreadyRunningError
+    probe_lock.release()
