@@ -9,12 +9,63 @@
 - `gui_status_client_latched`：sentinel 記著 latch（`_load_persisted_health` 讀入）。
 - `gui_status_client_pending_buffer`：buffer 有未送資料。
 """
+import asyncio
+
 import httpx
+import keyring
+import keyring.errors
 import pytest
 
+from quanquant.agent import keyring_store, profile_registry
+from quanquant.agent.device_flow_client import AGENT_AUTHORIZE_PATH
 from quanquant.agent.gui.coordinator import build_app
 from quanquant.agent.gui.security import GUI_SESSION_COOKIE, GuiSecurityState
+from quanquant.agent.profile_registry import ProfileEntry
 from quanquant.agent.runner import AgentRunner
+
+_DEFAULT_PROFILE = ProfileEntry(
+    profile_id="42", username="tester",
+    buffer_path="/tmp/fake-status-buffer-profile.db", created_at="2026-01-01T00:00:00",
+)
+
+
+class _FakeSecureBackend(keyring.backend.KeyringBackend):
+    """比照 `tests/test_agent_keyring_store.py::_FakeSecureBackend`：純記憶體 fake
+    backend，測試絕不碰真正的系統 keychain。"""
+    priority = 1
+
+    def __init__(self) -> None:
+        self._store: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service, key):
+        return self._store.get((service, key))
+
+    def set_password(self, service, key, value):
+        self._store[(service, key)] = value
+
+    def delete_password(self, service, key):
+        if (service, key) not in self._store:
+            raise keyring.errors.PasswordDeleteError("not found")
+        del self._store[(service, key)]
+
+
+@pytest.fixture
+def fake_keyring_backend(monkeypatch):
+    backend = _FakeSecureBackend()
+    monkeypatch.setattr(keyring, "get_keyring", lambda: backend)
+    monkeypatch.setattr(keyring, "get_password", backend.get_password)
+    monkeypatch.setattr(keyring, "set_password", backend.set_password)
+    monkeypatch.setattr(keyring, "delete_password", backend.delete_password)
+    return backend
+
+
+@pytest.fixture(autouse=True)
+def _isolated_profile_registry(tmp_path, monkeypatch):
+    """比照 `tests/test_agent_profile_registry.py`：全檔 autouse，隔離
+    `~/.quanquant-agent/profiles.json`，避免任何 delete_profile 測試不小心動到本機真實
+    registry。"""
+    monkeypatch.setattr(profile_registry, "REGISTRY_PATH", tmp_path / "profiles.json")
+    monkeypatch.setattr(profile_registry, "LOCK_PATH", tmp_path / "profiles.lock")
 
 
 class _FakeBuffer:
@@ -49,7 +100,11 @@ class _FakeChild:
 
 
 def _build_app(*, port: int, pending: int = 0, sentinel: dict | None = None,
-                terminate_result: bool = True):
+                terminate_result: bool = True, profile: ProfileEntry | None = _DEFAULT_PROFILE):
+    """`profile`：預設帶一個固定 `ProfileEntry`（模擬精靈完成後 `gui_current_profile`
+    已寫入的正常狀態，見 `status_routes._current_profile`）——`clear_credential`／
+    `delete_profile`／`reauth` 三個 handler 都要靠它定位 keyring/registry 筆。傳
+    `profile=None` 模擬『無法定位目前 profile』的防禦分支。"""
     state = GuiSecurityState(port=port)
     state.session_token = f"test-status-session-{port}"
     app = build_app(state)
@@ -61,6 +116,8 @@ def _build_app(*, port: int, pending: int = 0, sentinel: dict | None = None,
         mode="sim",
     )
     app.state.agent_runner = runner
+    if profile is not None:
+        app.state.gui_current_profile = profile
     return app, state
 
 
@@ -221,19 +278,43 @@ async def test_stop_agent_failure_page_still_has_meta_refresh():
 
 
 # ---------------------------------------------------------------------------
-# 補充：刪除 profile 在 buffer 淨空時不誤判為「拒絕」（Task 11/12 尚未落地，先樁接）
+# 終審收口：clear_credential／delete_profile／reauth 真的接上 Task 11（keyring）／
+# Task 12（profile registry），不再是樁接文案。
 # ---------------------------------------------------------------------------
 
-async def test_delete_profile_allows_when_buffer_is_empty_but_stubs_pending_task_11_12():
+async def test_delete_profile_clears_keyring_and_registry_when_buffer_is_empty(fake_keyring_backend):
     app, state = _build_app(port=54406, pending=0)
+    profile = app.state.gui_current_profile
+    keyring_store.save_token(site_origin=app.state.site_origin, profile_id=profile.profile_id,
+                              token="tok", expires_at="2099-01-01T00:00:00", username="u")
+    keyring_store.save_broker_credentials(site_origin=app.state.site_origin, profile_id=profile.profile_id,
+                                           api_key="k", secret_key="s")
+    profile_registry.upsert_profile(site_origin=app.state.site_origin, profile_id=profile.profile_id,
+                                     username=profile.username, buffer_path=profile.buffer_path)
+
     async with _client_for(app, state) as client:
         resp = await client.post("/status/delete-profile")
+
     assert resp.status_code == 200
-    assert "Task 11" in resp.text or "Task 12" in resp.text
+    assert "已刪除" in resp.text
+    assert keyring_store.load_token(site_origin=app.state.site_origin, profile_id=profile.profile_id) is None
+    assert keyring_store.load_broker_credentials(
+        site_origin=app.state.site_origin, profile_id=profile.profile_id) is None
+    assert profile_registry.find_profile(site_origin=app.state.site_origin, profile_id=profile.profile_id) is None
+
+
+async def test_delete_profile_rejects_when_profile_unidentifiable():
+    app, state = _build_app(port=54417, pending=0, profile=None)
+    async with _client_for(app, state) as client:
+        resp = await client.post("/status/delete-profile")
+    assert resp.status_code == 409
+    assert "無法識別" in resp.text
 
 
 # ---------------------------------------------------------------------------
-# 補充：重新授權／清除已存憑證——Task 11 尚未落地，回應樁接文案而非裸例外
+# 補充：重新授權——「未勾」分支維持既有指引文案；「已勾記住」分支見 module docstring
+# 「重新授權」段：InstanceLock 已被目前這個 runner 持有，不能透過整套精靈重跑，改跑獨立
+# 一輪 device flow，核准後直接 rotate_token_secret 寫入 keyring。
 # ---------------------------------------------------------------------------
 
 async def test_reauth_not_remembering_shows_restart_guidance():
@@ -244,21 +325,103 @@ async def test_reauth_not_remembering_shows_restart_guidance():
     assert "停止 Agent" in resp.text and "重新啟動" in resp.text
 
 
-async def test_reauth_remembering_shows_keyring_stub_notice():
+def _reauth_device_flow_handler(profile_id: str, username: str = "tester"):
+    """approved 回應的 `profile_id` 可調整——供 mismatch 測試指定一個不同於目前 profile
+    的值。"""
+    def _handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/agent/device-code":
+            return httpx.Response(200, json={
+                "device_code": "test-reauth-device-code", "user_code": "REAUTH-CODE",
+                "verification_path": AGENT_AUTHORIZE_PATH, "interval": 0, "expires_in": 600,
+            })
+        return httpx.Response(200, json={
+            "state": "approved", "token": "new-rotated-token", "profile_id": profile_id,
+            "username": username, "token_expires_at": "2099-01-01T00:00:00",
+        })
+    return _handler
+
+
+async def test_reauth_remembering_completes_and_rotates_keyring_token(fake_keyring_backend):
     app, state = _build_app(port=54408)
+    profile = app.state.gui_current_profile
+    app.state.agent_http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_reauth_device_flow_handler(profile.profile_id)),
+        base_url=app.state.site_origin,
+    )
+    try:
+        async with _client_for(app, state) as client:
+            resp = await client.post("/status/reauth", data={"remember_device": "on"})
+            assert resp.status_code == 200
+            await asyncio.wait_for(app.state.reauth_task, timeout=2)
+            resp2 = await client.get("/status")
+        assert app.state.reauth_success is True
+        assert "已重新授權" in resp2.text
+        loaded = keyring_store.load_token(site_origin=app.state.site_origin, profile_id=profile.profile_id)
+        assert loaded is not None and loaded["token"] == "new-rotated-token"
+    finally:
+        await app.state.agent_http_client.aclose()
+
+
+async def test_reauth_remembering_rejects_when_approved_account_differs_from_current_profile(
+    fake_keyring_backend,
+):
+    app, state = _build_app(port=54418)
+    profile = app.state.gui_current_profile
+    app.state.agent_http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(_reauth_device_flow_handler("some-other-profile-id")),
+        base_url=app.state.site_origin,
+    )
+    try:
+        async with _client_for(app, state) as client:
+            await client.post("/status/reauth", data={"remember_device": "on"})
+            await asyncio.wait_for(app.state.reauth_task, timeout=2)
+            resp2 = await client.get("/status")
+        assert app.state.reauth_error == "ProfileMismatch"
+        assert "帳號" in resp2.text and "不同" in resp2.text
+        assert keyring_store.load_token(
+            site_origin=app.state.site_origin, profile_id=profile.profile_id) is None
+    finally:
+        await app.state.agent_http_client.aclose()
+
+
+async def test_reauth_remembering_rejects_when_profile_unidentifiable():
+    app, state = _build_app(port=54419, profile=None)
     async with _client_for(app, state) as client:
         resp = await client.post("/status/reauth", data={"remember_device": "on"})
-    assert resp.status_code == 200
-    assert "Task 11" in resp.text
+    assert resp.status_code == 409
+    assert "無法識別" in resp.text
+    assert getattr(app.state, "reauth_task", None) is None  # 沒有 profile 就不啟動任何背景 task
 
 
-async def test_clear_credential_stubs_for_token_and_broker():
+# ---------------------------------------------------------------------------
+# 終審收口：清除已存憑證——真的呼叫 keyring_store.clear_secret，token/broker 各自獨立。
+# ---------------------------------------------------------------------------
+
+async def test_clear_credential_calls_keyring_clear_secret_for_token_and_broker(fake_keyring_backend):
     app, state = _build_app(port=54409)
+    profile = app.state.gui_current_profile
+    keyring_store.save_token(site_origin=app.state.site_origin, profile_id=profile.profile_id,
+                              token="tok", expires_at="2099-01-01T00:00:00", username="u")
+    keyring_store.save_broker_credentials(site_origin=app.state.site_origin, profile_id=profile.profile_id,
+                                           api_key="k", secret_key="s")
+
     async with _client_for(app, state) as client:
         resp_token = await client.post("/status/clear-credential", params={"which": "token"})
         resp_broker = await client.post("/status/clear-credential", params={"which": "broker"})
-    assert resp_token.status_code == 200 and "Task 11" in resp_token.text
-    assert resp_broker.status_code == 200 and "Task 11" in resp_broker.text
+
+    assert resp_token.status_code == 200 and "已清除" in resp_token.text
+    assert resp_broker.status_code == 200 and "已清除" in resp_broker.text
+    assert keyring_store.load_token(site_origin=app.state.site_origin, profile_id=profile.profile_id) is None
+    assert keyring_store.load_broker_credentials(
+        site_origin=app.state.site_origin, profile_id=profile.profile_id) is None
+
+
+async def test_clear_credential_rejects_when_profile_unidentifiable():
+    app, state = _build_app(port=54420, profile=None)
+    async with _client_for(app, state) as client:
+        resp = await client.post("/status/clear-credential", params={"which": "token"})
+    assert resp.status_code == 409
+    assert "無法識別" in resp.text
 
 
 async def test_clear_credential_rejects_unknown_which():

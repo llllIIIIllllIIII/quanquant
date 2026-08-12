@@ -59,6 +59,28 @@ async def test_two_different_source_ips_are_recorded_distinctly_through_caddy_ip
 
 
 @pytest.mark.asyncio
+async def test_multi_hop_xff_uses_rightmost_untrusted_real_peer_not_leftmost_forged():
+    """opus 終審測試強化：既有測試只驗過單筆 XFF，補一個多筆案例。header 帶兩段——
+    最左 `1.2.3.4` 是攻擊者可自由偽造、自己塞進請求裡的假位址；最右
+    `198.51.100.9` 模擬真正經過信任 Caddy 轉發時、由 Caddy 附加上去的真實來源
+    （現實中 reverse_proxy 一律「附加」而非覆寫既有 XFF，惡意使用者能左邊塞任何值，
+    但塞不了最右邊那格）。uvicorn `ProxyHeadersMiddleware.get_trusted_client_address()`
+    從右往左掃，找到第一個不在 `trusted_hosts` 的值就採信為 client——這裡驗證結果是
+    最右側那個真實 peer，偽造的最左值完全不被採信，也不等於 Caddy 自己的 IP（避免
+    per-IP 限流被三個位址中的任一個錯誤合流／誤判）。"""
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    app = ProxyHeadersMiddleware(_build_probe_app(), trusted_hosts=["172.28.0.10"])
+    transport = httpx.ASGITransport(app=app, client=("172.28.0.10", 443))
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as c:
+        resp = await c.get("/whoami", headers={"X-Forwarded-For": "1.2.3.4, 198.51.100.9"})
+    resolved_ip = resp.json()["ip"]
+    assert resolved_ip == "198.51.100.9"          # 最右側、非信任的真實 peer 被採信
+    assert resolved_ip != "1.2.3.4"                # 偽造的最左值不被誤判為 client
+    assert resolved_ip != "172.28.0.10"            # 也不會跟 Caddy 自己的位址混淆
+
+
+@pytest.mark.asyncio
 async def test_untrusted_proxy_ip_is_not_honored():
     """偽造來源測試：request 不是從被信任的 172.28.0.10 送來（例如攻擊者直連 app 容器），
     ProxyHeadersMiddleware 不採信其 XFF，client IP 仍是連線本身的 peer。"""
