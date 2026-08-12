@@ -334,6 +334,131 @@ async def test_step3_launch_failure_shows_themed_error_page_not_raw_500(gui_clie
 
 
 # ---------------------------------------------------------------------------
+# Task 14 補入項（controller 依 spec §5.3）：InstanceLock 接線——同 profile 禁止第二個
+# agent 程序。用一個「搶先持有同一個 buffer_path InstanceLock」的外部 lock 物件模擬
+# 已有另一個 agent 程序在跑。
+# ---------------------------------------------------------------------------
+
+async def test_step3_launch_blocked_when_instance_lock_already_held(gui_client, tmp_path):
+    from quanquant.agent import profile_registry
+    from quanquant.agent.profile_registry import ProfileEntry
+
+    buffer_path = tmp_path / "outbox.db"
+    gui_client.app.state.device_flow_result = {
+        "token": "tok", "profile_id": "1", "username": "tester",
+        "token_expires_at": "2099-01-01T00:00:00",
+    }
+    gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+    gui_client.app.state.gui_current_profile = ProfileEntry(
+        profile_id="1", username="tester", buffer_path=str(buffer_path),
+        created_at="2020-01-01T00:00:00",
+    )
+
+    external_lock = profile_registry.InstanceLock(buffer_path)
+    external_lock.acquire()
+    try:
+        resp = await gui_client.post("/setup/step3/launch", follow_redirects=False)
+        assert resp.status_code == 409
+        assert "此帳號的 Agent 已在執行中" in resp.text
+        assert gui_client.app.state.agent_runner is None   # 沒有建構出任何 runner
+    finally:
+        external_lock.release()
+
+
+async def test_step3_launch_succeeds_after_conflicting_lock_released(gui_client, tmp_path, monkeypatch):
+    """release 後可重取：外部 lock 釋放後，下一次 launch 正常成功並掛上 runner、且把
+    自己的 InstanceLock 存進 app.state.instance_lock。"""
+    from quanquant.agent import profile_registry
+    from quanquant.agent.profile_registry import ProfileEntry
+
+    buffer_path = tmp_path / "outbox.db"
+    gui_client.app.state.device_flow_result = {
+        "token": "tok", "profile_id": "1", "username": "tester",
+        "token_expires_at": "2099-01-01T00:00:00",
+    }
+    gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+    gui_client.app.state.gui_current_profile = ProfileEntry(
+        profile_id="1", username="tester", buffer_path=str(buffer_path),
+        created_at="2020-01-01T00:00:00",
+    )
+
+    external_lock = profile_registry.InstanceLock(buffer_path)
+    external_lock.acquire()
+    resp_blocked = await gui_client.post("/setup/step3/launch", follow_redirects=False)
+    assert resp_blocked.status_code == 409
+    external_lock.release()
+
+    class _FakeChildHandle:
+        def __init__(self, **kwargs):
+            pass
+
+    class _FakeTransport:
+        def __init__(self, url, *, token):
+            pass
+
+    class _FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+    class _FakeBuffer:
+        def __init__(self, path):
+            pass
+
+    def _fake_attach_runner(app, runner):
+        app.state.agent_runner = runner
+        app.state.runner_task = None
+
+    import quanquant.agent.buffer as buffer_module
+    import quanquant.agent.gui.coordinator as coordinator_module
+    import quanquant.agent.runner as runner_module
+    import quanquant.agent.ws_client as ws_client_module
+
+    monkeypatch.setattr(buffer_module, "DurableBuffer", _FakeBuffer)
+    monkeypatch.setattr(runner_module, "AgentRunner", _FakeRunner)
+    monkeypatch.setattr(runner_module, "ChildHandle", _FakeChildHandle)
+    monkeypatch.setattr(ws_client_module, "WebsocketsTransport", _FakeTransport)
+    monkeypatch.setattr(coordinator_module, "attach_runner", _fake_attach_runner)
+
+    resp = await gui_client.post("/setup/step3/launch", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/status"
+    assert isinstance(gui_client.app.state.instance_lock, profile_registry.InstanceLock)
+
+
+async def test_step3_launch_releases_lock_when_runner_construction_fails(gui_client, tmp_path, monkeypatch):
+    """建構失敗（既有 reviewer Minor fix 走的錯誤頁）不得洩漏 lock——否則使用者照錯誤頁
+    指示重試會被自己先前失敗的那次卡死。"""
+    from quanquant.agent import profile_registry
+    from quanquant.agent.profile_registry import ProfileEntry
+
+    buffer_path = tmp_path / "outbox.db"
+    gui_client.app.state.device_flow_result = {
+        "token": "tok", "profile_id": "1", "username": "tester",
+        "token_expires_at": "2099-01-01T00:00:00",
+    }
+    gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+    gui_client.app.state.gui_current_profile = ProfileEntry(
+        profile_id="1", username="tester", buffer_path=str(buffer_path),
+        created_at="2020-01-01T00:00:00",
+    )
+
+    import quanquant.agent.runner as runner_module
+
+    def _boom(**kwargs):
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(runner_module, "AgentRunner", _boom)
+
+    resp = await gui_client.post("/setup/step3/launch", follow_redirects=False)
+    assert resp.status_code == 500
+
+    # lock 已釋放：外部現在可以拿到
+    probe_lock = profile_registry.InstanceLock(buffer_path)
+    probe_lock.acquire()
+    probe_lock.release()
+
+
+# ---------------------------------------------------------------------------
 # Task 13 Step 3b：核准後的 profile 收斂點（_finalize_approved_profile）
 # ---------------------------------------------------------------------------
 

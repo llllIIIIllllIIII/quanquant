@@ -1,6 +1,14 @@
-"""quanquant-agent：本機 broker agent CLI（Increment 0，僅 simtrade）。
+"""quanquant-agent：本機 broker agent CLI（Increment 0，僅 simtrade；Increment 1 起可選
+GUI 設定精靈，見 `quanquant.agent.startup` 的七層優先序）。
 
 憑證 session-only：getpass/env 讀入記憶體，不落地、不進 argv、不進 log。
+
+`build_parser()`（本檔）是 Inc0 遺留的窄範圍 parser（僅
+`--server`/`--mode`/`--symbol`/`--buffer`，`--server`/`--buffer` 預設沿用
+env-based 舊行為）——刻意保留、不刪不改，供既有測試/外部呼叫端相容（G5 紅線：這個
+函式的輸出逐位不變）。`main()` 實際解析真正 `sys.argv` 改用
+`quanquant.agent.startup.build_parser()`（七層優先序的超集合 parser，多了
+`--gui`/`--reset`/`--no-gui`/`--site`/`--profile`），兩個 parser 刻意分開、不合併。
 """
 import argparse
 import asyncio
@@ -22,7 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = build_parser().parse_args()
+    from quanquant.agent.startup import build_parser as build_startup_parser
+    from quanquant.agent.startup import resolve_startup_plan
+
+    args = build_startup_parser().parse_args()
+    plan = resolve_startup_plan(args, env=os.environ, is_tty=sys.stdin.isatty())
+
+    if not plan.headless:
+        from quanquant.agent.gui.coordinator import run_gui
+        asyncio.run(run_gui(site_origin=plan.site, profile=plan.profile, reset=plan.reset))
+        return
+
     token = os.environ.get("QQ_AGENT_TOKEN") or getpass.getpass("Agent token: ")
     api_key = os.environ.get("QQ_AGENT_API_KEY") or getpass.getpass("Shioaji API Key: ")
     secret_key = os.environ.get("QQ_AGENT_SECRET_KEY") or getpass.getpass("Shioaji Secret Key: ")
@@ -32,13 +50,13 @@ def main() -> None:
     from quanquant.agent.ws_client import WebsocketsTransport
 
     runner = AgentRunner(
-        transport=WebsocketsTransport(args.server, token=token),
-        buffer=DurableBuffer(args.buffer),
+        transport=WebsocketsTransport(plan.server, token=token),
+        buffer=DurableBuffer(plan.buffer),
         child=ChildHandle(credentials={"api_key": api_key, "secret_key": secret_key},
-                          symbol=args.symbol, mode=args.mode, buffer_path=args.buffer),
+                          symbol=args.symbol, mode=args.mode, buffer_path=plan.buffer),
         mode=args.mode,
     )
-    print(f"agent 啟動（simtrade）→ {args.server}；Ctrl-C 結束（憑證僅存記憶體）")
+    print(f"agent 啟動（simtrade）→ {plan.server}；Ctrl-C 結束（憑證僅存記憶體）")
     try:
         asyncio.run(runner.run_forever())
     except KeyboardInterrupt:

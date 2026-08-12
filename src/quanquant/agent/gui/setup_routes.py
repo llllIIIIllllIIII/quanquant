@@ -376,7 +376,15 @@ async def setup_step3_launch(request: Request) -> Response:
     見其 docstring）是這裡唯一的 profile 來源——不得再各自讀 `approved["profile_id"]`
     另組 buffer 路徑。啟動前先跑 `_guard_legacy_buffer_before_first_launch`：只在這是這台
     機器第一次建立這個 `(site_origin, profile_id)` 時才擋（見其 docstring），擋下就完全
-    不建 registry／不寫 keyring／不建構 runner。"""
+    不建 registry／不寫 keyring／不建構 runner。
+
+    Task 14 補入項（spec §5.3）：建構 `AgentRunner` 前，對解析後的 buffer 路徑取得
+    `profile_registry.InstanceLock`——同 profile 已有另一個 agent 程序在跑時
+    `acquire()` 拋 `AgentAlreadyRunningError`，這裡轉譯成主題化錯誤頁（沿用既有的
+    `_render_step3(launch_error=...)`），不繼續 upsert registry／不建構 runner。成功
+    acquire 後存 `app_state.instance_lock`；runner 建構/掛載失敗時連帶釋放（否則使用者
+    照錯誤頁指示重試會被自己剛才那次失敗卡死），GUI 關閉時由 `shutdown_runner()`
+    收尾釋放。"""
     app_state = request.app.state
     approved = getattr(app_state, "device_flow_result", None)
     broker = getattr(app_state, "broker_credentials", None)
@@ -391,6 +399,15 @@ async def setup_step3_launch(request: Request) -> Response:
     )
     if conflict is not None:
         return HTMLResponse(conflict, status_code=409)
+
+    # Task 14 補入項：同 profile 單實例 process lock——擋在 upsert_profile()／建構 runner
+    # 之前，衝突時完全不動 registry、不建 runner。
+    instance_lock = profile_registry.InstanceLock(profile.buffer_path)
+    try:
+        instance_lock.acquire()
+    except profile_registry.AgentAlreadyRunningError:
+        return _render_step3(request, launch_error="此帳號的 Agent 已在執行中",
+                              status_code=409)
 
     profile_registry.upsert_profile(
         site_origin=site_origin, profile_id=profile.profile_id,
@@ -415,7 +432,9 @@ async def setup_step3_launch(request: Request) -> Response:
             mode="sim",
         )
         attach_runner(request.app, runner)
+        app_state.instance_lock = instance_lock
     except Exception:
+        instance_lock.release()   # 不洩漏：使用者照錯誤頁指示重試不該被自己這次失敗卡死
         log.exception("setup: step3 啟動 agent runner 失敗")
         return _render_step3(request, launch_error="啟動失敗，請確認伺服器位址與憑證正確後重試。",
                               status_code=500)

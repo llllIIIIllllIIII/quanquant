@@ -7,6 +7,7 @@ import inspect
 from types import SimpleNamespace
 
 import httpx
+import pytest
 from fastapi import Depends, FastAPI
 
 from quanquant.agent.gui.coordinator import attach_runner, build_app, launch_direct, shutdown_runner
@@ -212,6 +213,35 @@ async def test_shutdown_runner_is_idempotent_across_repeated_calls():
     assert runner._child.terminate_calls == 2   # 兩次呼叫都安全，第二次一樣是 no-op 結果
 
 
+async def test_shutdown_runner_releases_instance_lock(tmp_path):
+    """Task 14 補入項：GUI 關閉（OS signal 經 lifespan shutdown，或『停止 Agent』）收尾時
+    釋放 app.state.instance_lock，讓同一個 profile 之後可以重新 launch。"""
+    from quanquant.agent import profile_registry as profile_registry_module
+
+    app = _fake_app()
+    runner = _FakeRunner()
+    attach_runner(app, runner)
+
+    buffer_path = tmp_path / "outbox.db"
+    lock = profile_registry_module.InstanceLock(buffer_path)
+    lock.acquire()
+    app.state.instance_lock = lock
+
+    result = await shutdown_runner(app)
+    assert result is True
+    assert app.state.instance_lock is None
+
+    probe_lock = profile_registry_module.InstanceLock(buffer_path)
+    probe_lock.acquire()   # 若沒釋放，這裡會拋 AgentAlreadyRunningError
+    probe_lock.release()
+
+
+async def test_shutdown_runner_is_noop_for_instance_lock_when_none_attached():
+    app = _fake_app()
+    assert await shutdown_runner(app) is True
+    assert getattr(app.state, "instance_lock", None) is None
+
+
 # ---------------------------------------------------------------------------
 # Task 13 reviewer 必修（Important）：launch_direct() 的 "rejected" 分支——之前零測試
 # 覆蓋，正是根因分析裡 race-prone 的整合點。probe_direct_connect() 本身的『立即返回，
@@ -251,7 +281,7 @@ class _NoExpiresAtPeekToken(dict):
         return super().get(key, default)
 
 
-async def test_launch_direct_rejected_branch_redirects_to_setup_and_ignores_expires_at(monkeypatch):
+async def test_launch_direct_rejected_branch_redirects_to_setup_and_ignores_expires_at(monkeypatch, tmp_path):
     import quanquant.agent.buffer as buffer_module
     import quanquant.agent.keyring_store as keyring_store_module
     import quanquant.agent.runner as runner_module
@@ -270,7 +300,9 @@ async def test_launch_direct_rejected_branch_redirects_to_setup_and_ignores_expi
     monkeypatch.setattr(ws_client_module, "WebsocketsTransport", lambda url, *, token: object())
 
     app = _fake_app()
-    profile = SimpleNamespace(profile_id="1", buffer_path="/x1")
+    # Task 14：launch_direct() 現在會對這個路徑真的取 InstanceLock（見其 docstring），
+    # 用 tmp_path 而非佔位字串路徑，避免撞到唯讀檔案系統。
+    profile = SimpleNamespace(profile_id="1", buffer_path=str(tmp_path / "outbox.db"))
 
     target_path, notice = await launch_direct(app, profile=profile, site_origin="https://q.example")
 
@@ -307,3 +339,121 @@ async def test_launch_direct_skips_relaunch_when_runner_already_running(monkeypa
 
     app.state.runner_task.cancel()
     await asyncio.gather(app.state.runner_task, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# Task 14 補入項（controller 依 spec §5.3）：InstanceLock 接線——launch_direct() 建構
+# runner 前 acquire，同 profile 禁止第二個 agent 程序（驗收情境 10）。
+# ---------------------------------------------------------------------------
+
+class _ConnectedDirectRunner:
+    """直接落在 "connected"，probe_direct_connect() 立刻返回，不必等 run_forever。"""
+
+    async def snapshot(self):
+        return SimpleNamespace(connection="connected")
+
+    async def run_forever(self, *, stop_on_token_reject=False):
+        await asyncio.Event().wait()   # 一直跑到被 cancel
+
+
+async def test_launch_direct_blocked_when_instance_lock_already_held(monkeypatch, tmp_path):
+    from quanquant.agent import profile_registry as profile_registry_module
+    import quanquant.agent.keyring_store as keyring_store_module
+
+    def _must_not_be_called(**kwargs):
+        raise AssertionError("instance lock 衝突時不該繼續讀 keyring／建構 runner")
+
+    monkeypatch.setattr(keyring_store_module, "load_token", lambda **kw: {
+        "token": "tok", "expires_at": "2099-01-01T00:00:00", "username": "alice",
+    })
+    monkeypatch.setattr(keyring_store_module, "load_broker_credentials",
+                         lambda **kw: {"api_key": "K1", "secret_key": "S1"})
+
+    buffer_path = tmp_path / "outbox.db"
+    app = _fake_app()
+    profile = SimpleNamespace(profile_id="1", buffer_path=str(buffer_path))
+
+    external_lock = profile_registry_module.InstanceLock(buffer_path)
+    external_lock.acquire()
+    try:
+        target_path, notice = await launch_direct(app, profile=profile, site_origin="https://q.example")
+        assert target_path == "/setup"
+        assert notice is not None and "已在執行中" in notice
+        assert app.state.agent_runner is None
+    finally:
+        external_lock.release()
+
+
+async def test_launch_direct_acquires_and_stores_lock_then_recoverable_after_release(monkeypatch, tmp_path):
+    import quanquant.agent.buffer as buffer_module
+    from quanquant.agent import profile_registry as profile_registry_module
+    import quanquant.agent.keyring_store as keyring_store_module
+    import quanquant.agent.runner as runner_module
+    import quanquant.agent.ws_client as ws_client_module
+
+    monkeypatch.setattr(keyring_store_module, "load_token", lambda **kw: {
+        "token": "tok", "expires_at": "2099-01-01T00:00:00", "username": "alice",
+    })
+    monkeypatch.setattr(keyring_store_module, "load_broker_credentials",
+                         lambda **kw: {"api_key": "K1", "secret_key": "S1"})
+    monkeypatch.setattr(buffer_module, "DurableBuffer", lambda path: object())
+    monkeypatch.setattr(runner_module, "ChildHandle", lambda **kw: object())
+    fake_runner = _ConnectedDirectRunner()
+    monkeypatch.setattr(runner_module, "AgentRunner", lambda **kw: fake_runner)
+    monkeypatch.setattr(ws_client_module, "WebsocketsTransport", lambda url, *, token: object())
+
+    buffer_path = tmp_path / "outbox.db"
+    app = _fake_app()
+    profile = SimpleNamespace(profile_id="1", buffer_path=str(buffer_path))
+
+    target_path, notice = await launch_direct(app, profile=profile, site_origin="https://q.example")
+    assert target_path == "/status" and notice is None
+    assert isinstance(app.state.instance_lock, profile_registry_module.InstanceLock)
+
+    # 尚未 release：另一個 InstanceLock 嘗試 acquire 同一路徑必須被擋
+    probe_lock = profile_registry_module.InstanceLock(buffer_path)
+    with pytest.raises(profile_registry_module.AgentAlreadyRunningError):
+        probe_lock.acquire()
+
+    app.state.instance_lock.release()
+    app.state.runner_task.cancel()
+    await asyncio.gather(app.state.runner_task, return_exceptions=True)
+
+    # release 後可重取
+    probe_lock2 = profile_registry_module.InstanceLock(buffer_path)
+    probe_lock2.acquire()
+    probe_lock2.release()
+
+
+async def test_launch_direct_rejected_branch_releases_instance_lock(monkeypatch, tmp_path):
+    """"rejected" 分支的 runner 已經真的停止——不釋放 lock 會讓同一個 GUI 程序自己都無法
+    在重新授權後再次 launch_direct() 同一個 profile（見 coordinator.py launch_direct
+    docstring）。"""
+    import quanquant.agent.buffer as buffer_module
+    from quanquant.agent import profile_registry as profile_registry_module
+    import quanquant.agent.keyring_store as keyring_store_module
+    import quanquant.agent.runner as runner_module
+    import quanquant.agent.ws_client as ws_client_module
+
+    fake_runner = _RejectingDirectRunner()
+
+    monkeypatch.setattr(keyring_store_module, "load_token", lambda **kw: {
+        "token": "tok", "expires_at": "2099-01-01T00:00:00", "username": "alice",
+    })
+    monkeypatch.setattr(keyring_store_module, "load_broker_credentials",
+                         lambda **kw: {"api_key": "K1", "secret_key": "S1"})
+    monkeypatch.setattr(buffer_module, "DurableBuffer", lambda path: object())
+    monkeypatch.setattr(runner_module, "ChildHandle", lambda **kw: object())
+    monkeypatch.setattr(runner_module, "AgentRunner", lambda **kw: fake_runner)
+    monkeypatch.setattr(ws_client_module, "WebsocketsTransport", lambda url, *, token: object())
+
+    buffer_path = tmp_path / "outbox.db"
+    app = _fake_app()
+    profile = SimpleNamespace(profile_id="1", buffer_path=str(buffer_path))
+
+    target_path, notice = await launch_direct(app, profile=profile, site_origin="https://q.example")
+    assert target_path == "/setup" and notice is not None
+
+    probe_lock = profile_registry_module.InstanceLock(buffer_path)
+    probe_lock.acquire()   # lock 已釋放，這裡不該拋 AgentAlreadyRunningError
+    probe_lock.release()

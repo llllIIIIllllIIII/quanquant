@@ -100,6 +100,7 @@ def build_app(state: GuiSecurityState) -> FastAPI:
     app.state.gui_security = state
     app.state.agent_runner = None
     app.state.runner_task = None
+    app.state.instance_lock = None   # Task 14：profile_registry.InstanceLock，見 launch_direct()/shutdown_runner()
     app.state.gui_bootstrap_redirect_path = _SETUP_PATH
     return app
 
@@ -154,6 +155,7 @@ async def shutdown_runner(app: FastAPI) -> bool:
     """
     runner = getattr(app.state, "agent_runner", None)
     if runner is None:
+        _release_instance_lock(app)
         return True
     runner.stop()
     transport = getattr(runner, "_transport", None)
@@ -168,9 +170,21 @@ async def shutdown_runner(app: FastAPI) -> bool:
         await asyncio.gather(task, return_exceptions=True)
     child = getattr(runner, "_child", None)
     if child is None:
+        _release_instance_lock(app)
         return True
     died = await asyncio.to_thread(child.terminate)
+    _release_instance_lock(app)
     return died is not False
+
+
+def _release_instance_lock(app: FastAPI) -> None:
+    """Task 14：`shutdown_runner()` 收尾處釋放 `app.state.instance_lock`（若有）——
+    冪等，重複呼叫安全（`InstanceLock.release()` 本身冪等，見其 docstring），讓同一個
+    profile 之後可以重新 `launch_direct()`/`/setup/step3/launch`。"""
+    lock = getattr(app.state, "instance_lock", None)
+    if lock is not None:
+        lock.release()
+        app.state.instance_lock = None
 
 
 async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str, str | None]:
@@ -194,6 +208,16 @@ async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str
     倒退再重送 `POST /profiles/select`；或未來任何其他呼叫端重複呼叫這裡），不重新讀
     keyring／建構第二個 `AgentRunner`（會造成第二條 WS 連線＋第二個背景 task 洩漏，兩者
     同時碰同一個 buffer/broker 帳號），直接沿用既有 runner，回傳 `("/status", None)`。
+
+    Task 14 補入項（spec §5.3）：建構 `AgentRunner` 前，先對「解析後的 buffer 路徑」
+    取得 `profile_registry.InstanceLock`——同 profile 若已有另一個 agent 程序（真的另一
+    個 process，或本機另一個尚未關閉的 GUI）持有這個 lock，`acquire()` 拋
+    `AgentAlreadyRunningError`，這裡轉譯成主題化提示（併入 `GuiStartupDecision.notice`
+    顯示，見呼叫端 `run_gui()`/`setup_routes.py::profiles_select`）並回精靈，不繼續讀
+    keyring／建構 runner。lock 成功掛上後存 `app.state.instance_lock`——`"rejected"`
+    分支的 runner 已經真的停止，這裡連帶釋放（否則同一個 GUI 程序日後重新授權成功後再
+    呼叫一次 `launch_direct()` 會被自己先前那把沒放的 lock 卡死）；`"connected"`/未定案
+    分支保持持有，直到 `shutdown_runner()` 收尾釋放。
     """
     existing_runner = getattr(app.state, "agent_runner", None)
     existing_task = getattr(app.state, "runner_task", None)
@@ -207,9 +231,16 @@ async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str
         # 防禦（例如兩次呼叫之間 keyring 被外部清空的極窄競態），不是正常路徑。
         return "/setup", "設定資料不完整，請重新設定"
 
+    from quanquant.agent import profile_registry
     from quanquant.agent.buffer import DurableBuffer
     from quanquant.agent.runner import AgentRunner, ChildHandle
     from quanquant.agent.ws_client import WebsocketsTransport
+
+    lock = profile_registry.InstanceLock(profile.buffer_path)
+    try:
+        lock.acquire()
+    except profile_registry.AgentAlreadyRunningError:
+        return "/setup", "此帳號的 Agent 已在執行中"
 
     ws_url = _derive_ws_url(site_origin)
     runner = AgentRunner(
@@ -220,6 +251,7 @@ async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str
         mode="sim",
     )
     app.state.agent_runner = runner
+    app.state.instance_lock = lock
     task = asyncio.create_task(runner.run_forever(stop_on_token_reject=True))
     app.state.runner_task = task
 
@@ -233,6 +265,8 @@ async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str
             # 既有慣例，避免 "Task exception was never retrieved" 警告／未回收的例外。
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        lock.release()
+        app.state.instance_lock = None
         return "/setup", "先前記住的授權已失效（token 可能已被撤銷），請重新授權"
     return "/status", None
 
