@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>核准 Agent 連線請求</h2>
+
+{% if result %}
+  <p>{{ result }}</p>
+  <p><a href="/agent/authorize">回到輸入代碼</a></p>
+{% elif confirm %}
+  {% include "partials/agent_authorize_confirm.html" %}
+{% else %}
+  <p class="muted" style="font-size:.85em;">
+    在你的下單 agent（模擬盤）啟動時會顯示一組裝置代碼，請把它手動輸入在這裡以核准連線。
+  </p>
+  {% if error %}<p class="field-error">{{ error }}</p>{% endif %}
+  <form method="post" action="/agent/authorize">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <label>裝置代碼
+      <input type="text" name="user_code" placeholder="XXXX-XXXX" autocomplete="off" required>
+    </label>
+    <button type="submit">查詢</button>
+  </form>
+{% endif %}
+{% endblock %}

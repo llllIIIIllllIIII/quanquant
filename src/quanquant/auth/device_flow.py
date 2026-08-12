@@ -100,6 +100,56 @@ def create_device_code(
     raise AssertionError("unreachable")  # pragma: no cover
 
 
+def find_pending_by_user_code(session: Session, *, user_code: str) -> AgentDeviceCode | None:
+    """唯讀查詢：status='pending' 且未過期。找不到／已過期／已處理一律回 None（Task 6
+    `/agent/authorize` 頁面顯示 generic「找不到此代碼或已過期」，不區分是打錯碼還是碼
+    已核准過——避免資訊洩漏助攻枚舉）。"""
+    return session.exec(
+        select(AgentDeviceCode).where(
+            AgentDeviceCode.user_code == user_code,
+            AgentDeviceCode.status == "pending",
+            AgentDeviceCode.expires_at > _utcnow(),
+        )
+    ).first()
+
+
+def approve_device_code(session: Session, *, user_code: str, user_id: int) -> AgentDeviceCode | None:
+    """conditional UPDATE：WHERE user_code=:code AND status='pending' AND expires_at>now
+    → SET status='approved', user_id=:uid（spec §4.1 step2）。回傳 None＝搶占失敗（已被
+    處理或過期，讓 router 顯示「已處理」）；比照 `claim_and_issue_device_token` 的
+    `result.rowcount` 判斷寫法。"""
+    t = AgentDeviceCode.__table__
+    stmt = (
+        sa_update(t)
+        .where(t.c.user_code == user_code, t.c.status == "pending", t.c.expires_at > _utcnow())
+        .values(status="approved", user_id=user_id)
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    if result.rowcount == 0:
+        session.rollback()
+        return None
+    session.commit()
+    return session.exec(
+        select(AgentDeviceCode).where(AgentDeviceCode.user_code == user_code)
+    ).first()
+
+
+def deny_device_code(session: Session, *, user_code: str) -> bool:
+    """同上條件 → SET status='denied'。回傳 True＝成功。"""
+    t = AgentDeviceCode.__table__
+    stmt = (
+        sa_update(t)
+        .where(t.c.user_code == user_code, t.c.status == "pending", t.c.expires_at > _utcnow())
+        .values(status="denied")
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    if result.rowcount == 0:
+        session.rollback()
+        return False
+    session.commit()
+    return True
+
+
 def claim_and_issue_device_token(
     session: Session, *, device_code_id: int, user_id: int, ttl_days: int,
 ) -> tuple[str, AgentToken] | None:

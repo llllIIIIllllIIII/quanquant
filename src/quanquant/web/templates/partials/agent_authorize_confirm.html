@@ -1,0 +1,12 @@
+<p class="field-error">
+  此裝置請求連線你的下單 agent（sim 模式）。請仔細核對下面的裝置代碼是否與 agent 端
+  畫面顯示的完全一致——<strong>代碼不一致就不要核准</strong>。
+</p>
+<p>裝置代碼：<strong>{{ confirm.user_code }}</strong></p>
+<p class="muted" style="font-size:.85em;">請求建立時間：{{ confirm.created_at | dt }}</p>
+<form method="post" action="/agent/authorize/decide">
+  <input type="hidden" name="device_code_id" value="{{ confirm.device_code_id }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button type="submit" name="decision" value="approve">核准</button>
+  <button type="submit" name="decision" value="deny" class="secondary">拒絕</button>
+</form>
