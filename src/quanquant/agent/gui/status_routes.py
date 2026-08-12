@@ -101,7 +101,11 @@ def _token_expiry_context(request: Request) -> dict:
 
 
 async def _render_status(request: Request, *, banner: str | None = None,
-                          banner_error: bool = False, status_code: int = 200) -> HTMLResponse:
+                          banner_error: bool = False, status_code: int = 200,
+                          stopped: bool = False) -> HTMLResponse:
+    """`stopped=True`（只有 `/status/stop` 成功時傳）：模板據此**省略** 1 秒
+    meta-refresh——見 `stop_agent` docstring reviewer Important fix 2，避免使用者被自動
+    導去一個即將關閉的 server。"""
     runner = request.app.state.agent_runner
     snap = await runner.snapshot()
     context = {
@@ -110,6 +114,7 @@ async def _render_status(request: Request, *, banner: str | None = None,
         "failstop_guidance": _FAILSTOP_GUIDANCE,
         "banner": banner,
         "banner_error": banner_error,
+        "stopped": stopped,
         "remember_device_auth": getattr(request.app.state, "remember_device_auth", False),
         **_token_expiry_context(request),
     }
@@ -133,7 +138,15 @@ async def stop_agent(request: Request) -> HTMLResponse:
     在模組層級 `include_router` 這個檔案的 `router`，若這裡在模組層級反向 import
     `coordinator.shutdown_runner` 會形成循環 import（`coordinator` 匯入到一半、
     `shutdown_runner` 尚未定義就被回頭 import）——延到函式呼叫時才 import，兩個模組互不
-    卡在對方初始化過程中。"""
+    卡在對方初始化過程中。
+
+    reviewer Important fix 1：`asyncio.create_task(_exit_soon())` 的回傳值必須存住
+    （`request.app.state.shutdown_task`）——全 codebase 其他 `create_task` 呼叫皆存引用
+    （`runner.py` 的 session task 列表／`coordinator.attach_runner` 的
+    `app.state.runner_task`／`setup_routes._ensure_device_flow_started` 的
+    `app.state.device_flow_task`），這裡原本是唯一例外：沒有外部引用的 task 有被
+    CPython 文件明載的 GC 風險（尚未在 uvloop 下實測重現，但沒理由自己開這個先例）。
+    存進 `app.state` 也讓測試能直接 `await` 它，驗證 `should_exit` 真的被翻成 True。"""
     from quanquant.agent.gui.coordinator import shutdown_runner
 
     clean = await shutdown_runner(request.app)
@@ -151,9 +164,16 @@ async def stop_agent(request: Request) -> HTMLResponse:
         async def _exit_soon() -> None:
             await asyncio.sleep(_SHUTDOWN_DELAY_SECONDS)
             server.should_exit = True
-        asyncio.create_task(_exit_soon())
+        request.app.state.shutdown_task = asyncio.create_task(_exit_soon())
     log.info("停止 Agent：已確認終止，GUI 即將關閉")
-    return await _render_status(request, banner="Agent 已停止，這個視窗即將關閉。")
+    # reviewer Important fix 2：這個成功頁**不能**沿用 status.html 預設的 1 秒
+    # meta-refresh——refresh 間隔（1s）比 `_SHUTDOWN_DELAY_SECONDS`（0.5s）還長，會導航到
+    # 一個已經 should_exit=True、隨時可能真的關閉的 server，使用者實際看到的是連線錯誤
+    # 而非「已停止」訊息，違背這裡想達成的『讓使用者看得到停止結果』。改渲染無
+    # meta-refresh 的終態頁，明確告知可以關閉分頁。
+    return await _render_status(
+        request, banner="Agent 已停止，可以關閉這個分頁。", stopped=True,
+    )
 
 
 @router.post("/status/reauth", response_class=HTMLResponse)

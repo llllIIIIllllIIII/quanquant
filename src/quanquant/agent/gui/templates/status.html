@@ -3,7 +3,9 @@
 <head>
   <meta charset="utf-8">
   <title>QuanQuant Agent 狀態</title>
+  {% if not stopped %}
   <meta http-equiv="refresh" content="1;url=/status">
+  {% endif %}
   <style>
     body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; }
     dt { font-weight: 700; margin-top: 0.5rem; }
@@ -51,7 +53,7 @@
     <dd>{{ snap.buffer_pending }} 筆</dd>
 
     <dt>資料更新時間</dt>
-    <dd>{{ snap.updated_at }}（本頁每 1 秒自動更新）</dd>
+    <dd>{{ snap.updated_at }}{% if not stopped %}（本頁每 1 秒自動更新）{% endif %}</dd>
 
     {% if token_expires_at %}
     <dt>裝置授權到期</dt>

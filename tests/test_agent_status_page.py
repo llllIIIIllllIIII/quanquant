@@ -168,6 +168,59 @@ async def test_stop_agent_reports_error_when_child_fails_to_terminate():
 
 
 # ---------------------------------------------------------------------------
+# reviewer Important fix 1：`_exit_soon()` 的 task 引用必須存住（`app.state.shutdown_task`），
+# 不能是 codebase 裡唯一一個「建了就丟」的 create_task——用一個假 server 物件驗證
+# `should_exit` 真的被排程翻成 True。
+# ---------------------------------------------------------------------------
+
+async def test_stop_agent_schedules_uvicorn_should_exit_and_retains_task_reference(monkeypatch):
+    import asyncio
+
+    import quanquant.agent.gui.status_routes as status_routes
+
+    monkeypatch.setattr(status_routes, "_SHUTDOWN_DELAY_SECONDS", 0.01)
+
+    class _FakeServer:
+        def __init__(self):
+            self.should_exit = False
+
+    app, state = _build_app(port=54411)
+    app.state.uvicorn_server = _FakeServer()
+    async with _client_for(app, state) as client:
+        resp = await client.post("/status/stop")
+    assert resp.status_code == 200
+
+    task = app.state.shutdown_task
+    assert task is not None  # 引用必須被存住，不能是無人持有、可能被 GC 的裸 task
+    await asyncio.wait_for(task, timeout=2)
+    assert app.state.uvicorn_server.should_exit is True
+
+
+# ---------------------------------------------------------------------------
+# reviewer Important fix 2：停止成功頁不能沿用 1 秒 meta-refresh（會導航到即將關閉的
+# server，使用者看到的其實是連線錯誤）——成功頁必須是無 refresh 的終態頁。
+# ---------------------------------------------------------------------------
+
+async def test_stop_agent_success_page_has_no_meta_refresh():
+    app, state = _build_app(port=54412)
+    async with _client_for(app, state) as client:
+        resp = await client.post("/status/stop")
+    assert resp.status_code == 200
+    assert 'http-equiv="refresh"' not in resp.text
+    assert "可以關閉這個分頁" in resp.text
+
+
+async def test_stop_agent_failure_page_still_has_meta_refresh():
+    """驗死失敗時 GUI 仍活著（沒有真的停止），狀態頁應維持既有的 1 秒自動更新，
+    不應被誤套用終態頁的『無 refresh』行為。"""
+    app, state = _build_app(port=54413, terminate_result=False)
+    async with _client_for(app, state) as client:
+        resp = await client.post("/status/stop")
+    assert resp.status_code == 500
+    assert 'http-equiv="refresh"' in resp.text
+
+
+# ---------------------------------------------------------------------------
 # 補充：刪除 profile 在 buffer 淨空時不誤判為「拒絕」（Task 11/12 尚未落地，先樁接）
 # ---------------------------------------------------------------------------
 
