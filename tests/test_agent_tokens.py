@@ -173,3 +173,23 @@ def test_get_active_token_returns_latest_non_revoked(engine):
     with Session(engine) as s:
         row = get_active_token(s, user_id=user.id)
         assert row is not None and row.revoked_at is None
+
+
+def test_stage_rotation_does_not_commit(session, user):
+    from quanquant.auth.agent_tokens import get_active_token, stage_rotation
+
+    raw, token = stage_rotation(session, user_id=user.id, ttl_days=30)
+    assert raw and token.token_hash
+    session.rollback()
+    # rollback 撤銷了尚未 commit 的 insert——沒有任何 active token 留下
+    assert get_active_token(session, user_id=user.id) is None
+
+
+def test_issue_token_still_rotates_via_stage_rotation(session, user):
+    from quanquant.auth.agent_tokens import issue_token, validate_token
+
+    first = issue_token(session, user_id=user.id, ttl_days=30)
+    second = issue_token(session, user_id=user.id, ttl_days=30)
+    assert first != second
+    assert validate_token(session, raw=first) is None       # 舊枚已撤銷
+    assert validate_token(session, raw=second) is not None  # 新枚有效

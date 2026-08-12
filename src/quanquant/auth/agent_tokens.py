@@ -34,27 +34,38 @@ def _hash(raw: str) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def stage_rotation(session: Session, *, user_id: int, ttl_days: int) -> tuple[str, AgentToken]:
+    """rotation 的『不自行 commit』半段：把該 user 目前有效的舊列標 revoked_at=now，
+    建一筆新 AgentToken（session.add，不 commit）。呼叫端負責決定何時 commit／要不要跟
+    別的寫入包在同一交易（Task 4 的 claim_and_issue_device_token 用這點把『搶占 device
+    code』與『簽發 token』綁進單一交易）。撞 uq_agent_tokens_active_per_user 的重試/
+    commit 邏輯不在這裡——那是呼叫端（issue_token 或 claim_and_issue_device_token）的
+    責任，因為重試需要知道『要不要連同呼叫端自己的其他寫入一起 rollback』。"""
+    now = _utcnow()
+    active_rows = session.exec(
+        select(AgentToken).where(
+            AgentToken.user_id == user_id,
+            AgentToken.revoked_at.is_(None),
+        )
+    ).all()
+    for row in active_rows:
+        row.revoked_at = now
+        session.add(row)
+    raw = secrets.token_urlsafe(32)
+    token = AgentToken(
+        user_id=user_id, token_hash=_hash(raw), expires_at=now + timedelta(days=ttl_days),
+    )
+    session.add(token)
+    return raw, token
+
+
 def issue_token(session: Session, *, user_id: int, ttl_days: int) -> str:
     """簽發（或 rotation）agent token：回傳明文（只有這一次），DB 只存 hash。撞
     `uq_agent_tokens_active_per_user`（併發 rotation 輸家）安全重試一次，見模組頂部 C10
     說明；重試仍撞鍵（理論上不該發生——重試前已把當下所有 active row 一併 revoke）就原樣
     往外拋，不無限重試。"""
     for attempt in range(2):
-        now = _utcnow()
-        active_rows = session.exec(
-            select(AgentToken).where(
-                AgentToken.user_id == user_id,
-                AgentToken.revoked_at.is_(None),
-            )
-        ).all()
-        for row in active_rows:
-            row.revoked_at = now
-            session.add(row)
-        raw = secrets.token_urlsafe(32)
-        token = AgentToken(
-            user_id=user_id, token_hash=_hash(raw), expires_at=now + timedelta(days=ttl_days),
-        )
-        session.add(token)
+        raw, token = stage_rotation(session, user_id=user_id, ttl_days=ttl_days)
         try:
             session.commit()
         except IntegrityError:
