@@ -1,3 +1,12 @@
+networks:
+  # Task 16（spec §4.3/§7 部署信任鏈）：固定子網，好讓 caddy 容器拿到固定 IP——
+  # app 容器的 uvicorn FORWARDED_ALLOW_IPS 才能用 IP 字面值信任它（不得用服務別名，
+  # uvicorn 只做 IP/CIDR 字面比對、不解析 DNS）。
+  quanquant_net:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+
 services:
   app:
     build: .
@@ -7,6 +16,11 @@ services:
       # Overrides env_file: in-network Postgres; bind on all interfaces inside the container.
       DB_URL: postgresql+psycopg://quanquant:${POSTGRES_PASSWORD}@postgres:5432/quanquant
       HOST: 0.0.0.0
+      # Task 16：只信任固定的 caddy 容器 IP（見下方 caddy.networks.quanquant_net.ipv4_address）
+      # 送來的 X-Forwarded-*；換 caddy IP 時必須同步改這裡（docs/deployment.md 有說明）。
+      FORWARDED_ALLOW_IPS: 172.28.0.10
+    networks:
+      quanquant_net:
     depends_on:
       postgres:
         condition: service_healthy
@@ -26,6 +40,8 @@ services:
       POSTGRES_DB: quanquant
     volumes:
       - pgdata:/var/lib/postgresql/data
+    networks:
+      quanquant_net:
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U quanquant -d quanquant"]
       interval: 10s
@@ -44,6 +60,9 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    networks:
+      quanquant_net:
+        ipv4_address: 172.28.0.10
     depends_on:
       - app
 

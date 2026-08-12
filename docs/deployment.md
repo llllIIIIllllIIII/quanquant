@@ -46,6 +46,42 @@
 - app/postgres 皆有 healthcheck；app `depends_on: service_healthy`。
 - SSE 經 Caddy 串流正常（`text/event-stream` 自動不緩衝）。
 
+### 2.1 反向代理信任鏈（Task 16，spec §4.3/§7）
+
+per-IP 限流（如 device-code 發起端點，見 `web/routers/agent_device.py::client_ip`）要看到
+「真實使用者」的來源 IP，必須讓信任鏈兩段都設定正確，否則全部請求會在 app 端合流成 Caddy
+容器自己的 IP（等於限流失效、還可能互相 DoS）：
+
+1. **Caddy 段（預設行為，不需額外設定）**：Caddy 的裸 `reverse_proxy app:8000`
+   （見 `Caddyfile`）預設**忽略**客戶端送入的 `X-Forwarded-For`，一律以真實 peer IP
+   覆寫後再轉發——所以外部使用者無法直接偽造這個標頭騙過 Caddy 這一段。
+2. **uvicorn 段（app 容器）**：app 與 Caddy 是**不同容器**，uvicorn 預設只信任
+   `127.0.0.1` 送來的轉發標頭；不設定的話，所有請求都會被記成 Caddy 容器的 IP。
+   部署時必須設定 `FORWARDED_ALLOW_IPS` 環境變數（對應 `Settings.forwarded_allow_ips`，
+   本機開發預設 `127.0.0.1`）＝**Caddy 容器的 IP/CIDR 字面值**，`web/app.py::run()` 會把
+   這個值原樣傳給 `uvicorn.run(forwarded_allow_ips=...)`，內部掛上
+   `ProxyHeadersMiddleware`，只有從這個字面值送來的連線，其 `X-Forwarded-For` 才會被
+   採信換算進 `request.client.host`。
+
+**為什麼不能用 Docker 服務別名（如 `caddy`）**：uvicorn 的 `forwarded_allow_ips`
+只做 IP/CIDR **字面比對**，不解析 DNS 名稱——填服務別名等於永遠比對不到，形同沒設定。
+因此 `docker-compose.yml` 額外固定了一個子網（`quanquant_net`，`172.28.0.0/24`）並把
+`caddy` 服務釘死在 `172.28.0.10`（`ipv4_address`），`app` 服務的 `FORWARDED_ALLOW_IPS`
+env 直接寫這個 IP 字面值。
+
+**換 Caddy 容器 IP 時**（例如手動調整 compose 的 `ipv4_address`，或改用不同子網）：
+`docker-compose.yml` 裡 `services.caddy.networks.quanquant_net.ipv4_address` 與
+`services.app.environment.FORWARDED_ALLOW_IPS` 這兩個值必須**同步更新**，兩者不一致時
+uvicorn 會拒信新 IP 送來的轉發標頭，per-IP 限流又會全部合流回 app 直接看到的連線 IP
+（即 Caddy 的新 IP）。`tests/test_deployment_trust_chain.py` 有靜態驗證兩值必須相等，
+可作為改動後的第一道防線；但仍建議改完後跑一次 `docker compose up -d` 並用兩個不同來源
+IP 打 `/api/agent/device-code` 人工確認限流沒有合流。
+
+本機開發（無 Caddy、無 proxy）：`forwarded_allow_ips` 保持預設 `127.0.0.1`，
+uvicorn 不會信任任何轉發標頭，`request.client.host` 就是直接連線的 socket peer IP；
+即使外部刻意帶假的 `X-Forwarded-For`，app 端也不會採信（見
+`tests/test_deployment_trust_chain.py::test_client_ip_reflects_direct_peer_when_no_proxy_trusted`）。
+
 ## 3. 規格選型依據
 
 實測工作負載（部署前量測）：

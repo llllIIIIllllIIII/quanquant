@@ -56,6 +56,12 @@ class Settings(BaseSettings):
     db_url: str = "sqlite:///./quanquant.db"
     host: str = "127.0.0.1"
     port: int = 8000
+    # Task 16（spec §4.3/§7 部署信任鏈）：uvicorn 只信任這個 IP/CIDR 字面值送來的
+    # X-Forwarded-*（掛 ProxyHeadersMiddleware，見 web/app.py::run()）。預設 127.0.0.1
+    # 對應本機開發（無 proxy，request.client.host 就是真正的 peer）；雲端部署由
+    # docker-compose.yml 的 FORWARDED_ALLOW_IPS env 覆寫成固定的 Caddy 容器 IP——
+    # 絕不能填服務別名（uvicorn 只做 IP/CIDR 字面比對，不解析 DNS）。
+    forwarded_allow_ips: str = "127.0.0.1"
     tv_symbol: str = "TAIFEX:TXF1!"  # TradingView chart symbol (TAIEX Futures 台指期大台; 小台=MXF1!)
 
     # Shioaji 下單風控（Task 7 RiskGuard 建構參數的最小必要欄位；Task 8 lifespan 用

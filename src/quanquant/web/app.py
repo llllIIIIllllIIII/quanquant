@@ -620,4 +620,8 @@ def run() -> None:
         host=settings.host,
         port=settings.port,
         reload=False,
+        # Task 16（spec §4.3/§7）：只信任 settings.forwarded_allow_ips（IP/CIDR 字面值）
+        # 送來的 X-Forwarded-*——uvicorn 內部掛 ProxyHeadersMiddleware，見
+        # web/routers/agent_device.py::client_ip 對此的依賴說明。
+        forwarded_allow_ips=settings.forwarded_allow_ips,
     )
