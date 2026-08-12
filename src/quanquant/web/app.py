@@ -36,6 +36,7 @@ from quanquant.sources.registry import make_source
 from quanquant.web.deps import get_current_user
 from quanquant.web.routers import alerts, candles, dashboard, health, stats, trades
 from quanquant.web.routers import admin as admin_routes
+from quanquant.web.routers import agent_device as agent_device_routes
 from quanquant.web.routers import agent_ws as agent_ws_routes
 from quanquant.web.routers import auth as auth_routes
 from quanquant.web.routers import orders as orders_routes
@@ -584,6 +585,13 @@ def create_app() -> FastAPI:
     app.include_router(auth_routes.router)    # public: /login, /logout
     app.include_router(health.router)         # public: /healthz
     app.include_router(agent_ws_routes.router)  # public: /ws/agent（token 認證，非 cookie）
+    app.include_router(agent_device_routes.router)  # public: device-code flow（未認證，見 §4.3）
+
+    # Task 5：device-code 端點的 per-IP token bucket 限流。lock 不依賴設定值，這裡直接建
+    # 好（比照既有 app.state.agent_registry 掛法）；bucket 則 lazy-init（見
+    # routers/agent_device.py 的 `_device_code_bucket` docstring：延到第一次真正呼叫才讀
+    # settings，才能吃到啟動之後才調整的限流參數）。
+    app.state.device_code_lock = asyncio.Lock()
 
     protected = [Depends(get_current_user)]
     app.include_router(dashboard.router, dependencies=protected)
