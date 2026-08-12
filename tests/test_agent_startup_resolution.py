@@ -114,3 +114,23 @@ def test_headless_server_priority_flag_beats_env_beats_default():
     assert plan2.server == "ws://env"
     plan3 = resolve_startup_plan(_args(no_gui=True), env={}, is_tty=True)
     assert plan3.server == "ws://127.0.0.1:8000/ws/agent"   # G5：現行預設值逐位不變
+
+
+# ---- GUI 模式禁 QQ_AGENT_BUFFER（spec §5.3：--buffer 與 QQ_AGENT_BUFFER 都禁） ----
+
+def test_gui_plan_rejects_qq_agent_buffer_env_conflict():
+    env = {"QQ_AGENT_BUFFER": "/some/legacy/outbox.db"}
+    with pytest.raises(SystemExit):
+        resolve_startup_plan(_args(gui=True, site="https://q.example"), env=env, is_tty=False)
+    with pytest.raises(SystemExit):
+        resolve_startup_plan(_args(reset=True, site="https://q.example"), env=env, is_tty=False)
+    with pytest.raises(SystemExit):
+        resolve_startup_plan(_args(site="https://q.example"), env=env, is_tty=True)   # 層6
+
+
+def test_no_gui_plan_ignores_qq_agent_buffer_env_conflict_check():
+    """headless 分支（層2）完全不檢查這條——QQ_AGENT_BUFFER 是 headless 既有、合法的
+    覆寫管道，只有 GUI 分支才禁用。"""
+    env = {"QQ_AGENT_BUFFER": "/some/legacy/outbox.db"}
+    plan = resolve_startup_plan(_args(no_gui=True), env=env, is_tty=True)
+    assert plan.headless is True and plan.buffer == "/some/legacy/outbox.db"
