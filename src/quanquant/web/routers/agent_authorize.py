@@ -3,9 +3,10 @@
 都回一整頁（`{% extends "base.html" %}`），不走 HTMX 局部 swap。
 
 owner-only：借用下單子系統既有的 `RiskGuard`（`orders.get_order_risk_guard`）判斷「誰是
-owner」，比照 `orders.py` 對 `POST /orders/agent-token` 的資格檢查寫法。這個頁面本身不
-依賴下單子系統是否已連線——若 `risk_guard` 未接線（子系統停用／本機測試環境），就沒有
-owner 名單可比對，見 `_require_owner` 的處理。
+owner」，比照 `orders.py` 對 `POST /orders/agent-token` 的資格檢查寫法。`risk_guard`
+未接線（子系統停用／`ORDER_CHANNEL` 未配置／`connect()` 失敗，皆為可達的生產狀態）一律
+fail closed——GET 頁面顯示「子系統未啟用」資訊、POST 一律 403，不當成「無限制放行」，
+見 `_owner_status`/`_require_owner_or_403` 的處理。
 
 CSRF：核准/拒絕（以及查詢）POST 一律要求 `csrf.verify_csrf_token` 過關（double-submit
 cookie，見 `web/csrf.py` 模組說明）——session cookie 是 SameSite=Lax，頂層導覽仍會帶上，
@@ -16,7 +17,6 @@ from fastapi.responses import HTMLResponse
 from sqlmodel import Session
 
 from quanquant.auth.device_flow import approve_device_code, deny_device_code, find_pending_by_user_code
-from quanquant.broker.base import AuthorizationError
 from quanquant.db.models import AgentDeviceCode, User
 from quanquant.web.csrf import issue_csrf_token, verify_csrf_token
 from quanquant.web.deps import get_current_user, get_session
@@ -26,23 +26,41 @@ from quanquant.web.templating import templates
 router = APIRouter()
 
 _ALREADY_PROCESSED = "已處理，請對方重新開始授權流程"
+_SUBSYSTEM_DISABLED = "下單子系統未啟用，無法核准"
 
 
-def _require_owner(risk_guard, user_id: int) -> None:
-    """owner-only 檢查；risk_guard 未接線時視為無限制（沒有 owner 名單可比對），比照
-    `orders.py` 對『下單子系統停用不擋』的既有精神——這個頁面唯一的硬性前提是已登入
-    （由 `Depends(get_current_user)` 把關），owner 名單只有在子系統真的連線時才有意義。"""
+def _owner_status(risk_guard, user_id: int) -> str:
+    """回傳 `'owner'` / `'not_owner'` / `'disabled'`。
+
+    round4（reviewer Critical）：`risk_guard is None` 先前被當成『無限制放行』，但這是
+    可達的生產狀態（`ORDER_CHANNEL` 未配置／子系統停用／`connect()` 失敗，見
+    `app.py:_start_order_subsystem`），而這支 router 是無條件掛載（`app.py` 只走
+    `dependencies=protected`＝需登入，不看下單子系統狀態）——等於任何已登入使用者都能在
+    子系統未接線時核准/拒絕任意裝置代碼，是授權繞過。codebase 既有三處消費
+    `risk_guard`／owner 名單的地方全部 fail closed：`orders.py issue_agent_token`／
+    `toggle_kill_switch`（None → 回停用片段，不執行動作）、`agent_ws._authenticate`
+    （`risk_guard is None or not risk_guard.is_owner(...)` → 直接視為未通過驗證）。這裡
+    比照同一精神：`disabled` 與 `not_owner` 都不是『owner』，呼叫端一律不得放行 mutation；
+    只有 GET 頁面本身用 `disabled` 這個狀態顯示一段資訊（不是允許操作）。"""
     if risk_guard is None:
+        return "disabled"
+    return "owner" if risk_guard.is_owner(user_id) else "not_owner"
+
+
+def _require_owner_or_403(risk_guard, user_id: int) -> None:
+    """POST 端點（查碼／核准／拒絕）一律 fail closed：`not_owner` 與 `disabled` 都 403，
+    只有文案不同。比 GET 的資訊頁更嚴格——查碼本身雖然只讀，但沒有 owner 名單可信任的
+    請求不該連『這組代碼是否存在待核准請求』都能問到；決定端點更是直接 mutate 狀態。"""
+    status = _owner_status(risk_guard, user_id)
+    if status == "owner":
         return
-    try:
-        risk_guard.assert_owner(user_id)
-    except AuthorizationError:
-        raise HTTPException(status_code=403, detail="not owner")
+    detail = "not owner" if status == "not_owner" else _SUBSYSTEM_DISABLED
+    raise HTTPException(status_code=403, detail=detail)
 
 
 def _page_response(
     request: Request, *, error: str | None = None, confirm: dict | None = None,
-    result: str | None = None, status_code: int = 200,
+    result: str | None = None, disabled: bool = False, status_code: int = 200,
 ) -> HTMLResponse:
     """統一組裝 `agent_authorize.html` 全頁回應，並在裡頭發一顆新的 CSRF cookie／隱藏欄位
     值。做法：先在一個丟棄用的 `Response()` 上呼叫 `issue_csrf_token` 拿到 token，再把它
@@ -55,7 +73,7 @@ def _page_response(
     response = templates.TemplateResponse(
         request, "agent_authorize.html",
         {"active": "agent_authorize", "error": error, "confirm": confirm, "result": result,
-         "csrf_token": csrf_token},
+         "disabled": disabled, "csrf_token": csrf_token},
         status_code=status_code,
     )
     for name, value in cookie_carrier.raw_headers:
@@ -70,8 +88,10 @@ def authorize_page(
     user: User = Depends(get_current_user),
     risk_guard=Depends(get_order_risk_guard),
 ):
-    _require_owner(risk_guard, user.id)
-    return _page_response(request)
+    status = _owner_status(risk_guard, user.id)
+    if status == "not_owner":
+        raise HTTPException(status_code=403, detail="not owner")
+    return _page_response(request, disabled=(status == "disabled"))
 
 
 @router.post("/agent/authorize", response_class=HTMLResponse)
@@ -83,9 +103,12 @@ async def authorize_lookup(
     user: User = Depends(get_current_user),
     risk_guard=Depends(get_order_risk_guard),
 ):
+    # owner 檢查在 CSRF 之前：兩者任一失敗都是 403、動作都不執行，順序不影響安全性；
+    # 但把 owner 檢查放前面讓「非 owner／子系統未接線」這兩種情境不需要先合法取得一顆
+    # CSRF cookie 才能驗證會被拒絕（GET 對 not_owner 直接 403、不發 cookie）。
+    _require_owner_or_403(risk_guard, user.id)
     if not verify_csrf_token(request, csrf_token):
         raise HTTPException(status_code=403, detail="csrf token 無效")
-    _require_owner(risk_guard, user.id)
     # 手動輸碼容錯：碼本身只用大寫英數（見 generate_user_code 的 alphabet），使用者若
     # 輸入小寫或帶前後空白，正規化後再查——這是本任務「手動輸碼」的核心情境，不正規化
     # 幾乎每次都會誤判成「找不到」。
@@ -106,9 +129,9 @@ async def authorize_decide(
     user: User = Depends(get_current_user),
     risk_guard=Depends(get_order_risk_guard),
 ):
+    _require_owner_or_403(risk_guard, user.id)
     if not verify_csrf_token(request, csrf_token):
         raise HTTPException(status_code=403, detail="csrf token 無效")
-    _require_owner(risk_guard, user.id)
     if decision not in ("approve", "deny"):
         raise HTTPException(status_code=400, detail="invalid decision")
 

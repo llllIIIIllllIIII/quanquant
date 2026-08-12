@@ -2,7 +2,10 @@
 {% block content %}
 <h2>核准 Agent 連線請求</h2>
 
-{% if result %}
+{% if disabled %}
+  <p class="field-error">下單子系統未啟用，無法核准 agent 連線請求。請聯絡系統管理者確認
+    子系統連線狀態後再試。</p>
+{% elif result %}
   <p>{{ result }}</p>
   <p><a href="/agent/authorize">回到輸入代碼</a></p>
 {% elif confirm %}
