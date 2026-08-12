@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <title>QuanQuant Agent — 選擇帳號</title>
+  <style>
+    body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+    .profile { border: 1px solid #ddd; border-radius: 0.5rem; padding: 1rem; margin-bottom: 1rem; display: flex; justify-content: space-between; align-items: center; }
+    .add-account { margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <h1>選擇帳號</h1>
+  <p>這台機器上已經設定過多個帳號，請選擇要啟動哪一個：</p>
+
+  {% for p in profiles %}
+  <div class="profile">
+    <span>{{ p.username }}</span>
+    <form method="post" action="/profiles/select">
+      <input type="hidden" name="profile_id" value="{{ p.profile_id }}">
+      <button type="submit">使用此帳號</button>
+    </form>
+  </div>
+  {% endfor %}
+
+  <p class="add-account"><a href="/setup">新增帳號</a></p>
+</body>
+</html>

@@ -30,13 +30,20 @@ from contextlib import asynccontextmanager
 import uvicorn
 from fastapi import FastAPI, Response, status
 
+from quanquant.agent import keyring_store
 from quanquant.agent.gui.security import (
     GuiSecurityState,
     bootstrap_url,
     consume_bootstrap,
     install_security_headers,
 )
+from quanquant.agent.gui.setup_routes import _DEFAULT_SYMBOL, _derive_ws_url
 from quanquant.agent.gui.setup_routes import router as setup_router
+from quanquant.agent.gui.startup_flow import (
+    GuiStartupDecision,
+    probe_direct_connect,
+    resolve_gui_startup,
+)
 from quanquant.agent.gui.status_routes import router as status_router
 
 log = logging.getLogger(__name__)
@@ -81,13 +88,19 @@ def build_app(state: GuiSecurityState) -> FastAPI:
         # 實例時會整份取代掉注入的 response（含它身上 consume_bootstrap 剛
         # set_cookie() 種上去的 Set-Cookie 標頭），不會合併；沿用同一物件才能確保
         # session cookie 真的隨這個 303 一起送出。
+        #
+        # Task 13：導向目標改讀 `app.state.gui_bootstrap_redirect_path`（預設仍是
+        # `_SETUP_PATH`，向後相容既有測試）——`run_gui()` 算完 GUI 決策樹之後會覆寫這個
+        # 欄位成 `/profiles`（多筆帳號）或 `/status`（direct 快速連線成功），讓瀏覽器
+        # 首次開啟就直接落在正確的頁面，而不是每次都先繞經 `/setup`。
         response.status_code = status.HTTP_303_SEE_OTHER
-        response.headers["location"] = _SETUP_PATH
+        response.headers["location"] = getattr(app.state, "gui_bootstrap_redirect_path", _SETUP_PATH)
         return response
 
     app.state.gui_security = state
     app.state.agent_runner = None
     app.state.runner_task = None
+    app.state.gui_bootstrap_redirect_path = _SETUP_PATH
     return app
 
 
@@ -160,11 +173,66 @@ async def shutdown_runner(app: FastAPI) -> bool:
     return died is not False
 
 
+async def launch_direct(app: FastAPI, *, profile, site_origin: str) -> tuple[str, str | None]:
+    """spec §5.3 決策樹 `kind="direct"` 分支的唯一實作——`run_gui()` 啟動時的 direct
+    快速路徑與 `/profiles` 選擇頁『使用此帳號』（`setup_routes.py::profiles_select`）
+    共用同一段邏輯，不重複兩份。用 keyring 裡已存的 token/永豐憑證組出真正的
+    `AgentRunner`，`run_forever(stop_on_token_reject=True)` 背景跑（GUI 路徑唯一允許
+    停用無限重試的地方——headless 呼叫端從不傳這個參數，見 `runner.py` G5），
+    `probe_direct_connect()` 短窗觀察握手結果：
+
+    - `"rejected"`（WS 被 server 以 close code 1008 拒絕，token 已失效/被撤銷）→
+      `run_forever` 內部已經 `stop()`（latch "rejected"）＋`return`，這裡等它收尾
+      （逾時才 `cancel()`，見 brief），回傳 `("/setup", <提示重新授權的文案>)`——**不信任**
+      keyring 裡的 `expires_at`，呼叫端負責把這個 notice 併入接下來顯示的
+      `GuiStartupDecision`。
+    - 其餘（`"connected"` 或短窗內未定案，純網路延遲）→ 背景連線持續跑，回傳
+      `("/status", None)`。
+    """
+    token = keyring_store.load_token(site_origin=site_origin, profile_id=profile.profile_id)
+    broker = keyring_store.load_broker_credentials(site_origin=site_origin, profile_id=profile.profile_id)
+    if token is None or broker is None:
+        # resolve_gui_startup() 已經先驗過這兩者存在才會回傳 kind="direct"；這裡是純
+        # 防禦（例如兩次呼叫之間 keyring 被外部清空的極窄競態），不是正常路徑。
+        return "/setup", "設定資料不完整，請重新設定"
+
+    from quanquant.agent.buffer import DurableBuffer
+    from quanquant.agent.runner import AgentRunner, ChildHandle
+    from quanquant.agent.ws_client import WebsocketsTransport
+
+    ws_url = _derive_ws_url(site_origin)
+    runner = AgentRunner(
+        transport=WebsocketsTransport(ws_url, token=token["token"]),
+        buffer=DurableBuffer(profile.buffer_path),
+        child=ChildHandle(credentials=broker, symbol=_DEFAULT_SYMBOL, mode="sim",
+                           buffer_path=profile.buffer_path),
+        mode="sim",
+    )
+    app.state.agent_runner = runner
+    task = asyncio.create_task(runner.run_forever(stop_on_token_reject=True))
+    app.state.runner_task = task
+
+    result = await probe_direct_connect(runner)
+    if result == "rejected":
+        try:
+            await asyncio.wait_for(task, timeout=1.0)
+        except asyncio.TimeoutError:
+            task.cancel()
+        return "/setup", "先前記住的授權已失效（token 可能已被撤銷），請重新授權"
+    return "/status", None
+
+
 async def run_gui(*, site_origin: str, profile: str | None, reset: bool) -> None:
-    """GUI 協調器主入口，見 module docstring。`site_origin`/`profile`/`reset` 目前只
-    存進 `app.state`——Task 9（device flow 需要 `site_origin`）、Task 12/13（profile
-    選擇／`--reset` 決策樹）落地後才會真的讀取，本 task 只負責原樣傳遞、不預先發明
-    用法（YAGNI）。"""
+    """GUI 協調器主入口，見 module docstring。Task 13：④自動開瀏覽器之前先呼叫
+    `resolve_gui_startup()` 跑一次 spec §5.3 決策樹，依 `decision.kind` 決定瀏覽器
+    第一頁該落在哪裡（`/bootstrap` 的一次性 302 導向目標改讀
+    `app.state.gui_bootstrap_redirect_path`，見 `build_app()`）：
+    - `"profile_select"` → `/profiles`（多筆帳號、無 `--profile` 命中）。
+    - `"setup"` → `/setup`，帶 `decision.start_step`/`decision.notice`（存進
+      `app.state.gui_startup_decision`，`setup_routes.py` 的 `GET /setup` 讀它）。
+    - `"direct"` → 呼叫 `launch_direct()`（見其 docstring）：連線失敗（`"rejected"`）
+      降級為 `"setup"` 決策＋提示重新授權；其餘導向 `/status`（背景連線已在跑）。
+    """
     sock = _bind_ephemeral_socket()
     port = sock.getsockname()[1]
     state = GuiSecurityState(port=port)
@@ -172,6 +240,21 @@ async def run_gui(*, site_origin: str, profile: str | None, reset: bool) -> None
     app.state.site_origin = site_origin
     app.state.profile = profile
     app.state.reset = reset
+
+    decision = resolve_gui_startup(site_origin=site_origin, profile_hint=profile, reset=reset)
+    app.state.gui_startup_decision = decision
+
+    if decision.kind == "profile_select":
+        app.state.gui_bootstrap_redirect_path = "/profiles"
+    elif decision.kind == "direct":
+        target_path, notice = await launch_direct(app, profile=decision.profile, site_origin=site_origin)
+        if notice is not None:
+            app.state.gui_startup_decision = GuiStartupDecision(
+                kind="setup", start_step=1, profile=decision.profile, notice=notice,
+            )
+        app.state.gui_bootstrap_redirect_path = target_path
+    else:
+        app.state.gui_bootstrap_redirect_path = _SETUP_PATH
 
     config = uvicorn.Config(app, access_log=False)
     server = uvicorn.Server(config)

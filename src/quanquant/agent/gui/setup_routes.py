@@ -50,7 +50,6 @@ Task 11/12 落地後直接補上，不預先發明它們的介面。
 """
 import asyncio
 import logging
-import os
 from pathlib import Path
 
 import httpx
@@ -58,6 +57,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
+from quanquant.agent import keyring_store, profile_registry
 from quanquant.agent.device_flow_client import (
     DeviceFlowClient,
     DeviceFlowDeniedError,
@@ -67,6 +67,12 @@ from quanquant.agent.device_flow_client import (
     VerificationPathMismatchError,
 )
 from quanquant.agent.gui.security import require_gui_session
+from quanquant.agent.gui.startup_flow import (
+    GuiStartupDecision,
+    check_legacy_buffer_conflict,
+    reconcile_profile_after_approval,
+    resolve_gui_startup,
+)
 
 log = logging.getLogger(__name__)
 
@@ -75,9 +81,6 @@ router = APIRouter(dependencies=[Depends(require_gui_session)])
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
-_LEGACY_BUFFER_PATH = os.path.expanduser("~/.quanquant-agent/outbox.db")  # 與
-    # `agent/main.py` 的 `--buffer` 預設值一致；per-profile 路徑待 Task 12
-    # `profile_registry.buffer_path_for()` 落地後改用。
 _DEFAULT_SYMBOL = "TXF"  # Inc0 既有唯一支援商品，見 `agent/main.py` 預設值。
 
 # 步驟①錯誤文案對照表：key 是背景 task 存進 app.state.device_flow_error 的例外類別名
@@ -91,6 +94,37 @@ _ERROR_MESSAGES = {
     "DeviceFlowGaveUpError": "授權多次交付失敗，請按「開始授權」重試或檢查伺服器狀態。",
     "UnexpectedError": "發生未預期錯誤，請重新開始授權。",
 }
+
+
+# ---------------------------------------------------------------------------
+# Task 13：核准後的 profile 收斂點＋首次 launch 的舊 buffer 防呆
+# ---------------------------------------------------------------------------
+
+def _finalize_approved_profile(
+    app_state, *, site_origin: str, expected_profile: "profile_registry.ProfileEntry | None",
+    approved: dict,
+) -> "profile_registry.ProfileEntry":
+    """device flow 核准完成（approved dict 含 profile_id/username/token/token_expires_at）
+    後的唯一收斂點：一律呼叫 reconcile_profile_after_approval 決定要沿用哪個 profile
+    （expected_profile 是精靈啟動當下的預期——0 筆分支/miss 分支為 None，1 筆分支/
+    --profile 命中為 resolve_gui_startup 回傳的 decision.profile）。回傳值存進
+    app_state.gui_current_profile，後續 step2/step3 一律讀這個欄位取得 buffer_path，
+    不得再各自讀 approved["profile_id"] 另外組路徑。"""
+    entry, _is_new = reconcile_profile_after_approval(
+        site_origin=site_origin, expected_profile=expected_profile,
+        approved_profile_id=approved["profile_id"], username=approved["username"],
+    )
+    app_state.gui_current_profile = entry
+    return entry
+
+
+def _guard_legacy_buffer_before_first_launch(*, site_origin: str, profile_id: str) -> str | None:
+    """回傳非 None＝擋下 launch（HTTP 409，顯示這段文案，不建立 profile、不啟動 runner）；
+    None＝放行。只在『這個 (site_origin, profile_id) 在 registry 裡還不存在』時才檢查——
+    舊 buffer 衝突只對『這台機器第一次從 headless 轉 GUI』有意義。"""
+    if profile_registry.find_profile(site_origin=site_origin, profile_id=profile_id) is not None:
+        return None
+    return check_legacy_buffer_conflict()
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +161,22 @@ def _ensure_device_flow_started(app) -> None:
         try:
             await client.initiate()
             result = await client.poll_until_done()
+            # Task 13 Step 3b：核准回應到手的當下、寫入 app.state.device_flow_result 之前，
+            # 唯一收斂點——不得讓 step2/step3 handler 各自 upsert_profile／另組 buffer 路徑。
+            decision = getattr(app.state, "gui_startup_decision", None)
+            expected_profile = decision.profile if decision is not None else None
+            entry = _finalize_approved_profile(
+                app.state, site_origin=app.state.site_origin,
+                expected_profile=expected_profile, approved=result,
+            )
+            profile_hint = getattr(app.state, "profile", None)
+            if profile_hint is not None and profile_hint != entry.profile_id:
+                # spec §5.3：--profile 捷徑命中的帳號與核准頁實際登入的帳號不同——常見於
+                # 使用者換了帳號登入核准頁。不擋，正常完成精靈，只在步驟③額外提醒使用者
+                # 桌面捷徑已經跟不上了。
+                app.state.gui_shortcut_mismatch_notice = (
+                    "捷徑指向的帳號已變更，請重新產生捷徑或修改 --profile"
+                )
             app.state.device_flow_result = result
             log.info("setup: device flow 已核准（帳號：%s）", result.get("username"))
         except (VerificationPathMismatchError, DeviceFlowExpiredError,
@@ -147,11 +197,13 @@ def _ensure_device_flow_started(app) -> None:
 def _render_step1(request: Request, *, status_code: int = 200) -> HTMLResponse:
     client: DeviceFlowClient | None = getattr(request.app.state, "device_flow_client", None)
     error_code = getattr(request.app.state, "device_flow_error", None)
+    decision: GuiStartupDecision | None = getattr(request.app.state, "gui_startup_decision", None)
     context = {
         "started": client is not None,
         "user_code": client.user_code if client is not None else None,
         "approval_url": client.approval_url if client is not None else None,
         "error": _ERROR_MESSAGES.get(error_code, error_code) if error_code else None,
+        "notice": decision.notice if decision is not None else None,
     }
     return templates.TemplateResponse(request, "setup_step1.html", context, status_code=status_code)
 
@@ -170,6 +222,7 @@ def _render_step3(request: Request, *, launch_error: str | None = None, status_c
         "symbol": _DEFAULT_SYMBOL,
         "username": approved.get("username", ""),
         "launch_error": launch_error,
+        "shortcut_notice": getattr(request.app.state, "gui_shortcut_mismatch_notice", None),
     }
     return templates.TemplateResponse(request, "setup_step3.html", context, status_code=status_code)
 
@@ -183,13 +236,70 @@ async def setup_page(request: Request) -> HTMLResponse:
     """依 `app.state` 目前進度顯示對應步驟：尚未拿到核准結果 → 步驟①（純渲染，不觸發
     任何 mutation——見 module docstring「mutation 一律走 POST」；尚未啟動 device flow
     時 `setup_step1.html` 會顯示「開始授權」按鈕，由使用者按下才真的
-    `POST /setup/step1/start`）；已核准但永豐憑證未收 → 步驟②；兩者皆備 → 步驟③。"""
+    `POST /setup/step1/start`）；已核准但永豐憑證未收 → 步驟②；兩者皆備 → 步驟③。
+
+    Task 13：`resolve_gui_startup()` 決定 `start_step=2`（既有 profile 的 token 仍有效，
+    只缺永豐憑證）時，`app.state.gui_startup_decision.profile` 帶著這個既有 profile——
+    這裡直接用 keyring 裡現成的 token 建出等價的 `device_flow_result`，不必重跑一次裝置
+    授權，讓上面既有的『依進度顯示步驟』邏輯自然落在步驟②。"""
     app_state = request.app.state
+    decision: GuiStartupDecision | None = getattr(app_state, "gui_startup_decision", None)
+    if (decision is not None and decision.kind == "setup" and decision.start_step >= 2
+            and decision.profile is not None
+            and getattr(app_state, "device_flow_result", None) is None):
+        token = keyring_store.load_token(
+            site_origin=app_state.site_origin, profile_id=decision.profile.profile_id,
+        )
+        if token is not None:
+            app_state.device_flow_result = {
+                "token": token["token"], "profile_id": decision.profile.profile_id,
+                "username": token["username"], "token_expires_at": token["expires_at"],
+            }
+            app_state.gui_current_profile = decision.profile
     if getattr(app_state, "device_flow_result", None) is None:
         return _render_step1(request)
     if getattr(app_state, "broker_credentials", None) is None:
         return _render_step2(request)
     return _render_step3(request)
+
+
+@router.get("/profiles", response_class=HTMLResponse)
+async def profiles_page(request: Request) -> HTMLResponse:
+    """spec §6.3：多筆 profile 且無 --profile 命中時的落地頁——列出所有已知帳號，各自
+    一顆「使用此帳號」（POST /profiles/select）；固定一個「新增帳號」連到 /setup（不帶
+    任何 profile 相關參數，等同全新精靈）。"""
+    entries = profile_registry.list_profiles(site_origin=request.app.state.site_origin)
+    return templates.TemplateResponse(request, "profile_select.html", {"profiles": entries})
+
+
+@router.post("/profiles/select")
+async def profiles_select(request: Request) -> Response:
+    """使用者在 /profiles 選了一個帳號：以該 profile_id 重呼 resolve_gui_startup，依回傳
+    的 decision.kind 導向對應頁面——kind="direct" 比照 coordinator 既有 direct 分支邏輯
+    （見 coordinator.launch_direct，兩處共用同一段實作，不重複）。"""
+    form = await request.form()
+    profile_id = str(form.get("profile_id") or "")
+    app_state = request.app.state
+    decision = resolve_gui_startup(
+        site_origin=app_state.site_origin, profile_hint=profile_id, reset=False,
+    )
+    app_state.gui_startup_decision = decision
+
+    if decision.kind == "direct":
+        from quanquant.agent.gui.coordinator import launch_direct
+        target_path, notice = await launch_direct(
+            request.app, profile=decision.profile, site_origin=app_state.site_origin,
+        )
+        if notice is not None:
+            app_state.gui_startup_decision = GuiStartupDecision(
+                kind="setup", start_step=1, profile=decision.profile, notice=notice,
+            )
+    else:
+        target_path = "/setup"
+
+    response = Response(status_code=303)
+    response.headers["location"] = target_path
+    return response
 
 
 @router.post("/setup/step1/start", response_class=HTMLResponse)
@@ -260,22 +370,32 @@ def _derive_ws_url(site_origin: str) -> str:
 async def setup_step3_launch(request: Request) -> Response:
     """精靈最後一步：用 device flow 拿到的 token＋永豐憑證組出真正的
     `AgentRunner`/`ChildHandle`/`WebsocketsTransport`，交給 coordinator 的
-    `attach_runner()` 啟動（沿用既有 Inc0 machinery，非本 task 新增）。"""
+    `attach_runner()` 啟動（沿用既有 Inc0 machinery，非本 task 新增）。
+
+    Task 13：`app_state.gui_current_profile`（唯一由 `_finalize_approved_profile` 寫入，
+    見其 docstring）是這裡唯一的 profile 來源——不得再各自讀 `approved["profile_id"]`
+    另組 buffer 路徑。啟動前先跑 `_guard_legacy_buffer_before_first_launch`：只在這是這台
+    機器第一次建立這個 `(site_origin, profile_id)` 時才擋（見其 docstring），擋下就完全
+    不建 registry／不寫 keyring／不建構 runner。"""
     app_state = request.app.state
     approved = getattr(app_state, "device_flow_result", None)
     broker = getattr(app_state, "broker_credentials", None)
-    if approved is None or broker is None:
+    profile = getattr(app_state, "gui_current_profile", None)
+    if approved is None or broker is None or profile is None:
         raise HTTPException(status_code=409, detail="尚未完成前面步驟，無法啟動")
 
-    # TODO(Task 11 keyring 落地後補上)：依 app_state.remember_device_auth／
-    # remember_broker_credentials 兩個 opt-in 旗標，分別呼叫
-    # keyring_store.save_token()/save_broker_credentials() 把這一輪憑證寫入系統
-    # keyring；目前這兩個旗標只停留在 app_state，尚未有任何持久化效果。
-    # TODO(Task 12 profile registry 落地後補上)：呼叫
-    # profile_registry.upsert_profile(site_origin=..., profile_id=approved["profile_id"],
-    # username=approved["username"], buffer_path=...) 寫入
-    # ~/.quanquant-agent/profiles.json，並改用 profile_registry.buffer_path_for() 算出
-    # per-profile 的 buffer 路徑（目前先沿用下面的 legacy 單一路徑）。
+    site_origin = app_state.site_origin
+
+    conflict = _guard_legacy_buffer_before_first_launch(
+        site_origin=site_origin, profile_id=profile.profile_id,
+    )
+    if conflict is not None:
+        return HTMLResponse(conflict, status_code=409)
+
+    profile_registry.upsert_profile(
+        site_origin=site_origin, profile_id=profile.profile_id,
+        username=profile.username, buffer_path=profile.buffer_path,
+    )
 
     from quanquant.agent.buffer import DurableBuffer
     from quanquant.agent.gui.coordinator import attach_runner
@@ -286,12 +406,12 @@ async def setup_step3_launch(request: Request) -> Response:
     # 拋例外）不該變成未接住的 500 裸例外——包 try/except 改走已存在但先前從未真的被填的
     # `_render_step3(launch_error=...)` 主題化錯誤頁，使用者留在步驟③可以再按一次「啟動」。
     try:
-        ws_url = _derive_ws_url(app_state.site_origin)
+        ws_url = _derive_ws_url(site_origin)
         runner = AgentRunner(
             transport=WebsocketsTransport(ws_url, token=approved["token"]),
-            buffer=DurableBuffer(_LEGACY_BUFFER_PATH),
+            buffer=DurableBuffer(profile.buffer_path),
             child=ChildHandle(credentials=broker, symbol=_DEFAULT_SYMBOL, mode="sim",
-                               buffer_path=_LEGACY_BUFFER_PATH),
+                               buffer_path=profile.buffer_path),
             mode="sim",
         )
         attach_runner(request.app, runner)
@@ -300,7 +420,25 @@ async def setup_step3_launch(request: Request) -> Response:
         return _render_step3(request, launch_error="啟動失敗，請確認伺服器位址與憑證正確後重試。",
                               status_code=500)
 
-    log.info("setup: 精靈完成，agent runner 已啟動（帳號：%s）", approved.get("username"))
+    # opt-in：依 step2 收的 remember_device_auth／remember_broker_credentials 兩個旗標，
+    # 分別把這一輪憑證寫入系統 keyring——寫入失敗只記警告、不影響本次已經啟動的 runner
+    # （下次啟動時 resolve_gui_startup 會因為 keyring 沒這筆而重新走精靈，不會裝作記住了）。
+    if getattr(app_state, "remember_device_auth", False):
+        result = keyring_store.save_token(
+            site_origin=site_origin, profile_id=profile.profile_id, token=approved["token"],
+            expires_at=approved["token_expires_at"], username=profile.username,
+        )
+        if not result.ok:
+            log.warning("setup: 記住裝置授權寫入 keyring 失敗，不影響本次啟動（%s）", result.error)
+    if getattr(app_state, "remember_broker_credentials", False):
+        result = keyring_store.save_broker_credentials(
+            site_origin=site_origin, profile_id=profile.profile_id,
+            api_key=broker["api_key"], secret_key=broker["secret_key"],
+        )
+        if not result.ok:
+            log.warning("setup: 記住永豐 API 憑證寫入 keyring 失敗，不影響本次啟動（%s）", result.error)
+
+    log.info("setup: 精靈完成，agent runner 已啟動（帳號：%s）", profile.username)
 
     response = Response(status_code=303)
     response.headers["location"] = "/status"

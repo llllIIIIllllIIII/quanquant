@@ -7,6 +7,7 @@
     body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
     dt { font-weight: 700; margin-top: 0.75rem; }
     .error { color: #b00020; }
+    .notice { color: #8a6100; background: #fff8e1; border-radius: 0.5rem; padding: 0.75rem 1rem; }
   </style>
 </head>
 <body>
@@ -14,6 +15,10 @@
 
   {% if launch_error %}
     <p class="error">{{ launch_error }}</p>
+  {% endif %}
+
+  {% if shortcut_notice %}
+    <p class="notice">{{ shortcut_notice }}</p>
   {% endif %}
 
   <dl>

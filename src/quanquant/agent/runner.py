@@ -50,6 +50,7 @@ from quanquant.broker.agent_protocol import (
 )
 from quanquant.agent.buffer import SentinelUnreadableError
 from quanquant.agent.native_runner import child_main
+from quanquant.agent.ws_client import TokenRejectedError
 
 log = logging.getLogger(__name__)
 
@@ -80,12 +81,14 @@ class FatalAgentError(RuntimeError):
 @dataclass(frozen=True)
 class AgentSnapshot:
     """整份替換的不可變快照，由主 event loop 單一擁有（GUI 與 runner 同 loop，讀取
-    不需 lock）。connection 的合法值目前為 "connecting"/"connected"/"reconnecting"/
-    "offline"；Task 13 會再追加 "rejected"（WS 握手被拒，token 無效/停用/非 owner）——
-    寫入這個欄位永遠只能經過下面 _connection_state_for_session_exception() 這一個集中
-    判斷點，不得在 _pump/_receive_loop/_heartbeat/_child_watchdog 等個別 task 各自
-    setattr（多處同時寫同一欄位、例外同步收攏無 await 讓出點，會有後寫覆蓋先寫的競態，
-    這是 fresh read-back 覆核抓到的教訓，Task 13 段落有完整根因分析）。"""
+    不需 lock）。connection 的合法值為 "connecting"/"connected"/"reconnecting"/
+    "offline"/"rejected"（Task 13：WS 握手被拒，token 無效/停用/非 owner）——寫入這個
+    欄位永遠只能經過下面 _connection_state_for_session_exception() 這一個集中判斷點
+    （run_once() 例外收攏處），或 stop()／run_forever() 的 TokenRejectedError latch
+    分支（見其 docstring，刻意不呼叫 stop() 以免蓋掉 "rejected"），不得在
+    _pump/_receive_loop/_heartbeat/_child_watchdog 等個別 task 各自 setattr（多處同時寫
+    同一欄位、例外同步收攏無 await 讓出點，會有後寫覆蓋先寫的競態，這是 fresh read-back
+    覆核抓到的教訓，Task 13 段落有完整根因分析）。"""
     connection: str          # "connecting" | "connected" | "reconnecting" | "offline" | "rejected"（Task 13 起）
     account: str
     mode: str
@@ -99,9 +102,10 @@ class AgentSnapshot:
 def _connection_state_for_session_exception(exc: BaseException) -> str:
     """run_once() 收攏本輪 session 結束例外後、re-raise 前的唯一狀態判斷點——刻意抽成
     模組層級純函式，不塞進例外處理的行內邏輯：往後任何『某類例外該對應哪個連線態』的
-    規則都只改這一個函式，杜絕分散設定造成的競態。本 task 只建立預設 fallback：
-    "reconnecting"；TokenRejectedError→"rejected" 這個分支由 Task 13 補上（因為
-    TokenRejectedError 定義在 Task 13 才新增的 ws_client.py，本 task 尚未 import 它）。"""
+    規則都只改這一個函式，杜絕分散設定造成的競態。Task 13：`TokenRejectedError`（WS
+    握手被拒，見 ws_client.py）→ "rejected"；其餘所有例外沿用預設 "reconnecting"。"""
+    if isinstance(exc, TokenRejectedError):
+        return "rejected"
     return "reconnecting"
 
 
@@ -805,7 +809,7 @@ class AgentRunner:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await self._transport.close()
 
-    async def run_forever(self) -> None:
+    async def run_forever(self, *, stop_on_token_reject: bool = False) -> None:
         """不斷跑 run_once()：連線/子程序凍結例外時依 backoff 重試（backoff×2 封頂
         backoff_max）；ChildFrozenError 則 terminate 子程序，下一輪 ensure_child()
         respawn＋（run_once 內）重新登入——server 端視角即 WS 斷線→重連→重新 login，
@@ -822,7 +826,15 @@ class AgentRunner:
         `SessionRestartRequested`（`_recover()` 完成本機轉移後主動拋出、`run_forever` 需
         特別處理不重設 backoff 的受控訊號）隨 `_recover()` 一併移除——現在沒有任何路徑會
         因為「recovery 完成」而結束 session，下面的 except 分支只剩 `FatalAgentError`／
-        `ChildFrozenError`／一般例外三種既有情境。"""
+        `ChildFrozenError`／`TokenRejectedError`／一般例外四種既有情境。
+
+        `stop_on_token_reject`（Task 13，預設 `False`，G5 紅線）：`TokenRejectedError`
+        （WS 握手被 server 以 close code 1008 拒絕，見 ws_client.py）發生時是否停止重試。
+        headless 呼叫端（`main.py`）完全不改、不傳這個參數，永遠是 `False`——沿用既有
+        「當一般例外處理、照 backoff 繼續重連」的行為，逐位元組不變。只有 GUI coordinator
+        的 kind="direct" 快速連線路徑顯式傳 `True`：token 已知失效時不該無限重試（每輪都是
+        一次真的握手嘗試），而是讓使用者知道要重新授權——這是整條 agent 程式碼裡唯一允許
+        停用無限重試的地方。"""
         await self._startup_recovery_probe()
         backoff = self._backoff_base
         while not self._stopping:
@@ -854,6 +866,24 @@ class AgentRunner:
                         "agent 子程序無法終止，請人工處理（ChildFrozenError 後 terminate "
                         "驗死失敗，拒絕 respawn 避免雙 child）"
                     )
+            except TokenRejectedError:
+                if stop_on_token_reject:
+                    log.error(
+                        "agent WS 握手被 server 拒絕（token 無效/停用/非 owner），"
+                        "不再重試，需要重新授權"
+                    )
+                    # 刻意不呼叫 self.stop()：那會把 self._connection_state 蓋成
+                    # "offline"，蓋掉 run_once() 集中點剛寫入的 "rejected"（更精確的
+                    # 診斷資訊——GUI probe_direct_connect() 靠這個值判斷要不要導去重新
+                    # 授權）。只設 _stopping=True 讓主迴圈不再重試，等價於 stop() 的
+                    # 「不再重試」語意，但保留 "rejected" 這個更有資訊量的終態。
+                    self._stopping = True
+                    return
+                log.exception("agent WS session 異常結束，準備依 backoff 重連")
+                # 不 stop_on_token_reject（headless 預設）：與既有「一般例外」分支寫一模
+                # 一樣的 log 訊息、不 return，falls through 到下面共用的 elapsed/backoff
+                # 計算，繼續正常重試——這是 G5 的直接保證：headless 呼叫端不傳這個參數，
+                # 預設 False，控制流/日誌逐位不變。
             except asyncio.CancelledError:
                 raise
             except Exception:

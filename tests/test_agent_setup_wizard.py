@@ -4,6 +4,24 @@ import logging
 import pytest
 
 # ---------------------------------------------------------------------------
+# Task 13：本檔所有測試共用的隔離 fixture——沿用 tests/test_agent_profile_registry.py
+# 的 _isolated_home 手法，autouse 保護整個檔案：Task 13 起，`/setup/step3/launch` 會真的
+# 呼叫 profile_registry.upsert_profile()／check_legacy_buffer_conflict()，沒有這層隔離
+# 會誤寫真正的 ~/.quanquant-agent/。
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(tmp_path, monkeypatch):
+    from quanquant.agent import profile_registry
+    monkeypatch.setattr(profile_registry, "REGISTRY_PATH", tmp_path / "profiles.json")
+    monkeypatch.setattr(profile_registry, "LOCK_PATH", tmp_path / "profiles.lock")
+    import quanquant.agent.gui.startup_flow as sf
+    monkeypatch.setattr(sf, "LEGACY_DEFAULT_BUFFER", tmp_path / "legacy_outbox.db")
+    return tmp_path
+
+
+# ---------------------------------------------------------------------------
 # Step 5b 秘密掃描共用工具（reviewer Important fix a：不只查 record.getMessage()，
 # 也要查 logging.Formatter().format(record)——後者才含 exc_info 的完整 traceback
 # 文字；log.exception(...) 附帶的 traceback 最後一行固定是
@@ -228,12 +246,21 @@ async def test_step3_launch_rejects_when_prerequisites_missing(gui_client):
     assert resp.status_code == 409
 
 
-async def test_step3_launch_builds_runner_and_attaches_it(gui_client, monkeypatch):
+async def test_step3_launch_builds_runner_and_attaches_it(gui_client, monkeypatch, tmp_path):
+    from quanquant.agent.profile_registry import ProfileEntry
+
     gui_client.app.state.device_flow_result = {
         "token": "tok", "profile_id": "1", "username": "tester",
         "token_expires_at": "2099-01-01T00:00:00",
     }
     gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+    # Task 13：step3/launch 唯一讀 app_state.gui_current_profile 取得 profile——正常流程
+    # 由 _finalize_approved_profile（核准當下）寫入，這裡直接注入等價狀態，測試不必真的
+    # 跑一輪 device flow 背景 task。
+    gui_client.app.state.gui_current_profile = ProfileEntry(
+        profile_id="1", username="tester", buffer_path=str(tmp_path / "outbox.db"),
+        created_at="2020-01-01T00:00:00",
+    )
 
     calls = {}
 
@@ -278,14 +305,20 @@ async def test_step3_launch_builds_runner_and_attaches_it(gui_client, monkeypatc
     assert isinstance(calls["attached_runner"], _FakeRunner)
 
 
-async def test_step3_launch_failure_shows_themed_error_page_not_raw_500(gui_client, monkeypatch):
+async def test_step3_launch_failure_shows_themed_error_page_not_raw_500(gui_client, monkeypatch, tmp_path):
     """reviewer Minor fix：runner 建構/掛載失敗時走 `_render_step3(launch_error=...)`
     主題化錯誤頁，而非未接住裸例外。"""
+    from quanquant.agent.profile_registry import ProfileEntry
+
     gui_client.app.state.device_flow_result = {
         "token": "tok", "profile_id": "1", "username": "tester",
         "token_expires_at": "2099-01-01T00:00:00",
     }
     gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+    gui_client.app.state.gui_current_profile = ProfileEntry(
+        profile_id="1", username="tester", buffer_path=str(tmp_path / "outbox.db"),
+        created_at="2020-01-01T00:00:00",
+    )
 
     import quanquant.agent.runner as runner_module
 
@@ -298,6 +331,172 @@ async def test_step3_launch_failure_shows_themed_error_page_not_raw_500(gui_clie
     assert resp.status_code == 500
     assert "啟動失敗" in resp.text
     assert "construction failed" not in resp.text  # 例外原始訊息不外洩
+
+
+# ---------------------------------------------------------------------------
+# Task 13 Step 3b：核准後的 profile 收斂點（_finalize_approved_profile）
+# ---------------------------------------------------------------------------
+
+def test_finalize_approved_profile_reuses_existing_when_id_matches_registry(_isolated_home):
+    from types import SimpleNamespace
+
+    from quanquant.agent import profile_registry
+    from quanquant.agent.gui import setup_routes as sr
+
+    profile_registry.upsert_profile(site_origin="https://q.example", profile_id="7",
+                                     username="dave", buffer_path="/x7")
+    app_state = SimpleNamespace()
+    result = sr._finalize_approved_profile(
+        app_state, site_origin="https://q.example", expected_profile=None,
+        approved={"profile_id": "7", "username": "dave", "token": "t",
+                  "token_expires_at": "2099-01-01T00:00:00"},
+    )
+    assert result.buffer_path == "/x7"
+    assert app_state.gui_current_profile is result
+
+
+def test_finalize_approved_profile_creates_isolated_new_profile_when_mismatched(_isolated_home):
+    from types import SimpleNamespace
+
+    from quanquant.agent.gui import setup_routes as sr
+    from quanquant.agent.profile_registry import ProfileEntry
+
+    expected = ProfileEntry(profile_id="1", username="old", buffer_path="/x1", created_at="2020-01-01T00:00:00")
+    app_state = SimpleNamespace()
+    result = sr._finalize_approved_profile(
+        app_state, site_origin="https://q.example", expected_profile=expected,
+        approved={"profile_id": "2", "username": "new", "token": "t",
+                  "token_expires_at": "2099-01-01T00:00:00"},
+    )
+    assert result.profile_id == "2" and result.buffer_path != expected.buffer_path
+
+
+# ---------------------------------------------------------------------------
+# Task 13 Step 3c：舊 buffer 防呆只擋『這台機器第一次建立這個 profile』的 launch
+# ---------------------------------------------------------------------------
+
+async def test_launch_blocked_when_legacy_buffer_has_unsent_rows_and_profile_is_new(gui_client, tmp_path):
+    from quanquant.agent.buffer import DurableBuffer
+    from quanquant.agent.gui.setup_routes import _finalize_approved_profile
+
+    legacy = tmp_path / "legacy_outbox.db"  # _isolated_home（autouse）已把 LEGACY_DEFAULT_BUFFER 指到這裡
+    DurableBuffer(str(legacy)).append("order_report", {"x": 1})
+
+    approved = {"token": "tok", "profile_id": gui_client.profile_id, "username": "tester",
+                "token_expires_at": "2099-01-01T00:00:00"}
+    gui_client.app.state.device_flow_result = approved
+    gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+    _finalize_approved_profile(gui_client.app.state, site_origin=gui_client.site_origin,
+                                expected_profile=None, approved=approved)
+
+    resp = await gui_client.post("/setup/step3/launch")
+    assert resp.status_code == 409
+    assert "不會自動搬移" in resp.text
+
+
+async def test_launch_not_blocked_when_profile_already_exists_in_registry(gui_client, tmp_path, monkeypatch):
+    """既有 profile（reset 或補問憑證流程）不是『首次建立』，即使舊 buffer 有 pending 也
+    不擋——這條規則只保護真正的新使用者。"""
+    from quanquant.agent import profile_registry
+    from quanquant.agent.buffer import DurableBuffer
+    from quanquant.agent.gui.setup_routes import _finalize_approved_profile
+
+    legacy = tmp_path / "legacy_outbox.db"
+    DurableBuffer(str(legacy)).append("order_report", {"x": 1})
+    profile_registry.upsert_profile(site_origin=gui_client.site_origin, profile_id=gui_client.profile_id,
+                                     username="tester", buffer_path=str(tmp_path / "existing_outbox.db"))
+
+    approved = {"token": "tok", "profile_id": gui_client.profile_id, "username": "tester",
+                "token_expires_at": "2099-01-01T00:00:00"}
+    gui_client.app.state.device_flow_result = approved
+    gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+    _finalize_approved_profile(gui_client.app.state, site_origin=gui_client.site_origin,
+                                expected_profile=None, approved=approved)
+
+    import quanquant.agent.gui.coordinator as coordinator_module
+    monkeypatch.setattr(coordinator_module, "attach_runner", lambda app, runner: None)
+
+    resp = await gui_client.post("/setup/step3/launch")
+    assert resp.status_code != 409
+
+
+# ---------------------------------------------------------------------------
+# Task 13 Step 6：/profiles 選擇頁
+# ---------------------------------------------------------------------------
+
+async def test_profiles_page_lists_usernames_and_add_account_link(gui_client):
+    from quanquant.agent import profile_registry
+    profile_registry.upsert_profile(site_origin=gui_client.site_origin, profile_id="1",
+                                     username="alice", buffer_path="/x1")
+    profile_registry.upsert_profile(site_origin=gui_client.site_origin, profile_id="2",
+                                     username="bob", buffer_path="/x2")
+
+    resp = await gui_client.get("/profiles")
+
+    assert resp.status_code == 200
+    assert "alice" in resp.text and "bob" in resp.text
+    assert "新增帳號" in resp.text and "/setup" in resp.text
+
+
+async def test_profiles_page_requires_gui_session(gui_anon_client):
+    resp = await gui_anon_client.get("/profiles")
+    assert resp.status_code == 403
+
+
+async def test_select_profile_posts_profile_id_and_redirects_toward_resolved_decision(gui_client):
+    from quanquant.agent import profile_registry
+    profile_registry.upsert_profile(site_origin=gui_client.site_origin, profile_id="1",
+                                     username="alice", buffer_path="/x1")
+
+    resp = await gui_client.post("/profiles/select", data={"profile_id": "1"}, follow_redirects=False)
+
+    assert resp.status_code in (302, 303)
+    assert resp.headers["location"] == "/setup"  # 沒有 keyring 憑證 → decision.kind="setup"
+
+
+async def test_select_profile_direct_branch_reuses_coordinator_launch_direct_and_redirects_to_status(
+    gui_client, tmp_path, monkeypatch,
+):
+    """decision.kind="direct"（keyring 憑證齊備）時，/profiles/select 呼叫
+    coordinator.launch_direct（與 run_gui() 的 direct 分支共用同一段實作），連線成功導向
+    /status。"""
+    from quanquant.agent import keyring_store, profile_registry
+
+    profile_registry.upsert_profile(site_origin=gui_client.site_origin, profile_id="1",
+                                     username="alice", buffer_path=str(tmp_path / "outbox.db"))
+    monkeypatch.setattr(keyring_store, "load_token", lambda *, site_origin, profile_id: {
+        "token": "tok", "expires_at": "2099-01-01T00:00:00", "username": "alice",
+    })
+    monkeypatch.setattr(keyring_store, "load_broker_credentials", lambda *, site_origin, profile_id: {
+        "api_key": "K1", "secret_key": "S1",
+    })
+
+    class _FakeSnapshot:
+        connection = "connected"
+
+    class _FakeRunner:
+        def __init__(self, **kwargs): ...
+        async def run_forever(self, *, stop_on_token_reject=False):
+            await asyncio.Event().wait()
+        async def snapshot(self):
+            return _FakeSnapshot()
+
+    import quanquant.agent.buffer as buffer_module
+    import quanquant.agent.runner as runner_module
+    import quanquant.agent.ws_client as ws_client_module
+    monkeypatch.setattr(buffer_module, "DurableBuffer", lambda path: object())
+    monkeypatch.setattr(runner_module, "AgentRunner", lambda **kwargs: _FakeRunner())
+    monkeypatch.setattr(runner_module, "ChildHandle", lambda **kwargs: object())
+    monkeypatch.setattr(ws_client_module, "WebsocketsTransport", lambda url, *, token: object())
+
+    resp = await gui_client.post("/profiles/select", data={"profile_id": "1"}, follow_redirects=False)
+
+    assert resp.status_code in (302, 303)
+    assert resp.headers["location"] == "/status"
+    task = gui_client.app.state.runner_task
+    assert task is not None
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.parametrize("site_origin,expected", [

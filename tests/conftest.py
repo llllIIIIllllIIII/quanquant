@@ -115,8 +115,36 @@ async def gui_client():
         headers={"Host": f"127.0.0.1:{port}"},
     ) as client:
         client.app = app
+        # Task 13：固定暴露這兩個屬性，方便測試組出與 fixture 內部一致的 profile
+        # registry key（`(site_origin, profile_id)` 唯一鍵）——`profile_id` 是任意固定
+        # 常數，測試自行決定要不要用它先在 registry 裡預先建一筆同 id 的 profile。
+        client.site_origin = app.state.site_origin
+        client.profile_id = "1"
         yield client
     await app.state.agent_http_client.aclose()
+
+
+@pytest.fixture
+async def gui_anon_client():
+    """比照 `gui_client`，但不種 session cookie——供驗證 `require_gui_session` 擋下未
+    登入請求（比照 `tests/test_agent_gui_security.py` 對『缺 session cookie』情境的既有
+    測法：同一支 app、無 cookie，預期任何受保護路由回 403）。"""
+    from quanquant.agent.gui.coordinator import build_app
+    from quanquant.agent.gui.security import GuiSecurityState
+
+    port = 54321
+    state = GuiSecurityState(port=port)
+    state.session_token = "test-gui-session-token"
+    app = build_app(state)
+    app.state.site_origin = "https://quant.example"
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url=f"http://127.0.0.1:{port}",
+        headers={"Host": f"127.0.0.1:{port}"},
+    ) as client:
+        client.app = app
+        yield client
 
 
 def make_create(**overrides) -> TradeCreate:
