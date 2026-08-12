@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <title>QuanQuant Agent 設定精靈 — 步驟 3／3</title>
+  <style>
+    body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+    dt { font-weight: 700; margin-top: 0.75rem; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>設定精靈 — 步驟 3／3：確認啟動</h1>
+
+  {% if launch_error %}
+    <p class="error">{{ launch_error }}</p>
+  {% endif %}
+
+  <dl>
+    <dt>伺服器</dt><dd>{{ site_origin }}</dd>
+    <dt>模式</dt><dd>{{ mode }}</dd>
+    <dt>商品</dt><dd>{{ symbol }}</dd>
+    <dt>帳號</dt><dd>{{ username }}</dd>
+  </dl>
+
+  <form method="post" action="/setup/step3/launch">
+    <button type="submit">啟動</button>
+  </form>
+</body>
+</html>

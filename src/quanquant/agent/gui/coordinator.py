@@ -36,11 +36,12 @@ from quanquant.agent.gui.security import (
     consume_bootstrap,
     install_security_headers,
 )
+from quanquant.agent.gui.setup_routes import router as setup_router
 
 log = logging.getLogger(__name__)
 
-_SETUP_PATH = "/setup"   # Task 9 掛的精靈首頁；本 task 階段該路由尚不存在，redirect
-                          # 目的地先寫死常數，Task 9 落地後即可直接命中，不需回頭改這裡。
+_SETUP_PATH = "/setup"   # Task 9 掛的精靈首頁（`setup_routes.router`，本檔
+                          # `build_app()` 已 `include_router`）。
 
 
 @asynccontextmanager
@@ -60,6 +61,7 @@ def build_app(state: GuiSecurityState) -> FastAPI:
     填入。"""
     app = FastAPI(lifespan=_lifespan, openapi_url=None, docs_url=None, redoc_url=None)
     install_security_headers(app)
+    app.include_router(setup_router)  # Task 9：/setup 三步精靈＋device flow 輪詢路由
 
     @app.get("/bootstrap")
     async def bootstrap(secret: str, response: Response) -> Response:
