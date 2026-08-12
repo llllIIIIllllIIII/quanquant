@@ -628,3 +628,31 @@ class AgentAccountBinding(SQLModel, table=True):
     account: str
     user_id: int = Field(index=True)
     bound_at: datetime = Field(default_factory=_utcnow)
+
+
+class AgentDeviceCode(SQLModel, table=True):
+    """Device-code 授權流程狀態表（spec §4.2）。走 SQLModel.metadata.create_all 自動建
+    （比照 AgentToken/AgentCommand 既有範式），不進 db/migrate.py 的 _MIGRATIONS。"""
+
+    __tablename__ = "agent_device_codes"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','approved','denied')",
+            name="ck_agent_device_codes_status",
+        ),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    device_code_hash: str = Field(unique=True, index=True)
+    code_challenge: str                                    # sha256(code_verifier) hex，PoP（§8）
+    user_code: str = Field(unique=True, index=True)         # "XXXX-XXXX" 人類可讀
+    user_id: int | None = Field(default=None, index=True)   # 核准時綁定
+    request_ip: str = Field(index=True)                     # 限流計數用（§4.3）
+    status: str = Field(default="pending", index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime
+    consumed_at: datetime | None = None
+    last_polled_at: datetime | None = None
+    current_interval: int = Field(default=5)
+    consecutive_violations: int = Field(default=0)
+    blocked_until: datetime | None = None
