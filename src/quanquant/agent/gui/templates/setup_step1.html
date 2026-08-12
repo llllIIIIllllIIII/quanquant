@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>QuanQuant Agent 設定精靈 — 步驟 1／3</title>
-  {% if not error %}
+  {% if not error and started %}
   <meta http-equiv="refresh" content="2;url=/setup/poll-status">
   {% endif %}
   <style>
@@ -16,17 +16,22 @@
   <h1>設定精靈 — 步驟 1／3：連線授權</h1>
 
   {% if error %}
-    <p class="error">授權未完成（{{ error }}），請重新開始。</p>
+    <p class="error">{{ error }}</p>
     <form method="post" action="/setup/step1/start">
-      <button type="submit">重新開始授權</button>
+      <button type="submit">開始授權</button>
     </form>
   {% elif user_code %}
     <p>請在瀏覽器另開分頁（或使用手機）開啟核准頁，輸入以下代碼完成授權：</p>
     <p class="user-code">{{ user_code }}</p>
     <p><a href="{{ approval_url }}" target="_blank" rel="noopener noreferrer">開核准頁</a></p>
     <p>等待核准中……（本頁每 2 秒自動更新）</p>
-  {% else %}
+  {% elif started %}
     <p>正在與伺服器建立連線……</p>
+  {% else %}
+    <p>按下方按鈕開始裝置授權：QuanQuant Agent 會產生一組代碼，請在核准頁輸入以完成連線。</p>
+    <form method="post" action="/setup/step1/start">
+      <button type="submit">開始授權</button>
+    </form>
   {% endif %}
 </body>
 </html>

@@ -26,6 +26,9 @@ import httpx
 AGENT_AUTHORIZE_PATH = "/agent/authorize"  # 內建常數；server 回傳值僅供 exact-match 核對，
                                             # 絕不採信其值本身去組任何網址。
 
+MAX_CONSUMED_RESTARTS = 3  # reviewer Important fix：連續收到 consumed 最多自動重開這麼
+                            # 多次——見 DeviceFlowGaveUpError／poll_until_done() 說明。
+
 
 class VerificationPathMismatchError(RuntimeError):
     """`initiate()` 收到的 `verification_path` 與內建常數 `AGENT_AUTHORIZE_PATH` 不完全
@@ -44,6 +47,15 @@ class DeviceFlowDeniedError(RuntimeError):
 class DeviceFlowProtocolError(RuntimeError):
     """收到未知/不應出現的 `state` 值——防禦性分支，理論上不會發生（伺服器端 state
     集合封閉，見 `auth/device_flow.py::poll_device_token`）。"""
+
+
+class DeviceFlowGaveUpError(RuntimeError):
+    """連續收到 `consumed` 超過 `MAX_CONSUMED_RESTARTS` 次仍未成功（reviewer Important
+    fix）——正常情況下 `consumed` 應該只在使用者剛好在舊一輪核准完成的瞬間又重整精靈
+    頁面這種罕見巧合下出現一次；若連續多次都是 `consumed`，代表 server 異常（例如每次
+    核准都被別的請求搶先消費）或惡意行為，放任 `poll_until_done()` 無上限自動重開會讓
+    精靈陷入無限迴圈。達到上限即放棄（`status` 設為 `"gave_up"`），呼叫端應顯示錯誤並
+    要求使用者手動按「開始授權」重新計數。"""
 
 
 class DeviceFlowClient:
@@ -102,10 +114,17 @@ class DeviceFlowClient:
 
     async def poll_until_done(self) -> dict:
         """迴圈：`sleep(當下 interval)` → `POST` 一次（client timeout=`interval+5s`）→
-        依 state 分派：pending/slow_down → 更新 interval 繼續迴圈；approved → 回傳；
-        expired/denied → raise 對應例外；consumed → 呼叫 `initiate()` 自動重開新一輪
-        （沿用同一 `DeviceFlowClient` 實例，重設 device_code/user_code/verifier），繼續
-        迴圈；invalid → raise `DeviceFlowProtocolError`（不應發生，防禦性）。"""
+        依 state 分派：pending/slow_down → 更新 interval 繼續迴圈（同時把
+        `consumed` 連續計數歸零——見下方）；approved → 回傳；expired/denied → raise
+        對應例外；consumed → 呼叫 `initiate()` 自動重開新一輪（沿用同一
+        `DeviceFlowClient` 實例，重設 device_code/user_code/verifier），繼續迴圈；
+        invalid → raise `DeviceFlowProtocolError`（不應發生，防禦性）。
+
+        reviewer Important fix：`consumed` 連續重開有上限（`MAX_CONSUMED_RESTARTS`）
+        ——`consumed_restarts` 只計「連續」次數，一旦收到 pending/slow_down（代表新一輪
+        device code 正常存活、等待使用者操作中，不是立即又被消費）就歸零；超過上限則
+        `raise DeviceFlowGaveUpError`，不再呼叫 `initiate()`。"""
+        consumed_restarts = 0
         while True:
             await asyncio.sleep(self._interval)
             resp = await self._http.post(
@@ -118,6 +137,7 @@ class DeviceFlowClient:
             self.status = state
             if state in ("pending", "slow_down"):
                 self._interval = body.get("interval", self._interval)
+                consumed_restarts = 0
                 continue
             if state == "approved":
                 return body
@@ -126,6 +146,12 @@ class DeviceFlowClient:
             if state == "denied":
                 raise DeviceFlowDeniedError()
             if state == "consumed":
+                consumed_restarts += 1
+                if consumed_restarts > MAX_CONSUMED_RESTARTS:
+                    self.status = "gave_up"
+                    raise DeviceFlowGaveUpError(
+                        f"連續 {consumed_restarts} 次收到 consumed 仍未成功，已放棄自動重開"
+                    )
                 await self.initiate()
                 continue
             raise DeviceFlowProtocolError(f"未知 state: {state!r}")

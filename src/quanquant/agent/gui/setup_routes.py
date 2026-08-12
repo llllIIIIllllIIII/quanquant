@@ -14,10 +14,16 @@ API 憑證 ③確認啟動。掛在 `coordinator.build_app()`（`app.include_rou
 
 **單一 in-flight 輪詢**（承接 `DeviceFlowClient` 自己的保證）：本模組另外用
 `app.state.device_flow_task is not None` 判斷「這一輪精靈的 device flow 是否已經在跑」
-——`_ensure_device_flow_started()` 是唯一的啟動點，冪等（已存在就直接返回），確保無論
-`GET /setup`（首次載入自動啟動）或 `POST /setup/step1/start`（使用者按鈕／自動刷新頁面
-重試）被呼叫幾次，同一輪精靈期間全域只會有一個背景 task 在跑 `initiate()`+
-`poll_until_done()`。
+——`_ensure_device_flow_started()` 是唯一的啟動點，冪等（已存在就直接返回），確保
+`POST /setup/step1/start` 無論被呼叫幾次，同一輪精靈期間全域只會有一個背景 task 在跑
+`initiate()`+`poll_until_done()`。
+
+**mutation 一律走 POST**（reviewer Important fix）：`GET /setup`／`GET /setup/poll-status`
+純渲染目前 `app.state`，絕不觸發 `_ensure_device_flow_started()`（會對外發 HTTP POST
+到 `/api/agent/device-code`，是貨真價實的 mutation）——首次造訪 `/setup` 只顯示步驟①
+的「開始授權」按鈕（`setup_step1.html` 的 `started` 為 false 分支），使用者按下才真的
+`POST /setup/step1/start` 啟動 device flow。這是本 task 第一版唯一被 reviewer 打回的
+Important 缺口，已修正。
 
 **秘密處理**（spec §5.1，鐵律）：
 - `POST /setup/step2` 用 `await request.form()` 手動解析（不用 Pydantic model／
@@ -56,6 +62,7 @@ from quanquant.agent.device_flow_client import (
     DeviceFlowClient,
     DeviceFlowDeniedError,
     DeviceFlowExpiredError,
+    DeviceFlowGaveUpError,
     DeviceFlowProtocolError,
     VerificationPathMismatchError,
 )
@@ -72,6 +79,18 @@ _LEGACY_BUFFER_PATH = os.path.expanduser("~/.quanquant-agent/outbox.db")  # 與
     # `agent/main.py` 的 `--buffer` 預設值一致；per-profile 路徑待 Task 12
     # `profile_registry.buffer_path_for()` 落地後改用。
 _DEFAULT_SYMBOL = "TXF"  # Inc0 既有唯一支援商品，見 `agent/main.py` 預設值。
+
+# 步驟①錯誤文案對照表：key 是背景 task 存進 app.state.device_flow_error 的例外類別名
+# （見 _ensure_device_flow_started）。DeviceFlowGaveUpError 用 reviewer 指定的文案；其餘
+# 沿用泛用但仍具體的說明，不逐字回顯例外訊息（避免任何潛在的輸入值/內部細節外洩）。
+_ERROR_MESSAGES = {
+    "VerificationPathMismatchError": "授權驗證失敗（伺服器回應的驗證路徑不符），請重新開始授權。",
+    "DeviceFlowExpiredError": "授權逾時未完成，請重新開始授權。",
+    "DeviceFlowDeniedError": "已在核准頁拒絕本次授權，請重新開始授權。",
+    "DeviceFlowProtocolError": "與伺服器溝通發生未預期錯誤，請重新開始授權。",
+    "DeviceFlowGaveUpError": "授權多次交付失敗，請按「開始授權」重試或檢查伺服器狀態。",
+    "UnexpectedError": "發生未預期錯誤，請重新開始授權。",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +130,7 @@ def _ensure_device_flow_started(app) -> None:
             app.state.device_flow_result = result
             log.info("setup: device flow 已核准（帳號：%s）", result.get("username"))
         except (VerificationPathMismatchError, DeviceFlowExpiredError,
-                DeviceFlowDeniedError, DeviceFlowProtocolError) as exc:
+                DeviceFlowDeniedError, DeviceFlowProtocolError, DeviceFlowGaveUpError) as exc:
             app.state.device_flow_error = type(exc).__name__
             log.warning("setup: device flow 未完成（%s）", type(exc).__name__)
         except Exception:
@@ -127,10 +146,12 @@ def _ensure_device_flow_started(app) -> None:
 
 def _render_step1(request: Request, *, status_code: int = 200) -> HTMLResponse:
     client: DeviceFlowClient | None = getattr(request.app.state, "device_flow_client", None)
+    error_code = getattr(request.app.state, "device_flow_error", None)
     context = {
+        "started": client is not None,
         "user_code": client.user_code if client is not None else None,
         "approval_url": client.approval_url if client is not None else None,
-        "error": getattr(request.app.state, "device_flow_error", None),
+        "error": _ERROR_MESSAGES.get(error_code, error_code) if error_code else None,
     }
     return templates.TemplateResponse(request, "setup_step1.html", context, status_code=status_code)
 
@@ -159,11 +180,12 @@ def _render_step3(request: Request, *, launch_error: str | None = None, status_c
 
 @router.get("/setup", response_class=HTMLResponse)
 async def setup_page(request: Request) -> HTMLResponse:
-    """依 `app.state` 目前進度顯示對應步驟：尚未拿到核准結果 → 步驟①（順便冪等啟動
-    device flow）；已核准但永豐憑證未收 → 步驟②；兩者皆備 → 步驟③。"""
+    """依 `app.state` 目前進度顯示對應步驟：尚未拿到核准結果 → 步驟①（純渲染，不觸發
+    任何 mutation——見 module docstring「mutation 一律走 POST」；尚未啟動 device flow
+    時 `setup_step1.html` 會顯示「開始授權」按鈕，由使用者按下才真的
+    `POST /setup/step1/start`）；已核准但永豐憑證未收 → 步驟②；兩者皆備 → 步驟③。"""
     app_state = request.app.state
     if getattr(app_state, "device_flow_result", None) is None:
-        _ensure_device_flow_started(request.app)
         return _render_step1(request)
     if getattr(app_state, "broker_credentials", None) is None:
         return _render_step2(request)
@@ -172,10 +194,11 @@ async def setup_page(request: Request) -> HTMLResponse:
 
 @router.post("/setup/step1/start", response_class=HTMLResponse)
 async def setup_step1_start(request: Request) -> HTMLResponse:
-    """明確的（重新）啟動點：使用者在步驟①按下「重新開始授權」時呼叫。若上一輪已經
-    以錯誤終結（`device_flow_error` 非 None），先清掉舊 task/client/error 讓
-    `_ensure_device_flow_started` 真的重開一輪；否則（例如頁面自動刷新時剛好也命中這支
-    路由）維持冪等、不重複啟動。"""
+    """唯一的 mutation 啟動點（見 module docstring）：使用者在步驟①按下「開始授權」
+    （首次或錯誤後重試皆同一顆按鈕）時呼叫。若上一輪已經以錯誤終結
+    （`device_flow_error` 非 None），先清掉舊 task/client/error 讓
+    `_ensure_device_flow_started` 真的重開一輪；否則（例如尚未啟動的首次呼叫）維持
+    冪等、不重複啟動。"""
     app_state = request.app.state
     if getattr(app_state, "device_flow_error", None) is not None:
         app_state.device_flow_task = None
@@ -259,15 +282,24 @@ async def setup_step3_launch(request: Request) -> Response:
     from quanquant.agent.runner import AgentRunner, ChildHandle
     from quanquant.agent.ws_client import WebsocketsTransport
 
-    ws_url = _derive_ws_url(app_state.site_origin)
-    runner = AgentRunner(
-        transport=WebsocketsTransport(ws_url, token=approved["token"]),
-        buffer=DurableBuffer(_LEGACY_BUFFER_PATH),
-        child=ChildHandle(credentials=broker, symbol=_DEFAULT_SYMBOL, mode="sim",
-                           buffer_path=_LEGACY_BUFFER_PATH),
-        mode="sim",
-    )
-    attach_runner(request.app, runner)
+    # reviewer Minor fix：建構/掛載失敗（例如 site_origin 格式異常、AgentRunner 建構期
+    # 拋例外）不該變成未接住的 500 裸例外——包 try/except 改走已存在但先前從未真的被填的
+    # `_render_step3(launch_error=...)` 主題化錯誤頁，使用者留在步驟③可以再按一次「啟動」。
+    try:
+        ws_url = _derive_ws_url(app_state.site_origin)
+        runner = AgentRunner(
+            transport=WebsocketsTransport(ws_url, token=approved["token"]),
+            buffer=DurableBuffer(_LEGACY_BUFFER_PATH),
+            child=ChildHandle(credentials=broker, symbol=_DEFAULT_SYMBOL, mode="sim",
+                               buffer_path=_LEGACY_BUFFER_PATH),
+            mode="sim",
+        )
+        attach_runner(request.app, runner)
+    except Exception:
+        log.exception("setup: step3 啟動 agent runner 失敗")
+        return _render_step3(request, launch_error="啟動失敗，請確認伺服器位址與憑證正確後重試。",
+                              status_code=500)
+
     log.info("setup: 精靈完成，agent runner 已啟動（帳號：%s）", approved.get("username"))
 
     response = Response(status_code=303)

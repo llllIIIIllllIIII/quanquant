@@ -1,6 +1,29 @@
+import asyncio
 import logging
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Step 5b 秘密掃描共用工具（reviewer Important fix a：不只查 record.getMessage()，
+# 也要查 logging.Formatter().format(record)——後者才含 exc_info 的完整 traceback
+# 文字；log.exception(...) 附帶的 traceback 最後一行固定是
+# f"{type(exc).__name__}: {exc}"，只看 getMessage() 完全看不到這段，必須看格式化後的
+# 完整輸出才驗得到。）
+# ---------------------------------------------------------------------------
+
+_SECRET_API_KEY = "SAPI-SUPER-SECRET-KEY-0001"
+_SECRET_SECRET_KEY = "SSEC-SUPER-SECRET-VALUE-0002"
+_SECRET_TOKEN_SAMPLE = "TOKEN-SUPER-SECRET-VALUE-0003"
+
+
+def _assert_no_secret_leak(records) -> None:
+    formatter = logging.Formatter()
+    for record in records:
+        message = record.getMessage()
+        formatted = formatter.format(record)  # 含 exc_info 的完整 traceback 文字
+        for secret in (_SECRET_API_KEY, _SECRET_SECRET_KEY, _SECRET_TOKEN_SAMPLE):
+            assert secret not in message
+            assert secret not in formatted
 
 
 # ---------------------------------------------------------------------------
@@ -20,22 +43,53 @@ async def test_setup_responses_are_no_store(gui_client):
 
 async def test_wizard_flow_logs_do_not_leak_secrets(gui_client, caplog):
     """spec §5.1『掃 access/application log 不含三項秘密』——application log 這一半，
-    跑一輪成功＋錯誤路徑的 step2 表單提交，斷言 caplog 全部 record 都不含任何一項秘密
-    明文（token 這項用一個假明文樣本模擬，因為本 task 尚未實際持有真 token——Task 10/11
-    另外各自針對自己新增的路徑補齊，這裡只保證本 task 引入的程式碼不洩漏）。"""
+    跑一輪成功＋錯誤路徑的 step2 表單提交，斷言 caplog 全部 record（getMessage()＋完整
+    格式化文字，見 `_assert_no_secret_leak`）都不含任何一項秘密明文（token 這項用一個假
+    明文樣本模擬，因為本 task 尚未實際持有真 token——Task 10/11 另外各自針對自己新增的
+    路徑補齊，這裡只保證本 task 引入的程式碼不洩漏）。"""
     caplog.set_level(logging.DEBUG)
-    secret_api_key = "SAPI-SUPER-SECRET-KEY-0001"
-    secret_secret_key = "SSEC-SUPER-SECRET-VALUE-0002"
-    secret_token_sample = "TOKEN-SUPER-SECRET-VALUE-0003"
 
-    await gui_client.post("/setup/step2", data={"api_key": secret_api_key, "secret_key": secret_secret_key})
-    await gui_client.post("/setup/step2", data={"api_key": "", "secret_key": secret_secret_key})  # 錯誤路徑（422）
+    await gui_client.post("/setup/step2", data={"api_key": _SECRET_API_KEY, "secret_key": _SECRET_SECRET_KEY})
+    await gui_client.post("/setup/step2", data={"api_key": "", "secret_key": _SECRET_SECRET_KEY})  # 錯誤路徑（422）
 
-    for record in caplog.records:
-        message = record.getMessage()
-        assert secret_api_key not in message
-        assert secret_secret_key not in message
-        assert secret_token_sample not in message
+    _assert_no_secret_leak(caplog.records)
+
+
+async def test_device_flow_background_task_exception_log_does_not_leak_secrets(gui_client, caplog, monkeypatch):
+    """reviewer Important fix (b)：先前 Step 5b 掃描從未真正驅動 `log.exception`
+    （application log 唯一會帶 exc_info/完整 traceback 的路徑，只掃 `record.getMessage()`
+    看不到這段文字，等於這條防線從未被驗證過）。這裡用 monkeypatch 讓
+    `DeviceFlowClient.initiate()` 拋一般例外，觸發
+    `_ensure_device_flow_started()` 背景 task 的
+    `except Exception: ... log.exception(...)` 分支：①先斷言這個分支真的被驅動
+    （存在 `exc_info is not None` 的 record，否則後面的『沒查到秘密』毫無意義——可能只是
+    根本沒東西可查）②同一輪也送出真的秘密（重用 step2 表單）驗證完整格式化輸出（含
+    traceback）仍不含任何一項秘密。"""
+    from quanquant.agent.device_flow_client import DeviceFlowClient
+
+    caplog.set_level(logging.DEBUG)
+
+    async def _boom(self) -> dict:
+        raise RuntimeError("device-code 端點連線逾時（模擬，不含任何秘密）")
+
+    monkeypatch.setattr(DeviceFlowClient, "initiate", _boom)
+
+    await gui_client.post("/setup/step2", data={"api_key": _SECRET_API_KEY, "secret_key": _SECRET_SECRET_KEY})
+    resp = await gui_client.post("/setup/step1/start")
+    assert resp.status_code == 200
+
+    task = gui_client.app.state.device_flow_task
+    for _ in range(200):
+        if task.done():
+            break
+        await asyncio.sleep(0)
+    assert task.done()
+    assert gui_client.app.state.device_flow_error == "UnexpectedError"
+
+    exception_records = [r for r in caplog.records if r.exc_info is not None]
+    assert exception_records, "log.exception 分支必須至少被驅動一次，否則本測試沒有意義"
+
+    _assert_no_secret_leak(caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -60,30 +114,47 @@ async def test_setup_rejects_missing_session_cookie():
 
 
 # ---------------------------------------------------------------------------
-# 補充：步驟①（device flow）渲染與單一 in-flight／冪等啟動
+# 補充：步驟①（device flow）渲染與單一 in-flight／mutation 只走 POST
+# （reviewer Important fix：GET /setup 先前會外呼 device-code 配發，違反
+# 「mutation 全 POST」——現在 GET 只渲染，POST /setup/step1/start 才是唯一啟動點。）
 # ---------------------------------------------------------------------------
 
-async def test_setup_step1_shows_user_code_once_device_flow_initiates(gui_client):
+async def test_setup_get_never_triggers_device_flow_mutation(gui_client):
+    """GET /setup（含重複造訪）純渲染，不得觸發任何背景 device flow task——
+    `app.state.device_flow_task` 應該全程維持 None，直到使用者明確 POST
+    /setup/step1/start。"""
     resp = await gui_client.get("/setup")
     assert resp.status_code == 200
-    # _ensure_device_flow_started 已排入背景 task；讓 event loop 跑一輪把 initiate() 執行完。
+    assert "開始授權" in resp.text
+    assert getattr(gui_client.app.state, "device_flow_task", None) is None
+
+    await gui_client.get("/setup")  # 重複造訪一樣不觸發
+    assert getattr(gui_client.app.state, "device_flow_task", None) is None
+
+
+async def test_setup_step1_start_is_the_only_mutation_trigger_and_shows_user_code(gui_client):
+    resp = await gui_client.post("/setup/step1/start")
+    assert resp.status_code == 200
     task = gui_client.app.state.device_flow_task
+    assert task is not None
     for _ in range(50):
         client = gui_client.app.state.device_flow_client
         if client is not None and client.user_code is not None:
             break
-        import asyncio
         await asyncio.sleep(0)
     assert gui_client.app.state.device_flow_client.user_code == "TEST-CODE"
-    assert task is gui_client.app.state.device_flow_task  # 仍是同一顆 task，未重開
-
-
-async def test_setup_get_does_not_start_a_second_device_flow_task_on_repeat_visits(gui_client):
+    # GET /setup 造訪不會重開背景 task（單一 in-flight，冪等維持同一顆 task）。
     await gui_client.get("/setup")
+    assert task is gui_client.app.state.device_flow_task
+
+
+async def test_step1_start_repeated_posts_do_not_start_a_second_task(gui_client):
+    resp1 = await gui_client.post("/setup/step1/start")
     first_task = gui_client.app.state.device_flow_task
-    await gui_client.get("/setup")
+    resp2 = await gui_client.post("/setup/step1/start")
     second_task = gui_client.app.state.device_flow_task
-    assert first_task is second_task  # 單一 in-flight：重複造訪不重開
+    assert resp1.status_code == 200 and resp2.status_code == 200
+    assert first_task is second_task  # 單一 in-flight：重複 POST 不重開
 
 
 async def test_poll_status_redirects_to_setup_once_approved(gui_client):
@@ -117,6 +188,18 @@ async def test_setup_step1_start_restarts_after_error(gui_client):
     resp = await gui_client.post("/setup/step1/start")
     assert resp.status_code == 200
     assert gui_client.app.state.device_flow_error is None  # 已清掉，重新開始一輪
+
+
+async def test_setup_shows_friendly_message_for_gave_up_error(gui_client):
+    """reviewer Important fix 2：DeviceFlowGaveUpError 對應到指定文案。"""
+    from quanquant.agent.device_flow_client import DeviceFlowGaveUpError
+
+    gui_client.app.state.device_flow_client = None
+    gui_client.app.state.device_flow_error = DeviceFlowGaveUpError.__name__
+
+    resp = await gui_client.get("/setup")
+    assert resp.status_code == 200
+    assert "授權多次交付失敗" in resp.text
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +276,28 @@ async def test_step3_launch_builds_runner_and_attaches_it(gui_client, monkeypatc
     assert calls["token"] == "tok"
     assert calls["child_kwargs"]["credentials"] == {"api_key": "K1", "secret_key": "S1"}
     assert isinstance(calls["attached_runner"], _FakeRunner)
+
+
+async def test_step3_launch_failure_shows_themed_error_page_not_raw_500(gui_client, monkeypatch):
+    """reviewer Minor fix：runner 建構/掛載失敗時走 `_render_step3(launch_error=...)`
+    主題化錯誤頁，而非未接住裸例外。"""
+    gui_client.app.state.device_flow_result = {
+        "token": "tok", "profile_id": "1", "username": "tester",
+        "token_expires_at": "2099-01-01T00:00:00",
+    }
+    gui_client.app.state.broker_credentials = {"api_key": "K1", "secret_key": "S1"}
+
+    import quanquant.agent.runner as runner_module
+
+    def _boom(**kwargs):
+        raise RuntimeError("construction failed")
+
+    monkeypatch.setattr(runner_module, "AgentRunner", _boom)
+
+    resp = await gui_client.post("/setup/step3/launch", follow_redirects=False)
+    assert resp.status_code == 500
+    assert "啟動失敗" in resp.text
+    assert "construction failed" not in resp.text  # 例外原始訊息不外洩
 
 
 @pytest.mark.parametrize("site_origin,expected", [
