@@ -93,6 +93,15 @@ class Settings(BaseSettings):
     # D2：per-user DB opaque token（見 auth/agent_tokens.py）取代 Inc0 的全站靜態
     # AGENT_WS_TOKEN——WS 握手改查 DB，不再有站台層級的靜態密鑰設定。
     agent_token_ttl_days: int = 30      # agent token 預設有效天數（簽發/rotation 皆套用）
+    # M1（Task 3）：device-code flow（spec §4）發起端參數——8 碼 user_code、輪詢間隔、
+    # per-IP／全域限流上限。rate_per_minute/rate_burst 是 token bucket 參數，本 task 只
+    # 定義設定值，實際限流判斷在 Task 5（router）用 count_active_pending_for_ip/_global。
+    agent_device_code_ttl_seconds: int = 600
+    agent_device_code_poll_interval_seconds: int = 5
+    agent_device_code_rate_per_minute: int = 10   # 每 IP token bucket 補充速率（Task 5 用）
+    agent_device_code_rate_burst: int = 5         # 每 IP token bucket burst 容量（Task 5 用）
+    agent_device_code_max_active_per_ip: int = 10
+    agent_device_code_max_active_global: int = 500
     # D4/D7 §7（Task 10）：command ledger 送前持久化的 expires_at = created_at + 這個秒數，
     # 過期與否只由 agent 端判斷（server 不自主過期，見 agent_commands.py 模組頂部說明）。
     # Task 8/agent_channel.py 曾各自用同名的模組層常數（agent_commands.DEFAULT_COMMAND_
