@@ -918,6 +918,33 @@ def test_rotation_invalidates_old_token_new_token_still_works(ws_env, engine):
         assert _wait(lambda: _slot(ws_env).session_state.ready)
 
 
+def test_revoke_does_not_interrupt_existing_ws_connection(ws_env, engine):
+    """spec §3 正式化不變量：『token revoke 不中斷既有 WS 連線（token 只在握手驗）』——
+    既有 test_rotation_invalidates_old_token_new_token_still_works 只測了「rotation 後
+    新連線」，這裡補「rotation 當下已連上的那條連線是否存活」半段。"""
+    owner_id = ws_env.state.agent_test_owner_id
+    old_token = ws_env.state.agent_test_token
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": old_token}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)
+
+        with Session(engine) as s:
+            issue_token(s, user_id=owner_id, ttl_days=30)  # rotation：revoke old_token
+
+        # 既有連線只在握手驗 token；revoke 之後仍可繼續收送，不會被 server 主動踢掉——
+        # 若這裡拋 WebSocketDisconnect 就是不變量被打破。
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 1})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)
+
+    # 斷線後舊 token 重連必失敗（重申前提，讓本測試自成一體，不需跳去另一支確認）
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": old_token}) as ws_old:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws_old.receive_json()
+    assert exc_info.value.code == 1008
+
+
 def test_same_user_only_one_valid_token_after_rotation(ws_env, engine):
     # 與 test_agent_tokens.py 的 DB 層測試互補：這裡從 WS 握手的角度直接證明「同一時刻
     # 只有最新那一枚能連得上」——rotation 前後各連一次，只有最後簽發的那枚成功。
