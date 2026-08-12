@@ -37,6 +37,7 @@ import logging
 import multiprocessing as mp
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -74,6 +75,34 @@ class FatalAgentError(RuntimeError):
     `run_forever` 會照 backoff 無限重試——每一輪都是一次真的 Shioaji 登入，會燒掉
     person_id 每日 1000 次登入配額。這個例外讓 `run_forever` 的例外鏈識別出「重試也沒用，
     需要人工介入」，直接停止（不 respawn、不 backoff），把例外原樣往外拋給 main。"""
+
+
+@dataclass(frozen=True)
+class AgentSnapshot:
+    """整份替換的不可變快照，由主 event loop 單一擁有（GUI 與 runner 同 loop，讀取
+    不需 lock）。connection 的合法值目前為 "connecting"/"connected"/"reconnecting"/
+    "offline"；Task 13 會再追加 "rejected"（WS 握手被拒，token 無效/停用/非 owner）——
+    寫入這個欄位永遠只能經過下面 _connection_state_for_session_exception() 這一個集中
+    判斷點，不得在 _pump/_receive_loop/_heartbeat/_child_watchdog 等個別 task 各自
+    setattr（多處同時寫同一欄位、例外同步收攏無 await 讓出點，會有後寫覆蓋先寫的競態，
+    這是 fresh read-back 覆核抓到的教訓，Task 13 段落有完整根因分析）。"""
+    connection: str          # "connecting" | "connected" | "reconnecting" | "offline" | "rejected"（Task 13 起）
+    account: str
+    mode: str
+    latched: bool
+    latch_detail: str | None
+    health_epoch: int
+    buffer_pending: int
+    updated_at: datetime
+
+
+def _connection_state_for_session_exception(exc: BaseException) -> str:
+    """run_once() 收攏本輪 session 結束例外後、re-raise 前的唯一狀態判斷點——刻意抽成
+    模組層級純函式，不塞進例外處理的行內邏輯：往後任何『某類例外該對應哪個連線態』的
+    規則都只改這一個函式，杜絕分散設定造成的競態。本 task 只建立預設 fallback：
+    "reconnecting"；TokenRejectedError→"rejected" 這個分支由 Task 13 補上（因為
+    TokenRejectedError 定義在 Task 13 才新增的 ws_client.py，本 task 尚未 import 它）。"""
+    return "reconnecting"
 
 
 def _select_session_end_exception(exceptions: list[BaseException]) -> BaseException:
@@ -529,6 +558,10 @@ class AgentRunner:
         self._health_epoch = 0
         self._health_queue: asyncio.Queue = asyncio.Queue()
         self._load_persisted_health()
+        # Task 7：連線狀態觀測面（GUI snapshot 用）。合法值見 AgentSnapshot docstring；
+        # 寫入點僅限 run_once()（連線成功/例外收攏）與 stop()，見各處註記——不得在
+        # _pump/_receive_loop/_heartbeat/_child_watchdog 等個別 task 內 setattr。
+        self._connection_state = "connecting"
 
     def _load_persisted_health(self) -> None:
         """啟動時（同步、建構子內）讀取 durable 狀態：sentinel 檔存在＝latch 仍在效（buffer
@@ -740,6 +773,9 @@ class AgentRunner:
                         # 重設本連線已見最大 epoch，見 agent_ws.py AgentChannel.mark_logged_in）。
                         health_epoch=self._health_epoch).model_dump()
             )
+            # Task 7：WS 連線成功、UpLogin 送出後 → "connected"（主 loop 上直接賦值，
+            # 不需 call_soon_threadsafe，見 AgentSnapshot docstring）。
+            self._connection_state = "connected"
             # D9⑥：login 後立刻排一次健康回報（不等 heartbeat_interval）——server 端的
             # pending_health 才能盡快收斂，不必乾等第一次 heartbeat（生產環境預設 15s，
             # 太慢；latch 中一樣送、status 會如實回報 failstop）。
@@ -755,7 +791,13 @@ class AgentRunner:
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
             exceptions = [exc for t in done if (exc := t.exception()) is not None]
             if exceptions:
-                raise _select_session_end_exception(exceptions)
+                exc = _select_session_end_exception(exceptions)
+                # Task 7：唯一允許寫入 self._connection_state 的例外收攏點——不得在
+                # _pump/_receive_loop/_heartbeat/_child_watchdog 等個別 task 內各自
+                # setattr（見 AgentSnapshot/_connection_state_for_session_exception
+                # docstring）。
+                self._connection_state = _connection_state_for_session_exception(exc)
+                raise exc
         finally:
             for t in tasks:
                 t.cancel()
@@ -829,6 +871,26 @@ class AgentRunner:
 
     def stop(self) -> None:
         self._stopping = True
+        self._connection_state = "offline"
+
+    async def snapshot(self) -> AgentSnapshot:
+        """組出目前快照。buffer_pending 走 asyncio.to_thread(self._buffer.unsent_count)
+        （SQLite 同步 I/O 不壓 loop，repo 既有鐵律）——這個 await 完成後才寫回，本身就在
+        event loop 上執行，不需要 call_soon_threadsafe；目前程式庫裡沒有任何『子執行緒
+        直接寫快照』的呼叫點（buffer 計數走 to_thread 但結果回到呼叫者所在的 loop 才處理），
+        若未來新增子執行緒直接寫入的路徑，一律要包 loop.call_soon_threadsafe(...)，不得
+        繞過——這是 spec §6.4 不變量，即使目前沒有具體呼叫點也要保留這條規則供未來遵守。"""
+        pending = await asyncio.to_thread(self._buffer.unsent_count)
+        return AgentSnapshot(
+            connection=self._connection_state,
+            account=self._account,
+            mode=self._mode,
+            latched=self._latched,
+            latch_detail=self._latch_detail,
+            health_epoch=self._health_epoch,
+            buffer_pending=pending,
+            updated_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
 
     async def _pump(self) -> None:
         while True:
