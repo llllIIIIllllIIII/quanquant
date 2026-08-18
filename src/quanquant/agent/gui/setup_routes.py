@@ -8,9 +8,18 @@ API 憑證 ③確認啟動。掛在 `coordinator.build_app()`（`app.include_rou
 從 CDN 載入（`web/templates/base.html` 走 `https://unpkg.com/htmx.org`），在這個 CSP 下
 會被瀏覽器擋掉，若沒有把整個函式庫改成本機供應（本 task 檔案清單未列，且會讓「純三個
 模板檔」的範圍膨脹成額外資產管線）就硬用 hx-trigger，等於精靈在真瀏覽器裡會安靜卡死在
-「等待中」，比不做還糟。改用 `<meta http-equiv="refresh" content="2;url=...">`
-（`setup_step1.html`）純 HTML 達成等價的『每 2 秒自動刷新』效果，不需要任何 script、
-不觸碰 CSP，仍完全滿足 `GET /setup/poll-status` 這個介面本身（brief 明確要求的路由）。
+「等待中」，比不做還糟。
+
+**步驟①輪詢：同源背景 JS，不整頁刷新**（UX 改善，取代初版的
+`<meta http-equiv="refresh" content="2;url=/setup/poll-status">`——後者每 2 秒整頁重新
+載入，會把游標焦點/捲動位置都重置，體驗很干擾）。同樣受 CSP `default-src 'self'` 約束
+（inline `<script>` 會被擋），但同源外部 JS 檔與同源 `fetch()` 皆允許，故改為：
+`setup_step1.html` 引入同源 `<script src="/setup/step1-poll.js">`（純文字常數
+`_STEP1_POLL_JS`，由 `GET /setup/step1-poll.js` 供應，見下方）；該腳本每 ~2 秒
+`fetch('/setup/poll-status.json')` 一次，依回應更新頁面上 `#qq-poll-status` 的文字，
+只在核准完成（`state="ready"`）時才做一次 `window.location` 導頁。舊的
+`GET /setup/poll-status`（回整頁 HTML／303）保留不刪，只是不再被頁面使用——見其
+docstring。
 
 **單一 in-flight 輪詢**（承接 `DeviceFlowClient` 自己的保證）：本模組另外用
 `app.state.device_flow_task is not None` 判斷「這一輪精靈的 device flow 是否已經在跑」
@@ -54,7 +63,7 @@ from pathlib import Path
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 
 from quanquant.agent import keyring_store, profile_registry
@@ -322,12 +331,103 @@ async def setup_step1_start(request: Request) -> HTMLResponse:
 async def setup_poll_status(request: Request) -> Response:
     """步驟①頁面每 2 秒的自動刷新目的地（`setup_step1.html` 的 `<meta http-equiv=
     "refresh">`）：已核准 → 303 導回 `/setup`（`setup_page` 會依此時的 `app.state`
-    改渲染步驟②）；尚未核准 → 重新渲染步驟①局部（含目前 user_code／錯誤狀態）。"""
+    改渲染步驟②）；尚未核准 → 重新渲染步驟①局部（含目前 user_code／錯誤狀態）。
+
+    UX 改善（背景 JS 輪詢取代整頁刷新）之後，`setup_step1.html` 已改用
+    `GET /setup/poll-status.json`（見下方）當作輪詢目的地，本路由不再被頁面呼叫；
+    保留不刪是因為 `test_poll_status_redirects_to_setup_once_approved` 這個既有回歸測試
+    還在斷言它的行為，且它是無害的純渲染 GET，留著不影響新行為。"""
     if getattr(request.app.state, "device_flow_result", None) is not None:
         response = Response(status_code=303)
         response.headers["location"] = "/setup"
         return response
     return _render_step1(request)
+
+
+# 步驟①背景輪詢用的同源 JS——不可 inline（CSP `default-src 'self'` 擋 inline script，
+# 見 module docstring），也不可引 CDN，故手寫成一支由 `GET /setup/step1-poll.js` 供應的
+# 純文字檔。邏輯：每 ~2 秒 fetch 一次 `poll-status.json`，依 state 更新頁面上
+# `#qq-poll-status` 的文字（不整頁 reload）；state=ready 才做一次 `window.location`
+# 導頁；state=error 顯示訊息並停止輪詢；網路層 fetch 失敗（暫時性）不中止輪詢，留給
+# 下一輪重試，避免使用者被偶發網路問題卡在錯誤畫面。
+_STEP1_POLL_JS = """(function () {
+  "use strict";
+  var statusEl = document.getElementById("qq-poll-status");
+  var timer = null;
+
+  function stop() {
+    if (timer !== null) {
+      clearInterval(timer);
+      timer = null;
+    }
+  }
+
+  function poll() {
+    fetch("/setup/poll-status.json", { credentials: "same-origin" })
+      .then(function (resp) {
+        if (!resp.ok) {
+          throw new Error("HTTP " + resp.status);
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        if (data.state === "ready") {
+          stop();
+          window.location = data.next || "/setup";
+          return;
+        }
+        if (data.state === "error") {
+          stop();
+          if (statusEl) {
+            statusEl.textContent = data.message || "發生未預期錯誤，請重新開始授權。";
+          }
+          return;
+        }
+        if (statusEl) {
+          statusEl.textContent = "等待核准中……";
+        }
+      })
+      .catch(function () {
+        // 暫時性網路錯誤：不中止輪詢，留給下一輪重試。
+      });
+  }
+
+  poll();
+  timer = setInterval(poll, 2000);
+})();
+"""
+
+
+@router.get("/setup/poll-status.json")
+async def setup_poll_status_json(request: Request) -> JSONResponse:
+    """`step1-poll.js` 背景輪詢的 JSON 版本：純讀 `app.state`、不觸發任何 mutation
+    （比照 `GET /setup`／`GET /setup/poll-status` 的既有鐵律）。狀態對應沿用既有 device
+    flow 狀態，不自創新語意：
+    - `device_flow_result` 非 None（已核准）→ `"ready"`，`next` 固定為 `/setup`
+      （`setup_page` 會依此時的 `app.state` 自動渲染下一步，不在這裡重複判斷邏輯）。
+    - `device_flow_error` 非 None（`DeviceFlowGaveUpError`／expired／denied／協定錯誤／
+      未預期例外，見 `_ensure_device_flow_started`）→ `"error"`，`message` 用既有
+      `_ERROR_MESSAGES` 對照表（與步驟①錯誤頁同一份文案，不重複定義）。
+    - 兩者皆無 → `"waiting"`（仍在等待使用者於核准頁完成授權）。"""
+    app_state = request.app.state
+    if getattr(app_state, "device_flow_result", None) is not None:
+        return JSONResponse({"state": "ready", "next": "/setup", "message": None})
+    error_code = getattr(app_state, "device_flow_error", None)
+    if error_code is not None:
+        return JSONResponse({
+            "state": "error", "next": None,
+            "message": _ERROR_MESSAGES.get(error_code, error_code),
+        })
+    return JSONResponse({"state": "waiting", "next": None, "message": None})
+
+
+@router.get("/setup/step1-poll.js")
+async def setup_step1_poll_js() -> Response:
+    """同源供應 `_STEP1_POLL_JS`（見上方常數的設計理由）。`require_gui_session` 依賴掛在
+    整個 router 上自動套用；同源 `<script src="/setup/step1-poll.js">` 請求會帶
+    session cookie，Origin/Sec-Fetch-Site 檢查對同源 subresource 請求同樣放行
+    （見 `security.require_gui_session`），故不需要額外處理。"""
+    return Response(content=_STEP1_POLL_JS, media_type="application/javascript")
 
 
 @router.post("/setup/step2")

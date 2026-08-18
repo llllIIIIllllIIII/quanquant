@@ -221,6 +221,132 @@ async def test_setup_shows_friendly_message_for_gave_up_error(gui_client):
 
 
 # ---------------------------------------------------------------------------
+# 補充：步驟①背景 JS 輪詢（UX 改善——同源 JS 取代 meta-refresh 整頁刷新）
+# ---------------------------------------------------------------------------
+
+async def test_poll_status_json_reports_waiting_when_not_yet_approved(gui_client):
+    """尚未核准、也還沒進入錯誤終態 → "waiting"，不含 next/message。"""
+    resp = await gui_client.get("/setup/poll-status.json")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("application/json")
+    data = resp.json()
+    assert data == {"state": "waiting", "next": None, "message": None}
+
+
+async def test_poll_status_json_reports_ready_once_approved(gui_client):
+    """已核准（`device_flow_result` 非 None）→ "ready"，`next` 固定 "/setup"（由
+    `setup_page` 依 app.state 自動渲染下一步，JSON 端點本身不重複判斷邏輯）。"""
+    gui_client.app.state.device_flow_result = {
+        "token": "tok", "profile_id": "1", "username": "tester",
+        "token_expires_at": "2099-01-01T00:00:00",
+    }
+    resp = await gui_client.get("/setup/poll-status.json")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "ready"
+    assert data["next"] == "/setup"
+
+
+async def test_poll_status_json_reports_error_and_reuses_existing_gave_up_message(gui_client):
+    """error 狀態沿用既有 device flow 狀態（`DeviceFlowGaveUpError`）與既有
+    `_ERROR_MESSAGES` 文案，不自創新語意——與 `GET /setup` 步驟①錯誤頁同一份文案。"""
+    from quanquant.agent.device_flow_client import DeviceFlowGaveUpError
+
+    gui_client.app.state.device_flow_client = None
+    gui_client.app.state.device_flow_error = DeviceFlowGaveUpError.__name__
+
+    resp = await gui_client.get("/setup/poll-status.json")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "error"
+    assert data["next"] is None
+    assert data["message"] == "授權多次交付失敗，請按「開始授權」重試或檢查伺服器狀態。"
+
+
+async def test_poll_status_json_does_not_trigger_device_flow_mutation(gui_client):
+    """比照 `GET /setup`／`GET /setup/poll-status` 的既有鐵律：純渲染，不觸發
+    `_ensure_device_flow_started()`。"""
+    resp = await gui_client.get("/setup/poll-status.json")
+    assert resp.status_code == 200
+    assert getattr(gui_client.app.state, "device_flow_task", None) is None
+
+
+async def test_poll_status_json_requires_gui_session(gui_anon_client):
+    resp = await gui_anon_client.get("/setup/poll-status.json")
+    assert resp.status_code == 403
+
+
+async def test_step1_poll_js_is_served_same_origin_as_javascript(gui_client):
+    resp = await gui_client.get("/setup/step1-poll.js")
+    assert resp.status_code == 200
+    assert "javascript" in resp.headers["content-type"]
+    assert "poll-status.json" in resp.text
+    assert "window.location" in resp.text
+
+
+async def test_step1_poll_js_requires_gui_session(gui_anon_client):
+    resp = await gui_anon_client.get("/setup/step1-poll.js")
+    assert resp.status_code == 403
+
+
+async def test_setup_step1_started_page_uses_background_js_poll_not_meta_refresh(gui_client):
+    """核心 UX 斷言：`started=True` 分支（有 user_code）不再靠整頁 `<meta http-equiv=
+    "refresh">` 刷新，改引入同源 `step1-poll.js`＋一個可被 JS 更新文字的狀態元素；核准
+    連結仍是 `target="_blank"`（開新分頁，不受本次改動影響）。"""
+    resp = await gui_client.post("/setup/step1/start")
+    assert resp.status_code == 200
+    for _ in range(50):
+        client = gui_client.app.state.device_flow_client
+        if client is not None and client.user_code is not None:
+            break
+        await asyncio.sleep(0)
+
+    resp = await gui_client.get("/setup")
+    assert resp.status_code == 200
+    assert 'http-equiv="refresh"' not in resp.text
+    assert '<script src="/setup/step1-poll.js"></script>' in resp.text
+    assert 'id="qq-poll-status"' in resp.text
+    assert 'target="_blank"' in resp.text
+
+
+async def test_setup_step1_connecting_page_also_uses_background_js_poll(gui_client, monkeypatch):
+    """`started=True` 但尚未拿到 user_code（「正在與伺服器建立連線……」子分支）同樣要
+    輪詢，比照原本 meta-refresh 的涵蓋範圍（`not error and started`）。"""
+    import asyncio as _asyncio
+
+    from quanquant.agent.device_flow_client import DeviceFlowClient
+
+    async def _never_returns(self) -> dict:
+        await _asyncio.sleep(3600)
+        raise AssertionError("不應該真的等到")
+
+    monkeypatch.setattr(DeviceFlowClient, "initiate", _never_returns)
+
+    resp = await gui_client.post("/setup/step1/start")
+    assert resp.status_code == 200
+    assert gui_client.app.state.device_flow_client.user_code is None
+
+    resp = await gui_client.get("/setup")
+    assert resp.status_code == 200
+    assert 'http-equiv="refresh"' not in resp.text
+    assert '<script src="/setup/step1-poll.js"></script>' in resp.text
+    assert 'id="qq-poll-status"' in resp.text
+
+
+async def test_setup_step1_error_page_has_no_poll_script(gui_client):
+    """error 分支已是終態，不該再輪詢（不引入 step1-poll.js）——與原本 meta-refresh 只在
+    `not error and started` 時出現的行為一致。"""
+    from quanquant.agent.device_flow_client import DeviceFlowGaveUpError
+
+    gui_client.app.state.device_flow_client = None
+    gui_client.app.state.device_flow_error = DeviceFlowGaveUpError.__name__
+
+    resp = await gui_client.get("/setup")
+    assert resp.status_code == 200
+    assert "step1-poll.js" not in resp.text
+
+
+# ---------------------------------------------------------------------------
 # 補充：步驟②（永豐憑證）成功路徑
 # ---------------------------------------------------------------------------
 
