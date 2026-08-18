@@ -54,7 +54,11 @@ def require_gui_session(request: Request) -> None:
     if request.headers.get("host") != expected_host:
         raise HTTPException(status_code=403)
     origin = request.headers.get("origin")
-    if origin is not None and origin != f"http://{expected_host}":
+    # `Origin: null`（字串）是不透明來源的合法值：本專案 Task 8 的 `Referrer-Policy:
+    # no-referrer` 安全標頭會讓瀏覽器對同源 form POST 送出 `Origin: null`，若在此誤擋
+    # 會讓精靈第一步 `POST /setup/step1/start` 一律 403。同源性改由下方 `Sec-Fetch-Site`
+    # （跨站攻擊必得 `cross-site`）與不可猜的 session cookie 把關，故放行 "null"。
+    if origin is not None and origin not in ("null", f"http://{expected_host}"):
         raise HTTPException(status_code=403)
     fetch_site = request.headers.get("sec-fetch-site")
     if fetch_site is not None and fetch_site not in ("same-origin", "none"):
