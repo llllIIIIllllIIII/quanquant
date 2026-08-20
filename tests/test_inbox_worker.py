@@ -969,3 +969,198 @@ def test_request_wake_after_worker_stopped_is_quiet_noop(engine):
         worker.request_wake()  # 不 raise 就是通過
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# 批次內快速重試（association_pending 隔離列）：本批有列真正成功落地（非單純 quarantine）
+# 時，對本 worker scope 內 reason=association_pending 的隔離列做一次 unquarantine→重新
+# 處理，把原本得等 watchdog `_retry_quarantined`（預設 300s）的尾端延遲壓到與觸發批次
+# 同一次或緊接下一次 process_batch_once。
+# ---------------------------------------------------------------------------
+
+def test_association_pending_deal_resolves_within_batch_when_order_ack_lands_later(session, engine):
+    """核心情境：deal 比自己委託的 ack 早進 RawInbox → quarantine（association_pending）；
+    委託的 ack 之後才落地（模擬 `ShioajiAdapter.place` 同步寫回 ordno 較晚完成的競態），這筆
+    委託自己的 order_report 落地時觸發批次內快速重試——原本孤立的 deal 在緊接的下一次
+    process_batch_once 呼叫內解隔離並成功落地（Fill/BrokerPosition 更新）。全程只呼叫
+    process_batch_once，不呼叫 watchdog 任何函式、不 sleep、不等 300s/15s。"""
+    # 1) deal 先到，此時對應委託尚未存在 → quarantine（association_pending）
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    worker = _worker(engine)
+    first = worker.process_batch_once()
+    assert first == 1  # quarantine 也算「確定處理完」；這批沒有任何東西真正成功落地
+
+    with Session(engine) as s:
+        deal_row = s.exec(select(RawInbox)).first()
+        assert deal_row.quarantine is True and deal_row.quarantine_reason == "association_pending"
+        assert s.exec(select(Deal)).first() is None  # 沒有部分寫入
+
+    # 2) 委託的 ack 現在才落地（模擬同步下單路徑較晚完成 set_order_ack）
+    _seed_order(session)  # ordno=O1, broker_order_id=B1，與 _deal_payload() 預設一致
+
+    # 3) 這筆委託自己的 order_report（狀態回報）落地——本批唯一的新列，成功處理，
+    #    觸發批次內快速重試。
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+        )))
+        s.commit()
+
+    second = worker.process_batch_once()
+    # 1（order_report 落地）+ 1（deal 批次內快速重試,這次成功解隔離）
+    assert second == 2
+
+    with Session(engine) as s:
+        deal_row = s.exec(select(RawInbox).where(RawInbox.kind == "deal_report")).first()
+        assert deal_row.processed is True and deal_row.quarantine is False
+        assert s.exec(select(Deal)).first() is not None
+        pos = s.exec(select(BrokerPosition)).first()
+        assert pos is not None and pos.total_opened_qty == 1
+
+
+def test_batch_retry_never_touches_permanent_dead_letter_quarantine(session, engine):
+    """永久 dead-letter reason（scope_violation/payload_mismatch/user_mismatch）的隔離列必須
+    完全不被批次內快速重試碰到——即使本批有其他新列成功落地觸發重試檢查，這種列也要維持
+    quarantine=True／reason 不變、mapper 不再被呼叫（沿用 watchdog
+    `unquarantine_stale_raw_inbox` 既有的 reason 篩選，不是本分支另造規則）。"""
+    calls = {"n": 0}
+
+    def _selective_mismatch_mapper(payload: dict, *, account: str | None = None) -> Fill:
+        calls["n"] += 1
+        if payload["fill_id"] == "DEAD1":
+            raise RawInboxDeadLetterError("payload_mismatch", "payload.account_id 與列蓋章不符")
+        return _ok_deal_mapper(payload, account=account)
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload(fill_id="DEAD1")),
+        )
+        s.commit()
+
+    worker = _worker(engine, deal_mapper=_selective_mismatch_mapper)
+    first = worker.process_batch_once()
+    assert first == 1
+    assert calls["n"] == 1
+
+    with Session(engine) as s:
+        dead_row = s.exec(select(RawInbox)).first()
+        dead_row_id = dead_row.id
+        assert dead_row.quarantine is True and dead_row.processed is True
+        assert dead_row.quarantine_reason == "payload_mismatch"
+
+    # 另一筆全新委託＋成交，與上面無關，會成功落地（landed>0，觸發批次內快速重試檢查）
+    with Session(engine) as s:
+        other = brepo.create_order(s, **_order_kwargs(client_order_id="C2", request_hash="H2"))
+        brepo.set_order_ack(s, other.id, broker_order_id="B2", ordno="O2", status="submitted")
+        s.commit()
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="F2", ordno="O2", broker_order_id="B2")),
+        )
+        s.commit()
+
+    second = worker.process_batch_once()
+    assert second == 1  # 只有這筆全新委託落地；dead-letter 列完全沒被重試撿走
+    assert calls["n"] == 2  # mapper 沒有為 DEAD1 再被呼叫第二次
+
+    with Session(engine) as s:
+        dead_row = s.get(RawInbox, dead_row_id)
+        assert dead_row.quarantine is True and dead_row.processed is True
+        assert dead_row.quarantine_reason == "payload_mismatch"  # reason 不變、attempts 不增
+
+
+def test_batch_retry_retries_orphan_deal_once_per_landing_batch_no_hot_loop(session, engine):
+    """孤兒 deal（對應委託永遠不存在）在「含有新落地列」的批次被批次內快速重試檢查撿到、
+    重試一次後仍失敗、回到 association_pending 隔離；同一次 process_batch_once 呼叫內只重試
+    一次，不會反覆重試造成熱迴圈——用 mapper 呼叫次數證明恰好只多一次，不是無限次。"""
+    calls = {"n": 0}
+
+    def _counting_ok_mapper(payload: dict, *, account: str | None = None) -> Fill:
+        calls["n"] += 1
+        return _ok_deal_mapper(payload, account=account)
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(ordno="GHOST", broker_order_id="GHOST-B")),
+        )
+        s.commit()
+
+    worker = _worker(engine, deal_mapper=_counting_ok_mapper)
+    first = worker.process_batch_once()
+    assert first == 1
+    assert calls["n"] == 1
+
+    with Session(engine) as s:
+        orphan = s.exec(select(RawInbox)).first()
+        orphan_id = orphan.id
+        assert orphan.quarantine is True and orphan.quarantine_reason == "association_pending"
+
+    # 另一筆全新委託＋成交，與孤兒無關，會成功落地（landed>0）
+    with Session(engine) as s:
+        other = brepo.create_order(s, **_order_kwargs(client_order_id="C2", request_hash="H2"))
+        brepo.set_order_ack(s, other.id, broker_order_id="B2", ordno="O2", status="submitted")
+        s.commit()
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="F2", ordno="O2", broker_order_id="B2")),
+        )
+        s.commit()
+
+    second = worker.process_batch_once()
+    # 1（F2 成功落地）+ 1（孤兒重試一次，仍失敗→重新 quarantine，quarantine 也算「確定處理完」）
+    assert second == 2
+    # mapper 恰好只多被呼叫兩次（F2 一次＋孤兒重試一次），不是無限次熱迴圈
+    assert calls["n"] == 3
+
+    with Session(engine) as s:
+        orphan = s.get(RawInbox, orphan_id)
+        assert orphan.quarantine is True and orphan.processed is False
+        assert orphan.quarantine_reason == "association_pending"  # reason 不變，沒有升級/降級
+
+
+def test_batch_retry_scoped_to_worker_user_id_does_not_touch_other_scope(engine):
+    """Inc1 多人：per-slot worker（各自 user_id）批次內快速重試必須沿用批次查詢同一個 scope
+    過濾——worker A（user_id=1）觸發的重試不得撿走 worker B（user_id=2）scope 的隔離列，
+    跨 slot 完全互不影響（I8），比照既有
+    `test_worker_scoped_to_user_id_ignores_other_users_rows` 的 scope 驗證 pattern。"""
+    # worker B（user_id=2）的孤兒 deal：早就隔離，association_pending
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(ordno="GHOST-B-SLOT", broker_order_id="GHOST-B-SLOT-B")),
+            user_id=2,
+        )
+        s.commit()
+    worker_b = _worker(engine, user_id=2)
+    assert worker_b.process_batch_once() == 1  # B 自己的批次先把它隔離掉
+
+    with Session(engine) as s:
+        b_row = s.exec(select(RawInbox).where(RawInbox.user_id == 2)).first()
+        b_row_id = b_row.id
+        assert b_row.quarantine is True and b_row.quarantine_reason == "association_pending"
+
+    # worker A（user_id=1）現在有一筆全新、可正常落地的委託成交（landed>0，
+    # 觸發 A 自己批次內快速重試——scope 必須只認領 user_id=1）
+    with Session(engine) as s:
+        order_a = brepo.create_order(s, **_order_kwargs(user_id=1, client_order_id="CA", request_hash="HA"))
+        brepo.set_order_ack(s, order_a.id, broker_order_id="B1", ordno="O1", status="submitted")
+        s.commit()
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()), user_id=1,
+        )
+        s.commit()
+
+    worker_a = _worker(engine, user_id=1)
+    assert worker_a.process_batch_once() == 1  # 只有 A 自己這筆落地；沒有撿到 B 的隔離列
+
+    with Session(engine) as s:
+        b_row = s.get(RawInbox, b_row_id)
+        assert b_row.quarantine is True and b_row.processed is False  # B 的隔離列完全沒被動到
+        assert b_row.quarantine_reason == "association_pending"

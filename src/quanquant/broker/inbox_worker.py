@@ -30,6 +30,7 @@ import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, replace as _dc_replace
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
 from sqlmodel import Session
@@ -306,7 +307,19 @@ class RawInboxWorker:
 
     def process_batch_once(self) -> int:
         """同步、可直接測試。回傳「確定處理完」（processed 或 quarantine）的列數；
-        非預期例外的列不計入（見模組 docstring 的例外分類）。"""
+        非預期例外的列不計入（見模組 docstring 的例外分類）。
+
+        批次內快速重試（association_pending 隔離列，本分支新增）：本批若有列真正「成功
+        落地」（`_process_one` 回傳 True，非單純 quarantine），代表有新資訊進來（典型是
+        遲到的 order ack）——對本 worker scope 內 reason=association_pending 的隔離列做
+        「一次」unquarantine→重新處理（見 `_retry_association_pending_once`），把原本得等
+        watchdog `_retry_quarantined`（`order_unquarantine_after_seconds`，預設 300s）的
+        尾端延遲，壓到與觸發批次同一次或緊接下一次呼叫。只用「成功落地」（不含單純
+        quarantine）當觸發條件，是刻意避免本批自己剛產生的 quarantine 立刻自我重試（那不
+        代表任何新資訊出現，也會讓既有「quarantine 也算確定處理完」的 handled 計數斷言失真
+        ——見 tests/test_inbox_worker.py 既有回歸測試）。重試結果（無論再次成功落地或再次
+        quarantine）併入回傳值，讓呼叫端（`run()`）照既有邏輯視 handled>0 發一次 SSE
+        publish，不需要新增判斷分支。"""
         with self._session_factory() as scan_session:
             row_ids = [
                 r.id for r in brepo.list_unprocessed_raw_inbox(
@@ -314,19 +327,66 @@ class RawInboxWorker:
                 )
             ]
         handled = 0
+        landed = 0  # 本批「成功落地」（非 quarantine）的列數，見上方 docstring
         for row_id in row_ids:
             try:
-                self._process_one(row_id)
+                if self._process_one(row_id):
+                    landed += 1
                 handled += 1
             except Exception:
                 log.exception("raw_inbox id=%s 處理時發生未預期例外，留待下一輪重試（零丟單）", row_id)
+        if landed:
+            handled += self._retry_association_pending_once()
         return handled
 
-    def _process_one(self, row_id: int) -> None:
+    def _retry_association_pending_once(self) -> int:
+        """批次內快速重試：只在 `process_batch_once` 內、且只在本批有新列真正成功落地時被
+        呼叫「一次」（不遞迴呼叫自己）——重用 watchdog 同一套機制
+        （`repository.unquarantine_stale_raw_inbox`），只是 cutoff 傳「現在」而非 300 秒前：
+        任何已落地的隔離列 `received_at` 必然早於這個當下時刻，等同「不篩年齡、把 scope 內
+        現有的 association_pending 隔離列全部解除」；scope（`user_id=self._user_id`）與
+        reason 篩選（association_pending／NULL，跳過永久 dead-letter 三種 reason）完全沿用
+        該函式既有邏輯，不另造一份。
+
+        解除後的列會回到一般 unprocessed 佇列，用同一個 scoped 查詢
+        （`list_unprocessed_raw_inbox`）重新掃描並照常呼叫 `_process_one` 逐列處理——與
+        `run()` 平常撿到新列的路徑完全相同，沒有另外的處理邏輯。
+
+        天然節流：孤兒列（ack 永遠不來）重試失敗後原地重新 quarantine，等下一個有落地的
+        批次或 watchdog 的 300 秒 fallback，不會在同一批次內反覆重試造成熱迴圈——本函式
+        每次 `process_batch_once` 呼叫最多執行一次，內部也沒有任何迴圈或遞迴會再次觸發它。"""
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        with self._session_factory() as session:
+            released = brepo.unquarantine_stale_raw_inbox(session, older_than=now, user_id=self._user_id)
+            session.commit()
+        if not released:
+            return 0
+        with self._session_factory() as scan_session:
+            retry_ids = [
+                r.id for r in brepo.list_unprocessed_raw_inbox(
+                    scan_session, limit=self._batch_limit, user_id=self._user_id,
+                )
+            ]
+        retried = 0
+        for row_id in retry_ids:
+            try:
+                self._process_one(row_id)
+                retried += 1
+            except Exception:
+                log.exception(
+                    "raw_inbox id=%s 批次內快速重試時發生未預期例外，留待下一輪重試（零丟單）", row_id,
+                )
+        return retried
+
+    def _process_one(self, row_id: int) -> bool:
+        """處理單一 raw_inbox 列。回傳 True＝這次呼叫真正成功處理落地（非 quarantine、非
+        防禦性 no-op）；False＝quarantine 或防禦性 no-op（row 已經是終態，理論上不會發生）。
+        呼叫端（`process_batch_once`）用這個信號區分「有新資訊真的落地」與「純
+        quarantine」，只有前者才觸發批次內快速重試。"""
         with self._session_factory() as session:
             row = session.get(RawInbox, row_id)
             if row is None or row.processed or row.quarantine:
-                return  # 防禦性：理論上單一序列化通道內不會重複排到同一列
+                return False  # 防禦性：理論上單一序列化通道內不會重複排到同一列
             try:
                 payload = self._decode_payload(row.payload)
                 if row.kind == "deal_report":
@@ -335,6 +395,7 @@ class RawInboxWorker:
                     self._process_order_report(session, row, payload)
                 else:
                     raise ValueError(f"未知 raw_inbox.kind: {row.kind!r}")
+                return True
             except (RawInboxDeadLetterError, ValueError, PositionMismatchError) as exc:
                 session.rollback()
                 row = session.get(RawInbox, row_id)
@@ -352,6 +413,7 @@ class RawInboxWorker:
                         self._ops.quarantine(row_id=row_id, kind=kind, error=str(exc))
                     except Exception:
                         log.exception("quarantine 告警失敗（已吞，不影響處理流程）")
+                return False
 
     @staticmethod
     def _decode_payload(raw: str) -> dict:
