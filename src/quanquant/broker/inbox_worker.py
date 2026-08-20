@@ -219,6 +219,24 @@ class RawInboxWorker:
         # ——批次查詢只認領這個 user 蓋章的列（`repository.list_unprocessed_raw_inbox` 的
         # `RawInbox.user_id == user_id` 精確比對），跨 user 完全無共享可變狀態（I8）。
         self._user_id = user_id
+        # F1（opus 終審發現，本分支修復）：battery-guard——語意「本 scope 可能存在
+        # association_pending 隔離列」。`unquarantine_stale_raw_inbox` 對無索引的
+        # `quarantine` 欄全表掃，健康常態（零隔離列）下每個落地批次都白付一次 O(n)，且發生在
+        # `supervisor.lock` 內（成交越密→下單越被擋）。保守初始化 True：重啟後可能還有舊的
+        # 隔離列，開機後第一個落地批次付一次 O(n) 查詢就會歸位（見
+        # `_retry_association_pending_once`：released=0 才關閉；`_process_one` 把列 quarantine
+        # 成 association_pending 時撥回 True）。執行緒紀律：本 worker 單一實例，批次在
+        # `process_batch_once` 內、且呼叫端（`run()`）序列化於 `supervisor.lock` 之下，同一時間
+        # 只有一個批次在跑，所以是普通屬性即可，不需要鎖。
+        self._maybe_assoc_pending = True
+        # N1（opus 二輪複審發現，本輪修復，MEDIUM）：`self._maybe_assoc_pending` 光看
+        # `released == 0` 無法擋住「永不可解的孤兒 association_pending 列」（如券商官方 App
+        # 下的單，對應委託永遠不存在）——每個落地批次都會把它釋放、重試、失敗、重新隔離，
+        # `_process_one` 的隔離分支又把 flag 撥回 True，guard 形同虛設（opus 實測：連五個
+        # 健康落地批次，`unquarantine_stale_raw_inbox` 累計呼叫 1→5）。`_last_retry_released_ids`
+        # 記錄「上一次呼叫 `_retry_association_pending_once` 時，重掃到的列 id 集合」（`None`＝
+        # 尚無記錄／這個 scope 剛回到完全乾淨狀態），供零進展偵測比對，見該函式 docstring。
+        self._last_retry_released_ids: frozenset[int] | None = None
         self._stop = asyncio.Event()
         # 事件喚醒：新列落地後（commit_raw_callback 的 on_committed hook）可以立刻喚醒本
         # worker，把「委託/成交回報顯示延遲」從 idle_interval 純逾時輪詢壓到近零；喚醒遺失
@@ -319,7 +337,19 @@ class RawInboxWorker:
         代表任何新資訊出現，也會讓既有「quarantine 也算確定處理完」的 handled 計數斷言失真
         ——見 tests/test_inbox_worker.py 既有回歸測試）。重試結果（無論再次成功落地或再次
         quarantine）併入回傳值，讓呼叫端（`run()`）照既有邏輯視 handled>0 發一次 SSE
-        publish，不需要新增判斷分支。"""
+        publish，不需要新增判斷分支。
+
+        F1 in-memory guard（opus 終審發現，本分支修復）：`landed` 之外還要
+        `self._maybe_assoc_pending` 為 True 才觸發重試查詢——健康常態（零隔離列）下第一次
+        觸發會把 flag 關掉，之後的落地批次不再白付 `unquarantine_stale_raw_inbox` 的 O(n)
+        全表掃，直到又有新的 association_pending 隔離列出現（`_process_one` 撥回 True）才
+        重新開啟，見 `__init__`/`_retry_association_pending_once` docstring。
+
+        F2：快速重試是 best-effort 疊加功能，不是零丟單的必要路徑（watchdog 300s fallback
+        仍在）——包 try/except 避免它內部的暫時性 DB 例外（UPDATE+commit）一路穿出 `run()`
+        （迴圈本體無 except）害 worker task 靜默死掉、回報管線停擺。例外時刻意不動
+        `_maybe_assoc_pending`（保守維持目前值，通常是 True——下一個落地批次還會再試一次，
+        不因為這次失敗被誤判成「沒有隔離列」而永久關掉）。"""
         with self._session_factory() as scan_session:
             row_ids = [
                 r.id for r in brepo.list_unprocessed_raw_inbox(
@@ -335,8 +365,14 @@ class RawInboxWorker:
                 handled += 1
             except Exception:
                 log.exception("raw_inbox id=%s 處理時發生未預期例外，留待下一輪重試（零丟單）", row_id)
-        if landed:
-            handled += self._retry_association_pending_once()
+        if landed and self._maybe_assoc_pending:
+            try:
+                handled += self._retry_association_pending_once()
+            except Exception:
+                log.exception(
+                    "批次內快速重試發生未預期例外（best-effort，不影響本批已處理的列）："
+                    "留給下一個落地批次或 watchdog 300s fallback 重試",
+                )
         return handled
 
     def _retry_association_pending_once(self) -> int:
@@ -354,28 +390,96 @@ class RawInboxWorker:
 
         天然節流：孤兒列（ack 永遠不來）重試失敗後原地重新 quarantine，等下一個有落地的
         批次或 watchdog 的 300 秒 fallback，不會在同一批次內反覆重試造成熱迴圈——本函式
-        每次 `process_batch_once` 呼叫最多執行一次，內部也沒有任何迴圈或遞迴會再次觸發它。"""
+        每次 `process_batch_once` 呼叫最多執行一次，內部也沒有任何迴圈或遞迴會再次觸發它。
+
+        F1 guard：`released == 0`（本 scope 目前沒有任何 association_pending 隔離列）時把
+        `self._maybe_assoc_pending` 關成 False，讓呼叫端（`process_batch_once`）之後的落地
+        批次不再呼叫這個函式，直到 `_process_one` 因為新的 association_pending quarantine
+        把 flag 撥回 True。`released > 0` 時不動 flag（維持 True 不需要每次都重複賦值，語意
+        上也對稱：還有隔離列在，下一批繼續保持警覺）。
+
+        N1（opus 二輪複審發現，本輪修復，MEDIUM）：`released > 0` 不代表有進展——永不可解的
+        孤兒 association_pending 列（如券商官方 App 下的單，對應委託永遠不存在）每個落地
+        批次都會被這裡釋放、重掃、`_process_one` 重新隔離（那個分支會把
+        `self._maybe_assoc_pending` 撥回 True，見其 docstring），若只看 `released` 是否為
+        0，guard 永遠不會關閉——O(n) 全表掃＋整輪重試成本對著同一批孤兒每個落地批次白跑一次
+        （opus 實測：連五個健康落地批次，`unquarantine_stale_raw_inbox` 累計呼叫 1→5）。
+
+        零進展偵測（**嚴格語意**，opus 三輪複審修正——見下方「為何不能用 None 當萬用匹配」）：
+        `self._last_retry_released_ids` 記錄「上一次呼叫本函式時，重掃到的列 id 集合」
+        （`None`＝尚無記錄，或上一次是「這個 scope 完全沒有隔離列」的乾淨狀態——見下方
+        `not released` 分支）。這次重試迴圈跑完之後，只有在①沒有任何一列真正成功落地
+        （`retry_landed == 0`）**且**②`self._last_retry_released_ids` 不是 `None`（代表這不是
+        本函式第一次處理這個 id 集合，先前已經給過一次機會）**且**③這次重掃到的 id 集合與
+        上次呼叫時完全相同——三者同時成立才關閉 guard，交還 watchdog 300s 慢速路徑照顧（語意
+        回歸「快速重試只服務暫態 deal-before-ack 競態」：只有觸發批次當下就成功落地，或是
+        「同一批隔離列已經連續兩輪都沒有任何進展」才不繼續投入）。只要這次重試有任何一列成功
+        落地、這次的集合裡出現了上次沒有的新列，或這是第一次遇到這個集合，一律維持/恢復
+        True，正常參與下一個落地批次的快速重試。
+
+        **為何不能用「`None` 視為與任何集合相符」（上一輪設計，已修正的 BUG）**：deal D 先到、
+        無對應委託 quarantine(association_pending)；**不相關**的另一筆回報接著落地觸發本函式
+        第一次呼叫（`_last_retry_released_ids` 還是 `None`）——D 的委託 ack 還沒到，重試失敗
+        原地重新隔離（`retry_landed == 0`）。若把「`None`」視同「與這次集合相符」直接關閉
+        guard，D 自己委託的 ack 緊接著下一批落地時，guard 已經是 False、快速重試被整批跳過，
+        D 退回 watchdog 300 秒 fallback——這正是批次內快速重試要消滅的核心情境（deal-before-
+        ack 競態），在「多筆委託併發、有不相關回報插隊」的忙碌時段反而失效（見
+        `test_first_failed_retry_does_not_disable_guard_before_own_ack_gets_a_chance`）。現在
+        改成嚴格比對：`None` 一律不關閉（只記錄這次的集合），必須連續兩輪重試都是同一個集合、
+        且都零進展，才判定為解不開、關閉 guard——純孤兒情境代價是多付一輪觀察（第 2 個落地
+        批次才關閉），可忽略；換來的是「同一批隔離列連續兩輪」才會被判死，不會因為運氣不好
+        被不相關批次抽到一次就提前放棄。
+
+        **順序依賴**：迴圈內 `_process_one` 對每一列失敗都會把 `self._maybe_assoc_pending`
+        撥回 True（見該函式 docstring）——零進展判定必須放在這個迴圈**跑完之後**才執行，寫在
+        迴圈中間或之前都會被迴圈本身的副作用蓋掉，見下方程式碼順序。
+
+        選擇「重掃時比對 id 集合」而非修改 `unquarantine_stale_raw_inbox` 回傳型別：後者會
+        動到 watchdog.py 既有呼叫端（現在只認 `int` 筆數，見 `_retry_quarantined_blocking`），
+        侵入面更大；重掃本來就會撈出剛解除隔離的那批列（見上方既有 docstring：「解除後的列
+        會回到一般 unprocessed 佇列，用同一個 scoped 查詢重新掃描」），直接拿這次的 id 集合
+        當「本輪實際處理的列」的忠實代理，不需要額外查詢或改動 repository 層。"""
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         with self._session_factory() as session:
             released = brepo.unquarantine_stale_raw_inbox(session, older_than=now, user_id=self._user_id)
             session.commit()
         if not released:
+            self._maybe_assoc_pending = False
+            # 這個 scope 目前完全沒有隔離列——乾淨狀態，回到「尚無記錄」，讓未來第一次遇到
+            # 的孤兒／隔離列一樣享有「連續兩輪零進展才關閉」的一致行為（見上方 docstring）。
+            self._last_retry_released_ids = None
             return 0
+        # F7（opus 終審發現，LOW）：措辭比照 watchdog.py `_retry_quarantined_blocking` 的既有
+        # 訊息風格，標明來源是「批次內快速重試」而非 watchdog 週期性掃描。
+        log.info("批次內快速重試解除 %d 筆 quarantine raw_inbox 待重試（user_id=%s）", released, self._user_id)
         with self._session_factory() as scan_session:
             retry_ids = [
                 r.id for r in brepo.list_unprocessed_raw_inbox(
                     scan_session, limit=self._batch_limit, user_id=self._user_id,
                 )
             ]
+        retry_id_set = frozenset(retry_ids)
         retried = 0
+        retry_landed = 0
         for row_id in retry_ids:
             try:
-                self._process_one(row_id)
+                if self._process_one(row_id):
+                    retry_landed += 1
                 retried += 1
             except Exception:
                 log.exception(
                     "raw_inbox id=%s 批次內快速重試時發生未預期例外，留待下一輪重試（零丟單）", row_id,
                 )
+        # N1 零進展偵測（嚴格語意）：務必在上面的迴圈跑完之後才判斷（見本函式 docstring 的
+        # 順序依賴說明），否則會被迴圈內 `_process_one` 的隔離分支把 flag 撥回 True 的副作用
+        # 蓋掉。`self._last_retry_released_ids is None`（第一次遇到這個集合）一律不關閉——只
+        # 有連續兩輪都是同一個集合、且都零進展，才判定解不開。
+        same_as_last_round = (
+            self._last_retry_released_ids is not None and retry_id_set == self._last_retry_released_ids
+        )
+        if retry_landed == 0 and same_as_last_round:
+            self._maybe_assoc_pending = False
+        self._last_retry_released_ids = retry_id_set
         return retried
 
     def _process_one(self, row_id: int) -> bool:
@@ -406,6 +510,12 @@ class RawInboxWorker:
                 reason = exc.reason if isinstance(exc, RawInboxDeadLetterError) else "association_pending"
                 brepo.quarantine_raw_inbox(session, row, error=str(exc), reason=reason)
                 session.commit()
+                if reason == "association_pending":
+                    # F1 guard：這個 scope 剛剛真的多了一筆可重試的隔離列——把 flag 撥回
+                    # True，讓下一個落地批次會再跑一次批次內快速重試查詢（同一個分支天然
+                    # 涵蓋「快速重試路徑中重試失敗、原地重新 quarantine」的情況，不需要在
+                    # `_retry_association_pending_once` 另外處理）。
+                    self._maybe_assoc_pending = True
                 # T0.3 告警（純疊加）：quarantine 落地後才通知；取值/呼叫包 try/except 吞掉，
                 # 告警絕不能反噬處理流程（此列已成功 quarantine，DB 狀態不受告警影響）。
                 if self._ops is not None:

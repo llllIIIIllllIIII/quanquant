@@ -762,7 +762,16 @@ class AgentRunner:
         碰運氣：`FatalAgentError` 若被別的例外蓋掉，不可重試的致命錯誤可能被當一般錯誤
         重試，持續燒 Shioaji 登入配額。改用 `_select_session_end_exception()` 收集 `done`
         裡全部例外、依確定性優先序（`FatalAgentError`＞其他）選一個 raise，不受 set 迭代
-        順序影響。"""
+        順序影響。
+
+        F3（opus 終審發現，本分支修復）：開頭清空 `self._inflight`——`run_forever` 重用同一個
+        `AgentRunner` 實例，斷線重連時上一個 session 送出但未 ack 的列，其 `_inflight`
+        時間戳仍留在記憶體裡；不清掉的話，這些列會被 `_pump` 的冷卻窗（`resend_after`，
+        最長 5s）誤判成「剛送過、再等等」而延後補送——但新連線上的 server 根本沒收過那些
+        訊息，冷卻窗在這裡毫無意義，只會拖慢零丟單的補送。安全性依據：上行本就設計為可
+        重播（`_pump` 只認 `buffer.pending()`，server 端以 `event_id` 冪等去重，見 module
+        docstring），重連即刻補送只會讓 ack 更快回來，不會造成重複落地。"""
+        self._inflight.clear()
         self._load_persisted_health()
         self.ensure_child()
         await self._transport.connect()

@@ -1164,3 +1164,356 @@ def test_batch_retry_scoped_to_worker_user_id_does_not_touch_other_scope(engine)
         b_row = s.get(RawInbox, b_row_id)
         assert b_row.quarantine is True and b_row.processed is False  # B 的隔離列完全沒被動到
         assert b_row.quarantine_reason == "association_pending"
+
+
+# ---------------------------------------------------------------------------
+# F1（opus 終審發現）：健康常態（零隔離列）下，批次內快速重試每次落地批次都白付
+# unquarantine_stale_raw_inbox 的 O(n) 全表掃——加 in-memory guard（`_maybe_assoc_pending`），
+# released=0 後關閉，直到又有新的 association_pending 隔離列出現才重新開啟。
+# ---------------------------------------------------------------------------
+
+def _land_new_deal(engine, *, client_order_id: str, request_hash: str, ordno: str,
+                    broker_order_id: str, fill_id: str) -> None:
+    """建一筆全新委託＋對應成交，跑過 process_batch_once 必然成功落地（landed=1）。"""
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, **_order_kwargs(client_order_id=client_order_id, request_hash=request_hash)
+        )
+        brepo.set_order_ack(s, order.id, broker_order_id=broker_order_id, ordno=ordno, status="submitted")
+        s.commit()
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id=fill_id, ordno=ordno, broker_order_id=broker_order_id)),
+        )
+        s.commit()
+
+
+def test_healthy_steady_state_stops_calling_unquarantine_after_first_zero_release(engine, monkeypatch):
+    """F1 驗收(a)：建構後第一個落地批次跑過一次重試查詢；零隔離列常態下 released=0，
+    flag 轉 False——之後的落地批次不再呼叫 unquarantine_stale_raw_inbox（呼叫計數驗證，
+    不是黑箱猜測行為）。"""
+    calls = {"n": 0}
+    original = brepo.unquarantine_stale_raw_inbox
+
+    def _counting(*a, **kw):
+        calls["n"] += 1
+        return original(*a, **kw)
+
+    monkeypatch.setattr(brepo, "unquarantine_stale_raw_inbox", _counting)
+
+    worker = _worker(engine)
+    assert worker._maybe_assoc_pending is True  # 建構時保守初始化 True
+
+    _land_new_deal(engine, client_order_id="C1", request_hash="H1", ordno="O1",
+                   broker_order_id="B1", fill_id="F1")
+    first = worker.process_batch_once()
+    assert first == 1
+    assert calls["n"] == 1  # 第一個落地批次付了一次重試查詢
+    assert worker._maybe_assoc_pending is False  # 零隔離列 → released=0 → flag 關閉
+
+    _land_new_deal(engine, client_order_id="C2", request_hash="H2", ordno="O2",
+                   broker_order_id="B2", fill_id="F2")
+    second = worker.process_batch_once()
+    assert second == 1
+    assert calls["n"] == 1  # guard 生效：沒有再呼叫 unquarantine_stale_raw_inbox
+
+    _land_new_deal(engine, client_order_id="C3", request_hash="H3", ordno="O3",
+                   broker_order_id="B3", fill_id="F3")
+    third = worker.process_batch_once()
+    assert third == 1
+    assert calls["n"] == 1  # 連續第三個落地批次仍然不再白付 O(n) 查詢
+
+
+def test_flag_reactivates_after_new_association_pending_quarantine_appears(engine, monkeypatch):
+    """F1 驗收(b)：guard 進入 False 之後，一旦出現新的 association_pending 隔離列，
+    flag 必須回到 True，讓下一個落地批次重新跑重試查詢——不是永久關掉。"""
+    calls = {"n": 0}
+    original = brepo.unquarantine_stale_raw_inbox
+
+    def _counting(*a, **kw):
+        calls["n"] += 1
+        return original(*a, **kw)
+
+    monkeypatch.setattr(brepo, "unquarantine_stale_raw_inbox", _counting)
+
+    worker = _worker(engine)
+    _land_new_deal(engine, client_order_id="C1", request_hash="H1", ordno="O1",
+                   broker_order_id="B1", fill_id="F1")
+    worker.process_batch_once()
+    assert worker._maybe_assoc_pending is False
+    assert calls["n"] == 1
+
+    # 孤兒 deal（對應委託不存在）→ quarantine(association_pending)；quarantine 不算「落地」，
+    # 這批不會觸發重試查詢，但必須把 flag 撥回 True。
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="ORPHAN", ordno="GHOST", broker_order_id="GHOST-B")),
+        )
+        s.commit()
+    worker.process_batch_once()
+    assert worker._maybe_assoc_pending is True
+    assert calls["n"] == 1  # 純 quarantine 批次沒有觸發重試查詢
+
+    # 下一個全新落地批次：guard 現在是 True，重試查詢應該再跑一次。
+    _land_new_deal(engine, client_order_id="C2", request_hash="H2", ordno="O2",
+                   broker_order_id="B2", fill_id="F2")
+    worker.process_batch_once()
+    assert calls["n"] == 2  # 重試查詢真的又跑了一次，flag 不是永久關掉
+
+
+def test_existing_fast_retry_regressions_unaffected_by_guard(engine):
+    """F1 驗收(c)：guard 不得弱化既有四支批次內快速重試回歸測試——這裡只是把它們的核心
+    斷言原樣重跑一次（fresh worker，guard 預設 True），確認新增的 guard 邏輯沒有改變任何
+    既有可觀察行為。完整覆蓋見上面同名情境的既有測試本身，這裡是收斂性補證。"""
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+    worker = _worker(engine)
+    assert worker.process_batch_once() == 1  # quarantine 也算「確定處理完」
+
+    _seed_order_for_engine(engine)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+        )))
+        s.commit()
+    assert worker.process_batch_once() == 2  # order_report 落地 + 批次內快速重試解隔離
+
+
+def _seed_order_for_engine(engine, **over):
+    with Session(engine) as s:
+        order = brepo.create_order(s, **_order_kwargs(**over))
+        brepo.set_order_ack(s, order.id, broker_order_id="B1", ordno="O1", status="submitted")
+        s.commit()
+        return order
+
+
+def test_retry_exception_does_not_kill_worker_and_flag_stays_true(engine, monkeypatch):
+    """F2 驗收：`unquarantine_stale_raw_inbox` 拋暫時性例外 → `process_batch_once` 不得往外
+    拋、本批自己的落地照計入 handled、worker 不死；例外時不動 `_maybe_assoc_pending`
+    （保守維持 True——下一個落地批次還會再試，不是被這次失敗永久關掉）。"""
+    calls = {"n": 0}
+
+    def _boom(*a, **kw):
+        calls["n"] += 1
+        raise RuntimeError("暫時性 DB 故障（模擬）")
+
+    monkeypatch.setattr(brepo, "unquarantine_stale_raw_inbox", _boom)
+
+    worker = _worker(engine)
+    _land_new_deal(engine, client_order_id="C1", request_hash="H1", ordno="O1",
+                   broker_order_id="B1", fill_id="F1")
+    handled = worker.process_batch_once()  # 不應該往外拋例外
+    assert handled == 1  # 本批自己的落地照計，快速重試失敗不影響這個數字
+    assert calls["n"] == 1
+    assert worker._maybe_assoc_pending is True  # 例外時不動 flag，保守維持 True
+
+    _land_new_deal(engine, client_order_id="C2", request_hash="H2", ordno="O2",
+                   broker_order_id="B2", fill_id="F2")
+    second = worker.process_batch_once()  # worker 沒有因為上一批例外而死掉
+    assert second == 1
+    assert calls["n"] == 2  # flag 仍是 True，下一個落地批次還會再試一次（不是被永久關掉）
+
+
+# ---------------------------------------------------------------------------
+# F7（opus 終審發現，LOW）：批次內快速重試解除隔離筆數時補 log（比照 watchdog.py
+# `_retry_quarantined_blocking` 的既有訊息風格，標明來源是「批次內快速重試」而非 watchdog）。
+# ---------------------------------------------------------------------------
+
+def test_batch_retry_logs_release_count_on_success(engine, caplog):
+    caplog.set_level("INFO", logger="quanquant.broker.inbox_worker")
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+    worker = _worker(engine)
+    worker.process_batch_once()  # 孤兒 deal → quarantine(association_pending)
+
+    _seed_order_for_engine(engine)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+        )))
+        s.commit()
+    worker.process_batch_once()  # 觸發批次內快速重試，解除剛剛那筆隔離
+
+    assert any("批次內快速重試" in r.message and "1" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# N1（opus 二輪複審發現，MEDIUM）：永不可解的孤兒 association_pending 列（如券商官方 App
+# 下的單產生的成交回報，對應委託永遠不存在）過去會讓 F1 的 guard 形同虛設——每個落地批次都
+# 釋放→重掃失敗→_process_one 重新隔離→撥回 True→下個落地批次再來一輪，O(n) 查詢成本全額
+# 回歸。零進展偵測：本輪重試若零列成功落地、且重掃到的 id 集合與上一輪相同（或上一輪是
+# 「尚無記錄」），視為這批解不開，關閉 guard，交還 watchdog 300s 慢速路徑照顧。
+# ---------------------------------------------------------------------------
+
+def test_orphan_disables_guard_after_second_consecutive_zero_progress_retry(engine, monkeypatch):
+    """N1 驗收(1)（opus 三輪複審修正後的嚴格語意）：孤兒（對應委託永遠不存在）第 1 個落地
+    批次觸發第一次重試查詢——這是本函式第一次遇到這個 id 集合，即使零進展也不關閉 guard
+    （給它一次機會，避免誤殺 deal-before-ack 競態，見
+    `test_first_failed_retry_does_not_disable_guard_before_own_ack_gets_a_chance`）；第 2 個
+    落地批次重試到的仍是同一個 id 集合、依然零進展 → 連續兩輪零進展才關閉 guard。之後連續
+    多個落地批次都不再呼叫 unquarantine_stale_raw_inbox（呼叫計數維持在 2），不是每個落地
+    批次都白付一次 O(n) 全表掃——代價是純孤兒情境多付一輪觀察，可忽略。"""
+    calls = {"n": 0}
+    original = brepo.unquarantine_stale_raw_inbox
+
+    def _counting(*a, **kw):
+        calls["n"] += 1
+        return original(*a, **kw)
+
+    monkeypatch.setattr(brepo, "unquarantine_stale_raw_inbox", _counting)
+
+    worker = _worker(engine)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="ORPHAN", ordno="GHOST", broker_order_id="GHOST-B")),
+        )
+        s.commit()
+    worker.process_batch_once()  # 孤兒 quarantine(association_pending)；quarantine 不算落地
+    assert calls["n"] == 0  # 純 quarantine 批次沒有觸發重試查詢
+
+    _land_new_deal(engine, client_order_id="C1", request_hash="H1", ordno="O1",
+                   broker_order_id="B1", fill_id="F1")
+    worker.process_batch_once()  # 第 1 個落地批次 → 第一次遇到孤兒集合，零進展但先給一次機會
+    assert calls["n"] == 1
+    assert worker._maybe_assoc_pending is True  # 還沒關閉——只是第一次遇到
+
+    _land_new_deal(engine, client_order_id="C2", request_hash="H2", ordno="O2",
+                   broker_order_id="B2", fill_id="F2")
+    worker.process_batch_once()  # 第 2 個落地批次 → 同一個孤兒集合、依然零進展 → 連續兩輪關閉
+    assert calls["n"] == 2
+    assert worker._maybe_assoc_pending is False
+
+    _land_new_deal(engine, client_order_id="C3", request_hash="H3", ordno="O3",
+                   broker_order_id="B3", fill_id="F3")
+    worker.process_batch_once()
+    assert calls["n"] == 2  # guard 已關閉，沒有再呼叫 unquarantine_stale_raw_inbox
+
+    _land_new_deal(engine, client_order_id="C4", request_hash="H4", ordno="O4",
+                   broker_order_id="B4", fill_id="F4")
+    worker.process_batch_once()
+    assert calls["n"] == 2  # 連續第四個落地批次仍然沒有再白付 O(n) 查詢
+
+
+def test_new_pending_row_reactivates_guard_and_resolves_while_orphan_stays_quarantined(engine, monkeypatch):
+    """N1 驗收(2)（嚴格語意）：孤兒連續兩輪零進展、guard 關閉之後，出現一筆全新的
+    association_pending 隔離列（既有 `_process_one` 邏輯無條件把 flag 撥回 True）→ 下一個
+    落地批次的批次內快速重試應該再跑一次；這筆新列若委託 ack 已經補上，會在這次重試中成功
+    落地（有進展），孤兒本身仍然解不開、留在隔離——不會因為孤兒又失敗一次就被誤判成「沒有
+    進展」而繼續關閉（這次的集合裡有新列，`retry_landed>0`，兩個條件都不成立）。"""
+    calls = {"n": 0}
+    original = brepo.unquarantine_stale_raw_inbox
+
+    def _counting(*a, **kw):
+        calls["n"] += 1
+        return original(*a, **kw)
+
+    monkeypatch.setattr(brepo, "unquarantine_stale_raw_inbox", _counting)
+
+    worker = _worker(engine)
+    with Session(engine) as s:
+        orphan_row = brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="ORPHAN", ordno="GHOST", broker_order_id="GHOST-B")),
+        )
+        orphan_id = orphan_row.id
+        s.commit()
+    worker.process_batch_once()  # 孤兒 quarantine，非落地批次
+
+    _land_new_deal(engine, client_order_id="C1", request_hash="H1", ordno="O1",
+                   broker_order_id="B1", fill_id="F1")
+    worker.process_batch_once()  # 第 1 個落地批次 → 第一次遇到孤兒集合，零進展但先給一次機會
+    assert calls["n"] == 1
+    assert worker._maybe_assoc_pending is True  # 還沒關閉
+
+    _land_new_deal(engine, client_order_id="C2", request_hash="H2", ordno="O2",
+                   broker_order_id="B2", fill_id="F2")
+    worker.process_batch_once()  # 第 2 個落地批次 → 同一個孤兒集合、依然零進展 → 連續兩輪關閉
+    assert calls["n"] == 2
+    assert worker._maybe_assoc_pending is False
+
+    # 全新一筆 deal（N，委託 ack 還沒補上）→ quarantine(association_pending)；純 quarantine
+    # 批次沒有東西落地，不會觸發重試查詢，但既有 `_process_one` 邏輯會把 flag 撥回 True。
+    with Session(engine) as s:
+        n_row = brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="N", ordno="O3", broker_order_id="B3")),
+        )
+        n_id = n_row.id
+        s.commit()
+    worker.process_batch_once()
+    assert worker._maybe_assoc_pending is True
+    assert calls["n"] == 2  # 純 quarantine 批次不會觸發重試查詢
+
+    # N 的委託 ack 現在補上；下一個全新落地批次（C4）觸發批次內快速重試——這次會撿到孤兒與
+    # N 兩筆隔離列：N 因為委託已存在而成功落地（retry_landed>0），孤兒依然解不開、重新隔離。
+    with Session(engine) as s:
+        order_n = brepo.create_order(s, **_order_kwargs(client_order_id="CN", request_hash="HN"))
+        brepo.set_order_ack(s, order_n.id, broker_order_id="B3", ordno="O3", status="submitted")
+        s.commit()
+    _land_new_deal(engine, client_order_id="C4", request_hash="H4", ordno="O4",
+                   broker_order_id="B4", fill_id="F4")
+    worker.process_batch_once()
+    assert calls["n"] == 3  # 重試查詢真的又跑了一次，flag 不是永久關掉
+    assert worker._maybe_assoc_pending is True  # N 成功落地（有進展）→ 維持 True
+
+    with Session(engine) as s:
+        n_after = s.get(RawInbox, n_id)
+        assert n_after.processed is True and n_after.quarantine is False  # N 成功落地
+        orphan_after = s.get(RawInbox, orphan_id)
+        assert orphan_after.quarantine is True and orphan_after.processed is False  # 孤兒仍解不開
+        assert orphan_after.quarantine_reason == "association_pending"
+
+
+def test_first_failed_retry_does_not_disable_guard_before_own_ack_gets_a_chance(session, engine):
+    """N1 語意修正（opus 三輪複審發現，MEDIUM——先前「上一輪是 None 也算沒有新列」的寬鬆
+    判斷會提前判死）：deal D 先到、無對應委託 → quarantine(association_pending)；**不相關**
+    的另一筆回報接著落地（landed=1）觸發批次內快速重試——這是本函式第一次被呼叫
+    （`_last_retry_released_ids` 還是 None），D 的委託 ack 還沒到，重試失敗、原地重新隔離
+    （retry_landed=0）。這第一次零進展**不該**關閉 guard——D 才剛拿到第一次機會，只是運氣
+    不好在忙碌時段被不相關的批次抽到而已；緊接著 D 自己委託的 ack 落地時，批次內快速重試
+    必須還在，讓 D 當場解隔離成功，不必倒退回 watchdog 300 秒 fallback——這正是批次內快速
+    重試存在的核心情境（deal-before-ack 競態），在「多筆委託併發、有不相關回報插隊」的忙碌
+    時段不能失效。"""
+    with Session(engine) as s:
+        d_row = brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        d_id = d_row.id
+        s.commit()
+    worker = _worker(engine)
+    worker.process_batch_once()  # D quarantine(association_pending)，非落地批次
+
+    with Session(engine) as s:
+        d = s.get(RawInbox, d_id)
+        assert d.quarantine is True and d.quarantine_reason == "association_pending"
+
+    # 不相關的另一筆委託成交落地（與 D 完全無關）→ 觸發第一次批次內快速重試；D 的委託還
+    # 不存在，重試失敗、原地重新隔離——這是本函式第一次被呼叫，「上一輪」尚無記錄。
+    _land_new_deal(engine, client_order_id="U1", request_hash="HU1", ordno="U-O1",
+                   broker_order_id="U-B1", fill_id="U-F1")
+    worker.process_batch_once()
+    assert worker._maybe_assoc_pending is True  # 關鍵斷言：第一次零進展不該關閉 guard
+
+    with Session(engine) as s:
+        d = s.get(RawInbox, d_id)
+        assert d.quarantine is True and d.quarantine_reason == "association_pending"  # D 仍隔離
+
+    # D 自己委託的 ack 現在落地（同既有回歸情境
+    # test_association_pending_deal_resolves_within_batch_when_order_ack_lands_later）——這個
+    # 批次本身就有東西落地（order_report），觸發快速重試，這次應該讓 D 也一併解隔離成功，
+    # 不必等 watchdog。
+    _seed_order(session)  # ordno=O1, broker_order_id=B1，對應 _deal_payload() 預設值
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+        )))
+        s.commit()
+    worker.process_batch_once()
+
+    with Session(engine) as s:
+        d = s.get(RawInbox, d_id)
+        assert d.processed is True and d.quarantine is False  # D 當場解隔離成功，不必等 watchdog
+        assert s.exec(select(Deal)).first() is not None

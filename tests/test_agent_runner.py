@@ -241,6 +241,28 @@ async def test_crash_before_ack_resent_by_next_session(tmp_path):
     await asyncio.gather(t2, return_exceptions=True)
 
 
+async def test_reconnect_on_same_runner_resends_inflight_immediately_without_cooldown(tmp_path):
+    """F3（opus 終審發現）：`run_forever` 重用同一個 `AgentRunner` 實例，斷線重連後，斷線前
+    送出但未 ack 的列不該被冷卻窗（`resend_after`）擋住——新連線上 server 根本沒收過那些
+    訊息，等冷卻窗只是白白拖慢零丟單的補送。這裡直接在同一個 runner 實例上呼叫兩次
+    `run_once()`（模擬重連，不建立新 runner），驗證第二個 session 立刻重送、不必等
+    `resend_after`（本測試刻意設得很大，若 `_inflight` 沒有在重連時清掉就會逾時失敗）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    eid = buf.append("deal_report", {"n": 1})
+    r = _runner(tr, child, buf, resend_after=5.0)  # 遠大於下面的觀察窗
+    r.ensure_child()
+    t1 = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.reports()) >= 1)
+    t1.cancel()  # 模擬斷線（未收到 ack）
+    await asyncio.gather(t1, return_exceptions=True)
+
+    tr.sent.clear()  # 只看第二個 session（重連）送了什麼；重用同一個 runner + transport 物件
+    t2 = asyncio.create_task(r.run_once())
+    await _until(lambda: any(m["event_id"] == eid for m in tr.reports()), timeout=1.0)
+    t2.cancel()
+    await asyncio.gather(t2, return_exceptions=True)
+
+
 async def test_downlink_place_dispatched_to_child_and_acked(tmp_path):
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
