@@ -274,13 +274,27 @@ git grep -nE "SHIOAJI_(TRADE_)?(API_KEY|SECRET_KEY)\s*=\s*['\"][A-Za-z0-9]" -- .
      `agent_commands`/`agent_account_bindings` 三張新表經 `create_all` 自動建立，無需手動
      migration（比照 10.4 的既有慣例，首次啟用前仍建議照 10.4 的流程對一次真實 Postgres
      smoke，尤其這次多了 `agent_commands` 的兩條 partial unique index）。
-3. 每位使用者各自登入網站（自己的帳號），到 `/orders` 頁「Agent Token」段按「產生 Agent
-   Token」，複製明文 token（只顯示這一次）。
-4. 每位使用者各自在自己電腦上跑 `quanquant-agent`（`uv run quanquant-agent`），依提示輸入
-   剛才複製的 token 與自己的永豐 simtrade API Key/Secret（憑證 session-only，不落地、不進
-   log）；也可用環境變數 `QQ_AGENT_TOKEN`/`QQ_AGENT_API_KEY`/`QQ_AGENT_SECRET_KEY` 免互動
-   輸入。**一個永豐帳號只能綁定一位使用者**（先綁先贏，見 D10）。
-5. 回 orders 頁確認 badge 轉綠（🟢 agent 已連線）即完成。
+3. 每位使用者各自在自己電腦上跑 `quanquant-agent` 連上來。兩種方式擇一：
+
+   **(A) GUI 設定精靈（推薦，非技術者友善）** — `quanquant-agent --gui --site https://<staging網域>`：
+   - 自動開瀏覽器進三步精靈；**裝置授權 token 由 device-code flow 自動取得，使用者不需手動複製 token**。
+   - 步驟①「連線授權」：精靈顯示一組 `XXXX-XXXX` 裝置代碼（10 分鐘有效），使用者按「開核准頁」到
+     正式站 `/agent/authorize` 輸入該代碼並核准（**必須先登入且為 owner**，否則該頁顯示「下單子系統
+     未啟用」或 403）；核准後精靈自動前進（同源 JS 背景輪詢，不整頁刷新）。
+   - 步驟②「永豐憑證」：輸入自己的永豐 **simtrade** API Key/Secret；可勾「記住永豐 API 憑證」／「記住
+     裝置授權」把兩者分別存進**該使用者自己電腦的 OS keychain**（`keyring`，不進 server）；不勾則僅存
+     記憶體、關掉即失效。
+   - 步驟③「確認啟動」：核對伺服器／模式（sim）／商品（TXF）／帳號後按「啟動」→ 導到 `/status` 儀表板。
+   - 完整逐步圖文（給非技術測試者）見 `docs/agent-tester-onboarding.md`。
+
+   **(B) headless（環境變數／互動，適合自動化或無桌面環境）** — 先各自登入網站到 `/orders` 頁「Agent
+   Token」段按「產生 Agent Token」複製明文 token（只顯示一次），再跑 `quanquant-agent` 依提示輸入 token
+   與自己的永豐 simtrade API Key/Secret；或用環境變數 `QQ_AGENT_TOKEN`/`QQ_AGENT_API_KEY`/
+   `QQ_AGENT_SECRET_KEY` 免互動。此路徑憑證 **session-only、不落地、不進 log**（與 GUI 勾「記住」會落地
+   到 OS keychain 不同）。
+
+   兩種方式皆遵守 **一個永豐帳號只能綁定一位使用者**（先綁先贏，見 D10）。
+4. 回 `/orders` 頁（GUI 則看 `/status`）確認 badge 轉綠（🟢 agent 已連線）即完成。
 
 **已知營運行為（非故障，操作者需知悉）**：
 - `place` 逾時／agent 斷線導致的 unknown 委託，其配額保留**永不自動釋放**（只有券商端明確
