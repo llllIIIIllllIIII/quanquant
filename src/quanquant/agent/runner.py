@@ -521,7 +521,7 @@ def _to_op(msg: Any) -> dict:
 
 class AgentRunner:
     def __init__(self, *, transport, buffer, child, mode: str = "sim",
-                 pump_interval: float = 0.5, resend_after: float = 5.0,
+                 pump_interval: float = 0.1, resend_after: float = 5.0,
                  child_command_timeout: float = 8.0, child_ping_interval: float = 10.0,
                  child_ping_timeout: float = 20.0, heartbeat_interval: float = 15.0,
                  backoff_base: float = 1.0, backoff_max: float = 60.0,
@@ -923,16 +923,28 @@ class AgentRunner:
         )
 
     async def _pump(self) -> None:
+        """check-first / sleep-after（延遲優化，取代舊版 sleep-first）：先查
+        `self._buffer.pending(50)`；本輪只要有 ≥1 列被實際送出，就立刻回圈頂重新
+        `pending(50)`（drain-until-empty），不會為了「湊滿一輪」讓剛落地、甚至已經
+        backlog 多批的回報平白多等一輪 pump_interval。本輪「零送出」才
+        `sleep(self._pump_interval)`——零送出有兩種成因：`pending()` 真的查到空批，
+        或查到的列全部卡在 `resend_after` 冷卻窗內被下面的 `continue` 跳過（回歸修復：
+        後者若誤判成「有事做」而不睡，會在冷卻窗內〔最長 resend_after〕密集空轉查
+        SQLite）。睡眠判準因此是「這輪有沒有實際送出東西」，不是「pending() 是否為空」；
+        `resend_after`/`self._inflight` 的補送判斷邏輯本身不變。"""
         while True:
-            await asyncio.sleep(self._pump_interval)
-            now = time.monotonic()
             pending = await asyncio.to_thread(self._buffer.pending, 50)
+            now = time.monotonic()
+            sent_any = False
             for row in pending:
                 sent_at = self._inflight.get(row.id)
                 if sent_at is not None and (now - sent_at) < self._resend_after:
                     continue
                 await self._transport.send(self._to_uplink(row).model_dump())
                 self._inflight[row.id] = now
+                sent_any = True
+            if not sent_any:
+                await asyncio.sleep(self._pump_interval)
 
     def _to_uplink(self, row: Any) -> UpReport | UpCmdAck:
         """outbox 列有兩種：`cmd_id` 非空＝D4④執行 native 後存的 cmd_ack（record_execution/

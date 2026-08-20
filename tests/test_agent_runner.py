@@ -122,6 +122,106 @@ async def test_pump_resends_when_no_ack(tmp_path):
     await asyncio.gather(task, return_exceptions=True)
 
 
+class _ImmediateAckTransport(_FakeTransport):
+    """模擬 transport 送出後立即視為已 ack（直接 mark_sent）——把 buffer 逼到需要不只
+    一次 `pending(50)` 才能耗盡（>50 筆），用來驗證 drain-until-empty：批次之間不會
+    多睡一輪 `pump_interval`，只有真的耗盡（`pending()` 回空）才睡。"""
+    def __init__(self, buf):
+        super().__init__()
+        self._buf = buf
+    async def send(self, msg):
+        await super().send(msg)
+        if msg.get("type") == "report":
+            self._buf.mark_sent(msg["event_id"])
+
+
+async def test_pump_drains_backlog_across_batches_without_waiting_per_batch(tmp_path):
+    """紅測試前提：sleep-first 版本每批（`pending(50)`）處理前都要先睡滿一輪
+    `pump_interval`——120 筆需要 3 批（50+50+20），舊版至少 3*pump_interval=1.5s 才送完，
+    遠超下面的 0.3s 上限；check-first/drain-until-empty 版本應該幾乎零等待送完（送出
+    即視為已 ack，buffer 立刻露出下一批，不必等下一輪 pump_interval 才繼續 drain）。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    tr = _ImmediateAckTransport(buf)
+    ids = [buf.append("deal_report", {"n": i}) for i in range(120)]
+    r = _runner(tr, _FakeChild(), buf, pump_interval=0.5)  # 沿用舊預設值，驗證修好後仍快
+    task = asyncio.create_task(r._pump())
+    await _until(lambda: len(tr.reports()) >= 120, timeout=0.3)
+    assert [m["event_id"] for m in tr.reports()] == ids
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+class _CountingEmptyBuffer:
+    """buffer 永遠空的假物件，只提供 `_pump` 用得到的 `pending()`（用呼叫次數證明空批
+    確實有 sleep 節流，不是每輪不停查 SQLite 的空轉 busy-loop）；另外補上建構
+    `AgentRunner` 時 `_load_persisted_health()` 會用到的最小介面（無 sentinel、
+    health_epoch=0，等同一顆全新 buffer）。"""
+    path = "<fake>"
+    def __init__(self):
+        self.calls = 0
+    def pending(self, limit=50):
+        self.calls += 1
+        return []
+    def read_sentinel(self):
+        return None
+    def get_health_epoch(self):
+        return 0
+
+
+async def test_pump_sleeps_between_polls_when_buffer_empty(tmp_path):
+    buf = _CountingEmptyBuffer()
+    tr = _FakeTransport()
+    r = _runner(tr, _FakeChild(), buf, pump_interval=0.05)
+    task = asyncio.create_task(r._pump())
+    await asyncio.sleep(0.22)          # ~4 個 pump_interval 的時間
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    # 沒有 busy-loop 的話呼叫次數應落在 ~4-5 次量級；真的空轉的話會是數千次以上。
+    assert 2 <= buf.calls <= 10
+
+
+class _CountingBuffer:
+    """包一層真 `DurableBuffer`，只加 `pending()` 呼叫計數——用來證明 `pending()` 非空
+    但全部列都卡在 `resend_after` 冷卻窗內時，`_pump` 仍然有睡、不是被『非空』騙成
+    busy-loop（回歸測試，審查發現：睡眠判準應該是『這輪有沒有實際送出東西』，不是
+    『這輪 pending() 是否為空』）。"""
+    def __init__(self, inner):
+        self._inner = inner
+        self.pending_calls = 0
+    def pending(self, limit=50):
+        self.pending_calls += 1
+        return self._inner.pending(limit)
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def test_pump_sleeps_when_all_pending_rows_are_in_resend_cooldown(tmp_path):
+    """回歸測試：3 筆都送出去了但沒收到 ack（`_FakeTransport` 不主動 ack，outbox 列的
+    `sent_at` 因此還是 NULL），resend_after=5.0 遠大於本測試觀察窗——所以第一輪之後，
+    每一輪 `pending(50)` 都會非空（3 列都還在 outbox 裡），但全部因為在冷卻窗內被
+    `continue` 跳過、這輪『沒有實際送出任何東西』。正確行為是照樣 `sleep(pump_interval)`
+    節流；有這個回歸的版本會把『pending() 非空』誤判成『有事做』，在冷卻窗內
+    （長達 resend_after）密集空轉查 SQLite。"""
+    inner = DurableBuffer(tmp_path / "o.db")
+    buf = _CountingBuffer(inner)
+    for i in range(3):
+        inner.append("deal_report", {"n": i})
+    tr = _FakeTransport()  # 不主動 ack：送出後 outbox 列仍是未送達（sent_at IS NULL）
+    r = _runner(tr, _FakeChild(), buf, pump_interval=0.02, resend_after=5.0)
+    task = asyncio.create_task(r._pump())
+    await _until(lambda: len(tr.reports()) >= 3, timeout=0.3)  # 第一輪先把 3 筆都送出去
+    calls_at_first_send = buf.pending_calls
+    await asyncio.sleep(0.15)   # ~7 個 pump_interval；busy-loop 的話會是數千次呼叫
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    # 冷卻窗內（resend_after=5.0 遠大於這段觀察窗）不該有新的送出——沒有收到 ack 也沒有
+    # 逾時，補送邏輯本身不該被本次改動影響。
+    assert len(tr.reports()) == 3
+    # 呼叫次數應落在 pump_interval 節流量級（觀察窗 0.15s / 0.02s ≈ 7-8 次），
+    # 不是空轉才會出現的數千次。
+    assert buf.pending_calls - calls_at_first_send <= 20
+
+
 async def test_crash_before_ack_resent_by_next_session(tmp_path):
     """零丟單核心測試：送出未 ack 就崩潰 → 重啟後補送。"""
     tr1, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
