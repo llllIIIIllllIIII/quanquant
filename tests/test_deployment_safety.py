@@ -369,6 +369,9 @@ def test_start_order_subsystem_connect_failure_redacts_person_id_in_healthz_stat
     asyncio.run(_start_order_subsystem(app, Settings(
         shioaji_trade_api_key="k", shioaji_trade_secret_key="s",
         order_mode="sim", order_owner_user_ids="1", symbol="TXF",
+        # 明確釘住 in-process 路徑——不依賴 code-level 預設值，避免本機 `.env`（例如手動測試
+        # agent 通道時暫留的 ORDER_CHANNEL=agent）汙染導致這個測試跑錯分支。
+        order_channel="inprocess",
     ), tasks))
 
     assert app.state.order_service is None
@@ -412,6 +415,8 @@ def test_existing_fake_adapter_without_secrets_to_redact_attribute_still_works(m
     asyncio.run(_start_order_subsystem(app, Settings(
         shioaji_trade_api_key="k", shioaji_trade_secret_key="s",
         order_mode="sim", order_owner_user_ids="1", symbol="TXF",
+        # 同上：明確釘住 in-process 路徑，避免本機 `.env` 的 ORDER_CHANNEL 汙染。
+        order_channel="inprocess",
     ), tasks))
 
     assert app.state.order_service is None

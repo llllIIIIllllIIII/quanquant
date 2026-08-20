@@ -4,6 +4,7 @@ asyncio.Queue——QueueFull 這個攻擊面已被架構消除）逐列一交易
 Deal 重播冪等只補 processed 不重跑帳務、序列化鎖防兩協程同時改同一 BrokerPosition。"""
 import asyncio
 import json
+import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -18,6 +19,7 @@ from quanquant.broker.inbox_worker import (
     RawInboxWorker,
     commit_raw_callback,
 )
+from quanquant.broker.order_events import OrderEventHub
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import Fill
 from quanquant.db.models import (
@@ -69,15 +71,16 @@ def _noop_order_report_mapper(payload: dict, *, account: str | None = None) -> O
 
 
 def _worker(engine, *, deal_mapper=_ok_deal_mapper, order_report_mapper=_noop_order_report_mapper,
-            supervisor=None, ops_alerter=None, user_id=None):
+            supervisor=None, ops_alerter=None, user_id=None, idle_interval=0.01, order_events=None):
     return RawInboxWorker(
         session_factory=lambda: Session(engine),
         supervisor=supervisor or BrokerSupervisor(),
         deal_mapper=deal_mapper,
         order_report_mapper=order_report_mapper,
-        idle_interval=0.01,
+        idle_interval=idle_interval,
         ops_alerter=ops_alerter,
         user_id=user_id,
+        order_events=order_events,
     )
 
 
@@ -455,6 +458,50 @@ def test_commit_raw_callback_scope_violation_alerts_ops_once(engine):
     assert alerter.calls[0]["kind"] == "deal_report"
 
 
+# ---------------------------------------------------------------------------
+# 事件喚醒（RawInboxWorker request_wake）：commit_raw_callback 的 on_committed hook
+# ---------------------------------------------------------------------------
+
+def test_commit_raw_callback_invokes_on_committed_after_commit_succeeds(engine):
+    """喚醒只能發生在落地 commit 成功之後——`on_committed` 必須在 `session.commit()`
+    真正跑完、資料已可查得之後才被呼叫（best-effort，用來取代 idle_interval 純逾時輪詢）。"""
+    calls: list[int] = []
+
+    def _on_committed() -> None:
+        with Session(engine) as s:
+            # 呼叫當下必須已經看得到剛落地的列——證明 hook 在 commit 之後才觸發。
+            calls.append(len(s.exec(select(RawInbox)).all()))
+
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=None, account=None, mode=None, on_committed=_on_committed,
+    )
+    assert calls == [1]
+
+
+def test_commit_raw_callback_on_committed_default_none_is_noop(engine):
+    """未接線（預設 None）維持現行行為完全不變——不傳 on_committed 不得出錯。"""
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=None, account=None, mode=None,
+    )
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).first() is not None
+
+
+def test_commit_raw_callback_on_committed_exception_swallowed_does_not_lose_commit(engine):
+    """喚醒是 best-effort：hook 炸掉絕不能反噬已經成功的落地（durable 保證不受影響）。"""
+    def _boom() -> None:
+        raise RuntimeError("wake hook 炸了")
+
+    commit_raw_callback(
+        lambda: Session(engine), kind="deal_report", broker="shioaji", payload={"trade_id": "D1"},
+        user_id=None, account=None, mode=None, on_committed=_boom,
+    )  # 不得往外 raise
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).first() is not None  # 落地不受影響
+
+
 def test_unexpected_exception_leaves_row_pending_not_quarantined_zero_loss(session, engine):
     """V3-2 核心回歸：非預期例外（非 ValueError/PositionMismatchError）不得 quarantine，
     必須留 processed=False 讓下一輪重試——這就是『重啟後 raw-inbox 仍在，最終恰一次 effect』。"""
@@ -801,3 +848,124 @@ def test_worker_run_processes_pending_row_then_idles(engine):
     with Session(engine) as s:
         row = s.exec(select(RawInbox)).first()
         assert row.processed is True
+
+
+# ---------------------------------------------------------------------------
+# 事件喚醒（RawInboxWorker.request_wake）：把 run() 從 idle_interval 純逾時輪詢喚醒
+# ---------------------------------------------------------------------------
+
+async def _wait_until_loop_captured(worker: RawInboxWorker, timeout: float = 2.0) -> None:
+    """`run()` 進迴圈第一件事就是 `self._loop = asyncio.get_running_loop()`——等這個
+    發生，確保接下來呼叫 `request_wake()` 時 worker 真的已經在跑（不是巧合式
+    `asyncio.sleep(0)` 賭排程時機）。"""
+    end = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < end:
+        if worker._loop is not None:
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("worker.run() 逾時仍未捕捉到 event loop")
+
+
+def test_request_wake_processes_new_row_faster_than_idle_interval(engine):
+    """驗收條件1：事件喚醒快於逾時。worker 以刻意拉長的 idle_interval（5s）啟動；commit
+    一筆新列後呼叫 request_wake()，必須在遠小於 idle_interval 的時間內（<1s 的 asyncio
+    等待，不使用真 sleep 硬等 5s）被處理，且 hub 收到一次 publish。"""
+    with Session(engine) as s:
+        _seed_order(s)
+    hub = OrderEventHub()
+    worker = _worker(engine, idle_interval=5.0, order_events=hub)
+
+    async def scenario():
+        run_task = asyncio.create_task(worker.run())
+        await _wait_until_loop_captured(worker)
+        queue = hub.subscribe()
+
+        with Session(engine) as s:
+            brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
+                                   payload=json.dumps(_deal_payload()))
+            s.commit()
+        worker.request_wake()
+
+        # 遠小於 idle_interval=5s 的上限——事件喚醒若沒生效，這裡會逾時失敗，
+        # 證明喚醒確實比純逾時輪詢快。
+        await asyncio.wait_for(queue.get(), timeout=1.0)
+
+        await worker.stop_and_drain(timeout=1.0)
+        await run_task
+
+    asyncio.run(scenario())
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.processed is True
+
+
+def test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effective(engine):
+    """驗收條件2（有效性那一半）：從另一個沒有 event loop 的執行緒（比照 Shioaji SDK
+    callback thread）呼叫 request_wake 必須安全、且真的把 worker 喚醒——用
+    `threading.Thread`（非 asyncio 任何東西）呼叫，不能假設呼叫端在 loop 執行緒上。"""
+    with Session(engine) as s:
+        _seed_order(s)
+    worker = _worker(engine, idle_interval=5.0)
+
+    async def scenario():
+        run_task = asyncio.create_task(worker.run())
+        await _wait_until_loop_captured(worker)
+
+        with Session(engine) as s:
+            brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
+                                   payload=json.dumps(_deal_payload()))
+            s.commit()
+
+        errors: list[BaseException] = []
+
+        def _call_from_thread() -> None:
+            try:
+                worker.request_wake()
+            except BaseException as exc:  # noqa: BLE001 — 就是要證明「絕不 raise」
+                errors.append(exc)
+
+        t = threading.Thread(target=_call_from_thread)
+        t.start()
+        t.join(timeout=2.0)
+        assert not t.is_alive()
+        assert errors == []
+
+        for _ in range(100):
+            with Session(engine) as s:
+                row = s.exec(select(RawInbox)).first()
+                if row is not None and row.processed:
+                    break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("跨執行緒 request_wake 逾時仍未喚醒 worker 處理新列")
+
+        await worker.stop_and_drain(timeout=1.0)
+        await run_task
+
+    asyncio.run(scenario())
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.processed is True
+
+
+def test_request_wake_before_worker_started_is_quiet_noop(engine):
+    """驗收條件2（安全性那一半）：worker 尚未啟動（`run()` 從未被排程過，`_loop` 恆為
+    None）時呼叫 request_wake 必須安靜 no-op——不 raise（callback 執行緒炸掉會丟券商回報）。"""
+    worker = _worker(engine)
+    worker.request_wake()  # 不 raise 就是通過
+
+
+def test_request_wake_after_worker_stopped_is_quiet_noop(engine):
+    """worker 正常停止（`stop_and_drain` 完成、`run()` 已返回）後呼叫 request_wake 一樣要
+    安靜 no-op，不得 raise——`run()` 的 finally 必須把 `_loop` 重新歸零。"""
+    worker = _worker(engine)
+
+    async def scenario():
+        run_task = asyncio.create_task(worker.run())
+        await _wait_until_loop_captured(worker)
+        await worker.stop_and_drain(timeout=1.0)
+        await run_task
+        assert worker._loop is None
+        worker.request_wake()  # 不 raise 就是通過
+
+    asyncio.run(scenario())

@@ -181,11 +181,18 @@ async def agent_ws(websocket: WebSocket) -> None:
                     # scope 驗證（R1-5：account 是否屬於這個 user 的 binding）與 dead-letter
                     # 分級全部在 commit_raw_callback → stage_scoped_raw_inbox 內完成，違規列仍
                     # 照常落地＋commit-then-ack（I1/I4），不在這裡另外攔截。
+                    #
+                    # 事件喚醒：commit 成功後透過這個 slot 自己 adapter 的
+                    # `raw_committed_hook`（`web/app.py::_start_agent_channel_subsystem` 接到
+                    # 這個 slot 的 `RawInboxWorker.request_wake`）喚醒正確的 worker，取代純
+                    # idle_interval 逾時輪詢。`getattr` 防禦性讀取——測試替身/未接線的 adapter
+                    # 可能沒有這個屬性，一律當 None（no-op），不因此讓 report 落地路徑報錯。
                     await asyncio.to_thread(
                         commit_raw_callback, session_factory,
                         kind=msg.kind, broker="shioaji", payload=msg.payload,
                         user_id=agent_user_id, account=msg.account, mode=msg.mode,
                         ops_alerter=getattr(state, "ops_alerter", None),
+                        on_committed=getattr(adapter, "raw_committed_hook", None),
                     )
                     await websocket.send_json(
                         DownReportAck(event_id=msg.event_id).model_dump()

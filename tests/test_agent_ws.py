@@ -35,6 +35,9 @@ class _FakeAdapter:
         self.account = ""
         self.reconcile_calls = 0
         self.block = None            # asyncio.Event 時卡住 reconcile（測非 inline）
+        # 事件喚醒佈線：比照真實 ShioajiAdapter 的預設值——未接線時是 None，agent_ws 的
+        # UpReport 分支讀這個屬性當 commit_raw_callback 的 on_committed 傳入。
+        self.raw_committed_hook = None
     async def reconcile(self):
         self.reconcile_calls += 1
         if self.block is not None:
@@ -150,6 +153,26 @@ def test_report_staged_then_acked(ws_env, engine):
     with Session(engine) as s:
         rows = s.exec(select(RawInbox)).all()
         assert len(rows) == 1 and rows[0].kind == "deal_report"
+
+
+def test_report_committed_invokes_slot_adapter_raw_committed_hook(ws_env, engine):
+    """驗收條件3（agent 通道佈線）：UpReport 分支呼叫 `commit_raw_callback` 時必須把這個
+    user slot 自己 adapter 的 `raw_committed_hook` 當 `on_committed` 傳入——commit 成功後
+    才觸發（比照 `web/app.py::_start_agent_channel_subsystem` 的接線方式：
+    `adapter.raw_committed_hook = slot_inbox_worker.request_wake`）。這裡直接在 slot 的
+    adapter 上掛一個 spy，驗證真的透過 WS 路由被呼叫到，而非只是接線點存在但沒被讀取。"""
+    woke: list[bool] = []
+    _slot(ws_env).adapter.raw_committed_hook = lambda: woke.append(True)
+
+    client = TestClient(ws_env)
+    with client.websocket_connect("/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "report", "event_id": 7, "kind": "deal_report",
+                      "account": "F1", "mode": "sim", "payload": {"trade_id": "T1"}})
+        assert ws.receive_json() == {"type": "report_ack", "event_id": 7}
+    assert woke == [True]
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).all() != []  # 喚醒發生在真的落地之後，非空跑
 
 
 def test_duplicate_report_resend_both_staged_and_acked(ws_env, engine):

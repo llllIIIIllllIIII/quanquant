@@ -697,6 +697,35 @@ def test_callback_stamps_agent_user_id_when_adapter_constructed_with_one(engine)
         assert row.user_id == 42
 
 
+def test_persist_raw_wakes_wired_worker_after_commit_succeeds(engine):
+    """驗收條件3（in-process 佈線）：`_persist_raw`（callback thread 落地路徑，經
+    `commit_raw_callback`）commit 成功後，必須透過 `adapter.raw_committed_hook` 呼叫接線的
+    喚醒 callback——比照 `web/app.py::_start_order_subsystem` 的接線方式
+    （`adapter.raw_committed_hook = inbox_worker.request_wake`）。喚醒不能在落地之前發生。"""
+    adapter = _adapter(engine)
+    woke: list[bool] = []
+    adapter.raw_committed_hook = lambda: woke.append(True)
+
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+
+    assert woke == [True]
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).first() is not None  # 已落地，喚醒不是空跑
+
+
+def test_persist_raw_default_raw_committed_hook_is_none_and_noop(engine):
+    """未接線（預設 None，未被 app.py 設定過）維持現行行為完全不變——不 raise。"""
+    adapter = _adapter(engine)
+    assert adapter.raw_committed_hook is None
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).first() is not None
+
+
 def test_callback_order_report_uses_order_report_kind(engine):
     adapter = _adapter(engine)
     # 真實 FuturesOrderEvent 是巢狀結構（operation/order/status/contract，見 _core.pyi）。

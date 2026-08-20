@@ -149,6 +149,23 @@ async def test_agent_mode_two_owners_get_isolated_slot_runtimes(engine, monkeypa
     assert slot1.session_state is not slot2.session_state
 
 
+async def test_agent_mode_slot_adapter_raw_committed_hook_wired_to_its_own_inbox_worker(engine, monkeypatch):
+    """事件喚醒佈線（agent 通道）：每個 slot 的 `adapter.raw_committed_hook` 必須接到
+    「這個 slot 自己」的 `RawInboxWorker.request_wake`（見 `web/app.py` 迴圈內
+    `adapter.raw_committed_hook = slot_inbox_worker.request_wake`）——`agent_ws` 的
+    UpReport handler commit 成功後讀 `slot.adapter.raw_committed_hook` 來喚醒正確的
+    worker，兩個 owner 的 hook 必須各自指向各自的 worker，不能共用/串線（I8）。"""
+    app, state, tasks = await _run(_settings(order_owner_user_ids="1,2"), engine, monkeypatch)
+    slot1 = app.state.agent_registry.get(1)
+    slot2 = app.state.agent_registry.get(2)
+    workers = app.state.agent_inbox_workers
+    assert len(workers) == 2
+    worker1, worker2 = workers[0], workers[1]  # 迴圈依 sorted(owner_ids) 建置，順序穩定
+    assert slot1.adapter.raw_committed_hook == worker1.request_wake
+    assert slot2.adapter.raw_committed_hook == worker2.request_wake
+    assert slot1.adapter.raw_committed_hook != slot2.adapter.raw_committed_hook
+
+
 async def test_agent_mode_slot_adapter_reconcile_stages_with_slot_user_id(engine, monkeypatch):
     """Task 8 修復（round 1）驗收：`_start_agent_channel_subsystem` 建 slot 的 `ShioajiAdapter`
     必須傳 `agent_user_id=uid`，否則 `_stage_reconcile_results`（agent 模式對帳落地路徑）用

@@ -224,6 +224,12 @@ class ShioajiAdapter:
         # `expires_at = created_at + 這個值`，取代 Task 8 的模組層常數字面值。
         self._agent_command_expiry_seconds = agent_command_expiry_seconds
         self._fill_handler: Callable[[Fill], None] | None = None
+        # 事件喚醒（RawInboxWorker 從 idle_interval 純逾時輪詢改事件喚醒）：這個 adapter
+        # instance 構造當下還不知道之後會被哪個 RawInboxWorker 認領（app.py 兩個接線點都是
+        # adapter 先建、worker 後建，生命週期順序問題），故留一個可事後設定的 public 掛勾——
+        # 預設 None＝no-op，行為與現行完全一致；接線後（`adapter.raw_committed_hook =
+        # inbox_worker.request_wake`）`_persist_raw` commit 成功後才會呼叫。
+        self.raw_committed_hook: Callable[[], None] | None = None
         # Task 2 委派重構：所有直接碰 Shioaji SDK 的呼叫交給 native（`_api`/`_contract`/
         # `account` 三個 property 墊片委派讀寫 native 對應屬性，見下方）；`on_raw` 落地責任
         # 交回這個 adapter 的 `_persist_raw`（等價原本 `_on_order_cb` 直呼 commit_raw_callback
@@ -266,11 +272,15 @@ class ShioajiAdapter:
         Inc1 D5：在落地當下蓋章 `account=self.account, mode=self.mode`（事件產生瞬間的
         immutable snapshot，S3 拆除的另一半——mapper 之後讀的是這個蓋章值，不是處理當下可能
         已經被換帳號覆寫過的 `self.account`）；`user_id=self._agent_user_id`——in-process 與
-        目前仍未拆分的 agent 單例模式一律是 None，行為與現行完全一致。"""
+        目前仍未拆分的 agent 單例模式一律是 None，行為與現行完全一致。
+
+        事件喚醒：`on_committed=self.raw_committed_hook` 一路傳進 `commit_raw_callback`——
+        commit 成功後才可能觸發，未接線時是 None（no-op），行為與現行完全一致（見
+        `raw_committed_hook` 欄位註解／`commit_raw_callback` docstring）。"""
         commit_raw_callback(
             self._session_factory, kind=kind, broker=self.broker, payload=payload,
             user_id=self._agent_user_id, account=self.account, mode=self.mode,
-            ops_alerter=self._ops,
+            ops_alerter=self._ops, on_committed=self.raw_committed_hook,
         )
 
     # ---- T0.3 營運告警（純疊加，絕不反噬既有 fail-closed/冪等/redaction 行為） ----

@@ -303,6 +303,11 @@ async def _start_agent_channel_subsystem(
             order_events=getattr(app.state, "order_events", None),
             ops_alerter=ops_alerter, user_id=uid,   # D6：批次查詢 WHERE user_id = uid
         )
+        # 事件喚醒：這個 slot 的 adapter（in-process `_persist_raw`）與 agent_ws 的 UpReport
+        # handler（讀 `slot.adapter.raw_committed_hook`）commit 成功後都經這個 hook 喚醒
+        # 「這個 slot 自己」的 worker——adapter 先建、worker 後建（生命週期順序），故用
+        # adapter 上可事後設定的掛勾接線，不需要改 adapter 建構子簽章。
+        adapter.raw_committed_hook = slot_inbox_worker.request_wake
         slot = UserAgentSlot(
             user_id=uid, channel=channel, gateway=gateway, adapter=adapter,
             session_state=session_state, supervisor=slot_supervisor, tasks=[],
@@ -439,6 +444,11 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
     app.state.order_service = adapter
     app.state.order_risk_guard = risk_guard
     app.state.order_inbox_worker = inbox_worker
+    # 事件喚醒：`adapter._persist_raw` commit 成功後透過這個 hook 喚醒「這個」worker，取代
+    # idle_interval 純逾時輪詢（見 inbox_worker.py `request_wake`/`commit_raw_callback`
+    # docstring）；接線放在 connect() 成功之後——connect 失敗時 adapter 不會被 publish，
+    # 這個掛勾設不設都不影響 fail-closed 語意。
+    adapter.raw_committed_hook = inbox_worker.request_wake
     tasks.append(asyncio.create_task(inbox_worker.run()))
     # T0.2：開機做一次 best-effort reconcile——原本 reconcile 只在斷線重連後才跑（watchdog），
     # 正常開機不會補回停機期間券商端的委託/狀態變更。失敗不擋啟動（watchdog 後續仍會補）；

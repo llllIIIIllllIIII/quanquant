@@ -48,8 +48,9 @@ class _FakeNative:
 def _bare_adapter(session_factory):
     """繞過 __init__ 建最小 adapter：`_on_order_cb`→`_persist_raw` 用到
     `_session_factory`/`broker`/`_json_safe`；Inc1 D5 之後 `_persist_raw` 額外蓋章
-    `_agent_user_id`/`account`/`mode`/`_ops`（見 `ShioajiAdapter._persist_raw`），這裡一併補
-    最小值，不影響本檔測試焦點（落地失敗時的退化保存/不拋例外）。"""
+    `_agent_user_id`/`account`/`mode`/`_ops`（見 `ShioajiAdapter._persist_raw`），事件喚醒
+    佈線之後 `_persist_raw` 又多讀了 `raw_committed_hook`——這裡一併補最小值，不影響本檔
+    測試焦點（落地失敗時的退化保存/不拋例外）。"""
     adapter = object.__new__(ShioajiAdapter)
     adapter._session_factory = session_factory
     adapter.broker = "shioaji"
@@ -57,6 +58,7 @@ def _bare_adapter(session_factory):
     adapter._native = _FakeNative()
     adapter.mode = "sim"
     adapter._ops = None
+    adapter.raw_committed_hook = None
     return adapter
 
 

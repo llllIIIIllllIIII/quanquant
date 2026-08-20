@@ -151,6 +151,7 @@ def commit_raw_callback(
     account: str | None,
     mode: str | None,
     ops_alerter=None,
+    on_committed: Callable[[], None] | None = None,
 ) -> None:
     """callback thread（或排程協程）呼叫的同步落地函式（round3 BLOCKER#2）：用獨立 Session
     把 raw payload 落地到 RawInbox 並立即 commit——**返回前保證落地**。呼叫端（ShioajiAdapter
@@ -166,6 +167,14 @@ def commit_raw_callback(
       - remote reconcile 落列（`ShioajiAdapter._stage_reconcile_results`）改走
         `stage_scoped_raw_inbox`（不是本函式——那裡需要與 cursor 推進同一交易，見該函式
         docstring），語意仍是同一套驗證邏輯。
+
+    事件喚醒（RawInboxWorker 從 idle_interval 純逾時輪詢改事件喚醒補的掛載點）：
+    `on_committed` 是 best-effort 喚醒 hook，只在 `session.commit()` 真正成功**之後**才呼叫
+    ——durable 保證（「落地 commit 成功才 return」）完全不受影響，喚醒只是錦上添花。呼叫端
+    （`ShioajiAdapter._persist_raw`／`agent_ws` UpReport handler）各自傳自己對應那個
+    `RawInboxWorker.request_wake`；未接線（預設 None）行為與現行完全一致——不呼叫任何東西。
+    hook 本身若拋例外一律吞掉（不得反噬已經成功的落地），worker 端仍有 idle_interval 逾時
+    輪詢當 fallback（喚醒遺失不等於資料遺失）。
     """
     with session_factory() as session:
         stage_scoped_raw_inbox(
@@ -173,6 +182,11 @@ def commit_raw_callback(
             user_id=user_id, account=account, mode=mode, ops_alerter=ops_alerter,
         )
         session.commit()
+    if on_committed is not None:
+        try:
+            on_committed()
+        except Exception:
+            log.exception("commit_raw_callback: on_committed 喚醒 hook 失敗（已吞，不影響落地）")
 
 
 class RawInboxWorker:
@@ -205,20 +219,73 @@ class RawInboxWorker:
         # `RawInbox.user_id == user_id` 精確比對），跨 user 完全無共享可變狀態（I8）。
         self._user_id = user_id
         self._stop = asyncio.Event()
+        # 事件喚醒：新列落地後（commit_raw_callback 的 on_committed hook）可以立刻喚醒本
+        # worker，把「委託/成交回報顯示延遲」從 idle_interval 純逾時輪詢壓到近零；喚醒遺失
+        # （下面兩者的邊界情況）一律靠 idle_interval 逾時輪詢兜底，故 idle_interval 的預設值
+        # 與既有語意不變、不可移除（見 `request_wake`/`run` docstring）。
+        self._wake = asyncio.Event()
+        # `run()` 開始跑時才捕捉目前的 event loop，供 `request_wake()` 從任意執行緒（含沒有
+        # loop 的 Shioaji SDK callback thread）安全地 `call_soon_threadsafe` 回這個 loop；
+        # worker 尚未啟動或已經停止時這裡是 None，`request_wake()` 據此判斷安靜 no-op。
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     async def run(self) -> None:
-        while not self._stop.is_set():
-            async with self._supervisor.lock:
-                handled = await asyncio.to_thread(self.process_batch_once)
-            # 有列真的落地了（成交/委託狀態變更）→ 推 SSE，瀏覽器據此重抓委託/部位（取代盲輪詢）。
-            # 發布點在 to_thread 回來後、已回到 event loop 執行緒，故可直接呼叫、不需 call_soon_threadsafe。
-            if handled and self._order_events is not None:
-                self._order_events.publish()
-            if handled == 0:
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=self._idle_interval)
-                except TimeoutError:
-                    pass
+        self._loop = asyncio.get_running_loop()
+        try:
+            while not self._stop.is_set():
+                # 醒來（或本來就還沒睡）一律先 clear 再掃表：任何在 clear 之前已經
+                # commit 成功的列，這次的 process_batch_once 掃描必然涵蓋得到（commit
+                # 早於 request_wake() 呼叫，clear 又早於掃描）；clear 之後才落地的新列會
+                # 讓 wake 重新被設起來，留給下一輪處理，不會遺失（見模組頂部/
+                # request_wake docstring 的競態說明）。
+                self._wake.clear()
+                async with self._supervisor.lock:
+                    handled = await asyncio.to_thread(self.process_batch_once)
+                # 有列真的落地了（成交/委託狀態變更）→ 推 SSE，瀏覽器據此重抓委託/部位（取代盲輪詢）。
+                # 發布點在 to_thread 回來後、已回到 event loop 執行緒，故可直接呼叫、不需 call_soon_threadsafe。
+                if handled and self._order_events is not None:
+                    self._order_events.publish()
+                if handled == 0:
+                    await self._wait_for_stop_or_wake()
+        finally:
+            self._loop = None
+
+    async def _wait_for_stop_or_wake(self) -> None:
+        """等 `_stop` 或 `_wake` 任一被 set，逾時 `self._idle_interval` 秒即返回——取代原本
+        單純的 `wait_for(self._stop.wait(), timeout=idle_interval)`。事件喚醒只是讓這次等待
+        提早結束，`idle_interval` 逾時 fallback 完全保留（喚醒遺失時最慢還是這個時間內會被
+        撿起來，不會真的丟單）。"""
+        stop_task = asyncio.ensure_future(self._stop.wait())
+        wake_task = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait(
+                {stop_task, wake_task}, timeout=self._idle_interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (stop_task, wake_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(stop_task, wake_task, return_exceptions=True)
+
+    def request_wake(self) -> None:
+        """事件喚醒：commit 成功之後才可能被呼叫的 best-effort 喚醒——跨執行緒安全，
+        Shioaji SDK 原生 callback 執行緒（沒有 event loop）與任何其他執行緒皆可安全呼叫，
+        絕不 raise（callback 執行緒若因此炸掉，會連帶丟掉這筆券商回報，比晚一輪
+        idle_interval 才處理嚴重得多）。
+
+        worker 尚未啟動（`run()` 還沒開始跑、`_loop` 仍是 None）或已經停止（`run()` 已返回、
+        `_loop` 被 finally 清空）時安靜 no-op——不喚醒任何人，既有 idle_interval 逾時輪詢
+        仍是唯一且足夠的 fallback，不視為錯誤。"""
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._wake.set)
+        except RuntimeError:
+            # loop 已關閉（shutdown 競態下可能發生）——喚醒本來就只是 best-effort，
+            # 安靜吞掉即可，不影響任何 durable 保證。
+            pass
 
     async def stop_and_drain(self, timeout: float = 5.0) -> bool:
         """設停止旗標；等目前持鎖中的 batch 結束（拿得到鎖代表沒有 batch 在跑）或逾時。
