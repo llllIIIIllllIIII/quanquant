@@ -383,6 +383,14 @@ _STEP1_POLL_JS = """(function () {
           }
           return;
         }
+        // 代碼已產生但頁面還停在「正在建立連線」（尚未 render 出 .user-code）→ 重載一次，
+        // 讓 GET /setup 走 user_code 分支把代碼顯示出來；之後 .user-code 已在頁面上就不再
+        // 重載，不會 reload storm。
+        if (data.has_code && !document.querySelector(".user-code")) {
+          stop();
+          window.location = "/setup";
+          return;
+        }
         if (statusEl) {
           statusEl.textContent = "等待核准中……";
         }
@@ -418,7 +426,13 @@ async def setup_poll_status_json(request: Request) -> JSONResponse:
             "state": "error", "next": None,
             "message": _ERROR_MESSAGES.get(error_code, error_code),
         })
-    return JSONResponse({"state": "waiting", "next": None, "message": None})
+    # 中間態「代碼已產生、待核准」仍歸 waiting，但附 has_code：背景 initiate() 產生的
+    # user_code 只有整頁 GET 的 _render_step1 會寫進 HTML，若無此訊號，代碼要靠使用者手動
+    # 重新整理才出現（c67ac49 移除 meta-refresh 後的回歸）。步驟① JS 靠 has_code 在代碼
+    # 由無變有時重載一次頁面帶出代碼。
+    client = getattr(app_state, "device_flow_client", None)
+    has_code = client is not None and client.user_code is not None
+    return JSONResponse({"state": "waiting", "next": None, "message": None, "has_code": has_code})
 
 
 @router.get("/setup/step1-poll.js")
@@ -491,6 +505,14 @@ async def setup_step3_launch(request: Request) -> Response:
     profile = getattr(app_state, "gui_current_profile", None)
     if approved is None or broker is None or profile is None:
         raise HTTPException(status_code=409, detail="尚未完成前面步驟，無法啟動")
+
+    # 本精靈程序稍早已成功啟動過（app_state.instance_lock 於下方成功路徑設定）→ 使用者只是
+    # 又回到步驟③再按一次「啟動」（例如啟動成功後按了瀏覽器上一頁）。agent 其實正在跑，
+    # 直接導到 /status，不要再去 acquire 自己已持有的鎖、卡在「此帳號的 Agent 已在執行中」。
+    if getattr(app_state, "instance_lock", None) is not None:
+        response = Response(status_code=303)
+        response.headers["location"] = "/status"
+        return response
 
     site_origin = app_state.site_origin
 

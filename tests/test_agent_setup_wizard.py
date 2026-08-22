@@ -230,7 +230,19 @@ async def test_poll_status_json_reports_waiting_when_not_yet_approved(gui_client
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("application/json")
     data = resp.json()
-    assert data == {"state": "waiting", "next": None, "message": None}
+    assert data == {"state": "waiting", "next": None, "message": None, "has_code": False}
+
+
+async def test_poll_status_json_reports_has_code_once_device_code_ready(gui_client):
+    """代碼已產生、尚未核准 → 仍 "waiting" 但 has_code=True，讓步驟① JS 重載一次帶出
+    代碼（c67ac49 移除 meta-refresh 後的回歸修復）。"""
+    from types import SimpleNamespace
+    gui_client.app.state.device_flow_client = SimpleNamespace(user_code="ABCD-2345")
+    resp = await gui_client.get("/setup/poll-status.json")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["state"] == "waiting"
+    assert data["has_code"] is True
 
 
 async def test_poll_status_json_reports_ready_once_approved(gui_client):
@@ -245,6 +257,22 @@ async def test_poll_status_json_reports_ready_once_approved(gui_client):
     data = resp.json()
     assert data["state"] == "ready"
     assert data["next"] == "/setup"
+
+
+async def test_step3_launch_redirects_to_status_when_already_launched(gui_client):
+    """啟動成功後（app_state.instance_lock 已設）又回到步驟③再按「啟動」→ 導到 /status，
+    不卡在「此帳號的 Agent 已在執行中」（回歸：使用者實測凍結 App 撞到）。"""
+    from types import SimpleNamespace
+    st = gui_client.app.state
+    st.device_flow_result = {"token": "t", "profile_id": "1", "username": "henry",
+                             "token_expires_at": "2099-01-01T00:00:00"}
+    st.broker_credentials = {"api_key": "k", "secret_key": "s"}
+    st.gui_current_profile = SimpleNamespace(
+        profile_id="1", username="henry", buffer_path="/tmp/qq-test/outbox.db")
+    st.instance_lock = object()  # 佯裝本程序稍早已成功啟動、持有鎖
+    resp = await gui_client.post("/setup/step3/launch")
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/status"
 
 
 async def test_poll_status_json_reports_error_and_reuses_existing_gave_up_message(gui_client):
