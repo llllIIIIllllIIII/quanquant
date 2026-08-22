@@ -12,6 +12,7 @@ ShioajiAdapter（注入 _FakeApi，不連真網路）」測 round3 #1 的關鍵�
 - #6：positions 非 owner 403（非 200 空表）；place/update/cancel 非 owner 一律 403。
 """
 import re
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -21,11 +22,12 @@ from sqlmodel import Session, select
 from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, RiskError
+from quanquant.broker.connection_gate import AgentConnectionGate
 from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.broker.types import OrderAck, Position
-from quanquant.db.models import AgentToken
+from quanquant.db.models import AgentToken, Cooldown
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_poller, get_session
 from quanquant.web.routers.orders import _parse_optional_update_price, _parse_order_price
@@ -450,6 +452,119 @@ def test_orders_page_hides_agent_token_control_for_non_owner(order_client, fake_
     fake_guard._owner_ids = set()  # user 非 owner
     text = order_client.get("/orders").text
     assert 'hx-post="/orders/agent-token"' not in text
+
+
+# ---------------------------------------------------------------------------
+# D9/D11：手動斷開 Agent（agent-disconnect/reconnect）＋冷靜期（cooldown）路由層
+# owner-only；踢線 force_close 在無真實 WS 下難驗（order_client 未接 registry/slot），
+# 只驗 gate（in-memory）/DB 狀態＋回應片段字樣（模板真的 render）。
+# ---------------------------------------------------------------------------
+
+_CST = timezone(timedelta(hours=8))
+
+
+def _until_str(delta: timedelta) -> str:
+    """組出 datetime-local（'YYYY-MM-DDTHH:MM'）字串，相對現在偏移 delta（以台灣 +08:00
+    為基準；route 以 +08:00 解析，與 now_epoch_ms 同框可比）。"""
+    return (datetime.now(_CST) + delta).strftime("%Y-%m-%dT%H:%M")
+
+
+def test_orders_page_shows_disconnect_and_cooldown_controls_for_owner(order_client):
+    """owner GET /orders 頁面實際 render 出「斷開 Agent」與「冷靜期」控制（驗模板真的
+    render，不只端點存在）。"""
+    text = order_client.get("/orders").text
+    assert "斷開 Agent 連線" in text
+    assert 'hx-post="/orders/agent-disconnect"' in text
+    assert "冷靜期" in text
+    assert 'hx-post="/orders/cooldown"' in text
+
+
+def test_agent_disconnect_owner_blocks_gate_and_returns_partial(order_client, user):
+    order_client.app.state.agent_connection_gate = AgentConnectionGate()
+    resp = order_client.post("/orders/agent-disconnect")
+    assert resp.status_code == 200
+    assert order_client.app.state.agent_connection_gate.is_blocked(user.id) is True
+    assert "已手動斷開" in resp.text
+
+
+def test_agent_disconnect_non_owner_gets_403(order_client, fake_guard, user):
+    fake_guard._owner_ids = set()  # user 非 owner
+    order_client.app.state.agent_connection_gate = AgentConnectionGate()
+    resp = order_client.post("/orders/agent-disconnect")
+    assert resp.status_code == 403
+    assert order_client.app.state.agent_connection_gate.is_blocked(user.id) is False
+
+
+def test_agent_reconnect_owner_unblocks_gate(order_client, user):
+    gate = AgentConnectionGate()
+    gate.block(user.id)
+    order_client.app.state.agent_connection_gate = gate
+    resp = order_client.post("/orders/agent-reconnect")
+    assert resp.status_code == 200
+    assert gate.is_blocked(user.id) is False
+
+
+def test_agent_reconnect_non_owner_gets_403(order_client, fake_guard, user):
+    fake_guard._owner_ids = set()  # user 非 owner
+    gate = AgentConnectionGate()
+    gate.block(user.id)
+    order_client.app.state.agent_connection_gate = gate
+    resp = order_client.post("/orders/agent-reconnect")
+    assert resp.status_code == 403
+    assert gate.is_blocked(user.id) is True  # 未被解除
+
+
+def _active_cooldown(session, user_id):
+    return brepo.active_cooldown(session, user_id=user_id, now_ms=brepo.now_epoch_ms())
+
+
+def test_cooldown_valid_until_creates_active_row_and_shows_partial(order_client, session, user):
+    resp = order_client.post("/orders/cooldown", data={"until": _until_str(timedelta(days=1))})
+    assert resp.status_code == 200
+    assert "冷靜期" in resp.text
+    assert _active_cooldown(session, user.id) is not None  # DB 有 active cooldown
+
+
+def test_cooldown_past_until_rejected_and_no_row_created(order_client, session, user):
+    resp = order_client.post("/orders/cooldown", data={"until": _until_str(timedelta(days=-1))})
+    assert resp.status_code == 200
+    assert "晚於現在" in resp.text
+    assert _active_cooldown(session, user.id) is None
+
+
+def test_cooldown_over_max_days_rejected(order_client, session, user):
+    resp = order_client.post("/orders/cooldown", data={"until": _until_str(timedelta(days=91))})
+    assert resp.status_code == 200
+    assert "最長" in resp.text
+    assert _active_cooldown(session, user.id) is None
+
+
+def test_cooldown_invalid_until_format_rejected(order_client, session, user):
+    resp = order_client.post("/orders/cooldown", data={"until": "not-a-datetime"})
+    assert resp.status_code == 200
+    assert "有效" in resp.text
+    assert _active_cooldown(session, user.id) is None
+
+
+def test_cooldown_when_already_in_cooldown_is_rejected(order_client, session, user):
+    now = brepo.now_epoch_ms()
+    brepo.create_cooldown(session, user_id=user.id, until_ms=now + 3_600_000, now_ms=now)
+    session.commit()
+    resp = order_client.post("/orders/cooldown", data={"until": _until_str(timedelta(days=1))})
+    assert resp.status_code == 200
+    # 已在冷靜期 → 回既有 active 片段（🔒 冷靜期中面板，明確表達仍被鎖定、無法變更）；
+    # 模板在 cooldown 存在時走鎖定面板分支、不另顯 error 字串（見疑似 UX 落差說明）。
+    assert "冷靜期中" in resp.text
+    # 仍只有原本那筆，未被縮短/重設
+    rows = session.exec(select(Cooldown).where(Cooldown.user_id == user.id)).all()
+    assert len(rows) == 1 and rows[0].until_ts == now + 3_600_000
+
+
+def test_cooldown_non_owner_gets_403(order_client, fake_guard, session, user):
+    fake_guard._owner_ids = set()  # user 非 owner
+    resp = order_client.post("/orders/cooldown", data={"until": _until_str(timedelta(days=1))})
+    assert resp.status_code == 403
+    assert _active_cooldown(session, user.id) is None
 
 
 def test_orders_page_reload_does_not_leak_plaintext_after_issue(order_client):

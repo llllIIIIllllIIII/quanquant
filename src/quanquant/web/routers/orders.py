@@ -21,6 +21,7 @@ round3 #6：`positions` 非 owner 一律 403（不吞成 200 空表）；cancel/
 驗證），本檔只負責把 `AuthorizationError` 映射成 HTTP 403。
 """
 import uuid
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -233,11 +234,18 @@ async def orders_page(
     is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
     kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
     token_row = agent_token_service.get_active_token(session, user_id=user.id) if is_owner else None
+    # 冷靜期（self-lockout）／手動斷線狀態（owner 才顯示；D9/D11）
+    now_ms = brepo.now_epoch_ms()
+    cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms) if is_owner else None
+    gate = getattr(request.app.state, "agent_connection_gate", None)
+    agent_blocked = bool(is_owner and gate is not None and gate.is_blocked(user.id))
     return templates.TemplateResponse(request, "orders.html", {
         "active": "orders", "mode": resolved_mode,
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
         "symbols": ["TXF"], "is_owner": is_owner, "kill_switch": kill_switch,
         "token_row": token_row, "raw_token": None,
+        "cooldown": cooldown, "cooldown_until_text": _fmt_cst(cooldown.until_ts) if cooldown else None,
+        "agent_blocked": agent_blocked,
     })
 
 
@@ -307,6 +315,131 @@ async def toggle_kill_switch(
             kill_switch=risk_guard.kill_switch_view(user.id), disabled=False,
         )
     )
+
+
+# ---- 冷靜期（self-lockout）＋手動斷開 Agent（2026-08-22，D9/D11）----
+_MAX_COOLDOWN_DAYS = 90
+_COOLDOWN_CST = timezone(timedelta(hours=8))
+
+
+def _fmt_cst(ms: int | None) -> str | None:
+    """epoch-ms UTC → 台灣本地 'YYYY-MM-DD HH:MM' 顯示字串（固定 +08:00，台灣無 DST）。"""
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=_COOLDOWN_CST).strftime("%Y-%m-%d %H:%M")
+
+
+def _parse_cooldown_until(raw) -> int | None:
+    """datetime-local 輸入（'YYYY-MM-DDTHH:MM'）以固定 +08:00 解析成真 UTC epoch-ms（與
+    repository.now_epoch_ms 同框可比）；格式不符回 None。"""
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_COOLDOWN_CST)
+    return int(dt.timestamp() * 1000)
+
+
+def _connection_control(*, blocked: bool, disabled: bool = False) -> HTMLResponse:
+    return HTMLResponse(render_partial(
+        "partials/agent_connection_control.html", blocked=blocked, disabled=disabled,
+    ))
+
+
+def _cooldown_control(*, cooldown, error: str | None = None, disabled: bool = False) -> HTMLResponse:
+    return HTMLResponse(render_partial(
+        "partials/cooldown_control.html",
+        cooldown=cooldown, until_text=_fmt_cst(cooldown.until_ts) if cooldown else None,
+        error=error, disabled=disabled,
+    ))
+
+
+@router.post("/orders/agent-disconnect", response_class=HTMLResponse)
+async def agent_disconnect(
+    request: Request,
+    user: User = Depends(get_current_user),
+    risk_guard=Depends(get_order_risk_guard),
+    slot=Depends(get_agent_slot),
+):
+    """owner-only（D9）：手動斷開 agent——封鎖重連（in-memory gate）＋主動關閉現有 WS。比
+    kill switch 更強（kill switch 只擋新單、連線仍在）。自助恢復見 /orders/agent-reconnect。
+    子系統停用（risk_guard 為 None）優雅回停用片段，不 500。"""
+    if risk_guard is None:
+        return _connection_control(blocked=False, disabled=True)
+    try:
+        risk_guard.assert_owner(user.id)  # 非 owner → 403（比照 kill switch）
+    except AuthorizationError:
+        raise HTTPException(status_code=403, detail="not owner")
+    gate = getattr(request.app.state, "agent_connection_gate", None)
+    if gate is not None:
+        gate.block(user.id)
+    if slot is not None:
+        await slot.channel.force_close()  # 即時踢現有連線；離線標記由 agent_ws finally 接手
+    return _connection_control(blocked=True)
+
+
+@router.post("/orders/agent-reconnect", response_class=HTMLResponse)
+async def agent_reconnect(
+    request: Request,
+    user: User = Depends(get_current_user),
+    risk_guard=Depends(get_order_risk_guard),
+):
+    """owner-only（D9）：解除手動斷線封鎖——agent 端 supervisor 會自動重連（不需重開 App）。
+    冷靜期的封鎖走 DB、不受此影響（仍 admin-only 解除）。"""
+    if risk_guard is None:
+        return _connection_control(blocked=False, disabled=True)
+    try:
+        risk_guard.assert_owner(user.id)
+    except AuthorizationError:
+        raise HTTPException(status_code=403, detail="not owner")
+    gate = getattr(request.app.state, "agent_connection_gate", None)
+    if gate is not None:
+        gate.allow(user.id)
+    return _connection_control(blocked=False)
+
+
+@router.post("/orders/cooldown", response_class=HTMLResponse)
+async def set_cooldown(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    risk_guard=Depends(get_order_risk_guard),
+    slot=Depends(get_agent_slot),
+):
+    """owner-only（D5/D9）：建立冷靜期（self-lockout）——期間只能平倉、agent 一併斷線、
+    自己解不掉（只有 admin 能提前解除）。until 由 datetime-local 帶入；驗 until>now 且 ≤90 天。
+    已在冷靜期則拒絕（擋自我縮短/重設/提前解除）。子系統停用優雅回停用片段。"""
+    if risk_guard is None:
+        return _cooldown_control(cooldown=None, disabled=True)
+    try:
+        risk_guard.assert_owner(user.id)
+    except AuthorizationError:
+        raise HTTPException(status_code=403, detail="not owner")
+    now_ms = brepo.now_epoch_ms()
+    existing = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms)
+    if existing is not None:
+        return _cooldown_control(
+            cooldown=existing, error="你已在冷靜期中，無法變更或提前解除（請聯繫管理員）"
+        )
+    form = await request.form()
+    until_ms = _parse_cooldown_until(form.get("until"))
+    if until_ms is None:
+        return _cooldown_control(cooldown=None, error="請選擇有效的到期日期與時間")
+    if until_ms <= now_ms:
+        return _cooldown_control(cooldown=None, error="到期時間必須晚於現在")
+    if until_ms > now_ms + _MAX_COOLDOWN_DAYS * 86_400_000:
+        return _cooldown_control(cooldown=None, error=f"冷靜期最長 {_MAX_COOLDOWN_DAYS} 天")
+    created = brepo.create_cooldown(session, user_id=user.id, until_ms=until_ms, now_ms=now_ms)
+    session.commit()
+    if created is None:  # 競態：另一請求先建立成功
+        active = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms)
+        return _cooldown_control(cooldown=active, error="你已在冷靜期中，無法變更")
+    if slot is not None:
+        await slot.channel.force_close()  # D3：進入冷靜期一併斷線（DB cooldown 擋後續重連）
+    return _cooldown_control(cooldown=created)
 
 
 # 委託/部位是每 2s 輪詢的唯讀端點，一律用同步 `def`（比照 /api/candles 慣例）跑 threadpool、

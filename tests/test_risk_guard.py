@@ -21,7 +21,7 @@ from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, RiskError
 from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
 from quanquant.broker.types import OrderRequest, canonical_payload_hash
-from quanquant.db.models import Order, OrderAudit, QuotaReservation
+from quanquant.db.models import Cooldown, Order, OrderAudit, QuotaReservation
 
 
 def _req(**over):
@@ -459,3 +459,90 @@ def test_cas_quota_blocks_one_of_two_concurrent_places(tmp_path):
 
     asyncio.run(scenario())
     assert sorted(results) == ["blocked", "ok"]  # 一過一擋，5+5>5 的日限額不被突破
+
+
+# ---- 冷靜期（self-lockout，2026-08-22，D1/D9）：只擋開新倉、放行平倉，到期/解除後恢復 ----
+
+
+def _put_active_cooldown(session, *, user_id=1, minutes=60):
+    now_ms = brepo.now_epoch_ms()
+    brepo.create_cooldown(
+        session, user_id=user_id, until_ms=now_ms + minutes * 60_000, now_ms=now_ms
+    )
+    session.commit()
+
+
+def test_check_place_cooldown_blocks_opening_new(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="New")
+    with pytest.raises(RiskError, match="冷靜期"):
+        guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                          account="F1", request_hash=_hash_for(req))
+    assert session.exec(select(Order)).first() is None            # 無半成品委託
+    assert session.exec(select(QuotaReservation)).first() is None  # 無半成品配額保留
+
+
+def test_check_place_cooldown_allows_closing_cover(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="Cover")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    assert order.octype == "Cover" and order.status == "pending"  # 平倉放行
+
+
+def test_check_place_cooldown_blocks_auto_octype(session):
+    """Auto 由券商自行判定開/平，保守視為可能開倉一併擋（D1/D9）。"""
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="Auto")
+    with pytest.raises(RiskError, match="冷靜期"):
+        guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                          account="F1", request_hash=_hash_for(req))
+
+
+def test_check_place_expired_cooldown_does_not_block(session):
+    """到期（until_ts <= now）以查詢時判定失效，不需背景 job。"""
+    guard = _guard(session_factory=lambda: session)
+    now_ms = brepo.now_epoch_ms()
+    session.add(Cooldown(user_id=1, until_ts=now_ms - 1_000, created_ts=now_ms - 61_000))
+    session.commit()
+    req = _req(octype="New")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    assert order.status == "pending"
+
+
+def test_check_place_admin_lifted_cooldown_does_not_block(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    brepo.lift_cooldown(session, user_id=1, admin_user_id=2, now_ms=brepo.now_epoch_ms())
+    session.commit()
+    req = _req(octype="New")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    assert order.status == "pending"
+
+
+def test_check_place_cooldown_records_risk_reject_audit(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="New")
+    with pytest.raises(RiskError):
+        guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                          account="F1", request_hash=_hash_for(req))
+    rejects = session.exec(
+        select(OrderAudit).where(OrderAudit.action == "risk_reject")
+    ).all()
+    assert any(a.rule == "place" and a.result == "rejected" for a in rejects)
+
+
+def test_check_place_cooldown_is_per_user(session):
+    """一個 user 的冷靜期不影響其他 owner。"""
+    guard = _guard(session_factory=lambda: session, owner_user_ids=frozenset({1, 2}))
+    _put_active_cooldown(session, user_id=1)
+    req = _req(octype="New", user_id=2, client_order_id="C2")
+    order = guard.check_place(session, req, actor_user_id=2, mode="sim", broker="shioaji",
+                              account="F2", request_hash=_hash_for(req))
+    assert order.status == "pending"

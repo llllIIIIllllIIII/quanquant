@@ -13,6 +13,9 @@
 - **D6 時長**：until 必須 > now；上限 90 天（防手殘）；無下限（5 分鐘也可）。
 - **D7 持久化**：冷靜期狀態存 DB（重啟不失效——與現有 in-memory KillSwitchState 不同）。
 - **D8 範圍**：只做 sim（agent 通道鎖 sim）；不做通知（admin 靠頁面查看）。
+- **D9（2026-08-22 補）手動斷線鈕恢復方式**：改為**下單頁自助「允許 Agent 重連」按鈕**，取代原 D2「到 App 重啟才恢復」。理由：server 端無法區分「使用者重啟 App 的新連線」與「同一還在跑的 agent 自動重連」（同一 agent token、同一 WS 路徑），要做到「真・到重啟」須改 agent 端＋重 build/重發 .app，與「本功能純 server 端、不重 build」相牴觸。手動斷線＝自願暫停（非鎖定），自助恢復合理；**冷靜期（真正的自我禁制）仍 admin-only 解除、不受此影響**。使用者已確認（2026-08-22）。
+- **D10（實作細節）**：`cooldowns` 表不用 partial-unique index（broker_positions 的 `status='open'` 是事件翻轉欄位，冷靜期到期是**時間**判定、無欄位可翻，partial-unique on `lifted_at IS NULL` 會把「到期未解除」的舊列卡住新列）。改：plain index on `user_id`＋app 層「已在冷靜期則拒絕新建」（同時擋自我縮短/重設）；`active = lifted_at IS NULL AND until_ts > now`；admin lift 清掉該 user 全部 unlifted 列。時間一律用真 UTC epoch-ms（`datetime.now(timezone.utc)`），until 由 datetime-local 以固定 +08:00（台灣無 DST）解析，兩邊同框可比。
+- **D11（斷線機制）**：手動斷線與冷靜期共用 server 端 gate＝(in-memory 手動封鎖集合) OR (DB active cooldown)。WS `_authenticate` 後命中即 `close(1008)` 擋重連；即時踢現有連線靠 `AgentChannel.attach(..., closer=websocket.close)` 存 closer、route 端 `await channel.force_close()`。
 
 ## 資料模型（新表，兩方言可攜；比照 candles/repo.py named params＋BigInteger）
 `cooling_off`：`id`、`user_id`(FK)、`until_ts`(BigInteger epoch-ms)、`created_at`(BigInteger)、`lifted_by`(int, nullable)、`lifted_at`(BigInteger, nullable)。

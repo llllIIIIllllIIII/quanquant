@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>冷靜期管理</h2>
+<p class="muted">使用者自我禁制期間無法自行解除，只有管理員能在此提前解除。</p>
+
+{% if not items %}
+<p>目前沒有使用者處於冷靜期。</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>使用者</th><th>到期時間</th><th>建立時間</th><th>動作</th></tr>
+  </thead>
+  <tbody>
+  {% for item in items %}
+    <tr>
+      <td>{{ item.username }}{% if item.display_name %}（{{ item.display_name }}）{% endif %}</td>
+      <td>{{ item.until_text }}</td>
+      <td>{{ item.created_text }}</td>
+      <td>
+        <form method="post" action="/admin/cooling-off/{{ item.user_id }}/lift" style="display:inline">
+          <button class="secondary" type="submit">解除</button>
+        </form>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

@@ -15,6 +15,7 @@ from sqlmodel import Session
 
 from quanquant.alerts.engine import run_alert_engine
 from quanquant.broker.lifecycle import run_confirm_token_cleanup, shutdown_order_subsystem
+from quanquant.broker.connection_gate import AgentConnectionGate
 from quanquant.broker.order_events import OrderEventHub
 from quanquant.broker.preflight import order_subsystem_preflight
 from quanquant.broker.redaction import redact_secrets
@@ -499,6 +500,9 @@ async def lifespan(app: FastAPI):
     # 委託/成交/部位變動的 SSE ping hub：無條件建立（即使下單子系統停用，/orders/stream
     # 端點也有 hub 可訂閱，只是永不觸發），供 RawInboxWorker 發布、/orders/stream 訂閱。
     app.state.order_events = OrderEventHub()
+    # 手動斷線（D9）in-memory 連線封鎖：無條件建立（in-process 模式無 agent WS 也無妨，
+    # 只是永不觸發）。冷靜期的封鎖走 DB（active_cooldown），不在此。
+    app.state.agent_connection_gate = AgentConnectionGate()
 
     # Market Pulse: classify tick velocity off the un-coalesced poller stream;
     # the level is stamped onto the quote SSE, Telegram fires on entering Extreme.

@@ -1,0 +1,30 @@
+<div id="agent-connection-control" style="margin:0 0 1rem;display:flex;flex-direction:column;gap:.6rem;">
+  {% if disabled|default(false) %}
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid var(--pico-muted-border-color,#ccc);">
+    <span class="muted">⚪ 無法使用（下單子系統未啟用）</span>
+  </div>
+  {% elif blocked %}
+  <!-- 已手動斷線：連線被切斷且封鎖重連，需按「允許 Agent 重連」才恢復。 -->
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid #c0392b;background:rgba(192,57,43,.12);">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+      <strong style="color:#c0392b;">🔴 已手動斷開 Agent 連線</strong>
+      <form hx-post="/orders/agent-reconnect" hx-target="#agent-connection-control" hx-swap="outerHTML" style="margin:0;">
+        <button type="submit" class="secondary" style="margin:0;">允許 Agent 重連</button>
+      </form>
+    </div>
+    <div class="muted" style="font-size:.85em;margin-top:.3rem;">已封鎖重連，agent 無法連上。</div>
+  </div>
+  {% else %}
+  <!-- 正常：連線可用；斷開會真的切斷連線並封鎖重連（比急停更徹底）。 -->
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid var(--pico-muted-border-color,#ccc);">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
+      <strong>🟢 Agent 連線可用</strong>
+      <form hx-post="/orders/agent-disconnect" hx-target="#agent-connection-control" hx-swap="outerHTML" style="margin:0;">
+        <button type="submit" class="contrast" style="margin:0;"
+                hx-confirm="確定要斷開 Agent 連線？（比急停更徹底，會切斷連線並封鎖重連，需按『允許 Agent 重連』才恢復）">斷開 Agent 連線</button>
+      </form>
+    </div>
+  </div>
+  {% endif %}
+  <div class="muted" style="font-size:.85em;">這比「急停」更強——急停只擋新單、連線仍在；斷開會真的切斷連線並封鎖重連。</div>
+</div>

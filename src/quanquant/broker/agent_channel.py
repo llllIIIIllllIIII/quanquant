@@ -34,6 +34,10 @@ def _default_expires_at() -> str:
 class AgentChannel:
     def __init__(self) -> None:
         self._send: Callable[[dict], Awaitable[None]] | None = None
+        # 手動斷線/進入冷靜期時 server 端主動關閉現有 WS 用（D9/D11）：attach 時由 agent_ws.py
+        # 注入 `websocket.close`，`force_close()` 呼叫它把 socket 關掉，receive-loop 的 finally
+        # 會接手標 offline/清 generation。純傳輸層 closer，與 send_json 同生命週期。
+        self._closer: Callable[..., Awaitable[None]] | None = None
         self._pending: dict[str, asyncio.Future] = {}
         self.logged_in = False
         self.account = ""
@@ -108,15 +112,35 @@ class AgentChannel:
             and not self.failstop
         )
 
-    def attach(self, send_json: Callable[[dict], Awaitable[None]]) -> int:
+    def attach(
+        self,
+        send_json: Callable[[dict], Awaitable[None]],
+        *,
+        closer: "Callable[..., Awaitable[None]] | None" = None,
+    ) -> int:
         self._generation += 1
         self._send = send_json
+        self._closer = closer
         return self._generation
+
+    async def force_close(self) -> None:
+        """server 端主動關閉目前的 agent WS（手動斷線/進入冷靜期，D9/D11）。冪等：無連線或
+        closer 未注入時 no-op。實際的 offline 標記/generation 清理交給 agent_ws.py receive-loop
+        的 finally（close 會讓 receive_json 拋 WebSocketDisconnect）；close 已在關閉中/競態下
+        可能拋例外，一律吞掉不反噬呼叫端。"""
+        closer = self._closer
+        if closer is None:
+            return
+        try:
+            await closer(code=1008)
+        except Exception:
+            pass
 
     def detach(self, generation: int | None = None) -> None:
         if generation is not None and generation != self._generation:
             return  # 舊連線的遲到 detach：已被新連線取代，不動目前狀態。
         self._send = None
+        self._closer = None
         self.logged_in = False
         self._health_confirmed_ok = False  # C2：斷線立即讓 ready 失效
         pending, self._pending = self._pending, {}

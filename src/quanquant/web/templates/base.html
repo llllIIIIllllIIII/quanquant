@@ -57,7 +57,7 @@
           <span class="user-name">{{ u.display_name }}</span>
         </summary>
         <ul dir="rtl">
-          {% if u.role == 'admin' %}<li><a href="/admin/users">使用者管理</a></li>{% endif %}
+          {% if u.role == 'admin' %}<li><a href="/admin/users">使用者管理</a></li><li><a href="/admin/cooling-off">冷靜期管理</a></li>{% endif %}
           <li><a href="/account">帳戶設定</a></li>
           <li class="menu-sep"><a href="#" class="danger"
               onclick="document.getElementById('logout-form').submit(); return false;">登出</a></li>

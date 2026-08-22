@@ -173,6 +173,14 @@ class RiskGuard:
             self.assert_owner(actor_user_id)
             if self.blocked(actor_user_id):
                 raise RiskError("kill switch 已啟動")
+            # 冷靜期（self-lockout，D1/D9）：active 期間只放行平倉（octype='Cover'），擋開新倉
+            # （New；Auto 由券商自行判定開/平，保守視為可能開倉一併擋）。用傳入的 session 查 DB
+            # （持久化、重啟不失效）；到期或 admin 解除後自動放行。取消/改單走 check_cancel/
+            # check_update、不經這裡，天然放行（符合 D1「放行平倉/取消/改單」）。
+            if req.octype != "Cover" and brepo.active_cooldown(
+                session, user_id=actor_user_id, now_ms=brepo.now_epoch_ms()
+            ) is not None:
+                raise RiskError("冷靜期中，僅允許平倉")
             if req.symbol not in self._symbol_whitelist:
                 raise RiskError(f"{req.symbol} 不在白名單")
             if req.qty > self._max_qty_per_order:

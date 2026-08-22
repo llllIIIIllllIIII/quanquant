@@ -35,6 +35,7 @@ from quanquant.db.models import (
     BrokerPosition,
     BrokerReconcileCursor,
     ConfirmToken,
+    Cooldown,
     Deal,
     Order,
     OrderAudit,
@@ -957,6 +958,77 @@ def release_quota(session: Session, *, reservation_id: str) -> bool:
     if ok:
         session.flush()
     return ok
+
+
+# ---- 冷靜期（self-lockout，2026-08-22）----
+# 時間一律真 UTC epoch-ms（TZ 無關），與 web 端 until 解析同框可比；active 定義＝
+# lifted_ts IS NULL AND until_ts > now（見 db/models.py Cooldown docstring，D10：刻意不用
+# partial-unique index、改 app 層「已在冷靜期則拒建」擋自我縮短/重設）。統一政策：只 flush、
+# 不 commit（交易邊界由呼叫端定）。
+
+
+def now_epoch_ms() -> int:
+    """真 UTC epoch-ms（TZ 無關）：冷靜期 until/now 比較的統一時鐘（與 web 端 datetime-local
+    以 +08:00 解析出的 until_ms 同框；不走 _utcnow().timestamp() 那條 naive-local 換算）。"""
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def active_cooldown(session: Session, *, user_id: int, now_ms: int) -> Cooldown | None:
+    """該 user 目前 active 的冷靜期列（未解除且未到期）；多筆時取 until_ts 最大者，無則 None。
+    純讀取。"""
+    return session.exec(
+        select(Cooldown)
+        .where(
+            Cooldown.user_id == user_id,
+            Cooldown.lifted_ts.is_(None),  # type: ignore[union-attr]
+            Cooldown.until_ts > now_ms,
+        )
+        .order_by(Cooldown.until_ts.desc())  # type: ignore[attr-defined]
+    ).first()
+
+
+def create_cooldown(
+    session: Session, *, user_id: int, until_ms: int, now_ms: int
+) -> Cooldown | None:
+    """建立冷靜期。該 user 已有 active 冷靜期 → 回 None（拒絕：擋自我縮短/重設/重複建立，
+    D5「無法自行縮短/取消」）。成功回新列（只 flush 不 commit）。呼叫端須先驗
+    until_ms > now_ms 且在上限內（見 web 端）。"""
+    if active_cooldown(session, user_id=user_id, now_ms=now_ms) is not None:
+        return None
+    row = Cooldown(user_id=user_id, until_ts=until_ms, created_ts=now_ms)
+    session.add(row)
+    session.flush()
+    return row
+
+
+def lift_cooldown(session: Session, *, user_id: int, admin_user_id: int, now_ms: int) -> int:
+    """admin 提前解除：把該 user 全部未解除列（lifted_ts IS NULL，含到期未解除的殘列）標為
+    已解除，回傳受影響列數（0＝無未解除列）。UPDATE rowcount 兩方言皆可靠（見 reserve_quota
+    註解）；只 flush 不 commit。"""
+    t = Cooldown.__table__
+    stmt = (
+        update(t)
+        .where(t.c.user_id == user_id, t.c.lifted_ts.is_(None))
+        .values(lifted_ts=now_ms, lifted_by=admin_user_id)
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    if result.rowcount:
+        session.flush()
+    return result.rowcount
+
+
+def list_active_cooldowns(session: Session, *, now_ms: int) -> list[Cooldown]:
+    """admin 頁用：目前全部 active 冷靜期，依到期時間升序。純讀取。"""
+    return list(
+        session.exec(
+            select(Cooldown)
+            .where(
+                Cooldown.lifted_ts.is_(None),  # type: ignore[union-attr]
+                Cooldown.until_ts > now_ms,
+            )
+            .order_by(Cooldown.until_ts.asc())  # type: ignore[attr-defined]
+        ).all()
+    )
 
 
 def reservation_id_for_update(*, client_order_id: str, request_hash: str) -> str:

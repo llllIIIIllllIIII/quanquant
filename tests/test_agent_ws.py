@@ -13,11 +13,12 @@ from quanquant.auth.agent_tokens import issue_token
 from quanquant.broker import repository as brepo
 from quanquant.broker.agent_channel import AgentChannel
 from quanquant.broker.agent_registry import AgentRegistry, UserAgentSlot
+from quanquant.broker.connection_gate import AgentConnectionGate
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.broker.supervisor import BrokerSupervisor
 from quanquant.config import get_settings
 from quanquant.db.models import (
-    AgentAccountBinding, AgentCommand, AgentToken, Order, QuotaReservation, RawInbox,
+    AgentAccountBinding, AgentCommand, AgentToken, Cooldown, Order, QuotaReservation, RawInbox,
 )
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_session
@@ -1115,3 +1116,68 @@ def test_reconnect_replay_does_not_resend_other_account_commands_after_switch(ws
     with Session(engine) as s:
         cmd_row = s.get(AgentCommand, "cmd-old-1")
         assert cmd_row.sent_at is None and cmd_row.transport_acked_at is None  # 完全沒被碰
+
+
+# ---- D9/D11：WS 連線 gate——手動斷線（in-memory AgentConnectionGate）或冷靜期（DB
+# active_cooldown）中的 owner，握手通過驗證後仍被 _connection_blocked 擋下、close(1008)；
+# 未封鎖、無冷靜期的 owner 正常完成既有握手。ws_env 不設 agent_connection_gate（gate 缺席
+# 視為未封鎖），測手動封鎖情境時自行塞一個 gate。----
+
+
+def test_ws_rejected_when_owner_manually_disconnected_via_gate(ws_env):
+    gate = AgentConnectionGate()
+    gate.block(ws_env.state.agent_test_owner_id)
+    ws_env.state.agent_connection_gate = gate
+
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+
+def test_ws_rejected_when_owner_has_active_cooldown(ws_env, engine):
+    owner_id = ws_env.state.agent_test_owner_id
+    now = brepo.now_epoch_ms()
+    with Session(engine) as s:
+        s.add(Cooldown(user_id=owner_id, until_ts=now + 3_600_000, created_ts=now))
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+
+
+def test_ws_expired_cooldown_does_not_block_connection(ws_env, engine):
+    """到期（until_ts <= now）的冷靜期不算 active，不擋連線——證明擋線判定走的是
+    active_cooldown（未到期）而非只要有列就擋。"""
+    owner_id = ws_env.state.agent_test_owner_id
+    now = brepo.now_epoch_ms()
+    with Session(engine) as s:
+        s.add(Cooldown(user_id=owner_id, until_ts=now - 1, created_ts=now - 3_600_000))
+        s.commit()
+
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)
+
+
+def test_ws_normal_owner_not_blocked_completes_handshake(ws_env):
+    """未封鎖、無冷靜期的 owner：連線通過既有握手（login→health→ready）——gate 放行。"""
+    client = TestClient(ws_env)
+    with client.websocket_connect(
+        "/ws/agent", headers={"x-agent-token": ws_env.state.agent_test_token}
+    ) as ws:
+        ws.send_json({"type": "login", "account": "F1", "mode": "sim", "protocol": 2, "health_epoch": 0})
+        ws.send_json({"type": "health", "status": "ok", "health_epoch": 0})
+        assert _wait(lambda: _slot(ws_env).session_state.ready)

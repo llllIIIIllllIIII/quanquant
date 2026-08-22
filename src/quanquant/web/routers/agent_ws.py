@@ -62,6 +62,19 @@ def _authenticate(session_factory, risk_guard, raw_token: str) -> int | None:
         return user.id
 
 
+def _connection_blocked(state, session_factory, user_id: int) -> bool:
+    """WS 連線 gate（同步 DB 工作，呼叫端須 to_thread）：手動斷線（in-memory
+    `agent_connection_gate`，D9）或冷靜期（DB `active_cooldown`，持久化、admin-only 解除）
+    任一命中即封鎖。gate 缺席（in-process/wiring 未完成）視為未封鎖，不影響連線。"""
+    gate = getattr(state, "agent_connection_gate", None)
+    if gate is not None and gate.is_blocked(user_id):
+        return True
+    with session_factory() as session:
+        return brepo.active_cooldown(
+            session, user_id=user_id, now_ms=brepo.now_epoch_ms()
+        ) is not None
+
+
 @router.websocket("/ws/agent")
 async def agent_ws(websocket: WebSocket) -> None:
     state = websocket.app.state
@@ -89,6 +102,14 @@ async def agent_ws(websocket: WebSocket) -> None:
     if agent_user_id is None:
         await websocket.close(code=1008)
         return
+    # 連線 gate（D9/D11）：手動斷線（in-memory gate）或冷靜期（DB active_cooldown）中的 user，
+    # 拒絕（重）連——擋 agent 端自動重連，直到使用者在下單頁按「允許 Agent 重連」、或冷靜期
+    # 到期/admin 解除。1008 與驗證失敗同碼（不對外洩漏被拒的精確原因；下單頁本就顯示斷線/
+    # 冷靜期狀態讓使用者知道為何）。
+    if await asyncio.to_thread(_connection_blocked, state, session_factory, agent_user_id):
+        log.info("agent WS：user_id=%s 目前被封鎖連線（手動斷線/冷靜期），拒絕", agent_user_id)
+        await websocket.close(code=1008)
+        return
     slot = registry.get(agent_user_id)
     if slot is None:
         # 防禦性：D1 eager 建置後，通過驗證（含 is_owner 白名單）的 user 理論上必定有 slot——
@@ -107,7 +128,8 @@ async def agent_ws(websocket: WebSocket) -> None:
     hub = getattr(state, "order_events", None)
     if channel.connected:
         channel.detach()   # 新連線取代殘留半開連線（agent 重啟；無條件，不帶 generation）
-    my_generation = channel.attach(websocket.send_json)
+    # 連線 gate（D9/D11）：注入 closer 讓 route 端可主動踢線；`closer=websocket.close`。
+    my_generation = channel.attach(websocket.send_json, closer=websocket.close)
     try:
         while True:
             data = await websocket.receive_json()

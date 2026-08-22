@@ -13,6 +13,8 @@
   {# owner-only 全域 kill switch 控制（server 端切換仍一律經 assert_owner，非只靠此隱藏）。 #}
   {% if is_owner %}
   {% include "partials/kill_switch_control.html" %}
+  {% with blocked=agent_blocked %}{% include "partials/agent_connection_control.html" %}{% endwith %}
+  {% with until_text=cooldown_until_text %}{% include "partials/cooldown_control.html" %}{% endwith %}
   {% include "partials/agent_token_control.html" with context %}
   {% endif %}
 

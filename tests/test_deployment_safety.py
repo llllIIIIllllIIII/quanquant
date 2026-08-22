@@ -34,6 +34,7 @@ from quanquant.db.models import (
     BrokerPosition,
     BrokerReconcileCursor,
     ConfirmToken,
+    Cooldown,
     Deal,
     Order,
     OrderAudit,
@@ -196,10 +197,22 @@ def test_broker_reconcile_cursor_table_ddl_has_scope_unique_and_mode_check():
 
 @pytest.mark.parametrize(
     "model",
-    [Order, Deal, RawInbox, BrokerPosition, OrderAudit, ConfirmToken, QuotaReservation, BrokerReconcileCursor],
+    [Order, Deal, RawInbox, BrokerPosition, OrderAudit, ConfirmToken, QuotaReservation,
+     BrokerReconcileCursor, Cooldown],
 )
 def test_all_eight_new_tables_compile_under_postgres_dialect(model):
+    # 冷靜期（self-lockout，2026-08-22）新增 `cooldowns` → 現為 9 張新表（原 8 + Cooldown）。
     assert "CREATE TABLE" in _ddl(model)
+
+
+def test_cooldown_table_ddl_compiles_with_biginteger_epoch_ms_columns():
+    """冷靜期 `cooldowns`：until_ts/created_ts/lifted_ts 皆 epoch-ms UTC，必用 BigInteger
+    （否則 Postgres 4-byte INTEGER 溢位，同 Candle.ts/Deal.ts 教訓）。"""
+    ddl = _ddl(Cooldown)
+    assert "CREATE TABLE cooldowns" in ddl
+    assert "until_ts BIGINT NOT NULL" in ddl
+    assert "created_ts BIGINT NOT NULL" in ddl
+    assert "lifted_ts BIGINT" in ddl
 
 
 def test_trade_table_with_mode_source_columns_compiles_under_postgres():

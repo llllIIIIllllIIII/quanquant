@@ -1,0 +1,25 @@
+<div id="cooldown-control" style="margin:0 0 1rem;display:flex;flex-direction:column;gap:.6rem;">
+  {% if disabled|default(false) %}
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid var(--pico-muted-border-color,#ccc);">
+    <span class="muted">⚪ 無法使用（下單子系統未啟用）</span>
+  </div>
+  {% elif cooldown %}
+  <!-- 冷靜期中：僅能平倉、無法開新倉；自己無法解除，只有管理員能提前解除（無解除表單是重點）。 -->
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid #c0392b;background:rgba(192,57,43,.12);">
+    <strong style="color:#c0392b;">🔒 冷靜期中</strong>
+    <div class="muted" style="font-size:.85em;margin-top:.3rem;">到期時間：{{ until_text }}</div>
+    <div style="margin-top:.3rem;"><strong>期間僅能平倉、無法下新（開倉）單；你無法自行解除，只有管理員能提前解除。</strong></div>
+  </div>
+  {% else %}
+  <!-- 未在冷靜期：可自我禁制，設定到期時間；啟動後自己無法解除。 -->
+  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid var(--pico-muted-border-color,#ccc);">
+    <div class="muted" style="font-size:.85em;margin-bottom:.3rem;">冷靜期＝自我禁制：設定一個到期時間，期間只能平倉出場、不能開新倉，agent 會一併斷線，且<strong>啟動後自己無法解除</strong>（只有管理員能提前解除）。</div>
+    {% if error %}<div style="color:#c0392b;font-size:.85em;margin-bottom:.3rem;">{{ error }}</div>{% endif %}
+    <form hx-post="/orders/cooldown" hx-target="#cooldown-control" hx-swap="outerHTML" style="margin:0;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;">
+      <input type="datetime-local" name="until" required style="margin:0;">
+      <button type="submit" class="contrast" style="margin:0;"
+              hx-confirm="冷靜期一旦啟動就無法自行解除、期間無法開新倉，只有管理員能提前解除。確定啟動？">啟動冷靜期</button>
+    </form>
+  </div>
+  {% endif %}
+</div>
