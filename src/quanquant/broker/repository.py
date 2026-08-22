@@ -899,7 +899,7 @@ def reserve_quota(
         src,
     )
     try:
-        result = session.exec(stmt)  # type: ignore[call-overload]
+        session.exec(stmt)  # type: ignore[call-overload]
     except IntegrityError:
         # 競態：另一請求以相同 reservation_id 搶先插入（同一冪等鍵重送）。
         session.rollback()
@@ -909,7 +909,17 @@ def reserve_quota(
         if existing is not None:
             return existing.state in _ACTIVE_QUOTA_STATES
         raise
-    ok = result.rowcount == 1
+    # 不可用 result.rowcount 判定成功：Postgres(psycopg) 對 `INSERT ... FROM SELECT`（無
+    # RETURNING）回報 rowcount=-1（實測 staging），令每次保留都誤判失敗——即使 configured
+    # limit 未滿也回 False → 每張單都「今日口數配額已滿」（SQLite rowcount 可靠，故單元測試
+    # 從未抓到；雲端 Postgres 上 agent/inprocess 下單因此從未成功過）。改在同一交易內回查該
+    # reservation_id 是否已寫入（WHERE (used+qty)<=limit 為真才會有列，read-your-writes 看得到
+    # 剛插入的列），SQLite/Postgres 皆可靠。confirm/release 走 UPDATE，rowcount 在兩方言都正確
+    # （UPDATE rowcount=1 實測正常），不受此問題影響、不需更動。
+    inserted = session.exec(
+        select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+    ).first()
+    ok = inserted is not None
     if ok:
         session.flush()
     return ok
