@@ -135,6 +135,7 @@
     _deductionDrawn: false,    // 目前是否有扣抵三角在圖上（關閉時只清一次）
     intradayMode: false,       // 分時模式（純檢視、不持久化）
     _prevAvgEnabled: false,    // 進入分時前 AVG 啟用狀態，退出時還原
+    _defaultBarSpace: null,    // init 當下的預設 K 棒寬度，供「重置排版」還原橫向縮放
 
     async init() {
       if (!window.klinecharts) {
@@ -161,6 +162,12 @@
       });
       if (this.chart.setTimezone) this.chart.setTimezone("Asia/Taipei");
       if (this.chart.setPriceVolumePrecision) this.chart.setPriceVolumePrecision(0, 0);
+      // 記錄 init 當下的預設 K 棒寬度，供「重置排版」還原橫向縮放。
+      // v9 的 getBarSpace() 直接回傳數字（預設 8），非物件；缺席時退回 8。
+      try {
+        const bs = this.chart.getBarSpace ? this.chart.getBarSpace() : 8;
+        this._defaultBarSpace = Number.isFinite(bs) ? bs : 8;
+      } catch (e) { this._defaultBarSpace = 8; }
 
       // 指標 tooltip 上的「編輯」icon → 打開指標設定 dialog
       this.chart.setStyles({
@@ -253,6 +260,30 @@
       // applyNewData keeps the previous scroll offset; after a TF switch that can
       // leave every bar off-screen (chart looks blank). Always snap to newest.
       if (this.chart.scrollToRealTime) this.chart.scrollToRealTime();
+    },
+
+    // 一鍵重置排版：拖曳縮放副圖後、或版面被玩壞時的唯一還原路徑。
+    // 副圖高度只在首次 createIndicator 設 90px（見 _applyIndicator），此後永不重設；
+    // 切時框走 applyNewData 不重建，會保留被拖過的高度 → 主圖被撐大、K 棒 y 軸自動縮放
+    // 鋪滿而變細長、副圖被壓扁且無法自行復原。這裡把副圖高度、橫向縮放與捲動一次拉回預設。
+    resetLayout() {
+      if (!this.chart) return;
+      // 1) 副圖高度全部復原成建立時的 90px（主圖 candle_pane 會自動吸走剩餘高度）。
+      //    paneIds 中 sub 指標存的是 pane id 字串；main 指標存 true、未啟用存 null/false。
+      if (this.chart.setPaneOptions) {
+        for (const key of Object.keys(this.paneIds)) {
+          const id = this.paneIds[key];
+          if (id && id !== true) this.chart.setPaneOptions({ id, height: 90 });
+        }
+      }
+      // 2) K 棒寬度／橫向縮放回 init 當下的預設值
+      if (this.chart.setBarSpace && this._defaultBarSpace) {
+        this.chart.setBarSpace(this._defaultBarSpace);
+      }
+      // 3) 重排 + 捲回最新（主圖 y 軸重新自動縮放）＋ 空白畫布自癒
+      this.chart.resize();
+      this._snapToLatest();
+      this._watchdog();
     },
 
     // NOTE on guards: every async data path captures the (tf, session) it was
@@ -982,6 +1013,11 @@
       document.body.classList.toggle("chart-fullscreen", this.fullscreen);
       // relayout after the CSS takes effect
       requestAnimationFrame(() => { if (QQChart.chart) QQChart.chart.resize(); });
+    },
+
+    resetLayout() {
+      QQChart.resetLayout();
+      this.moreOpen = false; // 收合「更多」選單
     },
 
     toggleColorScheme() {
