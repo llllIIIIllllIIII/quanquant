@@ -382,10 +382,30 @@ def test_orders_page_shows_kill_switch_control_for_owner(order_client):
     assert 'hx-post="/orders/kill-switch"' in text
 
 
-def test_orders_page_hides_kill_switch_control_for_non_owner(order_client, fake_guard):
-    fake_guard._owner_ids = set()  # user 非 owner
+def _demote_to_non_admin(session, user):
+    """測試 user 預設 role=admin；降成一般 user，讓 get_current_user 於下次請求讀到非 admin
+    （kill switch／斷開 Agent 收 admin-only 後，用來驗非 admin 看不到/不能用；2026-08-27）。"""
+    user.role = "user"
+    session.add(user)
+    session.commit()
+
+
+def test_orders_page_hides_kill_switch_control_for_non_admin(order_client, session, user):
+    _demote_to_non_admin(session, user)
     text = order_client.get("/orders").text
     assert 'hx-post="/orders/kill-switch"' not in text
+
+
+def test_kill_switch_non_admin_gets_403_and_does_not_toggle(
+    order_client, fake_guard, fake_ops, session, user
+):
+    """非 admin（即使是 owner）POST /orders/kill-switch → 403、未翻閘、不告警（server 端強制，
+    非只靠 UI 隱藏——嚴重授權漏洞的核心修正）。"""
+    _demote_to_non_admin(session, user)
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "global"})
+    assert resp.status_code == 403
+    assert fake_guard.set_kill_switch_calls == []
+    assert fake_ops.kill_switch_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -487,8 +507,9 @@ def test_agent_disconnect_owner_blocks_gate_and_returns_partial(order_client, us
     assert "已手動斷開" in resp.text
 
 
-def test_agent_disconnect_non_owner_gets_403(order_client, fake_guard, user):
-    fake_guard._owner_ids = set()  # user 非 owner
+def test_agent_disconnect_non_admin_gets_403(order_client, session, user):
+    """斷開 Agent 收 admin-only（2026-08-27）：非 admin → 403、未封鎖 gate（server 端強制）。"""
+    _demote_to_non_admin(session, user)
     order_client.app.state.agent_connection_gate = AgentConnectionGate()
     resp = order_client.post("/orders/agent-disconnect")
     assert resp.status_code == 403
@@ -504,14 +525,24 @@ def test_agent_reconnect_owner_unblocks_gate(order_client, user):
     assert gate.is_blocked(user.id) is False
 
 
-def test_agent_reconnect_non_owner_gets_403(order_client, fake_guard, user):
-    fake_guard._owner_ids = set()  # user 非 owner
+def test_agent_reconnect_non_admin_gets_403(order_client, session, user):
+    _demote_to_non_admin(session, user)
     gate = AgentConnectionGate()
     gate.block(user.id)
     order_client.app.state.agent_connection_gate = gate
     resp = order_client.post("/orders/agent-reconnect")
     assert resp.status_code == 403
     assert gate.is_blocked(user.id) is True  # 未被解除
+
+
+def test_non_admin_owner_sees_only_cooldown_not_killswitch_or_disconnect(order_client, session, user):
+    """非 admin 的 owner（測試者）：看不到「急停」與「斷開 Agent」，但**保留冷靜期**
+    （＝使用者要求「只要留冷靜期就好了」的驗收）。"""
+    _demote_to_non_admin(session, user)
+    text = order_client.get("/orders").text
+    assert 'hx-post="/orders/kill-switch"' not in text
+    assert 'hx-post="/orders/agent-disconnect"' not in text
+    assert 'hx-post="/orders/cooldown"' in text  # 冷靜期仍在
 
 
 def _active_cooldown(session, user_id):

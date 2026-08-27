@@ -232,17 +232,20 @@ async def orders_page(
     # assert_owner，非只靠前端隱藏）；risk_guard 可能為 None（下單子系統停用）——此時無
     # owner、也不顯示控制。
     is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
+    # kill switch＋手動斷開 Agent 收歸 admin-only（2026-08-27）：非 admin 測試者不得操作全站/
+    # 連線層控制，UI 亦不顯示（server 端已於各 route 強制）。冷靜期＋agent token 仍 owner。
+    is_admin = user.role == "admin"
     kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
     token_row = agent_token_service.get_active_token(session, user_id=user.id) if is_owner else None
-    # 冷靜期（self-lockout）／手動斷線狀態（owner 才顯示；D9/D11）
+    # 冷靜期（self-lockout）owner 顯示；手動斷線狀態僅 admin（D9/D11）
     now_ms = brepo.now_epoch_ms()
     cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms) if is_owner else None
     gate = getattr(request.app.state, "agent_connection_gate", None)
-    agent_blocked = bool(is_owner and gate is not None and gate.is_blocked(user.id))
+    agent_blocked = bool(is_admin and gate is not None and gate.is_blocked(user.id))
     return templates.TemplateResponse(request, "orders.html", {
         "active": "orders", "mode": resolved_mode,
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
-        "symbols": ["TXF"], "is_owner": is_owner, "kill_switch": kill_switch,
+        "symbols": ["TXF"], "is_owner": is_owner, "is_admin": is_admin, "kill_switch": kill_switch,
         "token_row": token_row, "raw_token": None,
         "cooldown": cooldown, "cooldown_until_text": _fmt_cst(cooldown.until_ts) if cooldown else None,
         "agent_blocked": agent_blocked,
@@ -295,8 +298,13 @@ async def toggle_kill_switch(
                 "partials/kill_switch_control.html", kill_switch=_DISABLED_KILL_SWITCH_VIEW, disabled=True
             )
         )
+    # kill switch（含全站急停）收歸 admin-only（2026-08-27）：全站急停會擋所有人下單，非 admin
+    # 的 owner（測試者）不得操作。server 端強制，非只靠 UI 隱藏。admin 亦須是 owner（set_kill_switch
+    # 內仍 assert_owner；正式部署的 admin henry 兩者皆是）。
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
     try:
-        risk_guard.assert_owner(user.id)  # 非 owner → AuthorizationError → 403（比照 positions L232-233）
+        risk_guard.assert_owner(user.id)
     except AuthorizationError:
         raise HTTPException(status_code=403, detail="not owner")
     form = await request.form()
@@ -369,10 +377,10 @@ async def agent_disconnect(
     子系統停用（risk_guard 為 None）優雅回停用片段，不 500。"""
     if risk_guard is None:
         return _connection_control(blocked=False, disabled=True)
-    try:
-        risk_guard.assert_owner(user.id)  # 非 owner → 403（比照 kill switch）
-    except AuthorizationError:
-        raise HTTPException(status_code=403, detail="not owner")
+    # 手動斷開/重連 Agent 收歸 admin-only（2026-08-27）：斷開會切斷連線＋封鎖重連，屬高權限
+    # 控制，非 admin 測試者只用冷靜期自保。server 端強制，非只靠 UI 隱藏。
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
     gate = getattr(request.app.state, "agent_connection_gate", None)
     if gate is not None:
         gate.block(user.id)
@@ -391,10 +399,8 @@ async def agent_reconnect(
     冷靜期的封鎖走 DB、不受此影響（仍 admin-only 解除）。"""
     if risk_guard is None:
         return _connection_control(blocked=False, disabled=True)
-    try:
-        risk_guard.assert_owner(user.id)
-    except AuthorizationError:
-        raise HTTPException(status_code=403, detail="not owner")
+    if user.role != "admin":  # admin-only（2026-08-27，同 agent-disconnect）
+        raise HTTPException(status_code=403, detail="admin only")
     gate = getattr(request.app.state, "agent_connection_gate", None)
     if gate is not None:
         gate.allow(user.id)

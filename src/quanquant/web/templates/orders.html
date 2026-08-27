@@ -10,10 +10,14 @@
   <p class="error-banner">下單子系統目前未啟用，無法送出新委託（歷史委託仍可查看）。</p>
   {% endif %}
 
-  {# owner-only 全域 kill switch 控制（server 端切換仍一律經 assert_owner，非只靠此隱藏）。 #}
-  {% if is_owner %}
+  {# admin-only：kill switch（含全站急停）＋手動斷開 Agent——影響全站/連線的高權限控制，
+     server 端各 route 亦強制 admin（非只靠此隱藏，2026-08-27）。 #}
+  {% if is_admin %}
   {% include "partials/kill_switch_control.html" %}
   {% with blocked=agent_blocked %}{% include "partials/agent_connection_control.html" %}{% endwith %}
+  {% endif %}
+  {# owner（含非 admin 測試者）：自己的 agent token（連線用）＋冷靜期（自我禁制）。 #}
+  {% if is_owner %}
   {% with until_text=cooldown_until_text %}{% include "partials/cooldown_control.html" %}{% endwith %}
   {% include "partials/agent_token_control.html" with context %}
   {% endif %}
