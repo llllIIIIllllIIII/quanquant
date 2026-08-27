@@ -54,6 +54,25 @@ def test_agent_timeout_wrapping_broker_code_message_still_unknown():
     assert _classify_place_failure(exc) == "unknown"
 
 
+def test_session_not_established_classified_failed():
+    """SessionNotEstablished（券商 Solace session 未建立就送單）＝請求沒送到券商 → 安全
+    failed（立即退配額，不佔用每日口數）。實測字串（2026-08）。"""
+    msg = (
+        "place_order: Shioaji error Session error SolClient send request "
+        "api/v1/paper/place_order, code: NotReady, Error ErrorInfo { sub_code: "
+        'SubCode(SessionNotEstablished), error_str: "Unable to wait for session '
+        "'(c0,s1)_sinopac' to be established\" }"
+    )
+    assert _classify_place_failure(Exception(msg)) == "failed"
+
+
+def test_agent_timeout_wrapping_session_not_established_still_unknown():
+    """型別優先於字串內容：即使逾時訊息夾帶 SessionNotEstablished 字樣，
+    AgentCommandTimeoutError 仍一律 unknown（結果不明、保守保留配額）。"""
+    exc = AgentCommandTimeoutError("下行送出失敗: ... SubCode(SessionNotEstablished) ...")
+    assert _classify_place_failure(exc) == "unknown"
+
+
 # ---- Task 6: remote_gateway 三段切行為矩陣 ----
 
 

@@ -120,7 +120,16 @@ def _classify_place_failure(exc: Exception) -> str:
     # 保證 AgentCommandTimeoutError 一律 unknown（保留配額，留給 watchdog reconcile 決議）。
     if isinstance(exc, AgentCommandTimeoutError):
         return "unknown"
-    match = _BROKER_REJECT_CODE_RE.search(str(exc))
+    text = str(exc)
+    # SessionNotEstablished（券商 Solace/SolClient session 未建立就送單，2026-08 實測）：
+    # place_order 的請求因 session 建立不起來而**根本沒離開 SDK、沒送到券商**，與
+    # `AgentUnavailableError`/`code: 4xx` 同屬「確定沒送達券商」的安全 failed 訊號，可立即
+    # 標 failed 退配額（不必等 watchdog reconcile）。實測字串：`code: NotReady, ...
+    # sub_code: SubCode(SessionNotEstablished), error_str: "Unable to wait for session
+    # '(c0,s1)_sinopac' to be established"`。比對 sub_code 名（穩定、非秘密、不隨帳號變）。
+    if "SessionNotEstablished" in text:
+        return "failed"
+    match = _BROKER_REJECT_CODE_RE.search(text)
     if match is None:
         return "unknown"
     code = int(match.group(1))
