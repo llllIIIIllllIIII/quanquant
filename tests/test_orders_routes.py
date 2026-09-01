@@ -206,6 +206,30 @@ def test_place_form_price_input_uses_readonly_not_disabled_for_mkt(order_client)
     assert "disabled" not in tag  # 不再用 disabled（會被排除在 FormData 之外）
 
 
+def test_direction_field_is_radio_toggle_not_select(order_client):
+    """001：方向改成左右分段開關（radio + fieldset），不再是 <select name="action">；
+    name/value 契約不變（"Buy"/"Sell"），buy 預設 checked。"""
+    text = order_client.get("/orders").text
+    assert '<select name="action">' not in text
+    assert re.search(r'<input type="radio"[^>]*name="action"[^>]*value="Buy"[^>]*checked', text) is not None
+    assert re.search(r'<input type="radio"[^>]*name="action"[^>]*value="Sell"', text) is not None
+
+
+def test_place_order_still_accepts_action_buy_and_sell(order_client, fake_service):
+    """001 的驗收邊界：改成 radio 之後，後端仍照舊收 action=Buy/Sell（表單契約不變）。"""
+    resp_buy = order_client.post("/orders", data={
+        "client_order_id": "C-BUY", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "18000",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp_buy.status_code == 200
+    resp_sell = order_client.post("/orders", data={
+        "client_order_id": "C-SELL", "symbol": "TXF", "action": "Sell", "qty": "1", "price": "18000",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp_sell.status_code == 200
+    assert [o.action for o in fake_service.placed] == ["Buy", "Sell"]
+
+
 def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
     """委託/部位改用 SSE 推送（sse:orders-changed）取代每 2s 盲輪詢：頁面要有 sse-connect
     容器、三個 div 的 trigger 含 sse:orders-changed（agent 狀態 badge + 委託 + 部位，Task 9

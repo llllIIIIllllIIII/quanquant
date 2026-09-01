@@ -267,10 +267,37 @@ td.nowrap, th { white-space: nowrap; }
 .numcell { text-align: right; }
 td.note { max-width: 14rem; }
 
-.dir.long { color: var(--up); font-weight: 700; }
-.dir.short { color: var(--down); font-weight: 700; }
-.pnl.up { color: var(--up); font-weight: 600; }
-.pnl.down { color: var(--down); font-weight: 600; }
+/* 001（2026-08-28 改訂）：方向與損益一律隨漲跌配色偏好（--rise/--fall），不再固定語意；
+   --up/--down 收斂為固定警示／錯誤色（錯誤橫幅、緊急停止狀態等）。 */
+.dir.long { color: var(--rise); font-weight: 700; }
+.dir.short { color: var(--fall); font-weight: 700; }
+.pnl.up { color: var(--rise); font-weight: 600; }
+.pnl.down { color: var(--fall); font-weight: 600; }
+
+/* ---- 001：方向左右分段開關（radio + fieldset，不靠 JS 也能送出） ---- */
+.side-field { border: none; padding: 0; margin: 0; }
+.side-field legend { padding: 0; font-size: 0.875rem; margin-bottom: 0.25rem; }
+.side-toggle {
+  display: flex; border: 1px solid var(--qq-border); border-radius: var(--qq-radius-sm);
+  overflow: hidden;
+}
+/* radio 視覺隱藏但保留可聚焦（opacity:0，不是 display:none——否則失去鍵盤焦點與可及性）。 */
+.side-radio { position: absolute; opacity: 0; width: 1px; height: 1px; pointer-events: none; }
+.side-opt {
+  flex: 1; text-align: center; padding: 0.5rem 0; margin: 0; cursor: pointer;
+  color: var(--qq-text-muted); font-weight: 600; user-select: none;
+  transition: background-color 150ms ease-out, color 150ms ease-out, box-shadow 150ms ease-out;
+}
+.side-buy { border-right: 1px solid var(--qq-border); }
+.side-radio:checked + .side-buy {
+  color: var(--rise); background: color-mix(in srgb, var(--rise) 16%, transparent);
+  box-shadow: inset 0 0 0 1px var(--rise);
+}
+.side-radio:checked + .side-sell {
+  color: var(--fall); background: color-mix(in srgb, var(--fall) 16%, transparent);
+  box-shadow: inset 0 0 0 1px var(--fall);
+}
+.side-radio:focus-visible + .side-opt { outline: 2px solid var(--qq-accent); outline-offset: -2px; }
 
 .badge { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 999px; }
 .badge.open { background: rgba(240, 185, 11, 0.18); color: #f0b90b; }

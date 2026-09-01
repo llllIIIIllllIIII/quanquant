@@ -79,6 +79,21 @@ def test_dashboard_wires_data_scheme_from_color_scheme(client):
     assert 'documentElement.setAttribute("data-scheme"' in body
 
 
+def test_html_root_carries_data_scheme_from_user_preference_on_every_page(client):
+    """001：漲跌配色偏好在下單頁根本沒有生效——data-scheme 移到 base.html 的 <html> 上，
+    全站頁面（不只儀表板）都要拿到，未設定時 fallback green_up。"""
+    for path in ("/", "/orders", "/journal"):
+        body = client.get(path).text
+        assert 'data-scheme="green_up"' in body, path
+
+
+def test_html_root_data_scheme_follows_saved_preference(client):
+    r = client.put("/api/user/color-scheme", json={"scheme": "red_up"})
+    assert r.status_code == 204
+    body = client.get("/orders").text
+    assert 'data-scheme="red_up"' in body
+
+
 def test_account_page_shows_color_scheme_radio(client):
     body = client.get("/account").text
     assert 'name="scheme"' in body

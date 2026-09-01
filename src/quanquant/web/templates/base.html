@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 {% set u = request.state.user if request.state.user is defined else None %}
-<html lang="zh-Hant" data-theme="{{ (u.theme if u else none) or 'dark' }}">
+<html lang="zh-Hant" data-theme="{{ (u.theme if u else none) or 'dark' }}"
+      data-scheme="{{ (u.chart_color_scheme if u else none) or 'green_up' }}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">

@@ -41,9 +41,15 @@
       <label>商品
         <select name="symbol">{% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
       </label>
-      <label>方向
-        <select name="action"><option value="Buy">買</option><option value="Sell">賣</option></select>
-      </label>
+      <fieldset class="side-field">
+        <legend>方向</legend>
+        <div class="side-toggle">
+          <input type="radio" id="side-buy" class="side-radio" name="action" value="Buy" checked>
+          <label for="side-buy" class="side-opt side-buy">買</label>
+          <input type="radio" id="side-sell" class="side-radio" name="action" value="Sell">
+          <label for="side-sell" class="side-opt side-sell">賣</label>
+        </div>
+      </fieldset>
       <label>口數
         <input name="qty" type="number" min="1" value="1">
       </label>
