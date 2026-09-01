@@ -433,9 +433,29 @@ def test_kill_switch_without_risk_guard_does_not_500(engine, user):
     assert "未啟用" in resp.text
 
 
-def test_orders_page_shows_kill_switch_control_for_owner(order_client):
+def test_orders_page_no_longer_shows_kill_switch_control_moved_to_risk_page(order_client):
+    """005：kill switch（緊急停止下單）控制項搬到獨立的 /risk 頁，下單頁不再有切換控制
+    （即使是 admin）。"""
     text = order_client.get("/orders").text
-    assert 'hx-post="/orders/kill-switch"' in text
+    assert 'hx-post="/orders/kill-switch"' not in text
+
+
+def test_orders_page_shows_red_banner_and_disables_submit_when_kill_switch_blocked(
+    order_client, fake_guard
+):
+    """005：緊急停止下單啟動時，下單頁必須顯示明確狀態（紅色橫幅，連到 /risk）並停用
+    送出鈕；正常狀態下不佔任何版面（見另一測試）。"""
+    fake_guard.global_on = True
+    text = order_client.get("/orders").text
+    assert "緊急停止下單已啟動" in text
+    assert 'href="/risk"' in text
+    assert re.search(r'<button type="submit"[^>]*disabled', text) is not None
+
+
+def test_orders_page_shows_no_risk_banner_when_kill_switch_and_cooldown_are_off(order_client):
+    """正常狀態下不佔任何版面：無緊急停止、無冷靜期時，下單頁不出現風控橫幅。"""
+    text = order_client.get("/orders").text
+    assert "risk-banner" not in text
 
 
 def _demote_to_non_admin(session, user):
@@ -545,14 +565,24 @@ def _until_str(delta: timedelta) -> str:
     return (datetime.now(_CST) + delta).strftime("%Y-%m-%dT%H:%M")
 
 
-def test_orders_page_shows_disconnect_and_cooldown_controls_for_owner(order_client):
-    """owner GET /orders 頁面實際 render 出「斷開 Agent」與「冷靜期」控制（驗模板真的
-    render，不只端點存在）。"""
+def test_orders_page_no_longer_shows_disconnect_or_cooldown_controls(order_client):
+    """005：斷開 Agent 與冷靜期的切換控制都搬到獨立的 /risk 頁，下單頁不再顯示這兩個
+    控制項（僅在冷靜期生效中才顯示等效狀態橫幅，見另一測試）。"""
     text = order_client.get("/orders").text
-    assert "斷開 Agent 連線" in text
-    assert 'hx-post="/orders/agent-disconnect"' in text
-    assert "冷靜期" in text
-    assert 'hx-post="/orders/cooldown"' in text
+    assert "斷開 Agent 連線" not in text
+    assert 'hx-post="/orders/agent-disconnect"' not in text
+    assert 'hx-post="/orders/cooldown"' not in text
+
+
+def test_orders_page_shows_equivalent_cooldown_banner_when_active(order_client, session, user):
+    """005 的驗收邊界：冷靜期生效時的既有下單頁提示行為維持等效——使用者仍要看得到
+    自己在冷靜期中，即使完整的冷靜期控制已經搬到 /risk 頁。"""
+    now = brepo.now_epoch_ms()
+    brepo.create_cooldown(session, user_id=user.id, until_ms=now + 3_600_000, now_ms=now)
+    session.commit()
+    text = order_client.get("/orders").text
+    assert "冷靜期中" in text
+    assert 'href="/risk"' in text
 
 
 def test_agent_disconnect_owner_blocks_gate_and_returns_partial(order_client, user):
@@ -591,14 +621,14 @@ def test_agent_reconnect_non_admin_gets_403(order_client, session, user):
     assert gate.is_blocked(user.id) is True  # 未被解除
 
 
-def test_non_admin_owner_sees_only_cooldown_not_killswitch_or_disconnect(order_client, session, user):
-    """非 admin 的 owner（測試者）：看不到「急停」與「斷開 Agent」，但**保留冷靜期**
-    （＝使用者要求「只要留冷靜期就好了」的驗收）。"""
+def test_non_admin_owner_sees_no_control_widgets_on_orders_page(order_client, session, user):
+    """005：非 admin 的 owner（測試者）在下單頁一律看不到任何切換控制（急停／斷開 Agent／
+    冷靜期都已搬到 /risk 頁）；冷靜期仍在的等效提示行為見另一測試。"""
     _demote_to_non_admin(session, user)
     text = order_client.get("/orders").text
     assert 'hx-post="/orders/kill-switch"' not in text
     assert 'hx-post="/orders/agent-disconnect"' not in text
-    assert 'hx-post="/orders/cooldown"' in text  # 冷靜期仍在
+    assert 'hx-post="/orders/cooldown"' not in text
 
 
 def _active_cooldown(session, user_id):
@@ -663,6 +693,60 @@ def test_orders_page_reload_does_not_leak_plaintext_after_issue(order_client):
     reload_text = order_client.get("/orders").text
     assert plaintext not in reload_text
     assert "尚未使用" in reload_text  # 剛簽發、還沒被 WS 握手用過
+
+
+# ---------------------------------------------------------------------------
+# 005：獨立的「風險控管」頁（GET /risk）——緊急停止下單（原 kill switch，admin-only
+# 授權不變）＋交易冷靜期（owner 皆可自我禁制）＋Agent 連線控制（admin-only）集中一頁。
+# ---------------------------------------------------------------------------
+
+def test_risk_page_requires_login(anon_client):
+    resp = anon_client.get("/risk", follow_redirects=False)
+    assert resp.status_code == 303
+    assert resp.headers["location"] == "/login"
+
+
+def test_risk_page_admin_sees_all_toggle_controls(order_client):
+    """admin：緊急停止下單（含全站/我的兩層）、冷靜期、Agent 連線控制皆有可切換的表單。"""
+    text = order_client.get("/risk").text
+    assert "風險控管" in text
+    assert "緊急停止下單" in text
+    assert "Kill switch" not in text  # 畫面上不再出現舊名稱
+    assert "只擋新單" in text and "不會自動取消既有掛單" in text
+    assert 'hx-post="/orders/kill-switch"' in text
+    assert 'hx-post="/orders/cooldown"' in text
+    assert 'hx-post="/orders/agent-disconnect"' in text
+
+
+def test_risk_page_non_admin_owner_sees_status_only_for_kill_switch_and_no_disconnect_section(
+    order_client, session, user
+):
+    """非 admin（即使是 owner）：急停只看得到狀態、沒有切換控制；Agent 連線控制整段不
+    出現（admin 專屬區）；冷靜期仍是本人授權，維持完整可切換控制。"""
+    _demote_to_non_admin(session, user)
+    text = order_client.get("/risk").text
+    assert "我的下單正常" in text or "全站下單正常" in text  # 狀態看得到
+    assert 'hx-post="/orders/kill-switch"' not in text  # 但沒有切換表單
+    assert 'hx-post="/orders/agent-disconnect"' not in text  # admin 專屬區整段不出現
+    assert 'hx-post="/orders/cooldown"' in text  # 冷靜期仍是本人授權，保留完整控制
+
+
+def test_risk_page_non_owner_hides_cooldown_section_entirely(order_client, fake_guard):
+    """非 owner（罕見情境，例如子系統白名單外的帳號）：冷靜期整段不出現（同下單頁既有
+    owner 判定），不會顯示他人也管不到的控制。"""
+    fake_guard._owner_ids = set()
+    text = order_client.get("/risk").text
+    assert 'hx-post="/orders/cooldown"' not in text
+
+
+def test_risk_page_toggle_still_works_after_moving_to_new_location(order_client, fake_guard, fake_ops):
+    """控制項移動後，owner 仍能在新位置即時切換，行為與現在完全一致——切換端點契約不變，
+    這裡驗證 /risk 頁 render 出的表單確實打同一支既有端點。"""
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "global"})
+    assert resp.status_code == 200
+    assert fake_guard.global_on is True
+    text = order_client.get("/risk").text
+    assert "全站緊急停止已啟動" in text
 
 
 # ---- bug 1（simtrade 實測回歸）：_parse_order_price 對 None 的確切防線單元測試 ----

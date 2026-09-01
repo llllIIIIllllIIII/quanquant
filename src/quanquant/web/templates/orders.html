@@ -1,11 +1,4 @@
 {% extends "base.html" %}
-{% block head %}
-{# flatpickr（釘版 4.6.13）：冷靜期到期時間選擇器。Safari/WebKit（含打包 .app）的
-   datetime-local 沒有可點開的日曆，故用 flatpickr 統一各瀏覽器體驗；只在本頁載入。 #}
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
-<script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/l10n/zh-tw.js"></script>
-{% endblock %}
 {% block content %}
 <div x-data="{ open: false }" @closeordermodal.window="open = false">
 
@@ -17,15 +10,24 @@
   <p class="error-banner">下單子系統目前未啟用，無法送出新委託（歷史委託仍可查看）。</p>
   {% endif %}
 
-  {# admin-only：kill switch（含全站急停）＋手動斷開 Agent——影響全站/連線的高權限控制，
-     server 端各 route 亦強制 admin（非只靠此隱藏，2026-08-27）。 #}
-  {% if is_admin %}
-  {% include "partials/kill_switch_control.html" %}
-  {% with blocked=agent_blocked %}{% include "partials/agent_connection_control.html" %}{% endwith %}
+  <!-- 005：緊急停止（原 kill switch）與冷靜期的切換控制都搬到獨立的「風險控管」頁
+       （/risk）；下單頁只在生效中才顯示狀態橫幅，正常狀態零占位。 -->
+  {% if kill_switch.blocked %}
+  <div class="risk-banner">
+    <strong>🔴 緊急停止下單已啟動 — 目前拒絕新委託</strong>
+    <a href="/risk">前往風險控管頁查看／解除</a>
+  </div>
   {% endif %}
-  {# owner（含非 admin 測試者）：自己的 agent token（連線用）＋冷靜期（自我禁制）。 #}
+  {% if cooldown %}
+  <div class="risk-banner">
+    <strong>🔒 你正在冷靜期中 — 只能平倉、無法開新倉</strong>
+    <span>到期時間：{{ cooldown_until_text }}</span>
+    <a href="/risk">前往風險控管頁查看</a>
+  </div>
+  {% endif %}
+
+  {# owner（含非 admin 測試者）：自己的 agent token（連線用）——未隨 005 搬家。 #}
   {% if is_owner %}
-  {% with until_text=cooldown_until_text %}{% include "partials/cooldown_control.html" %}{% endwith %}
   {% include "partials/agent_token_control.html" with context %}
   {% endif %}
 
@@ -100,7 +102,7 @@
       </label>
     </div>
     <footer class="form-actions">
-      <button type="submit" {% if not service_available %}disabled{% endif %}>送出</button>
+      <button type="submit" {% if not service_available or kill_switch.blocked %}disabled{% endif %}>送出</button>
     </footer>
   </form>
 

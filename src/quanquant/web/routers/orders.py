@@ -449,6 +449,33 @@ async def set_cooldown(
     return _cooldown_control(cooldown=created)
 
 
+# ---- 005：獨立的「風險控管」頁 ----
+@router.get("/risk", response_class=HTMLResponse)
+async def risk_page(
+    request: Request,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    risk_guard=Depends(get_order_risk_guard),
+):
+    """緊急停止下單（原 kill switch，更名，授權維持 admin-only 不變）＋交易冷靜期
+    （owner 皆可自我禁制，授權不變）＋Agent 連線控制（admin-only，授權不變）集中一頁。
+    本頁只是呈現層的搬家——各控制的實際切換仍走既有 POST 端點與既有授權判定
+    （assert_owner／admin-only），不在這裡重新決策。非 admin/owner 只看得到狀態，
+    沒有切換控制（kill_switch_control.html 的 readonly 分支）。"""
+    is_admin = user.role == "admin"
+    is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
+    kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
+    now_ms = brepo.now_epoch_ms()
+    cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms) if is_owner else None
+    gate = getattr(request.app.state, "agent_connection_gate", None)
+    agent_blocked = bool(is_admin and gate is not None and gate.is_blocked(user.id))
+    return templates.TemplateResponse(request, "risk.html", {
+        "active": "risk", "is_admin": is_admin, "is_owner": is_owner, "kill_switch": kill_switch,
+        "cooldown": cooldown, "cooldown_until_text": _fmt_cst(cooldown.until_ts) if cooldown else None,
+        "agent_blocked": agent_blocked,
+    })
+
+
 # 委託/部位是每 2s 輪詢的唯讀端點，一律用同步 `def`（比照 /api/candles 慣例）跑 threadpool、
 # 完全離開 event loop——否則這兩個每 2s 的同步 DB 讀會壓在單一 event loop 上，與餵 K 線的
 # 報價 SSE/tick fan-out 搶 loop，造成下單延遲與 K 線凍住（見診斷）。positions 讀 DB 快照，
