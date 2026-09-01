@@ -329,14 +329,14 @@ a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.75rem; margin: 1rem 0 1.5rem; }
 .cards article { margin: 0; padding: 0.9rem 1rem; border-radius: var(--qq-radius-lg); }
 .stat-card { border-left: 2px solid var(--qq-border-strong); }
-.stat-card.up { border-left-color: var(--up); }
-.stat-card.down { border-left-color: var(--down); }
+.stat-card.up { border-left-color: var(--rise); }
+.stat-card.down { border-left-color: var(--fall); }
 .stat-card.focus { grid-column: span 2; }
 .stat-card.focus .big { font-size: 2rem; }
 .cards small { color: var(--qq-text-muted); }
 .cards .big { font-size: 1.5rem; font-weight: 700; }
-.cards .big.up { color: var(--up); }
-.cards .big.down { color: var(--down); }
+.cards .big.up { color: var(--rise); }
+.cards .big.down { color: var(--fall); }
 .export-actions { display: flex; gap: 0.5rem; }
 .export-actions [role="button"] { font-size: 0.82rem; padding: 0.35rem 0.8rem; }
 

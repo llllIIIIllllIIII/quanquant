@@ -112,7 +112,10 @@ async def quote_stream(
 ):
     # symbol 未提供＝既有單一商品行為（不變）；提供但與 poller 追蹤商品不同＝目前沒有
     # 該商品的報價來源，回空 stream（不推送）——避免把別檔的價推給正在看無來源商品的
-    # 使用者；下單頁切換商品時前端會重建整個 sse-connect 容器重新打這支端點。
+    # 使用者。事實澄清（終審回饋）：目前只有單一商品，orders.html 的 sse-connect 寫死
+    # symbols[0]，前端並未依 symbol 切換重建這條 SSE 連線——多商品上線前必須補上「切換
+    # 商品時重建 sse-connect 容器」，否則會發生「hx-get 換上的無報價片段被舊商品的 SSE
+    # 推播覆蓋」的競態，這裡目前只做了參數收下與驗證。
     if poller is None or (symbol and symbol != poller.symbol):
         return EventSourceResponse(iter(()))
 

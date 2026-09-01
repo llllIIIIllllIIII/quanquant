@@ -14,7 +14,7 @@
   <h4>緊急停止下單</h4>
   <p class="muted">
     啟動後立即拒絕新委託；<strong>只擋新單，不會自動取消既有掛單</strong>——已送出且尚未成交的
-    委託仍留在市場上，需要人工判斷是否手動撤單。授權維持管理員限定（admin-only）。
+    委託仍留在市場上，需要人工判斷是否手動撤單。授權維持僅管理員可操作。
   </p>
   {% if is_admin %}
   {% include "partials/kill_switch_control.html" %}

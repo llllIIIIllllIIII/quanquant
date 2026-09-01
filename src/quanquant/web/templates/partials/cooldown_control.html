@@ -22,7 +22,8 @@
               hx-confirm="冷靜期一旦啟動就無法自行解除、期間無法開新倉，只有管理員能提前解除。確定啟動？">啟動冷靜期</button>
     </form>
     <script>
-      // flatpickr 由 orders.html head 載入；此段在初始渲染與 htmx 換入（含錯誤重繪）時都會執行。
+      // flatpickr 由 risk.html head 載入（005：冷靜期控制隨本片段一併搬到風險控管頁）；
+      // 此段在初始渲染與 htmx 換入（含錯誤重繪）時都會執行。
       // CDN 失效時退回原生 datetime-local，表單仍可用（後端 fromisoformat 兩種格式都收）。
       (function () {
         var el = document.querySelector("#cooldown-control input[name='until']");

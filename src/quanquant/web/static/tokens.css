@@ -13,7 +13,11 @@
   --down: #ea3943;
   /* price-direction colours: flip with the K-line colour scheme.
      green_up (default): rise=green, fall=red. red_up: rise=red, fall=green.
-     --up/--down stay fixed (profit/loss semantics on stats cards). */
+     --up/--down themselves stay fixed — 2026-08-28 revision: profit/loss (and all
+     direction semantics) now follow the scheme via --rise/--fall everywhere,
+     including stats cards; --up/--down are just the fixed colour values --rise/--fall
+     resolve to by default, and are otherwise reserved for fixed warning/error UI
+     (e.g. kill-switch/risk banners), not direction semantics. */
   --rise: var(--up);
   --fall: var(--down);
 }
