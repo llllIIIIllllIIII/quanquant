@@ -1,7 +1,15 @@
 from datetime import datetime, timezone
 from decimal import Decimal
 
+from fastapi.testclient import TestClient
+from sqlmodel import Session
+
+from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.models import FuturesSnapshot
+from quanquant.poller import QuoteEvent, QuotePoller
+from quanquant.sources.base import DataSource
+from quanquant.web.app import create_app
+from quanquant.web.deps import get_poller, get_session
 from quanquant.web.routers.dashboard import _quote_context
 from quanquant.web.templating import _symbol_label, render_partial
 
@@ -59,3 +67,71 @@ def test_flash_class_only_when_flag_set():
     # 價格有變動時 flash=True → fragment 帶 flash class
     ctx = _quote_context(_snap(), None, poller=None, flash=True)
     assert 'class="quote up flash"' in render_partial("partials/quote.html", **ctx)
+
+
+# ---------------------------------------------------------------------------
+# 002：GET /quote、GET /quote/stream 的 symbol-scoped 驗收（路由層，真 QuotePoller）
+# ---------------------------------------------------------------------------
+
+class _NullSource(DataSource):
+    """測試用假來源：QuotePoller 建構需要一個 DataSource，但測試只手動 publish()，
+    從不呼叫 run()，故 fetch_snapshot 永遠不會真的被呼叫。"""
+
+    async def fetch_snapshot(self, symbol: str = "TXF") -> FuturesSnapshot:
+        raise NotImplementedError
+
+    async def close(self) -> None:
+        pass
+
+
+def _seeded_poller(symbol: str = "TXF") -> QuotePoller:
+    poller = QuotePoller(_NullSource(), symbol, 5.0)
+    poller.publish(QuoteEvent(snapshot=_snap(), error=None, at=datetime.now(timezone.utc)))
+    return poller
+
+
+def _quote_client(engine, user, poller):
+    def _session_override():
+        with Session(engine) as s:
+            yield s
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _session_override
+    app.dependency_overrides[get_poller] = lambda: poller
+    c = TestClient(app)
+    c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
+    return c
+
+
+def test_quote_route_known_symbol_matching_poller_returns_price(engine, user):
+    """symbol 與 poller 追蹤商品相符 → 照常回報價（單一商品現況下行為不變）。"""
+    client = _quote_client(engine, user, _seeded_poller("TXF"))
+    resp = client.get("/quote?symbol=TXF")
+    assert resp.status_code == 200
+    assert "sym-code" in resp.text
+    assert "無報價" not in resp.text
+
+
+def test_quote_route_unknown_symbol_shows_no_quote_never_last_price(engine, user):
+    """未知/非 poller 追蹤商品 → 明確顯示「無報價」，絕不可繼續顯示其他商品的價格。"""
+    client = _quote_client(engine, user, _seeded_poller("TXF"))
+    resp = client.get("/quote?symbol=MXF")
+    assert resp.status_code == 200
+    assert "MXF 無報價" in resp.text
+    assert "18000" not in resp.text  # 不是殘留 TXF 的價
+
+
+def test_quote_route_without_symbol_param_keeps_existing_behavior(engine, user):
+    """symbol 參數缺席＝既有單一商品行為不變。"""
+    client = _quote_client(engine, user, _seeded_poller("TXF"))
+    resp = client.get("/quote")
+    assert resp.status_code == 200
+    assert "18000" in resp.text
+
+
+def test_quote_stream_unknown_symbol_returns_empty_stream_not_last_price(engine, user):
+    """SSE 對未知商品同樣不推別檔的價——回空 stream。"""
+    client = _quote_client(engine, user, _seeded_poller("TXF"))
+    resp = client.get("/quote/stream?symbol=MXF")
+    assert resp.status_code == 200
+    assert "18000" not in resp.text

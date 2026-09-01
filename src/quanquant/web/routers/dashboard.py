@@ -6,7 +6,7 @@ import asyncio
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse
 from sse_starlette.sse import EventSourceResponse
 
@@ -28,6 +28,8 @@ def _quote_context(
     pulse: PulseEngine | None = None,
     poller: QuotePoller | None = None,
     flash: bool = False,
+    unknown_symbol: bool = False,
+    req_symbol: str | None = None,
 ) -> dict:
     now = datetime.now(timezone.utc)
     sess = session_now(now)  # "day"/"night"/None（calendar-aware，含假日）
@@ -47,7 +49,25 @@ def _quote_context(
         "pulse_level": pulse_level,
         "pulse_state": pulse_state,
         "flash": flash,  # 僅在價格較上次推播有變動時 True → 前端才播閃爍動畫
+        # 002：symbol-scoped 報價——unknown_symbol=True 代表所選商品沒有報價來源（非
+        # poller 追蹤的商品），前端必須顯示明確「無報價」，絕不可繼續顯示上一檔／其他
+        # 商品的價格（snap 此時恆為 None，見 _resolve_snap）。
+        "unknown_symbol": unknown_symbol,
+        "req_symbol": req_symbol,
     }
+
+
+def _resolve_snap(
+    poller: QuotePoller | None, symbol: str | None
+) -> tuple[FuturesSnapshot | None, bool]:
+    """002 唯一的後端工作：`symbol` 與 poller 追蹤商品相符（或未提供，維持既有單一商品
+    行為不變）→ 照常回目前快照；否則（未知/無來源）回 (None, True)，呼叫端據此渲染
+    「無報價」狀態，絕不回別檔的價。"""
+    if poller is None:
+        return None, False
+    if symbol and symbol != poller.symbol:
+        return None, True
+    return poller.last, False
 
 
 @router.get("/", response_class=HTMLResponse)
@@ -68,13 +88,17 @@ async def dashboard(request: Request):
 @router.get("/quote", response_class=HTMLResponse)
 async def quote_now(
     request: Request,
+    symbol: str | None = Query(None),
     poller: QuotePoller | None = Depends(get_poller),
     pulse: PulseEngine | None = Depends(get_pulse),
 ):
-    snap = poller.last if poller else None
+    snap, unknown = _resolve_snap(poller, symbol)
     return HTMLResponse(
         render_partial(
-            "partials/quote.html", **_quote_context(snap, None, pulse=pulse, poller=poller)
+            "partials/quote.html",
+            **_quote_context(
+                snap, None, pulse=pulse, poller=poller, unknown_symbol=unknown, req_symbol=symbol
+            ),
         )
     )
 
@@ -82,10 +106,14 @@ async def quote_now(
 @router.get("/quote/stream")
 async def quote_stream(
     request: Request,
+    symbol: str | None = Query(None),
     poller: QuotePoller | None = Depends(get_poller),
     pulse: PulseEngine | None = Depends(get_pulse),
 ):
-    if poller is None:
+    # symbol 未提供＝既有單一商品行為（不變）；提供但與 poller 追蹤商品不同＝目前沒有
+    # 該商品的報價來源，回空 stream（不推送）——避免把別檔的價推給正在看無來源商品的
+    # 使用者；下單頁切換商品時前端會重建整個 sse-connect 容器重新打這支端點。
+    if poller is None or (symbol and symbol != poller.symbol):
         return EventSourceResponse(iter(()))
 
     queue = poller.subscribe()

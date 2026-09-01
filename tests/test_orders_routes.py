@@ -238,6 +238,30 @@ def test_symbol_select_uses_optgroup_with_chinese_label(order_client):
     assert '<option value="TXF">TXF</option>' in text
 
 
+def test_quote_compact_panel_present_with_symbol_selector_outside_form(order_client):
+    """002（B 版）：報價列在表單上方，商品選擇器併入報價列、放在 <form> 外面，用
+    form="order-form" 關聯回表單；報價片段 hx-include 商品選擇器、change 時重抓。"""
+    text = order_client.get("/orders").text
+    assert 'class="quote-panel quote-compact"' in text
+    assert '<form id="order-form"' in text
+    assert 'id="order-symbol" class="quote-symbol-select"' in text
+    assert 'form="order-form"' in text
+    assert 'hx-get="/quote" hx-include="#order-symbol"' in text
+    assert "change from:#order-symbol" in text
+    # 商品選擇器不再留在表單第一格內
+    assert "<label>商品" not in text
+
+
+def test_order_form_still_submits_symbol_via_form_attribute(order_client, fake_service):
+    """B 版關鍵驗收：選擇器雖在表單外，FormData 仍會帶上 symbol，送出契約不變。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-SYM", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "18000",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert fake_service.placed[0].symbol == "TXF"
+
+
 def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
     """委託/部位改用 SSE 推送（sse:orders-changed）取代每 2s 盲輪詢：頁面要有 sse-connect
     容器、三個 div 的 trigger 含 sse:orders-changed（agent 狀態 badge + 委託 + 部位，Task 9
