@@ -94,6 +94,14 @@ def test_html_root_data_scheme_follows_saved_preference(client):
     assert 'data-scheme="red_up"' in body
 
 
+def test_dashboard_chart_title_uses_symbol_label_with_session_suffix(client):
+    """003：儀表板圖表標題顯示中文顯示名，後綴隨時段選單變（全/日/夜為 Alpine x-text，
+    這裡驗證伺服器端已把 symbol_label 值嵌入表達式，而非裸代碼）。"""
+    body = client.get("/").text
+    assert "'台指近'" in body
+    assert "session === 'day' ? '日' : session === 'night' ? '夜' : '全'" in body
+
+
 def test_account_page_shows_color_scheme_radio(client):
     body = client.get("/account").text
     assert 'name="scheme"' in body

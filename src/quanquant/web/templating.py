@@ -12,6 +12,10 @@ STATIC_DIR = WEB_DIR / "static"
 _CST = timezone(timedelta(hours=8))
 SESSION_LABEL = {"day": "● 日盤", "night": "● 夜盤", "closed": "○ 休市"}
 
+# 003：商品代碼 → 中文品名簡稱（人看的辨識，對應交易者口語）。畫面顯示用，送單/API/資料表
+# key 一律仍是代碼；未知代碼由 symbol_label filter 回代碼本身，不可顯示空白或錯誤名稱。
+SYMBOL_LABELS = {"TXF": "台指", "MXF": "小台", "TMF": "微台"}
+
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
 
@@ -56,12 +60,20 @@ def _dt(value: datetime | None, fmt: str = "%Y-%m-%d %H:%M") -> str:
     return value.strftime(fmt) if value else "—"
 
 
+def _symbol_label(code: str | None) -> str:
+    """商品代碼 → 中文品名簡稱；未知/未對映代碼一律回代碼本身，不可顯示空白或錯誤名稱。"""
+    if not code:
+        return code or ""
+    return SYMBOL_LABELS.get(code, code)
+
+
 templates.env.filters["num"] = _num
 templates.env.filters["signed"] = _signed
 templates.env.filters["pct"] = _pct
 templates.env.filters["comma"] = _comma
 templates.env.filters["cst_time"] = _cst_time
 templates.env.filters["dt"] = _dt
+templates.env.filters["symbol_label"] = _symbol_label
 
 
 def render_partial(name: str, **context) -> str:

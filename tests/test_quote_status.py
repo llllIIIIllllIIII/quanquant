@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from quanquant.models import FuturesSnapshot
 from quanquant.web.routers.dashboard import _quote_context
-from quanquant.web.templating import render_partial
+from quanquant.web.templating import _symbol_label, render_partial
 
 
 def _snap(is_fresh=True):
@@ -28,6 +28,27 @@ def test_quote_partial_renders_status_attrs():
     html = render_partial("partials/quote.html", **ctx)
     assert "data-qq-market-status" in html
     assert "data-qq-fresh" in html
+
+
+def test_symbol_label_known_codes():
+    assert _symbol_label("TXF") == "台指"
+    assert _symbol_label("MXF") == "小台"
+    assert _symbol_label("TMF") == "微台"
+
+
+def test_symbol_label_unknown_code_falls_back_to_code_itself():
+    """003：未知／未對映商品代碼，顯示代碼本身，不可顯示錯誤中文名或空白。"""
+    assert _symbol_label("ZZZ") == "ZZZ"
+    assert _symbol_label(None) == ""
+
+
+def test_quote_partial_shows_sym_code_and_sym_name_split():
+    """003：報價列在商品選擇器與現價之間顯示中文顯示名＋期別（不含契約月，使用者定案）。"""
+    ctx = _quote_context(_snap(), None, poller=None)
+    html = render_partial("partials/quote.html", **ctx)
+    assert '<span class="sym-code">TXF</span>' in html
+    assert '<span class="sym-name">台指近</span>' in html
+    assert "2609" not in html  # 契約月不顯示（使用者定案）
 
 
 def test_flash_class_only_when_flag_set():

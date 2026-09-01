@@ -39,7 +39,13 @@
     <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
     <div class="grid">
       <label>商品
-        <select name="symbol">{% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
+        <!-- 003：展開看中文品名（optgroup 標題）、收合只看代碼（option 文字）——原生 <optgroup>
+             天然達成，不需自訂下拉元件，鍵盤/螢幕閱讀器/手機原生選單全部保留。 -->
+        <select name="symbol">
+          {% for s in symbols %}
+          <optgroup label="{{ s | symbol_label }}"><option value="{{ s }}">{{ s }}</option></optgroup>
+          {% endfor %}
+        </select>
       </label>
       <fieldset class="side-field">
         <legend>方向</legend>

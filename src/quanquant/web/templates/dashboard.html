@@ -10,7 +10,10 @@
 <section x-data="chartPanel()">
   <div class="chart-toolbar" @click.outside="moreOpen = false">
     <div class="tb-left">
-      <h3 class="chart-title">{{ symbol }}<small class="muted">即時</small></h3>
+      <!-- 003：標題後綴隨時段選單變（該處時段是使用者可選的維度）——全（all）/日（day）/夜（night）。 -->
+      <h3 class="chart-title"><span
+            x-text="'{{ symbol | symbol_label }}近' + (session === 'day' ? '日' : session === 'night' ? '夜' : '全')"
+          ></span><small class="muted">即時</small></h3>
       <select class="session-sel" x-model="session" @change="setSession(session)"
               aria-label="價格時段">
         <template x-for="s in sessions" :key="s.code">

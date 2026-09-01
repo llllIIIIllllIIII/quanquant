@@ -230,6 +230,14 @@ def test_place_order_still_accepts_action_buy_and_sell(order_client, fake_servic
     assert [o.action for o in fake_service.placed] == ["Buy", "Sell"]
 
 
+def test_symbol_select_uses_optgroup_with_chinese_label(order_client):
+    """003：商品下拉展開用中文名為群組標題（optgroup label）、代碼為選項文字；收合狀態
+    （option 文字）只有代碼，保持緊湊。"""
+    text = order_client.get("/orders").text
+    assert '<optgroup label="台指">' in text
+    assert '<option value="TXF">TXF</option>' in text
+
+
 def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
     """委託/部位改用 SSE 推送（sse:orders-changed）取代每 2s 盲輪詢：頁面要有 sse-connect
     容器、三個 div 的 trigger 含 sse:orders-changed（agent 狀態 badge + 委託 + 部位，Task 9
