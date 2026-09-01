@@ -401,3 +401,45 @@ html[data-theme="light"] .market-banner.halt {
 .ind-colors { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; }
 .ind-color-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .ind-color-row input[type="color"] { width: 40px; height: 24px; padding: 0; border: none; background: none; cursor: pointer; }
+
+/* flatpickr（冷靜期到期時間選擇器）：套 --qq-* token 跟隨深淺主題。
+   flatpickr.min.css 在 orders.html 的 head block 載入、順序晚於本檔，
+   故全部規則用 html[data-theme] 前綴拉高 specificity 才蓋得過預設亮色樣式。 */
+html[data-theme] .flatpickr-calendar {
+  background: var(--qq-surface);
+  color: var(--qq-text);
+  border: 1px solid var(--qq-border);
+  box-shadow: var(--qq-shadow-2);
+}
+html[data-theme] .flatpickr-calendar.arrowTop::before { border-bottom-color: var(--qq-border); }
+html[data-theme] .flatpickr-calendar.arrowTop::after { border-bottom-color: var(--qq-surface); }
+html[data-theme] .flatpickr-calendar.arrowBottom::before { border-top-color: var(--qq-border); }
+html[data-theme] .flatpickr-calendar.arrowBottom::after { border-top-color: var(--qq-surface); }
+html[data-theme] .flatpickr-months .flatpickr-month,
+html[data-theme] .flatpickr-current-month .flatpickr-monthDropdown-months,
+html[data-theme] .flatpickr-weekdays,
+html[data-theme] span.flatpickr-weekday {
+  background: transparent; color: var(--qq-text); fill: var(--qq-text);
+}
+html[data-theme] .flatpickr-months .flatpickr-prev-month,
+html[data-theme] .flatpickr-months .flatpickr-next-month { color: var(--qq-text); fill: var(--qq-text); }
+html[data-theme] .flatpickr-months .flatpickr-prev-month:hover svg,
+html[data-theme] .flatpickr-months .flatpickr-next-month:hover svg { fill: var(--qq-accent); }
+html[data-theme] .flatpickr-day { color: var(--qq-text); }
+html[data-theme] .flatpickr-day.prevMonthDay,
+html[data-theme] .flatpickr-day.nextMonthDay,
+html[data-theme] .flatpickr-day.flatpickr-disabled { color: var(--qq-text-muted); opacity: .45; }
+html[data-theme] .flatpickr-day:hover,
+html[data-theme] .flatpickr-day.prevMonthDay:hover,
+html[data-theme] .flatpickr-day.nextMonthDay:hover { background: var(--qq-surface-2); border-color: var(--qq-surface-2); }
+html[data-theme] .flatpickr-day.today { border-color: var(--qq-accent); }
+html[data-theme] .flatpickr-day.selected,
+html[data-theme] .flatpickr-day.selected:hover { background: var(--qq-accent); border-color: var(--qq-accent); color: #fff; }
+html[data-theme] .flatpickr-time { border-top: 1px solid var(--qq-border); }
+html[data-theme] .flatpickr-time input,
+html[data-theme] .flatpickr-time .flatpickr-time-separator { background: transparent; color: var(--qq-text); }
+html[data-theme] .flatpickr-time input:hover,
+html[data-theme] .flatpickr-time input:focus { background: var(--qq-surface-2); }
+html[data-theme] .flatpickr-calendar .numInputWrapper:hover { background: var(--qq-surface-2); }
+html[data-theme] .flatpickr-calendar .numInputWrapper span.arrowUp::after { border-bottom-color: var(--qq-text-muted); }
+html[data-theme] .flatpickr-calendar .numInputWrapper span.arrowDown::after { border-top-color: var(--qq-text-muted); }

@@ -1,4 +1,11 @@
 {% extends "base.html" %}
+{% block head %}
+{# flatpickr（釘版 4.6.13）：冷靜期到期時間選擇器。Safari/WebKit（含打包 .app）的
+   datetime-local 沒有可點開的日曆，故用 flatpickr 統一各瀏覽器體驗；只在本頁載入。 #}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/l10n/zh-tw.js"></script>
+{% endblock %}
 {% block content %}
 <div x-data="{ open: false }" @closeordermodal.window="open = false">
 

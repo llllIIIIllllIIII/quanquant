@@ -338,8 +338,9 @@ def _fmt_cst(ms: int | None) -> str | None:
 
 
 def _parse_cooldown_until(raw) -> int | None:
-    """datetime-local 輸入（'YYYY-MM-DDTHH:MM'）以固定 +08:00 解析成真 UTC epoch-ms（與
-    repository.now_epoch_ms 同框可比）；格式不符回 None。"""
+    """到期時間輸入以固定 +08:00 解析成真 UTC epoch-ms（與 repository.now_epoch_ms 同框可比）。
+    flatpickr 送 'YYYY-MM-DD HH:MM'、fallback 的 datetime-local 送 'YYYY-MM-DDTHH:MM'，
+    fromisoformat 兩者皆收；格式不符回 None。"""
     if not raw or not isinstance(raw, str):
         return None
     try:

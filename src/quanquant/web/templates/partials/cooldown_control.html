@@ -16,10 +16,25 @@
     <div class="muted" style="font-size:.85em;margin-bottom:.3rem;">冷靜期＝自我禁制：設定一個到期時間，期間只能平倉出場、不能開新倉，agent 會一併斷線，且<strong>啟動後自己無法解除</strong>（只有管理員能提前解除）。</div>
     {% if error %}<div style="color:#c0392b;font-size:.85em;margin-bottom:.3rem;">{{ error }}</div>{% endif %}
     <form hx-post="/orders/cooldown" hx-target="#cooldown-control" hx-swap="outerHTML" style="margin:0;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;">
-      <input type="datetime-local" name="until" required style="margin:0;">
+      <input type="text" name="until" required autocomplete="off"
+             placeholder="點選或輸入到期時間" style="margin:0;max-width:15rem;">
       <button type="submit" class="contrast" style="margin:0;"
               hx-confirm="冷靜期一旦啟動就無法自行解除、期間無法開新倉，只有管理員能提前解除。確定啟動？">啟動冷靜期</button>
     </form>
+    <script>
+      // flatpickr 由 orders.html head 載入；此段在初始渲染與 htmx 換入（含錯誤重繪）時都會執行。
+      // CDN 失效時退回原生 datetime-local，表單仍可用（後端 fromisoformat 兩種格式都收）。
+      (function () {
+        var el = document.querySelector("#cooldown-control input[name='until']");
+        if (!el) return;
+        if (!window.flatpickr) { el.type = "datetime-local"; el.placeholder = ""; return; }
+        flatpickr(el, {
+          enableTime: true, time_24hr: true, allowInput: true,
+          dateFormat: "Y-m-d H:i", minDate: "today",
+          locale: (flatpickr.l10ns && flatpickr.l10ns.zh_tw) ? "zh_tw" : "default",
+        });
+      })();
+    </script>
   </div>
   {% endif %}
 </div>
