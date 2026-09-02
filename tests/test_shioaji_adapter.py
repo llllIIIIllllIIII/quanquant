@@ -1109,8 +1109,8 @@ def test_map_deal_report_fills_sim_fee_from_setting_when_missing():
     """A6：sim 模擬單成交常缺 fee，依設定 sim_fee_per_lot * qty 估算，不留 None/0。"""
     adapter = _adapter_stub_for_mapper(sim_fee_per_lot=Decimal("20"))
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 3, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 3,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
     })  # payload 無 "fee" 欄位、無 "octype"（真實 FuturesDealEvent 沒有這個欄位）
     assert fill.fee == Decimal("60")  # 20 * 3 口
     assert fill.ts == 1_780_000_000_000  # 秒→毫秒
@@ -1119,8 +1119,8 @@ def test_map_deal_report_fills_sim_fee_from_setting_when_missing():
 def test_map_deal_report_real_missing_fee_stays_none_no_sim_substitution():
     adapter = _adapter_stub_for_mapper(sim_fee_per_lot=Decimal("20"), mode="real")
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
     })
     assert fill.fee is None  # real 一律取 broker 回報，缺就是缺，不用 sim 設定頂替
 
@@ -1130,8 +1130,8 @@ def test_map_deal_report_converts_epoch_seconds_ts_to_epoch_ms_for_correct_tradi
     會讓 trading_day_for 算出 1970 年（epoch 秒當 ms 用，值小了 1000 倍）。"""
     adapter = _adapter_stub_for_mapper()
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
     })
     assert fill.ts == 1_780_000_000_000
     trading_day = brepo.trading_day_for(fill.ts)
@@ -1144,10 +1144,36 @@ def test_map_deal_report_octype_is_placeholder_overridden_by_inbox_worker():
     覆蓋（見該檔/本檔下面的端到端契約測試）。"""
     adapter = _adapter_stub_for_mapper()
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
     })
     assert fill.octype == "Auto"
+
+
+def test_map_deal_report_fill_id_combines_trade_id_and_exchange_seq():
+    """同一張委託拆成多筆成交時，每筆共用同一個 trade_id、只有 exchange_seq 不同
+    （staging 實測：4 口市價單→4 筆 deal 同 trade_id、exchange_seq 000001–000004）。
+    fill_id 單獨用 trade_id 會讓去重帳本把第 2 筆起全部誤判為重播丟棄，
+    filled_qty 永遠卡在 1（1/x partfilled bug）。"""
+    adapter = _adapter_stub_for_mapper()
+    base = {"trade_id": "103217", "action": "Buy", "quantity": 1, "price": "18000",
+            "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20"}
+    f1 = adapter._map_deal_report({**base, "exchange_seq": "000001"})
+    f2 = adapter._map_deal_report({**base, "exchange_seq": "000002"})
+    assert f1.fill_id == "103217-000001"
+    assert f2.fill_id == "103217-000002"
+    assert f1.fill_id != f2.fill_id  # 兩筆都要能入帳，不可互撞去重鍵
+
+
+def test_map_deal_report_rejects_missing_or_empty_exchange_seq():
+    """缺/空 exchange_seq 比照缺 trade_id 拒絕（V3-4：不用可能碰撞的 fallback 冒充 fill_id）。"""
+    adapter = _adapter_stub_for_mapper()
+    base = {"trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+            "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20"}
+    with pytest.raises(ValueError):
+        adapter._map_deal_report(base)  # 缺 exchange_seq
+    with pytest.raises(ValueError):
+        adapter._map_deal_report({**base, "exchange_seq": ""})  # 空字串
 
 
 def test_map_order_report_rejects_missing_ordno_and_broker_order_id_flat_reconcile_shape():
@@ -1231,8 +1257,8 @@ def test_map_deal_report_payload_account_mismatch_raises_payload_mismatch_dead_l
     adapter = _adapter_stub_for_mapper()
     with pytest.raises(RawInboxDeadLetterError) as exc_info:
         adapter._map_deal_report(
-            {"trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-             "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1"},
+            {"trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+             "price": "18000", "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1"},
             account="F1",
         )
     assert exc_info.value.reason == "payload_mismatch"
@@ -1243,8 +1269,8 @@ def test_map_deal_report_account_none_skips_mismatch_check_backward_compat():
     （同 R2-2 的 user_id NULL 放行原則）。"""
     adapter = _adapter_stub_for_mapper()
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1",
     })  # account 未帶 → 預設 None，不驗證
     assert fill.account == "F9"
 
@@ -1252,8 +1278,8 @@ def test_map_deal_report_account_none_skips_mismatch_check_backward_compat():
 def test_map_deal_report_matching_account_passes_through():
     adapter = _adapter_stub_for_mapper()
     fill = adapter._map_deal_report(
-        {"trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-         "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1"},
+        {"trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+         "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1"},
         account="F1",
     )
     assert fill.account == "F1"
@@ -1351,6 +1377,52 @@ def test_futures_deal_event_contract_end_to_end_opens_position_using_resolved_or
         assert refreshed_order.filled_qty == 1
         row = s.exec(select(RawInbox)).first()
         assert row.processed is True and row.quarantine is False
+
+
+def test_multi_lot_order_split_deals_same_trade_id_all_accumulate_to_filled(engine):
+    """1/x partfilled 回歸測試（staging 實測 2026-09-01）：多口市價單被撮合拆成多筆
+    成交回報，每筆共用同一個 trade_id、exchange_seq 遞增。舊版 fill_id 只用 trade_id，
+    第 2 筆起被去重帳本誤判為重播丟棄 → filled_qty 永遠卡 1。修正後兩筆都入帳，
+    Order 走到 filled。"""
+    from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.db.models import Deal, Order
+
+    adapter = _adapter(engine)
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C1", request_hash="H1", user_id=1, mode="sim", broker="shioaji",
+            account="F1", symbol="TXF", action="Buy", qty=2, price=Decimal("18500"),
+            price_type="MKT", order_type="IOC", octype="New", trading_day="2026-06-16",
+        )
+        order_id = order.id
+        brepo.set_order_ack(s, order.id, broker_order_id="103217", ordno="O1", status="submitted")
+        s.commit()
+
+    base = {
+        "trade_id": "103217", "seqno": "103217", "ordno": "O1",
+        "broker_id": "F002000", "account_id": "F1", "action": "Buy", "code": "TXF",
+        "full_code": "TXFG6", "price": 18500.0, "quantity": 1, "subaccount": "",
+        "security_type": "FUT", "delivery_month": "202607", "strike_price": 0.0,
+        "option_right": "Future", "market_type": "Day", "combo": False,
+        "ts": 1_780_000_000.0,
+    }
+    adapter._on_order_cb("FuturesDeal", _FakeMapping({**base, "exchange_seq": "000001"}))
+    adapter._on_order_cb("FuturesDeal", _FakeMapping({**base, "exchange_seq": "000002",
+                                                      "ts": 1_780_000_001.0}))
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    assert worker.process_batch_once() == 2
+
+    with Session(engine) as s:
+        deals = list(s.exec(select(Deal)))
+        assert len(deals) == 2  # 兩筆各自入帳，第 2 筆不可被當成重播丟棄
+        assert {d.fill_id for d in deals} == {"103217-000001", "103217-000002"}
+        refreshed = s.get(Order, order_id)
+        assert refreshed.filled_qty == 2
+        assert refreshed.status == "filled"
 
 
 def test_futures_deal_event_contract_specific_contract_code_end_to_end_shows_up_in_positions(engine):

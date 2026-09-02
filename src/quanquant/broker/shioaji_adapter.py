@@ -1206,9 +1206,19 @@ class ShioajiAdapter:
         驗證，維持既有位元級行為（同 R2-2 的 user_id NULL 放行原則，不因為新增檢查而讓歷史/
         測試路徑退化）。"""
         try:
-            fill_id = payload["trade_id"]
-            if not fill_id:
+            trade_id = payload["trade_id"]
+            if not trade_id:
                 raise ValueError("trade_id 為空")
+            # trade_id 是「委託」層級識別碼：同一張委託拆成多筆成交時每筆共用同一個
+            # trade_id（staging 實測：4 口市價單→4 筆 deal 同 trade_id、exchange_seq
+            # 000001–000004）。單獨拿它當 fill_id 會讓 Deal 去重帳本把第 2 筆起的成交
+            # 全部誤判為重播丟棄，filled_qty 永遠卡在第一筆——fill_id 必須組上每筆
+            # 唯一的 exchange_seq。缺 exchange_seq 比照缺 trade_id 拒絕（V3-4：不用
+            # 可能碰撞的 fallback 冒充 fill_id）。
+            exchange_seq = payload["exchange_seq"]
+            if not exchange_seq:
+                raise ValueError("exchange_seq 為空")
+            fill_id = f"{trade_id}-{exchange_seq}"
             action = payload["action"]
             qty = int(payload["quantity"])
             price = Decimal(str(payload["price"]))
