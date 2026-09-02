@@ -528,8 +528,12 @@ async def setup_step3_launch(request: Request) -> Response:
     try:
         instance_lock.acquire()
     except profile_registry.AgentAlreadyRunningError:
-        return _render_step3(request, launch_error="此帳號的 Agent 已在執行中",
-                              status_code=409)
+        return _render_step3(
+            request,
+            launch_error=("此帳號的 Agent 已在執行中——可能是另一個 QuanQuant Agent 視窗，"
+                          "或先前啟動、尚未結束的程序。請直接使用執行中的那一份；若要重新"
+                          "啟動，請先完全結束所有 QuanQuant Agent（Dock 上按右鍵→結束）再開一份。"),
+            status_code=409)
 
     profile_registry.upsert_profile(
         site_origin=site_origin, profile_id=profile.profile_id,

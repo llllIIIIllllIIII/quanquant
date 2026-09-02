@@ -86,4 +86,8 @@ async def test_responses_carry_no_store_and_csp_headers():
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:54321") as client:
         resp = await client.get("/bootstrap", params={"secret": "x"}, headers={"Host": "127.0.0.1:54321"})
     assert resp.headers.get("cache-control") == "no-store"
-    assert "default-src 'self'" in resp.headers.get("content-security-policy", "")
+    csp = resp.headers.get("content-security-policy", "")
+    assert "default-src 'self'" in csp
+    # 精靈/狀態頁的 head inline `<style>` 必須放行，否則錯誤橫幅無樣式、訊息被忽略
+    # （使用者實測：launch 失敗「沒反應」）。script/connect 仍鎖 default-src 'self'。
+    assert "style-src 'self' 'unsafe-inline'" in csp

@@ -6,7 +6,9 @@
   <style>
     body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
     dt { font-weight: 700; margin-top: 0.75rem; }
-    .error { color: #b00020; }
+    .error { color: #b00020; background: #fdecea; border: 1px solid #f5c6cb; border-radius: 0.5rem; padding: 0.75rem 1rem; margin: 1rem 0; }
+    .error strong { display: block; margin-bottom: 0.35rem; }
+    .error a { color: #b00020; }
     .notice { color: #8a6100; background: #fff8e1; border-radius: 0.5rem; padding: 0.75rem 1rem; }
   </style>
 </head>
@@ -14,7 +16,11 @@
   <h1>設定精靈 — 步驟 3／3：確認啟動</h1>
 
   {% if launch_error %}
-    <p class="error">{{ launch_error }}</p>
+    <div class="error">
+      <strong>⚠️ 無法啟動</strong>
+      {{ launch_error }}
+      <p style="margin:0.5rem 0 0;">若 Agent 其實已在執行，可直接前往 <a href="/status">狀態頁</a> 查看。</p>
+    </div>
   {% endif %}
 
   {% if shortcut_notice %}

@@ -74,6 +74,14 @@ def install_security_headers(app: FastAPI) -> None:
         response = await call_next(request)
         response.headers["Referrer-Policy"] = "no-referrer"
         response.headers["Cache-Control"] = "no-store"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'"
+        # `style-src 'self' 'unsafe-inline'`：setup 精靈與狀態頁的樣式寫在各模板 head 的
+        # inline `<style>`（本機第一方、無使用者輸入）——`default-src 'self'` 會連 inline
+        # `<style>` 一併擋掉，害整組頁面（含 launch 失敗的錯誤橫幅）無樣式、訊息被忽略。
+        # 只放寬 style，script/connect/img 等仍由 `default-src 'self'` 鎖死：本機安全邊界真正
+        # 在意的「禁外部載入、禁 inline script」完全不變（inline style 非腳本執行向量，且此
+        # GUI 只綁 127.0.0.1 單一使用者）。
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
+        )
         response.headers["X-Frame-Options"] = "DENY"
         return response
