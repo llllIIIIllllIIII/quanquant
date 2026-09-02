@@ -14,19 +14,20 @@
   <h4>緊急停止下單</h4>
   <p class="muted">
     啟動後立即拒絕新委託；<strong>只擋新單，不會自動取消既有掛單</strong>——已送出且尚未成交的
-    委託仍留在市場上，需要人工判斷是否手動撤單。授權維持僅管理員可操作。
+    委託仍留在市場上，需要人工判斷是否手動撤單。「我的緊急停止」帳號本人即可操作；
+    「全站緊急停止」僅管理員可操作。
   </p>
-  {% if is_admin %}
+  {% with self_readonly=not is_owner, global_readonly=not is_admin %}
   {% include "partials/kill_switch_control.html" %}
-  {% else %}
-  {% with readonly=true %}{% include "partials/kill_switch_control.html" %}{% endwith %}
-  {% endif %}
+  {% endwith %}
 </article>
 
 {% if is_owner %}
 <article class="risk-card">
   <h4>交易冷靜期</h4>
-  {% with until_text=cooldown_until_text %}{% include "partials/cooldown_control.html" %}{% endwith %}
+  {% with until_text=cooldown_until_text, can_cancel=cooldown_can_cancel, cancel_deadline_text=cooldown_cancel_deadline_text %}
+  {% include "partials/cooldown_control.html" %}
+  {% endwith %}
 </article>
 {% endif %}
 

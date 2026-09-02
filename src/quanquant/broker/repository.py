@@ -1002,7 +1002,14 @@ def create_cooldown(
 
 
 def lift_cooldown(session: Session, *, user_id: int, admin_user_id: int, now_ms: int) -> int:
-    """admin 提前解除：把該 user 全部未解除列（lifted_ts IS NULL，含到期未解除的殘列）標為
+    """DEPRECATED（R2-2／D-2，2026-09-02）：這是「無時間窗、任何 admin_user_id 都能提前
+    解除」的舊版本，D-2 拍板後不得再接進任何 route——唯一的 production 呼叫者（admin.py
+    的 `POST /admin/cooling-off/{user_id}/lift`）已停用、一律回 403。反悔窗僅本人可在
+    啟動後 5 分鐘內自行取消，逾時後任何人（含 admin）都無法提前解除，正式路徑請走
+    `lift_cooldown_by_owner`（時間窗判定寫進 SQL WHERE）。這個函式保留純粹是因為
+    tests/test_cooldown.py、tests/test_risk_guard.py 仍直接呼叫它操縱測試資料（驗證
+    active_cooldown 對「已被解除」列的判定邏輯），僅供測試使用，不要重新接回任何
+    HTTP endpoint。把該 user 全部未解除列（lifted_ts IS NULL，含到期未解除的殘列）標為
     已解除，回傳受影響列數（0＝無未解除列）。UPDATE rowcount 兩方言皆可靠（見 reserve_quota
     註解）；只 flush 不 commit。"""
     t = Cooldown.__table__
@@ -1010,6 +1017,31 @@ def lift_cooldown(session: Session, *, user_id: int, admin_user_id: int, now_ms:
         update(t)
         .where(t.c.user_id == user_id, t.c.lifted_ts.is_(None))
         .values(lifted_ts=now_ms, lifted_by=admin_user_id)
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    if result.rowcount:
+        session.flush()
+    return result.rowcount
+
+
+def lift_cooldown_by_owner(session: Session, *, user_id: int, now_ms: int, window_ms: int) -> int:
+    """R2-2（D-2，2026-09-02）：反悔窗——本人在啟動後 `window_ms` 內可自行取消
+    （`lifted_by=user_id` 本人，不是 admin；admin 提前解除的舊路徑已停用，見
+    web/routers/admin.py）。逾時後這裡不解除任何列——時間窗判定寫進 SQL WHERE
+    （`created_ts > now_ms-window_ms`），是最後一道判定，不是只信任呼叫端算好的布林值：
+    避免「route 層算過一次視窗仍在，UPDATE 真正落地前視窗剛好過期」的競態。回傳受影響
+    列數（0＝無可取消的 active 列，含「不存在」與「已逾時」兩種情況，呼叫端另查
+    `active_cooldown` 分辨訊息）。只 flush 不 commit（同 `lift_cooldown`）。"""
+    t = Cooldown.__table__
+    stmt = (
+        update(t)
+        .where(
+            t.c.user_id == user_id,
+            t.c.lifted_ts.is_(None),
+            t.c.until_ts > now_ms,
+            t.c.created_ts > now_ms - window_ms,
+        )
+        .values(lifted_ts=now_ms, lifted_by=user_id)
     )
     result = session.exec(stmt)  # type: ignore[call-overload]
     if result.rowcount:

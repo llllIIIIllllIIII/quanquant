@@ -80,9 +80,11 @@ def change_role(user_id: int, session: Session = Depends(get_session), role: str
     return RedirectResponse("/admin/users", status_code=303)
 
 
-# ---- 冷靜期（self-lockout）管理（2026-08-22，D4）----
-# 使用者自我禁制期間自己解不掉，只有 admin 能提前解除（見 broker/risk.py check_place 攔截、
-# web/routers/orders.py set_cooldown）。這頁列出目前 active 的冷靜期＋逐人解除鈕。
+# ---- 冷靜期（self-lockout）管理（2026-08-22，D4；2026-09-02 R2-2/D-2 改唯讀）----
+# 使用者自我禁制期間，僅本人可在啟動後 5 分鐘反悔窗內自行取消（見
+# web/routers/orders.py::cancel_cooldown）；逾時後任何人（含 admin）都無法提前解除，
+# 只能等到期——單人部署下「admin 可提前解除」等於自己的後門，防衝動交易的效果歸零。
+# 這頁只列出目前 active 的冷靜期供查看，不再提供解除操作（見 lift_cooling_off）。
 
 
 @router.get("/cooling-off", response_class=HTMLResponse)
@@ -104,15 +106,13 @@ def cooling_off_page(request: Request, session: Session = Depends(get_session)):
 
 
 @router.post("/cooling-off/{user_id}/lift")
-def lift_cooling_off(
-    user_id: int,
-    session: Session = Depends(get_session),
-    admin: User = Depends(require_admin),
-):
-    """admin 提前解除某 user 的冷靜期（清該 user 全部未解除列，記錄解除者 admin.id）。"""
-    _user_or_404(session, user_id)
-    brepo.lift_cooldown(
-        session, user_id=user_id, admin_user_id=admin.id, now_ms=brepo.now_epoch_ms()
+def lift_cooling_off(user_id: int, admin: User = Depends(require_admin)):
+    """R2-2（D-2，2026-09-02）：admin 提前解除已停用——反悔窗僅本人可在啟動後 5 分鐘內
+    自行取消（見 web/routers/orders.py::cancel_cooldown），逾時後任何人（含 admin）都
+    無法提前解除，只能等到期。這個端點保留位置回應明確的 403，不整個移除（避免舊書籤/
+    文件連結悄悄變 404，含糊帶過權限已收回的事實）；server 端強制，不是只藏掉頁面上的
+    按鈕（admin_cooling_off.html 已改唯讀、不再有解除表單）。"""
+    raise HTTPException(
+        status_code=403,
+        detail="冷靜期提前解除已停用：僅本人可在啟動後 5 分鐘內自行取消，逾時後任何人都無法提前解除",
     )
-    session.commit()
-    return RedirectResponse("/admin/cooling-off", status_code=303)

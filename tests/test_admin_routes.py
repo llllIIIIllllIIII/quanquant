@@ -88,12 +88,25 @@ def test_cooling_off_page_empty_when_none_active(client):
     assert "目前沒有使用者處於冷靜期" in r.text
 
 
-def test_cooling_off_lift_removes_active(client, engine, user):
+def test_cooling_off_lift_now_disabled_even_for_admin(client, engine, user):
+    """R2-2（D-2，2026-09-02）：admin 提前解除已停用——反悔窗僅本人可在啟動後 5 分鐘內
+    自行取消，逾時後任何人（含 admin）都無法提前解除。這個端點一律 403，冷靜期不受影響。"""
     _seed_cooldown(engine, user.id)
-    r = client.post(f"/admin/cooling-off/{user.id}/lift", follow_redirects=False)
-    assert r.status_code == 303
+    r = client.post(f"/admin/cooling-off/{user.id}/lift")
+    assert r.status_code == 403
     with Session(engine) as s:
-        assert brepo.active_cooldown(s, user_id=user.id, now_ms=brepo.now_epoch_ms()) is None
+        assert brepo.active_cooldown(s, user_id=user.id, now_ms=brepo.now_epoch_ms()) is not None
+
+
+def test_cooling_off_page_is_read_only_no_lift_button(client, engine, user):
+    """R2-2 驗收：admin 冷靜期頁改唯讀——不再有指向 lift 端點的表單/按鈕（頁面說明文字裡
+    提到「無法提前解除」是預期的；base.html 的登出表單與導覽鈕不算，只驗證沒有 lift
+    相關的可操作元素）。"""
+    _seed_cooldown(engine, user.id)
+    r = client.get("/admin/cooling-off")
+    assert r.status_code == 200
+    assert f"action=\"/admin/cooling-off/{user.id}/lift\"" not in r.text
+    assert ">解除<" not in r.text  # 沒有文字為「解除」的按鈕
 
 
 def test_cooling_off_page_non_admin_403(plain_client):

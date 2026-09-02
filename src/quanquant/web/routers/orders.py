@@ -291,36 +291,46 @@ async def toggle_kill_switch(
     參數，server 端天然無法替他人翻閘）；`scope='global'` 翻全站總閘（沿用 Tier0 語意，
     任一 owner 可翻，火警拉桿原則）。翻 ON 只擋新單、不自動撤既有掛單（自動撤單危險，留給
     人工/T0.4）；改以告警列出當下未成交掛單數，提醒人工決定。子系統停用（risk_guard 為
-    None）時優雅回一個停用片段，不 500。"""
+    None）時優雅回一個停用片段，不 500。
+
+    R2-1（D-1，2026-09-02）：`scope='self'` 的 403 gate 從「role=='admin'」改為「本人
+    （owner）即可」——本端點結構上翻不到別人，把自我煞車真正交到使用者手上。
+    `scope='global'` 會擋所有人下單，維持 admin-only 不變。兩種 scope 最終都仍要求
+    actor 是 owner（`assert_owner`），這一層授權沒有被拿掉。"""
     if risk_guard is None:
         return HTMLResponse(
             render_partial(
                 "partials/kill_switch_control.html", kill_switch=_DISABLED_KILL_SWITCH_VIEW, disabled=True
             )
         )
-    # kill switch（含全站急停）收歸 admin-only（2026-08-27）：全站急停會擋所有人下單，非 admin
-    # 的 owner（測試者）不得操作。server 端強制，非只靠 UI 隱藏。admin 亦須是 owner（set_kill_switch
-    # 內仍 assert_owner；正式部署的 admin henry 兩者皆是）。
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="admin only")
-    try:
-        risk_guard.assert_owner(user.id)
-    except AuthorizationError:
-        raise HTTPException(status_code=403, detail="not owner")
     form = await request.form()
     enabled = _parse_kill_switch_enabled(form.get("enabled"))
     scope = _parse_kill_switch_scope(form.get("scope"))
     if scope is None:
         raise HTTPException(status_code=400, detail="invalid scope（僅接受 self/global）")
+    # scope=global 會擋所有人下單，維持 admin-only（2026-08-27 定案，R2-1 未改變這層）；
+    # scope=self 只影響 actor 自己，2026-09-02 起開放帳號本人（owner）操作，不再要求 admin。
+    if scope == "global" and user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+    try:
+        risk_guard.assert_owner(user.id)
+    except AuthorizationError:
+        raise HTTPException(status_code=403, detail="not owner")
     risk_guard.set_kill_switch(enabled, scope=scope, actor_user_id=user.id)  # runtime 即時生效
     open_count = _count_open_orders_best_effort(session, service)
     ops = getattr(request.app.state, "ops_alerter", None)
     if ops is not None:  # 告警本身絕不能反噬切換
         ops.kill_switch(enabled=enabled, actor_user_id=user.id, scope=scope, open_order_count=open_count)
+    # 終審 HIGH #1：這個回應片段直接 outerHTML 換掉 #kill-switch-control，一定要重新算
+    # self_readonly/global_readonly（同 risk_page 的邏輯），不能讓模板的
+    # `global_readonly|default(false)` 落回 False——否則非 admin owner 翻完 scope=self
+    # 後，畫面會多長出一顆「啟動全站緊急停止」表單（server 端仍 403，但違反 R2-1「全站對
+    # 非 admin 唯讀」的 UI 契約，等於改壞了自己剛做的授權分流）。
     return HTMLResponse(
         render_partial(
             "partials/kill_switch_control.html",
             kill_switch=risk_guard.kill_switch_view(user.id), disabled=False,
+            self_readonly=False, global_readonly=(user.role != "admin"),
         )
     )
 
@@ -328,6 +338,12 @@ async def toggle_kill_switch(
 # ---- 冷靜期（self-lockout）＋手動斷開 Agent（2026-08-22，D9/D11）----
 _MAX_COOLDOWN_DAYS = 90
 _COOLDOWN_CST = timezone(timedelta(hours=8))
+# R2-2（D-2，2026-09-02）：啟動後 5 分鐘反悔窗——本人可自行取消；逾時後任何人（含 admin）
+# 都無法提前解除，只能等到期（見 broker/repository.py::lift_cooldown_by_owner）。
+_COOLDOWN_REVOKE_WINDOW_MS = 5 * 60_000
+# R2-3（2026-09-02）：冷靜期快捷時長——伺服器端以「現在＋時長」換算到期時間（見
+# set_cooldown 的 duration_preset 分支），不靠前端 JS 算數。
+_COOLDOWN_PRESETS_MS = {"1h": 3_600_000, "1d": 86_400_000, "1w": 604_800_000}
 
 
 def _fmt_cst(ms: int | None) -> str | None:
@@ -335,6 +351,26 @@ def _fmt_cst(ms: int | None) -> str | None:
     if ms is None:
         return None
     return datetime.fromtimestamp(ms / 1000, tz=_COOLDOWN_CST).strftime("%Y-%m-%d %H:%M")
+
+
+def _fmt_cst_sec(ms: int | None) -> str | None:
+    """同 `_fmt_cst`，多帶秒——R2-2 反悔窗只有 5 分鐘，分鐘級精度會讓使用者以為畫面卡住
+    不動，秒級才看得出視窗真的在倒數。"""
+    if ms is None:
+        return None
+    return datetime.fromtimestamp(ms / 1000, tz=_COOLDOWN_CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _cooldown_cancel_window(cooldown) -> tuple[bool, str | None]:
+    """R2-2（D-2）：5 分鐘反悔窗——啟動後 `_COOLDOWN_REVOKE_WINDOW_MS` 內本人可取消，
+    逾時後任何人都不行。以 DB `created_ts`（真 UTC epoch-ms）計算，process 重啟不影響
+    （不是 in-memory 計時）。回傳 (是否仍在窗內, 視窗到期時刻的顯示字串或 None)。"""
+    if cooldown is None:
+        return False, None
+    now_ms = brepo.now_epoch_ms()
+    deadline_ms = cooldown.created_ts + _COOLDOWN_REVOKE_WINDOW_MS
+    can_cancel = now_ms < deadline_ms
+    return can_cancel, (_fmt_cst_sec(deadline_ms) if can_cancel else None)
 
 
 def _parse_cooldown_until(raw) -> int | None:
@@ -359,10 +395,12 @@ def _connection_control(*, blocked: bool, disabled: bool = False) -> HTMLRespons
 
 
 def _cooldown_control(*, cooldown, error: str | None = None, disabled: bool = False) -> HTMLResponse:
+    can_cancel, cancel_deadline_text = _cooldown_cancel_window(cooldown)
     return HTMLResponse(render_partial(
         "partials/cooldown_control.html",
         cooldown=cooldown, until_text=_fmt_cst(cooldown.until_ts) if cooldown else None,
         error=error, disabled=disabled,
+        can_cancel=can_cancel, cancel_deadline_text=cancel_deadline_text,
     ))
 
 
@@ -416,9 +454,14 @@ async def set_cooldown(
     risk_guard=Depends(get_order_risk_guard),
     slot=Depends(get_agent_slot),
 ):
-    """owner-only（D5/D9）：建立冷靜期（self-lockout）——期間只能平倉、agent 一併斷線、
-    自己解不掉（只有 admin 能提前解除）。until 由 datetime-local 帶入；驗 until>now 且 ≤90 天。
-    已在冷靜期則拒絕（擋自我縮短/重設/提前解除）。子系統停用優雅回停用片段。"""
+    """owner-only（D5/D9）：建立冷靜期（self-lockout）——期間只能平倉、agent 一併斷線。
+    R2-2（D-2，2026-09-02）：啟動後 5 分鐘反悔窗內本人可自行取消（見 `cancel_cooldown`）；
+    逾時後任何人（含 admin）都無法提前解除，只能等到期——admin 提前解除的舊路徑已停用
+    （見 web/routers/admin.py::lift_cooling_off）。R2-3：`duration_preset`
+    （'1h'/'1d'/'1w'）快捷以「現在＋時長」換算到期時間，優先於 `until` 自訂欄位；未帶或
+    值不合法時 fallback 走原本的 `until` 文字解析（flatpickr／datetime-local）。兩條路徑
+    算出的到期時間都要通過同一套 until>now 且 ≤90 天檢查。已在冷靜期則拒絕（擋自我縮短/
+    重設）。子系統停用優雅回停用片段。"""
     if risk_guard is None:
         return _cooldown_control(cooldown=None, disabled=True)
     try:
@@ -429,12 +472,21 @@ async def set_cooldown(
     existing = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms)
     if existing is not None:
         return _cooldown_control(
-            cooldown=existing, error="你已在冷靜期中，無法變更或提前解除（請聯繫管理員）"
+            cooldown=existing,
+            error="你已在冷靜期中，無法變更或重新設定；如仍在啟動後 5 分鐘反悔窗內，"
+                  "可用下方按鈕自行取消。",
         )
     form = await request.form()
-    until_ms = _parse_cooldown_until(form.get("until"))
-    if until_ms is None:
-        return _cooldown_control(cooldown=None, error="請選擇有效的到期日期與時間")
+    preset = str(form.get("duration_preset") or "").strip()
+    if preset:
+        preset_ms = _COOLDOWN_PRESETS_MS.get(preset)
+        if preset_ms is None:
+            return _cooldown_control(cooldown=None, error="不支援的快捷時長")
+        until_ms = now_ms + preset_ms
+    else:
+        until_ms = _parse_cooldown_until(form.get("until"))
+        if until_ms is None:
+            return _cooldown_control(cooldown=None, error="請選擇有效的到期日期與時間")
     if until_ms <= now_ms:
         return _cooldown_control(cooldown=None, error="到期時間必須晚於現在")
     if until_ms > now_ms + _MAX_COOLDOWN_DAYS * 86_400_000:
@@ -449,6 +501,38 @@ async def set_cooldown(
     return _cooldown_control(cooldown=created)
 
 
+@router.post("/orders/cooldown/cancel", response_class=HTMLResponse)
+async def cancel_cooldown(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    risk_guard=Depends(get_order_risk_guard),
+):
+    """owner-only（R2-2／D-2，2026-09-02）：啟動後 5 分鐘反悔窗內本人可自行取消（化解
+    誤觸）；逾時後任何人（含 admin）都無法提前解除，只能等到期——時間窗以 DB
+    `created_ts`（真 UTC epoch-ms）判斷、寫進 SQL WHERE（見
+    `broker.repository.lift_cooldown_by_owner`），process 重啟不影響，也不是只靠這裡少
+    判斷一次就放行。admin 提前解除的舊路徑已停用（見 web/routers/admin.py）。"""
+    if risk_guard is None:
+        return _cooldown_control(cooldown=None, disabled=True)
+    try:
+        risk_guard.assert_owner(user.id)
+    except AuthorizationError:
+        raise HTTPException(status_code=403, detail="not owner")
+    now_ms = brepo.now_epoch_ms()
+    lifted = brepo.lift_cooldown_by_owner(
+        session, user_id=user.id, now_ms=now_ms, window_ms=_COOLDOWN_REVOKE_WINDOW_MS,
+    )
+    if lifted:
+        session.commit()
+        return _cooldown_control(cooldown=None)
+    existing = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms)
+    if existing is None:
+        return _cooldown_control(cooldown=None)
+    return _cooldown_control(
+        cooldown=existing, error="已超過 5 分鐘反悔窗，無法取消，只能等到期。",
+    )
+
+
 # ---- 005：獨立的「風險控管」頁 ----
 @router.get("/risk", response_class=HTMLResponse)
 async def risk_page(
@@ -457,21 +541,26 @@ async def risk_page(
     user: User = Depends(get_current_user),
     risk_guard=Depends(get_order_risk_guard),
 ):
-    """緊急停止下單（原 kill switch，更名，授權維持 admin-only 不變）＋交易冷靜期
-    （owner 皆可自我禁制，授權不變）＋Agent 連線控制（admin-only，授權不變）集中一頁。
-    本頁只是呈現層的搬家——各控制的實際切換仍走既有 POST 端點與既有授權判定
-    （assert_owner／admin-only），不在這裡重新決策。非 admin/owner 只看得到狀態，
-    沒有切換控制（kill_switch_control.html 的 readonly 分支）。"""
+    """緊急停止下單（原 kill switch，更名）——R2-1（D-1，2026-09-02）：`scope=self`（我的
+    緊急停止）開放帳號本人操作，`scope=global`（全站）維持 admin-only。＋交易冷靜期
+    （owner 皆可自我禁制，5 分鐘反悔窗見 R2-2）＋Agent 連線控制（admin-only，授權不變）
+    集中一頁。本頁只是呈現層的搬家——各控制的實際切換仍走既有 POST 端點與既有授權判定
+    （assert_owner／admin-only／R2-1 的 scope 分流），不在這裡重新決策。kill_switch_
+    control.html 用 `self_readonly`/`global_readonly` 兩個獨立旗標分別控制兩層是否顯示
+    切換表單。"""
     is_admin = user.role == "admin"
     is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
     kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
     now_ms = brepo.now_epoch_ms()
     cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms) if is_owner else None
+    cooldown_can_cancel, cooldown_cancel_deadline_text = _cooldown_cancel_window(cooldown)
     gate = getattr(request.app.state, "agent_connection_gate", None)
     agent_blocked = bool(is_admin and gate is not None and gate.is_blocked(user.id))
     return templates.TemplateResponse(request, "risk.html", {
         "active": "risk", "is_admin": is_admin, "is_owner": is_owner, "kill_switch": kill_switch,
         "cooldown": cooldown, "cooldown_until_text": _fmt_cst(cooldown.until_ts) if cooldown else None,
+        "cooldown_can_cancel": cooldown_can_cancel,
+        "cooldown_cancel_deadline_text": cooldown_cancel_deadline_text,
         "agent_blocked": agent_blocked,
     })
 

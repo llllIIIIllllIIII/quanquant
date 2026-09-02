@@ -391,6 +391,41 @@ body.chart-fullscreen #kchart { height: calc(100vh - 205px); }
 }
 .risk-banner a { color: inherit; text-decoration: underline; }
 
+/* ---- R2-7（2026-09-02）：kill_switch_control／cooldown_control 的警示紅收斂成 --down
+   token＋class（原本硬編 #c0392b／rgba(192,57,43,...) 的 inline style，是 P2-19/20 在
+   新 partial 裡重蹈覆轍）；按鈕層級——同頁最多一顆 contrast（「啟動我的緊急停止」），
+   全站急停／啟動冷靜期／斷開 Agent 降為 .risk-btn-danger（outline＋--down，非實心）。 ---- */
+.risk-status-box {
+  padding: 0.6rem 0.9rem; border-radius: var(--qq-radius-sm);
+  border: 1px solid var(--pico-muted-border-color, #ccc);
+}
+.risk-status-box.is-active {
+  border-color: var(--down);
+  background: color-mix(in srgb, var(--down) 12%, transparent);
+}
+.risk-status-row {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 1rem; flex-wrap: wrap;
+}
+.risk-status-box.is-active .risk-status-title { color: var(--down); }
+.risk-status-note { font-size: 0.85em; margin-top: 0.3rem; }
+.risk-status-note.warn { color: var(--down); }
+.risk-status-error { color: var(--down); font-size: 0.85em; margin-bottom: 0.3rem; }
+
+button.risk-btn-danger, [role="button"].risk-btn-danger {
+  background: transparent; border-color: var(--down); color: var(--down);
+}
+button.risk-btn-danger:is(:hover, :focus), [role="button"].risk-btn-danger:is(:hover, :focus) {
+  background: color-mix(in srgb, var(--down) 15%, transparent);
+  border-color: var(--down); color: var(--down);
+}
+
+/* 終審 LOW #4：`.mini` 沒有裸規則（既有的只有 `a.mini` 與 `.alert-actions .mini` 兩個
+   scoped 版本），R2-3 的三顆冷靜期快捷鈕（`class="secondary mini"`）套不到，撞上 Pico v2
+   `button[type=submit]{width:100%}` 的預設值會直排變全寬。比照 `.alert-actions .mini`
+   慣例，scoped 到 `#cooldown-control`，讓快捷列維持一行 chip。 */
+#cooldown-control .mini { margin: 0; width: auto; padding: 0.15rem 0.5rem; font-size: 0.78rem; }
+
 /* ---- responsive polish ---- */
 @media (max-width: 767px) {
   .chart-toolbar { gap: 0.4rem; }

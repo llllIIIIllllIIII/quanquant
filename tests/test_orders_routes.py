@@ -475,13 +475,52 @@ def test_orders_page_hides_kill_switch_control_for_non_admin(order_client, sessi
 def test_kill_switch_non_admin_gets_403_and_does_not_toggle(
     order_client, fake_guard, fake_ops, session, user
 ):
-    """非 admin（即使是 owner）POST /orders/kill-switch → 403、未翻閘、不告警（server 端強制，
-    非只靠 UI 隱藏——嚴重授權漏洞的核心修正）。"""
+    """邊界②：非 admin（即使是 owner）POST scope=global → 403、未翻閘、不告警——維持
+    admin-only（server 端強制，非只靠 UI 隱藏）。"""
     _demote_to_non_admin(session, user)
     resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "global"})
     assert resp.status_code == 403
     assert fake_guard.set_kill_switch_calls == []
     assert fake_ops.kill_switch_calls == []
+
+
+def test_kill_switch_scope_self_non_admin_owner_succeeds(
+    order_client, fake_guard, fake_ops, session, user
+):
+    """邊界①（R2-1／D-1，2026-09-02）：scope=self 的 403 gate 從 role=='admin' 改為本人
+    （owner）即可——非 admin 但是 owner 的使用者可以翻自己的急停，200、per_user 真的翻了、
+    仍照舊告警。"""
+    _demote_to_non_admin(session, user)
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "self"})
+    assert resp.status_code == 200
+    assert fake_guard.per_user.get(user.id) is True
+    assert fake_guard.set_kill_switch_calls[-1] == (True, "self", user.id)
+    assert fake_ops.kill_switch_calls[-1]["scope"] == "self"
+
+
+def test_kill_switch_scope_self_non_admin_owner_response_keeps_global_readonly(
+    order_client, fake_guard, session, user
+):
+    """終審 HIGH #1：非 admin owner POST scope=self 後，回應片段（hx-swap outerHTML 換回
+    #kill-switch-control）不得含全站急停的切換表單——回應必須自己重新算 global_readonly
+    （user.role!='admin'），不能讓 partial 的 `global_readonly|default(false)` 落回預設值
+    False 而把全站表單畫出來（server 端仍 403，但違反 R2-1「全站對非 admin 唯讀」的 UI 契約）。"""
+    _demote_to_non_admin(session, user)
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "self"})
+    assert resp.status_code == 200
+    assert 'value="global"' not in resp.text  # 全站的 hidden scope 表單不該出現
+    assert 'name="scope" value="self"' in resp.text  # 我的急停表單仍在（本人可操作）
+
+
+def test_kill_switch_scope_self_non_owner_still_gets_403(
+    order_client, fake_guard, fake_ops, session, user
+):
+    """R2-1 邊界：scope=self 開放的是「本人（owner）」，不是「任何登入者」——非 owner（即使
+    demote 前是 admin）仍然 403，owner 授權判定本身沒有被拿掉。"""
+    fake_guard._owner_ids = set()  # user 非 owner
+    resp = order_client.post("/orders/kill-switch", data={"enabled": "true", "scope": "self"})
+    assert resp.status_code == 403
+    assert fake_guard.set_kill_switch_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +723,137 @@ def test_cooldown_non_owner_gets_403(order_client, fake_guard, session, user):
     assert _active_cooldown(session, user.id) is None
 
 
+# ---------------------------------------------------------------------------
+# R2-3（2026-09-02）：冷靜期快捷時長（1 小時／1 天／1 週）——伺服器端以「現在＋時長」
+# 換算到期時間（不靠前端 JS 算數，避免 client 時鐘/時區誤差；也因此可以直接 pytest 驗證
+# 換算是否正確，不需要 JS runtime）。
+# ---------------------------------------------------------------------------
+
+def test_cooldown_quick_preset_1h_computes_until_from_now(order_client, session, user):
+    """邊界⑥：快捷「1 小時」＝現在＋3_600_000ms（容忍測試執行耗時，±5 秒帶）。"""
+    before = brepo.now_epoch_ms()
+    resp = order_client.post("/orders/cooldown", data={"duration_preset": "1h"})
+    after = brepo.now_epoch_ms()
+    assert resp.status_code == 200
+    row = _active_cooldown(session, user.id)
+    assert row is not None
+    assert before + 3_600_000 - 5_000 <= row.until_ts <= after + 3_600_000 + 5_000
+    assert "到期時間" in resp.text  # 選後仍顯示實際到期時間供確認
+
+
+def test_cooldown_quick_preset_1d_computes_until_from_now(order_client, session, user):
+    before = brepo.now_epoch_ms()
+    resp = order_client.post("/orders/cooldown", data={"duration_preset": "1d"})
+    after = brepo.now_epoch_ms()
+    assert resp.status_code == 200
+    row = _active_cooldown(session, user.id)
+    assert before + 86_400_000 - 5_000 <= row.until_ts <= after + 86_400_000 + 5_000
+
+
+def test_cooldown_quick_preset_1w_computes_until_from_now(order_client, session, user):
+    before = brepo.now_epoch_ms()
+    resp = order_client.post("/orders/cooldown", data={"duration_preset": "1w"})
+    after = brepo.now_epoch_ms()
+    assert resp.status_code == 200
+    row = _active_cooldown(session, user.id)
+    assert before + 604_800_000 - 5_000 <= row.until_ts <= after + 604_800_000 + 5_000
+
+
+def test_cooldown_quick_preset_invalid_value_rejected(order_client, session, user):
+    resp = order_client.post("/orders/cooldown", data={"duration_preset": "bogus"})
+    assert resp.status_code == 200
+    assert _active_cooldown(session, user.id) is None
+
+
+def test_cooldown_quick_preset_still_respects_max_days_check(order_client, session, user):
+    """R2-3 驗收：上限 90 天維持——即使走快捷路徑，換算出的到期時間仍要過同一道上限檢查
+    （目前三個快捷值都遠低於上限，這裡用未知 preset 名稱＋超長 until 混合驗證『二選一、
+    until 分支仍受上限保護』，避免以後加大 preset 卻漏檢查）。"""
+    resp = order_client.post(
+        "/orders/cooldown", data={"until": _until_str(timedelta(days=91))}
+    )
+    assert resp.status_code == 200
+    assert "最長" in resp.text
+    assert _active_cooldown(session, user.id) is None
+
+
+# ---------------------------------------------------------------------------
+# R2-2（D-2，2026-09-02）：冷靜期反悔窗——啟動後 5 分鐘內本人可自行取消
+# （POST /orders/cooldown/cancel）；逾時後任何人（含 admin，見 test_admin_routes.py）都
+# 無法提前解除，只能等到期。時間一律直接操縱 DB created_ts，不 sleep。
+# ---------------------------------------------------------------------------
+
+def _seed_active_cooldown(session, user_id, *, created_ts, until_ts=None):
+    row = Cooldown(
+        user_id=user_id, until_ts=until_ts or (brepo.now_epoch_ms() + 3_600_000), created_ts=created_ts,
+    )
+    session.add(row)
+    session.commit()
+    return row
+
+
+def test_cooldown_cancel_within_5min_window_succeeds(order_client, session, user):
+    """邊界③：啟動後 4:59（未滿 5 分鐘）本人可取消——回到「未在冷靜期」的建立表單片段。"""
+    now = brepo.now_epoch_ms()
+    _seed_active_cooldown(session, user.id, created_ts=now - (4 * 60_000 + 59_000))
+    resp = order_client.post("/orders/cooldown/cancel")
+    assert resp.status_code == 200
+    assert _active_cooldown(session, user.id) is None
+    assert "啟動冷靜期" in resp.text  # 換回建立表單（無 active cooldown）
+
+
+def test_cooldown_cancel_after_5min_window_rejected(order_client, session, user):
+    """邊界④：超過 5 分鐘反悔窗（5:01）後本人取消被拒——冷靜期原封不動、回錯誤訊息。"""
+    now = brepo.now_epoch_ms()
+    _seed_active_cooldown(session, user.id, created_ts=now - (5 * 60_000 + 1_000))
+    resp = order_client.post("/orders/cooldown/cancel")
+    assert resp.status_code == 200  # 比照既有錯誤模式：partial 回錯誤文字，不是 4xx
+    assert "無法取消" in resp.text or "反悔窗" in resp.text
+    assert _active_cooldown(session, user.id) is not None  # 仍在冷靜期，未被解除
+
+
+def test_cooldown_cancel_no_active_cooldown_is_noop(order_client, session, user):
+    resp = order_client.post("/orders/cooldown/cancel")
+    assert resp.status_code == 200
+    assert _active_cooldown(session, user.id) is None
+
+
+def test_cooldown_cancel_non_owner_gets_403(order_client, fake_guard, session, user):
+    fake_guard._owner_ids = set()
+    now = brepo.now_epoch_ms()
+    _seed_active_cooldown(session, user.id, created_ts=now)
+    resp = order_client.post("/orders/cooldown/cancel")
+    assert resp.status_code == 403
+    assert _active_cooldown(session, user.id) is not None
+
+
+def test_cooldown_control_within_window_shows_cancel_button(order_client, session, user):
+    """R2-2 驗收：5 分鐘內卡片顯示「取消冷靜期」＋到期時間可見（GET /risk 走 risk_page，
+    不只是 POST 回應片段才有）。"""
+    now = brepo.now_epoch_ms()
+    _seed_active_cooldown(session, user.id, created_ts=now)
+    text = order_client.get("/risk").text
+    assert 'hx-post="/orders/cooldown/cancel"' in text
+    assert "取消冷靜期" in text
+
+
+def test_cooldown_control_after_window_hides_cancel_button(order_client, session, user):
+    """R2-2 驗收：逾時後無任何解除路徑——卡片不再顯示取消鈕。"""
+    now = brepo.now_epoch_ms()
+    _seed_active_cooldown(session, user.id, created_ts=now - (5 * 60_000 + 1_000))
+    text = order_client.get("/risk").text
+    assert 'hx-post="/orders/cooldown/cancel"' not in text
+
+
+def test_cooldown_text_states_five_minute_revoke_window_everywhere(order_client, session, user):
+    """R2-2 驗收：所有文案同步——建立表單、卡片鎖定文案都改成『5 分鐘內可取消；逾時後
+    任何人都無法提前解除，只能等到期』語意，不再出現舊的『只有管理員能提前解除』。"""
+    text = order_client.get("/risk").text
+    assert "5 分鐘" in text
+    assert "只有管理員能提前解除" not in text
+    assert "只有管理員" not in text
+
+
 def test_orders_page_reload_does_not_leak_plaintext_after_issue(order_client):
     """簽發當下的回應才看得到明文；重新整理 /orders 頁只看得到 expires_at/last_used_at，
     看不到明文（DB 本就只存 hash，route 只在簽發那次回應塞 raw_token）。"""
@@ -718,17 +888,95 @@ def test_risk_page_admin_sees_all_toggle_controls(order_client):
     assert 'hx-post="/orders/agent-disconnect"' in text
 
 
-def test_risk_page_non_admin_owner_sees_status_only_for_kill_switch_and_no_disconnect_section(
+def test_risk_page_non_admin_owner_can_toggle_self_kill_switch_but_global_is_readonly(
     order_client, session, user
 ):
-    """非 admin（即使是 owner）：急停只看得到狀態、沒有切換控制；Agent 連線控制整段不
-    出現（admin 專屬區）；冷靜期仍是本人授權，維持完整可切換控制。"""
+    """R2-1（D-1，2026-09-02）：scope=self 開放帳號本人——非 admin 的 owner 在風控頁能看到
+    且能操作「我的緊急停止」（有切換表單）；scope=global 維持 admin-only，對非 admin 唯讀
+    （無切換表單）。Agent 連線控制整段仍是 admin 專屬區；冷靜期仍是本人授權，維持完整
+    控制。"""
     _demote_to_non_admin(session, user)
     text = order_client.get("/risk").text
-    assert "我的下單正常" in text or "全站下單正常" in text  # 狀態看得到
-    assert 'hx-post="/orders/kill-switch"' not in text  # 但沒有切換表單
+    assert "我的下單正常" in text  # 我的急停狀態看得到
+    assert 'name="scope" value="self"' in text  # 我的急停有切換表單（R2-1 開放本人）
+    assert 'name="scope" value="global"' not in text  # 全站急停沒有切換表單（維持 admin-only）
     assert 'hx-post="/orders/agent-disconnect"' not in text  # admin 專屬區整段不出現
     assert 'hx-post="/orders/cooldown"' in text  # 冷靜期仍是本人授權，保留完整控制
+
+
+def test_risk_page_kill_switch_card_text_only_describes_global_as_admin_only(order_client):
+    """R2-1 驗收：卡片說明文字「授權維持僅管理員可操作」同步改寫——只描述全站，不再暗示
+    「我的緊急停止」也是 admin-only。"""
+    text = order_client.get("/risk").text
+    assert "全站緊急停止」僅管理員可操作" in text or "全站緊急停止僅管理員可操作" in text
+    assert "授權維持僅管理員可操作" not in text  # 舊的、涵蓋兩者的舊文案已改寫
+
+
+def test_risk_page_only_my_kill_switch_button_is_contrast(order_client, fake_guard, session, user):
+    """R2-7 驗收：風控頁按鈕層級——同頁最多一顆 contrast，只有「啟動我的緊急停止」保持
+    contrast；全站急停／啟動冷靜期／斷開 Agent 一律不是 contrast（降為一般或 danger）。
+    admin＋未啟動任何開關的狀態下四顆按鈕都在頁面上，用 class="contrast" 出現次數驗證。"""
+    text = order_client.get("/risk").text
+    assert text.count('class="contrast"') == 1
+    assert '>啟動我的緊急停止<' in text
+    assert 'class="risk-btn-danger"' in text  # 全站急停／啟動冷靜期／斷開 Agent 改走這個 class
+    assert "#c0392b" not in text  # R2-7：警示紅不再硬編，改走 --down token
+    assert "rgba(192,57,43" not in text
+
+
+def test_risk_page_active_states_still_have_no_hardcoded_warning_color(
+    order_client, fake_guard, session, user
+):
+    """R2-7 驗收（涵蓋 kill_switch_control／cooldown_control／agent_connection_control 的
+    「active」分支，不是只測預設關閉狀態）：我的急停、全站急停、冷靜期、已斷線 Agent 都
+    同時處於啟動中，四個 partial 的警示狀態都要走 --down token（.risk-status-box.is-active），
+    仍不能出現硬編 #c0392b／rgba(192,57,43,...)。"""
+    fake_guard.per_user[user.id] = True
+    fake_guard.global_on = True
+    now = brepo.now_epoch_ms()
+    session.add(Cooldown(user_id=user.id, until_ts=now + 3_600_000, created_ts=now))
+    session.commit()
+    order_client.app.state.agent_connection_gate = AgentConnectionGate()
+    order_client.app.state.agent_connection_gate.block(user.id)
+    text = order_client.get("/risk").text
+    assert "我的緊急停止已啟動" in text and "全站緊急停止已啟動" in text
+    assert "冷靜期中" in text and "已手動斷開 Agent 連線" in text
+    assert "#c0392b" not in text
+    assert "rgba(192,57,43" not in text
+
+
+def test_risk_page_hx_confirm_lives_on_form_not_button(order_client, fake_guard, session, user):
+    """終審 MEDIUM #3：htmx 2.0.4 的 getClosestAttributeValue 只從發請求的元素（帶 hx-post
+    的 <form>）及其祖先讀 hx-confirm，不會往下看子孫的 <button>——放在 button 上等於沒有
+    確認彈窗，R2-3 的快捷鈕會一按直接鎖住。用 regex 掃描整頁：任何 <button> 標籤都不得帶
+    hx-confirm；預設狀態（未啟動任何開關、非冷靜期中）風控頁上的 6 個危險動作
+    （全站急停啟動／冷靜期快捷 1h/1d/1w／冷靜期自訂／斷開 Agent）各自對應一個帶
+    hx-confirm 的 <form>。「啟動我的緊急停止」刻意無 confirm（2026-09-03 終審拍板）：
+    可逆的自救動作（本人隨時可解除、只擋新單），E-stop 要單一動作、審慎留給恢復端。"""
+    text = order_client.get("/risk").text
+    button_tags = re.findall(r"<button\b[^>]*>", text)
+    assert button_tags  # sanity：頁面上真的有按鈕，測試沒有測到空頁
+    assert not any("hx-confirm" in tag for tag in button_tags)
+    assert "確定要啟動我的緊急停止" not in text  # E-stop 不設確認，誤加要被抓到
+    form_tags = re.findall(r"<form\b[^>]*>", text)
+    confirming_forms = [f for f in form_tags if "hx-confirm" in f]
+    assert len(confirming_forms) == 6
+    for f in confirming_forms:  # 每個帶 confirm 的 form 都要自帶完整的 hx-post/target/swap
+        assert "hx-post=" in f and "hx-target=" in f and 'hx-swap="outerHTML"' in f
+
+
+def test_cooldown_control_quick_buttons_have_mini_sizing_css():
+    """終審 LOW #4：`.mini`（`class="secondary mini"`）在 app.css 沒有裸規則，只有
+    `a.mini`／`.alert-actions .mini` 兩個 scoped 版本套不到 button——撞上 Pico v2
+    `button[type=submit]{width:100%}` 的預設值，MEDIUM #3 拆完 form 後三顆快捷鈕會變成
+    直排全寬。驗證 `#cooldown-control .mini` 這條 scoped 規則存在，且真的把寬度收回
+    `auto`（不是又意外繼承 100%）。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    css = (STATIC_DIR / "app.css").read_text(encoding="utf-8")
+    m = re.search(r"#cooldown-control\s+\.mini\s*\{([^}]*)\}", css)
+    assert m is not None, "缺少 #cooldown-control .mini 規則"
+    assert "width" in m.group(1) and "auto" in m.group(1)
 
 
 def test_risk_page_non_owner_hides_cooldown_section_entirely(order_client, fake_guard):

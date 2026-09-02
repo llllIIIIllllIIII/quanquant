@@ -109,3 +109,59 @@ def test_list_active_cooldowns_only_active_ascending_cross_user(session):
 
 def test_list_active_cooldowns_empty_when_none(session):
     assert brepo.list_active_cooldowns(session, now_ms=_NOW) == []
+
+
+# ---- R2-2（D-2，2026-09-02）：5 分鐘反悔窗——本人可自行取消，逾時後任何人都不行 ----
+# `lift_cooldown_by_owner` 取代 admin 提前解除（該路徑已停用，見 web/routers/admin.py）；
+# 時間窗判定寫進 SQL WHERE（`created_ts > now_ms-window_ms`），不只信任呼叫端算好的
+# 布林值——這裡直接用顯式 now_ms 覆蓋窗內/窗外兩種邊界，不 sleep。
+
+_5MIN = 5 * 60_000
+
+
+def test_lift_cooldown_by_owner_within_window_succeeds(session):
+    """邊界③：啟動後 4:59（未滿 5 分鐘反悔窗）本人可取消。"""
+    brepo.create_cooldown(session, user_id=1, until_ms=_NOW + _HOUR, now_ms=_NOW)
+    session.commit()
+    later = _NOW + 4 * 60_000 + 59_000
+    n = brepo.lift_cooldown_by_owner(session, user_id=1, now_ms=later, window_ms=_5MIN)
+    session.commit()
+    assert n == 1
+    assert brepo.active_cooldown(session, user_id=1, now_ms=later) is None
+
+
+def test_lift_cooldown_by_owner_after_window_rejected(session):
+    """邊界④：超過 5 分鐘反悔窗（5:01）後本人取消被拒——0 rowcount，列完全不受影響。"""
+    brepo.create_cooldown(session, user_id=1, until_ms=_NOW + _HOUR, now_ms=_NOW)
+    session.commit()
+    later = _NOW + 5 * 60_000 + 1_000
+    n = brepo.lift_cooldown_by_owner(session, user_id=1, now_ms=later, window_ms=_5MIN)
+    assert n == 0
+    assert brepo.active_cooldown(session, user_id=1, now_ms=later) is not None
+
+
+def test_lift_cooldown_by_owner_records_self_not_admin_as_lifter(session):
+    """解除者記自己（本人），不是 admin_user_id——R2-2 是自我取消，不是 admin 代管。"""
+    brepo.create_cooldown(session, user_id=1, until_ms=_NOW + _HOUR, now_ms=_NOW)
+    session.commit()
+    n = brepo.lift_cooldown_by_owner(session, user_id=1, now_ms=_NOW + 60_000, window_ms=_5MIN)
+    session.commit()
+    assert n == 1
+    row = session.exec(select(Cooldown).where(Cooldown.user_id == 1)).first()
+    assert row.lifted_by == 1 and row.lifted_ts == _NOW + 60_000
+
+
+def test_lift_cooldown_by_owner_no_active_row_returns_zero(session):
+    assert brepo.lift_cooldown_by_owner(session, user_id=42, now_ms=_NOW, window_ms=_5MIN) == 0
+
+
+def test_lift_cooldown_by_owner_scoped_to_target_user_only(session):
+    """只清指定 user 的列，不影響同時間窗內其他人的冷靜期。"""
+    brepo.create_cooldown(session, user_id=1, until_ms=_NOW + _HOUR, now_ms=_NOW)
+    brepo.create_cooldown(session, user_id=2, until_ms=_NOW + _HOUR, now_ms=_NOW)
+    session.commit()
+    n = brepo.lift_cooldown_by_owner(session, user_id=1, now_ms=_NOW + 60_000, window_ms=_5MIN)
+    session.commit()
+    assert n == 1
+    assert brepo.active_cooldown(session, user_id=1, now_ms=_NOW + 60_000) is None
+    assert brepo.active_cooldown(session, user_id=2, now_ms=_NOW + 60_000) is not None

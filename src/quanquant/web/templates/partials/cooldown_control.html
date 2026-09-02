@@ -1,30 +1,87 @@
+{# R2-2（D-2，2026-09-02）：啟動後 5 分鐘反悔窗內本人可自行取消（`can_cancel`／
+   `cancel_deadline_text` 由 web/routers/orders.py::_cooldown_cancel_window 算出，以 DB
+   created_ts 判斷、process 重啟不影響）；逾時後無任何解除路徑（含 admin，admin 頁已改
+   唯讀，見 admin_cooling_off.html）。R2-3：快捷時長（1 小時／1 天／1 週）由伺服器端以
+   「現在＋時長」換算，優先於自訂 `until` 欄位（見 set_cooldown 的 duration_preset 分支）。
+   R2-7：警示紅收斂成 --down token＋class（.risk-status-box.is-active），不再硬編
+   #c0392b；啟動鈕降為 .risk-btn-danger（同頁最多一顆 contrast，見 kill_switch_control.html
+   的「我的緊急停止」）。 #}
 <div id="cooldown-control" style="margin:0 0 1rem;display:flex;flex-direction:column;gap:.6rem;">
   {% if disabled|default(false) %}
-  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid var(--pico-muted-border-color,#ccc);">
+  <div class="risk-status-box">
     <span class="muted">⚪ 無法使用（下單子系統未啟用）</span>
   </div>
   {% elif cooldown %}
-  <!-- 冷靜期中：僅能平倉、無法開新倉；自己無法解除，只有管理員能提前解除（無解除表單是重點）。 -->
-  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid #c0392b;background:rgba(192,57,43,.12);">
-    <strong style="color:#c0392b;">🔒 冷靜期中</strong>
-    <div class="muted" style="font-size:.85em;margin-top:.3rem;">到期時間：{{ until_text }}</div>
-    <div style="margin-top:.3rem;"><strong>期間僅能平倉、無法下新（開倉）單；你無法自行解除，只有管理員能提前解除。</strong></div>
+  <!-- 冷靜期中：僅能平倉、無法開新倉。5 分鐘反悔窗內本人可取消；逾時後無任何解除路徑。 -->
+  <div class="risk-status-box is-active">
+    <strong class="risk-status-title">🔒 冷靜期中</strong>
+    <div class="muted risk-status-note">到期時間：{{ until_text }}</div>
+    <div class="risk-status-note"><strong>期間僅能平倉、無法下新（開倉）單。</strong></div>
+    {% if error %}<div class="risk-status-error">{{ error }}</div>{% endif %}
+    {% if can_cancel|default(false) %}
+    <div class="risk-status-note">
+      啟動 5 分鐘內可取消，可取消至 <strong>{{ cancel_deadline_text }}</strong>；
+      逾時後任何人（含管理員）都無法提前解除，只能等到期。
+    </div>
+    <form hx-post="/orders/cooldown/cancel" hx-target="#cooldown-control" hx-swap="outerHTML"
+          hx-confirm="確定要取消這次冷靜期嗎？" style="margin-top:.2rem;">
+      <button type="submit" class="risk-btn-danger" style="margin:0;">取消冷靜期</button>
+    </form>
+    {% else %}
+    <div class="risk-status-note warn">已超過 5 分鐘反悔窗，任何人（含管理員）都無法提前解除，只能等到期。</div>
+    {% endif %}
   </div>
   {% else %}
-  <!-- 未在冷靜期：可自我禁制，設定到期時間；啟動後自己無法解除。 -->
-  <div style="padding:.6rem .9rem;border-radius:6px;border:1px solid var(--pico-muted-border-color,#ccc);">
-    <div class="muted" style="font-size:.85em;margin-bottom:.3rem;">冷靜期＝自我禁制：設定一個到期時間，期間只能平倉出場、不能開新倉，agent 會一併斷線，且<strong>啟動後自己無法解除</strong>（只有管理員能提前解除）。</div>
-    {% if error %}<div style="color:#c0392b;font-size:.85em;margin-bottom:.3rem;">{{ error }}</div>{% endif %}
-    <form hx-post="/orders/cooldown" hx-target="#cooldown-control" hx-swap="outerHTML" style="margin:0;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;">
-      <input type="text" name="until" required autocomplete="off"
-             placeholder="點選或輸入到期時間" style="margin:0;max-width:15rem;">
-      <button type="submit" class="contrast" style="margin:0;"
-              hx-confirm="冷靜期一旦啟動就無法自行解除、期間無法開新倉，只有管理員能提前解除。確定啟動？">啟動冷靜期</button>
-    </form>
+  <!-- 未在冷靜期：可自我禁制，用快捷時長或自訂到期時間；啟動後 5 分鐘內可取消，逾時後
+       任何人（含管理員）都無法提前解除。 -->
+  <div class="risk-status-box">
+    <div class="muted risk-status-note">
+      冷靜期＝自我禁制：期間只能平倉出場、不能開新倉，agent 會一併斷線。
+      <strong>啟動後 5 分鐘內可取消</strong>；逾時後任何人（含管理員）都無法提前解除，只能等到期。
+    </div>
+    {% if error %}<div class="risk-status-error">{{ error }}</div>{% endif %}
+    {# 終審 MEDIUM #3：hx-confirm 只在「發請求的元素」（帶 hx-post 的 form）或其祖先上才會
+       生效，htmx 2.0.4 的 getClosestAttributeValue 不會往下找子孫 button——原本 3 顆快捷
+       鈕擠在同一個 form 裡、confirm 掛在各自的 button 上完全不會跳出來，一按就直接鎖
+       1 週。改成每顆快捷鈕各自一個小 form（各帶自己的到期文案），自訂路徑也是獨立 form，
+       四個 form 各自完整帶 hx-post/hx-target/hx-swap/hx-confirm。 #}
+    <div style="display:flex;flex-direction:column;gap:.5rem;">
+      <div style="display:flex;gap:.4rem;flex-wrap:wrap;align-items:center;">
+        <span class="muted risk-status-note" style="margin:0;">快捷：</span>
+        <form hx-post="/orders/cooldown" hx-target="#cooldown-control" hx-swap="outerHTML"
+              hx-confirm="啟動 1 小時冷靜期。啟動 5 分鐘內可取消；逾時後任何人（含管理員）都無法提前解除，只能等到期。確定啟動？"
+              style="margin:0;">
+          <input type="hidden" name="duration_preset" value="1h">
+          <button type="submit" class="secondary mini" style="margin:0;">1 小時</button>
+        </form>
+        <form hx-post="/orders/cooldown" hx-target="#cooldown-control" hx-swap="outerHTML"
+              hx-confirm="啟動 1 天冷靜期。啟動 5 分鐘內可取消；逾時後任何人（含管理員）都無法提前解除，只能等到期。確定啟動？"
+              style="margin:0;">
+          <input type="hidden" name="duration_preset" value="1d">
+          <button type="submit" class="secondary mini" style="margin:0;">1 天</button>
+        </form>
+        <form hx-post="/orders/cooldown" hx-target="#cooldown-control" hx-swap="outerHTML"
+              hx-confirm="啟動 1 週冷靜期。啟動 5 分鐘內可取消；逾時後任何人（含管理員）都無法提前解除，只能等到期。確定啟動？"
+              style="margin:0;">
+          <input type="hidden" name="duration_preset" value="1w">
+          <button type="submit" class="secondary mini" style="margin:0;">1 週</button>
+        </form>
+      </div>
+      <form hx-post="/orders/cooldown" hx-target="#cooldown-control" hx-swap="outerHTML"
+            hx-confirm="冷靜期啟動 5 分鐘內可取消；逾時後任何人（含管理員）都無法提前解除，只能等到期。確定啟動？"
+            style="margin:0;display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;">
+        <input type="text" name="until" autocomplete="off"
+               placeholder="或自訂到期時間" style="margin:0;max-width:15rem;">
+        <button type="submit" class="risk-btn-danger" style="margin:0;">啟動冷靜期（自訂時間）</button>
+      </form>
+    </div>
     <script>
       // flatpickr 由 risk.html head 載入（005：冷靜期控制隨本片段一併搬到風險控管頁）；
       // 此段在初始渲染與 htmx 換入（含錯誤重繪）時都會執行。
       // CDN 失效時退回原生 datetime-local，表單仍可用（後端 fromisoformat 兩種格式都收）。
+      // R2-3：快捷時長按鈕是真正的 submit 按鈕（name="duration_preset"），到期時間由
+      // 伺服器端以「現在＋時長」換算——不靠這裡的 JS 算數，避免 client 時鐘/時區誤差；
+      // 自訂欄位的 flatpickr 綁定維持不變。
       (function () {
         var el = document.querySelector("#cooldown-control input[name='until']");
         if (!el) return;

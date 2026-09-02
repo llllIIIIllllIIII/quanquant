@@ -64,8 +64,10 @@ def _authenticate(session_factory, risk_guard, raw_token: str) -> int | None:
 
 def _connection_blocked(state, session_factory, user_id: int) -> bool:
     """WS 連線 gate（同步 DB 工作，呼叫端須 to_thread）：手動斷線（in-memory
-    `agent_connection_gate`，D9）或冷靜期（DB `active_cooldown`，持久化、admin-only 解除）
-    任一命中即封鎖。gate 缺席（in-process/wiring 未完成）視為未封鎖，不影響連線。"""
+    `agent_connection_gate`，D9）或冷靜期（DB `active_cooldown`，持久化；R2-2／D-2，
+    2026-09-02：僅本人可在啟動後 5 分鐘反悔窗內自行取消，逾時後任何人（含 admin）都無法
+    提前解除，只能等到期）任一命中即封鎖。gate 缺席（in-process/wiring 未完成）視為未封鎖，
+    不影響連線。"""
     gate = getattr(state, "agent_connection_gate", None)
     if gate is not None and gate.is_blocked(user_id):
         return True
@@ -104,8 +106,9 @@ async def agent_ws(websocket: WebSocket) -> None:
         return
     # 連線 gate（D9/D11）：手動斷線（in-memory gate）或冷靜期（DB active_cooldown）中的 user，
     # 拒絕（重）連——擋 agent 端自動重連，直到使用者在下單頁按「允許 Agent 重連」、或冷靜期
-    # 到期/admin 解除。1008 與驗證失敗同碼（不對外洩漏被拒的精確原因；下單頁本就顯示斷線/
-    # 冷靜期狀態讓使用者知道為何）。
+    # 到期（R2-2／D-2：僅本人可在啟動後 5 分鐘反悔窗內自行取消，逾時後任何人（含 admin）
+    # 都無法提前解除，只能等到期）。1008 與驗證失敗同碼（不對外洩漏被拒的精確原因；下單頁
+    # 本就顯示斷線/冷靜期狀態讓使用者知道為何）。
     if await asyncio.to_thread(_connection_blocked, state, session_factory, agent_user_id):
         log.info("agent WS：user_id=%s 目前被封鎖連線（手動斷線/冷靜期），拒絕", agent_user_id)
         await websocket.close(code=1008)

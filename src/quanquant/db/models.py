@@ -663,17 +663,21 @@ class Cooldown(SQLModel, table=True):
     `check_place` 只放行平倉（octype='Cover'）、擋開新倉（New/Auto），並一併斷開該 user 的
     agent 連線＋擋重連（見 broker/risk.py::check_place 與 web/routers/agent_ws.py 連線 gate）。
 
-    **自己解不掉**：到期（`until_ts <= now`）自動失效，或由 admin 提前解除（寫
-    `lifted_ts`/`lifted_by`）。時間一律真 UTC epoch-ms（`datetime.now(timezone.utc)`，見
-    repository.now_epoch_ms），until 由 datetime-local 以固定 +08:00 解析（台灣無 DST），
-    兩邊同框可比。
+    **反悔窗，非「自己解不掉」**（R2-2／D-2，2026-09-02 改版）：到期（`until_ts <= now`）
+    自動失效；啟動後 5 分鐘反悔窗內僅本人可自行取消（寫 `lifted_ts`/`lifted_by=user_id`
+    本人，見 web/routers/orders.py::cancel_cooldown、repository.lift_cooldown_by_owner）；
+    逾時後任何人（含 admin）都無法提前解除，只能等到期——admin 提前解除的舊路徑已停用
+    （見 web/routers/admin.py::lift_cooling_off，一律 403）。時間一律真 UTC epoch-ms
+    （`datetime.now(timezone.utc)`，見 repository.now_epoch_ms），until 由 datetime-local
+    以固定 +08:00 解析（台灣無 DST），兩邊同框可比。
 
     **刻意不用 partial-unique index**（broker_positions 的 `status='open'` 是事件翻轉欄位；
     冷靜期到期是**時間**判定、無欄位可翻，partial-unique on `lifted_ts IS NULL` 會把「到期
     未解除」的舊列永久卡住新列）——改用 plain index on `user_id` ＋ app 層
     「已在冷靜期則拒絕新建」（repository.create_cooldown，同時擋自我縮短/重設）。active 定義
-    ＝`lifted_ts IS NULL AND until_ts > now`；admin lift 清該 user 全部 unlifted 列。走
-    SQLModel.metadata.create_all 自動建（同上方既有新表範式，兩方言通用）。"""
+    ＝`lifted_ts IS NULL AND until_ts > now`；反悔窗內的自我取消（`lift_cooldown_by_owner`）
+    清該 user 全部 unlifted 列。走 SQLModel.metadata.create_all 自動建（同上方既有新表範式，
+    兩方言通用）。"""
 
     __tablename__ = "cooldowns"
 
@@ -681,7 +685,7 @@ class Cooldown(SQLModel, table=True):
     user_id: int = Field(index=True)
     until_ts: int = Field(sa_column=Column(BigInteger, nullable=False))     # 到期 epoch-ms UTC
     created_ts: int = Field(sa_column=Column(BigInteger, nullable=False))   # 建立 epoch-ms UTC
-    lifted_by: int | None = None                                            # admin user_id（提前解除者）；NULL=未解除
+    lifted_by: int | None = None                                            # 取消者 user_id（僅反悔窗內本人，非 admin）；NULL=未解除
     lifted_ts: int | None = Field(                                          # 解除 epoch-ms UTC；NULL=未解除
         default=None, sa_column=Column(BigInteger, nullable=True)
     )
