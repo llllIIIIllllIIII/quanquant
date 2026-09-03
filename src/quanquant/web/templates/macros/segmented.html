@@ -1,0 +1,25 @@
+{# R2-10：正式／模擬（sim/real）分頁的共用 segmented control 元件。
+
+   由來：orders.html／journal.html／stats.html 各自手寫三元條件決定哪一顆該長成 Pico 的
+   `contrast`（原設計語意：白＝選中、藍＝未選中，但反而讓「未選中」看起來比較顯眼），
+   orders.html 那份寫反了條件（P0-1）——同樣的 bug 以後還會在新頁面重犯。改成單一 macro，
+   選中/未選中的判斷只寫這一份，往後任何頁面呼叫都不會再寫反。
+
+   視覺語言與 001 買/賣分段開關（.side-toggle/.side-opt，見 app.css）同源，但選中色改用
+   中性 --qq-accent（mode 不是漲跌方向，不可用 --rise/--fall，避免讓人誤以為「模擬」跟
+   「跌」是同一件事）。
+
+   Accessibility：外層 `role="radiogroup"`＋逐項 `role="radio"` + `aria-checked` 讓螢幕
+   閱讀器讀出「這是一組單選」；`<a>` 原生可鍵盤聚焦與 Enter 觸發，不需額外 JS 或 tabindex。
+   mode 切換本質是導覽（換頁／換 query string），故用 `<a href>` 而非表單 radio input——
+   與買賣開關（送出同一張表單的欄位）語意不同，這裡刻意不用 <input type="radio">。 #}
+{% macro mode_tabs(mode, base_path, extra_qs="") %}
+<div class="segmented-control mode-tabs" role="radiogroup" aria-label="執行模式">
+  <a role="radio" aria-checked="{{ 'true' if mode == 'real' else 'false' }}"
+     class="segmented-option{{ ' is-selected' if mode == 'real' else '' }}"
+     href="{{ base_path }}?mode=real{{ extra_qs }}">正式</a>
+  <a role="radio" aria-checked="{{ 'true' if mode == 'sim' else 'false' }}"
+     class="segmented-option{{ ' is-selected' if mode == 'sim' else '' }}"
+     href="{{ base_path }}?mode=sim{{ extra_qs }}">模擬</a>
+</div>
+{% endmacro %}

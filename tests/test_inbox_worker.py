@@ -4,6 +4,7 @@ asyncio.Queue——QueueFull 這個攻擊面已被架構消除）逐列一交易
 Deal 重播冪等只補 processed 不重跑帳務、序列化鎖防兩協程同時改同一 BrokerPosition。"""
 import asyncio
 import json
+import logging
 import threading
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -143,6 +144,163 @@ def test_worker_scoped_to_user_id_ignores_other_users_rows(session, engine):
         rows = s.exec(select(RawInbox)).all()
         assert len(rows) == 2
         assert all(r.processed is False and r.quarantine is False for r in rows)  # 完全沒被動到
+
+
+# ---------------------------------------------------------------------------
+# 007（批次 B-1）：Deal 落地／委託回報事件——user-scoped、只送給 owner；一筆 Deal 一事件
+# （滑價一價一橫幅天然成立）；不影響既有無資料 orders-changed 廣播 ping。
+#
+# CRITICAL-1（fresh-context opus 終審修復，2026-09）：`_process_deal`/`_process_order_
+# report` 現在只把事件 append 進 `worker._pending_events`（可能跑在 worker thread 上，
+# 見 inbox_worker.py `run()`/`process_batch_once` docstring）——真正呼叫 hub、把事件送進
+# `asyncio.Queue` 的動作，搬到 `worker._flush_pending_events()`（只能在 event loop 執行
+# 緒上呼叫）。下面這 6 個測試直接同步呼叫 `process_batch_once()`（單一測試執行緒，呼叫
+# `_flush_pending_events()` 本身安全），呼叫完後補一行 `worker._flush_pending_events()`
+# 才能在 queue 上看到事件——這 6 個測試驗證的是「payload 內容/事件種類/user 隔離」等業務
+# 邏輯，不驗證跨執行緒安全本身；跨執行緒安全（真正的 CRITICAL-1 重現）另見
+# `test_deal_landing_publish_runs_on_loop_thread_safe_under_asyncio_debug_mode`（走真正
+# 的 `run()` + `asyncio.to_thread` + `loop.set_debug(True)`）。
+# ---------------------------------------------------------------------------
+
+def test_deal_landing_publishes_scoped_deal_event_to_owner(session, engine):
+    """①：成交落地觸發一個 user-scoped 'deal' 事件，payload 含商品/方向/口數/價格。"""
+    _seed_order(session)  # user_id=1
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    queue = hub.subscribe(user_id=1)
+    assert worker.process_batch_once() == 1
+    worker._flush_pending_events()  # CRITICAL-1：直呼 process_batch_once 不再自動送出事件
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    deal_events = [e for e in events if e["event"] == "deal"]
+    assert len(deal_events) == 1
+    payload = deal_events[0]["payload"]
+    assert payload["symbol"] == "TXF"
+    assert payload["action"] == "Buy"
+    assert payload["qty"] == 1
+    assert payload["price"] == "18000"
+
+
+def test_deal_landing_also_publishes_order_report_reflecting_new_status(session, engine):
+    """委託狀態變化（部分成交/全部成交）是 Deal 落地觸發 apply_order_fill 的直接結果——
+    同一次落地也要發一個 'order-report' 事件，反映委託目前的最新狀態，不只有成交事件。"""
+    _seed_order(session)  # qty=1，成交 1 口後應轉 filled
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    queue = hub.subscribe(user_id=1)
+    assert worker.process_batch_once() == 1
+    worker._flush_pending_events()
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get_nowait())
+    kinds = {e["event"] for e in events}
+    assert kinds == {"deal", "order-report"}
+    order_evt = next(e for e in events if e["event"] == "order-report")
+    assert order_evt["payload"]["status"] == "filled"
+    assert order_evt["payload"]["symbol"] == "TXF"
+
+
+def test_multiple_deals_in_one_batch_each_publish_a_separate_scoped_event(session, engine):
+    """②：市價單滑價分兩口不同價成交——一次批次內兩筆 Deal，各自觸發一個獨立的
+    'deal' 事件（不聚合成一條），前端才能一價一橫幅。"""
+    _seed_order(session, qty=2)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="F1", price="18000")),
+        )
+        brepo.stage_raw_inbox(
+            s, kind="deal_report", broker="shioaji",
+            payload=json.dumps(_deal_payload(fill_id="F2", price="18010")),
+        )
+        s.commit()
+
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    queue = hub.subscribe(user_id=1)
+    assert worker.process_batch_once() == 2
+    worker._flush_pending_events()
+
+    deal_prices = []
+    while not queue.empty():
+        item = queue.get_nowait()
+        if item["event"] == "deal":
+            deal_prices.append(item["payload"]["price"])
+    assert sorted(deal_prices) == ["18000", "18010"]  # 兩筆各自獨立的事件，兩個價格都在
+
+
+def test_deal_landing_event_not_delivered_to_a_different_users_subscriber(session, engine):
+    """③：非 owner 收不到——另一個 user 的訂閱者完全收不到這筆 Deal 的任何事件。"""
+    _seed_order(session)  # user_id=1
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    owner_queue = hub.subscribe(user_id=1)  # 真正的 owner——用來證明事件確實有送出
+    other_queue = hub.subscribe(user_id=2)  # 不是這筆委託的 owner
+    assert worker.process_batch_once() == 1
+    worker._flush_pending_events()
+    assert not owner_queue.empty()  # 事件確實送出了（不是因為根本沒送出才收不到）
+    assert other_queue.empty()
+
+
+def test_order_report_status_change_publishes_scoped_order_report_event(session, engine):
+    """委託回報（券商 callback，如 cancelled）落地時發一個 user-scoped 'order-report' 事件。"""
+    _seed_order(session)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="cancelled",
+        )))
+        s.commit()
+
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    queue = hub.subscribe(user_id=1)
+    assert worker.process_batch_once() == 1
+    worker._flush_pending_events()
+
+    item = queue.get_nowait()
+    assert item["event"] == "order-report"
+    assert item["payload"]["status"] == "cancelled"
+    assert item["payload"]["symbol"] == "TXF"
+
+
+def test_replayed_deal_report_does_not_republish_events(session, engine):
+    """冪等重播（watchdog 對帳補進同一筆 fill_id）只補 processed，不重跑帳務——同理也不得
+    重複發送成交/委託回報事件，否則同一筆成交會被展示兩次，誤導使用者。"""
+    _seed_order(session)
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    queue = hub.subscribe(user_id=1)
+    assert worker.process_batch_once() == 1
+    worker._flush_pending_events()
+    assert not queue.empty()  # 第一次落地：有事件
+    while not queue.empty():
+        queue.get_nowait()
+
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
+        s.commit()
+    assert worker.process_batch_once() == 1  # 仍算「處理完」（mark_raw_inbox_processed）
+    worker._flush_pending_events()
+    assert queue.empty()  # 但重播冪等路徑不再重發任何事件
 
 
 def test_unresolvable_order_correlation_quarantines_not_dropped(session, engine):
@@ -897,6 +1055,92 @@ def test_request_wake_processes_new_row_faster_than_idle_interval(engine):
     with Session(engine) as s:
         row = s.exec(select(RawInbox)).first()
         assert row.processed is True
+
+
+def test_deal_landing_scoped_event_coexists_with_unaffected_broadcast_ping(engine):
+    """④：既有 `orders-changed` 廣播 ping（`subscribe()` 無參數、`run()` 迴圈 handled>0
+    才 `publish()`）在新增 007 的 scoped 事件之後行為完全不變——同一批落地同時觸發兩種
+    訊號，各自送到各自的訂閱者，互不干擾、互不取代。"""
+    with Session(engine) as s:
+        _seed_order(s)  # user_id=1
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+
+    async def scenario():
+        run_task = asyncio.create_task(worker.run())
+        await _wait_until_loop_captured(worker)
+        broadcast_queue = hub.subscribe()       # 既有無資料廣播訂閱者（如另一個分頁）
+        owner_queue = hub.subscribe(user_id=1)  # 這筆委託的當事人
+
+        with Session(engine) as s:
+            brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
+                                   payload=json.dumps(_deal_payload()))
+            s.commit()
+        worker.request_wake()
+
+        broadcast_item = await asyncio.wait_for(broadcast_queue.get(), timeout=1.0)
+        owner_item = await asyncio.wait_for(owner_queue.get(), timeout=1.0)
+
+        await worker.stop_and_drain(timeout=1.0)
+        await run_task
+        return broadcast_item, owner_item
+
+    # debug=True：與 CRITICAL-1 的重現/回歸測試同規格（見下一個測試），這裡也順便驗證
+    # ping 與 scoped 事件並存不會觸發 asyncio 的跨執行緒不變式檢查。
+    broadcast_item, owner_item = asyncio.run(scenario(), debug=True)
+    assert broadcast_item == "1"  # 既有 orders-changed ping 語意逐位元不變
+    assert owner_item["event"] in ("deal", "order-report")  # scoped 事件也照常送達，互不排擠
+
+
+def test_deal_landing_publish_runs_on_loop_thread_safe_under_asyncio_debug_mode(engine, caplog):
+    """CRITICAL-1（fresh-context opus 終審修復）：`process_batch_once()` 整批在
+    `asyncio.to_thread()` 裡執行（worker thread，見 `run()`）；`_process_deal`/
+    `_process_order_report` 若直接呼叫 hub 的 `publish_deal`/`publish_order_report`
+    （進而 `asyncio.Queue.put_nowait`），就是從非本執行緒操作 `asyncio.Queue`——違反
+    thread-affinity 不變式。`loop.set_debug(True)` 下，若這個 queue 當下有人正在
+    `await queue.get()`（本測試就是這樣：先掛上 `asyncio.wait_for(queue.get(), ...)`
+    再觸發批次），非本執行緒的 `put_nowait` 會促使 asyncio 排程一個 callback 回原執行緒
+    （`Future.set_result` → `loop.call_soon`），debug 模式下的執行緒檢查會直接
+    RuntimeError；且這個例外原本會被 `process_batch_once` 逐列的 `except Exception`
+    吞掉（該列不計 handled，SSE 靜默降級，不會讓 pytest 顯式失敗，只會逾時）。
+
+    這裡真正走 `run()` 的 async 路徑（`asyncio.to_thread` 真實跨執行緒），在
+    `asyncio.run(..., debug=True)` 下斷言：①不逾時、事件確實送達（不是被吞掉例外後
+    卡住）；②這一列確實被算進「處理完」（`processed=True`，不是卡在 quarantine=False/
+    processed=False 的半吊子狀態）；③沒有任何「處理時發生未預期例外」的 log（證明沒有
+    例外被靜默吞掉——CRITICAL-1 修復前的確切失敗模式）。"""
+    caplog.set_level(logging.ERROR, logger="quanquant.broker.inbox_worker")
+    with Session(engine) as s:
+        _seed_order(s)  # user_id=1
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+
+    async def scenario():
+        run_task = asyncio.create_task(worker.run())
+        await _wait_until_loop_captured(worker)
+        queue = hub.subscribe(user_id=1)  # 掛上 waiter——重現條件（見 docstring）
+
+        with Session(engine) as s:
+            brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
+                                   payload=json.dumps(_deal_payload()))
+            s.commit()
+        worker.request_wake()
+
+        # 若 CRITICAL-1 重現（例外被吞、該列不計 handled），這裡會逾時而非拿到事件。
+        item = await asyncio.wait_for(queue.get(), timeout=1.0)
+
+        await worker.stop_and_drain(timeout=1.0)
+        await run_task
+        return item
+
+    item = asyncio.run(scenario(), debug=True)
+    assert item["event"] in ("deal", "order-report")
+
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.processed is True  # 這一批真的算「處理完」，不是被吞掉例外後卡住
+
+    assert "處理時發生未預期例外" not in caplog.text  # 沒有例外被靜默吞掉
 
 
 def test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effective(engine):

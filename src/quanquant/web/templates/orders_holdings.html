@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% from "macros/segmented.html" import mode_tabs %}
+{% block content %}
+
+<div class="journal-head">
+  <h3>未平倉</h3>
+</div>
+
+{{ mode_tabs(mode, '/orders/holdings') }}
+
+<div hx-ext="sse" sse-connect="/orders/stream">
+  <div class="table-wrap">
+    <div hx-get="/orders/positions?mode={{ mode }}"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+  </div>
+</div>
+
+{% endblock %}

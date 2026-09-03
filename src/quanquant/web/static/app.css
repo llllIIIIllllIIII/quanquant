@@ -317,8 +317,65 @@ td.note { max-width: 14rem; }
 }
 .side-radio:focus-visible + .side-opt { outline: 2px solid var(--qq-accent); outline-offset: -2px; }
 
-.badge { font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 999px; }
-.badge.open { background: rgba(240, 185, 11, 0.18); color: #f0b90b; }
+/* ---- R2-10：mode（正式／模擬）共用 segmented control（macros/segmented.html），視覺同源
+   於上面的買/賣分段開關，但選中色用中性 --qq-accent（mode 不是漲跌方向）。 ---- */
+.segmented-control {
+  display: inline-flex; border: 1px solid var(--qq-border); border-radius: var(--qq-radius-sm);
+  overflow: hidden; margin: 0.75rem 0;
+}
+.segmented-option {
+  padding: 0.4rem 1.1rem; margin: 0; text-decoration: none; cursor: pointer;
+  color: var(--qq-text-muted); font-weight: 600; font-size: 0.85rem; user-select: none;
+  border-right: 1px solid var(--qq-border);
+}
+.segmented-option:last-child { border-right: none; }
+.segmented-option.is-selected {
+  color: var(--qq-accent); background: color-mix(in srgb, var(--qq-accent) 16%, transparent);
+  box-shadow: inset 0 0 0 1px var(--qq-accent);
+}
+.segmented-option:hover { color: var(--qq-text); }
+.segmented-option.is-selected:hover { color: var(--qq-accent); }
+.segmented-option:focus-visible { outline: 2px solid var(--qq-accent); outline-offset: -2px; }
+
+/* ---- 006：下單頁「未平倉/浮動損益/可動用保證金」精簡條——單列、不佔表格版面。 ---- */
+.pos-strip {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem 1.5rem;
+  padding: 0.6rem 0.9rem; margin: 0.75rem 0;
+  background: var(--qq-surface); border: 1px solid var(--qq-border); border-radius: var(--qq-radius-lg);
+  font-size: 0.88rem;
+}
+.pos-strip-seg { display: flex; align-items: center; gap: 0.4rem; color: var(--qq-text-muted); }
+.pos-strip-seg .dir, .pos-strip-seg .pnl { font-family: var(--qq-font-mono); font-variant-numeric: tabular-nums; }
+.pos-strip-margin { margin-left: auto; }
+@media (max-width: 767px) { .pos-strip-margin { margin-left: 0; } }
+
+/* ---- 006：主導覽「交易」大類下拉（Pico .dropdown，同 .user-menu 慣例） ---- */
+.nav-trade { position: relative; }
+.nav-trade summary {
+  list-style: none; cursor: pointer;
+  padding: 0.55rem 0.8rem; color: var(--qq-text-muted); font-size: 0.92rem;
+  border-bottom: 2px solid transparent;
+}
+.nav-trade summary::-webkit-details-marker { display: none; }
+.nav-trade summary.active { color: var(--qq-text); font-weight: 700; border-bottom-color: var(--qq-accent); }
+.nav-trade ul { min-width: 8rem; }
+.nav-trade ul a.active { color: var(--qq-accent); font-weight: 700; }
+
+.badge {
+  font-size: 0.72rem; padding: 0.1rem 0.45rem; border-radius: 999px;
+  border: 1px solid var(--qq-border); color: var(--qq-text-muted); white-space: nowrap;
+}
+.badge.open { background: rgba(240, 185, 11, 0.18); color: #f0b90b; border-color: transparent; }
+
+/* ---- 006（P1-9）：委託狀態小標籤配色——filled 用固定成功色 --up（非漲跌語意，狀態不隨
+   紅綠偏好翻轉）；進行中用中性 accent；cancelled 用靜音灰；failed/unknown 用固定警示色
+   --down。 ---- */
+.badge-status-filled { background: color-mix(in srgb, var(--up) 16%, transparent); color: var(--up); border-color: transparent; }
+.badge-status-submitted, .badge-status-partfilled, .badge-status-sending, .badge-status-pending {
+  background: color-mix(in srgb, var(--qq-accent) 16%, transparent); color: var(--qq-accent); border-color: transparent;
+}
+.badge-status-cancelled { background: var(--qq-surface-2); color: var(--qq-text-muted); border-color: transparent; }
+.badge-status-failed, .badge-status-unknown { background: color-mix(in srgb, var(--down) 15%, transparent); color: var(--down); border-color: transparent; }
 .tag { display: inline-block; font-size: 0.72rem; padding: 0.1rem 0.45rem; margin: 0.1rem;
   border-radius: var(--qq-radius-sm); background: var(--qq-surface-2);
   border: 1px solid var(--qq-border); }

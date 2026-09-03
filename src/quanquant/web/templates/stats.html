@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros/segmented.html" import mode_tabs %}
 
 {% macro metric_cards(m) %}
 <div class="cards">
@@ -49,10 +50,7 @@
   </div>
 </div>
 
-<div class="mode-tabs" role="tablist">
-  <a role="button" class="{{ '' if f.mode == 'sim' else 'contrast' }}" href="/stats?mode=real">正式</a>
-  <a role="button" class="{{ 'contrast' if f.mode == 'sim' else '' }}" href="/stats?mode=sim">模擬</a>
-</div>
+{{ mode_tabs(f.mode, '/stats') }}
 
 <form class="filterbar card-bar" method="get" action="/stats">
   <input type="hidden" name="mode" value="{{ f.mode }}">

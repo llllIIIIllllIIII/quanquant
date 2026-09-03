@@ -67,6 +67,27 @@ DealMapper = Callable[..., Fill]  # (payload, *, account=...) -> Fill（Inc1 D5/
 OrderReportMapper = Callable[..., OrderReport]  # (payload, *, account=...) -> OrderReport（同上）
 
 
+def _order_report_event_payload(order: Order) -> dict:
+    """007（批次 B-1）：`order-report` SSE 事件的 payload——`_process_deal`（Deal 觸發
+    apply_order_fill 造成的部分成交/全部成交）與 `_process_order_report`（券商 callback
+    的已送出/已取消/失敗等）共用同一個 shape，前端不需要分兩種格式解析。
+
+    價格取 `avg_fill_price`（已有成交時，均價比原始掛單價更有意義）、缺值時 fallback 回
+    `order.price`（尚未成交的委託，如剛送出/被取消）。`error_message` 目前固定 None——
+    `Order`/`OrderReport` 資料模型都沒有回報失敗原因的欄位（券商 callback 只給狀態碼，
+    見 ShioajiAdapter._map_order_report），留著這個欄位是為了讓 payload shape 穩定、
+    B-3 前端不用等後續補欄位就能先接線；同步下單失敗（RiskError/OrderError）的訊息走既有
+    HTTP 回應本身，不經這條 SSE 路徑，見本檔模組 docstring 與 007 規格「不要動到的部分」。
+    """
+    price = order.avg_fill_price if order.avg_fill_price is not None else order.price
+    return {
+        "symbol": order.symbol, "action": order.action, "qty": order.qty,
+        "filled_qty": order.filled_qty, "price": str(price), "status": order.status,
+        "octype": order.octype, "broker_order_id": order.broker_order_id,
+        "error_message": None,
+    }
+
+
 class RawInboxDeadLetterError(Exception):
     """Inc1 D5/R2-6：代表這列 raw_inbox 應該**永久** dead-letter，不進 `association_pending`
     的 unquarantine 重試迴圈——reason 必須是 `repository.DEAD_LETTER_QUARANTINE_REASONS`
@@ -247,6 +268,21 @@ class RawInboxWorker:
         # loop 的 Shioaji SDK callback thread）安全地 `call_soon_threadsafe` 回這個 loop；
         # worker 尚未啟動或已經停止時這裡是 None，`request_wake()` 據此判斷安靜 no-op。
         self._loop: asyncio.AbstractEventLoop | None = None
+        # CRITICAL-1（fresh-context opus 終審修復，2026-09）：`process_batch_once()`
+        # 整批在 `asyncio.to_thread()` 裡執行（見 `run()`）——`_process_deal`/
+        # `_process_order_report` 因此可能跑在 worker thread 上，不能直接呼叫
+        # `self._order_events.publish_deal`/`publish_order_report`（內部是
+        # `asyncio.Queue.put_nowait`，不是 thread-safe，`loop.set_debug(True)` 下非本
+        # 執行緒操作會直接 RuntimeError；非 debug 模式下則是隱性資料競態，且該例外會被
+        # `process_batch_once` 逐列 `except Exception` 吞掉，該列不計 handled、SSE 靜默
+        # 降級，見 `test_deal_landing_publish_runs_on_loop_thread_safe_under_asyncio_
+        # debug_mode` 的重現）。改成：commit 成功後只把 (kind, user_id, payload) 三元組
+        # append 進這個 list（純 Python list.append，哪個執行緒呼叫都安全）；真正呼叫 hub
+        # 的動作留給 `_flush_pending_events()`，只在 event loop 執行緒上呼叫（`run()` 在
+        # `await asyncio.to_thread(...)` 回來後那一刻，或測試直接呼叫）。單一 worker
+        # 實例、批次序列化於 `supervisor.lock`，同一時間只有一個批次在累積／清空這個
+        # list，不需要額外的鎖。
+        self._pending_events: list[tuple[str, int, dict]] = []
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -260,6 +296,15 @@ class RawInboxWorker:
                 self._wake.clear()
                 async with self._supervisor.lock:
                     handled = await asyncio.to_thread(self.process_batch_once)
+                # CRITICAL-1：to_thread 回來的這一刻已經確定回到 event loop 執行緒——
+                # `_flush_pending_events()` 把批次期間（可能在 worker thread 上）累積的
+                # 帶 payload 事件，在這裡才真正送進 hub（asyncio.Queue.put_nowait 只能在
+                # 本執行緒呼叫）。「先 flush scoped、後發 ping」的順序是**刻意且 load-bearing
+                # 的**：queue 滿時採 drop-oldest（見 order_events.py `_put_evicting_oldest`），
+                # ping 最後入列才保證它不會被同一批 >8 筆的 scoped 洪峰擠掉——ping 一掉，
+                # 委託/成交/部位三頁該批次就不刷新。對調這兩行會讓 MEDIUM-4 原樣復活
+                # （反向測試釘在 test_order_events.py::test_ping_published_before_burst_gets_evicted）。
+                self._flush_pending_events()
                 # 有列真的落地了（成交/委託狀態變更）→ 推 SSE，瀏覽器據此重抓委託/部位（取代盲輪詢）。
                 # 發布點在 to_thread 回來後、已回到 event loop 執行緒，故可直接呼叫、不需 call_soon_threadsafe。
                 if handled and self._order_events is not None:
@@ -268,6 +313,22 @@ class RawInboxWorker:
                     await self._wait_for_stop_or_wake()
         finally:
             self._loop = None
+
+    def _flush_pending_events(self) -> None:
+        """CRITICAL-1：把 `_pending_events` 清空並逐一送進 hub——呼叫端必須保證這是在
+        event loop 執行緒上執行（`run()` 在 `await asyncio.to_thread(...)` 回來後呼叫；
+        直接呼叫 `process_batch_once()` 的測試單執行緒跑，呼叫這個方法一樣安全）。先把
+        list 換成新的空 list 再迭代舊內容，避免迭代期間又有人 append 進同一個 list
+        （目前的呼叫方式不會發生，但這樣寫本身就不依賴這個假設）。`self._order_events`
+        為 None（下單子系統停用／測試未接線）時單純清空、不呼叫任何東西。"""
+        pending, self._pending_events = self._pending_events, []
+        if self._order_events is None:
+            return
+        for kind, owner_id, payload in pending:
+            if kind == "deal":
+                self._order_events.publish_deal(user_id=owner_id, payload=payload)
+            else:
+                self._order_events.publish_order_report(user_id=owner_id, payload=payload)
 
     async def _wait_for_stop_or_wake(self) -> None:
         """等 `_stop` 或 `_wake` 任一被 set，逾時 `self._idle_interval` 秒即返回——取代原本
@@ -604,12 +665,38 @@ class RawInboxWorker:
         # PositionTracker.apply_fill 內部會自行以複合 scope 重新解析 order 並在成功時呼叫
         # brepo.apply_order_fill 更新 filled_qty/avg_fill_price/status（round3 #12）；
         # 這裡不再額外呼叫一次 apply_order_fill，避免同一筆 fill 的 filled_qty 被累加兩次。
+        # 注意：`apply_fill` 內部（`PositionTracker._resolve_order`）用同一個 `session` 以
+        # 複合鍵重新查詢同一張 Order——SQLAlchemy identity map 保證回傳同一個 Python 物件，
+        # 故下面直接讀這個 scope 內的 `order` 變數就能看到 apply_order_fill 剛寫入的最新
+        # filled_qty/avg_fill_price/status，不需要再查一次。
         self._tracker.apply_fill(session, resolved_fill, user_id=order.user_id)
 
         deal.processed = True
         session.add(deal)
         brepo.mark_raw_inbox_processed(session, row)
+
+        # 007（批次 B-1）：一筆 Deal 落地＝一個 user-scoped 'deal' 事件（滑價一價一橫幅天然
+        # 成立，不聚合）；同一次落地也順帶發一個 'order-report'，反映這筆 fill 之後委託的
+        # 最新狀態（部分成交/全部成交這兩種狀態轉換只會由這裡的 apply_order_fill 觸發，不會
+        # 經過 _process_order_report 那條路徑，兩者互補才涵蓋完整的「委託狀態變化」）。事件
+        # payload 在 commit 前就地取值（避免 commit 後 expire_on_commit 觸發多餘的重新查詢），
+        # 但 append 進 `_pending_events` 的動作留到 commit 成功之後才做——落地保證與既有其餘
+        # 分支一致，事件只是錦上添花的即時提示，不影響 durable 保證。重播（下方
+        # `deal is None` 的早退路徑）不會走到這裡，天然不會重複發送。CRITICAL-1：這裡只
+        # append 進 list（純 Python 操作，這個函式可能跑在 worker thread 上，見
+        # `process_batch_once`/`run()`），真正呼叫 hub 送進 asyncio.Queue 的動作交給
+        # `_flush_pending_events()`，只在 event loop 執行緒上執行。
+        deal_payload = {
+            "symbol": deal.symbol, "action": deal.action, "qty": deal.qty,
+            "price": str(deal.price), "octype": deal.octype, "ts": deal.ts,
+            "fee": str(deal.fee) if deal.fee is not None else None,
+        }
+        order_report_payload = _order_report_event_payload(order)
+        owner_id = order.user_id
         session.commit()
+        if self._order_events is not None:
+            self._pending_events.append(("deal", owner_id, deal_payload))
+            self._pending_events.append(("order-report", owner_id, order_report_payload))
 
     def _process_order_report(self, session: Session, row: RawInbox, payload: dict) -> None:
         # Inc1 D5/S3 拆除：mapper 改吃列上蓋章的 account，不再讀 adapter.account（那是 mutable
@@ -637,7 +724,17 @@ class RawInboxWorker:
             # 影響——原路徑零變更。
             self._resolve_agent_commands_after_terminal(session, order)
         brepo.mark_raw_inbox_processed(session, row)
+        # 007（批次 B-1）：委託回報（券商 callback：已送出/已取消/失敗等）落地即發一個
+        # user-scoped 'order-report' 事件。`mark_order_status` 內部受狀態偏序守衛，晚到/
+        # 重播的低序回報會 no-op（`order.status` 不變）——這裡不特判是否真的有變化，一律
+        # 反映當下的最新狀態；重複收到同一狀態頂多讓前端重繪同一條橫幅，不算誤導。
+        # CRITICAL-1：同 `_process_deal`，只 append 進 `_pending_events`，真正送進 hub
+        # 的動作交給 `_flush_pending_events()`（只在 event loop 執行緒上執行）。
+        order_report_payload = _order_report_event_payload(order)
+        owner_id = order.user_id
         session.commit()
+        if self._order_events is not None:
+            self._pending_events.append(("order-report", owner_id, order_report_payload))
 
     @staticmethod
     def _resolve_agent_commands_after_terminal(session: Session, order: Order) -> None:

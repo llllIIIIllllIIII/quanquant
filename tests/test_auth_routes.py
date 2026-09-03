@@ -1,4 +1,6 @@
 """Login/logout flow. Router protection is asserted in test_route_protection.py (Task 5)."""
+import re
+
 import pytest
 from sqlmodel import Session
 
@@ -17,6 +19,33 @@ def _fresh_lockout():
 def henry(engine):
     with Session(engine) as s:
         return service.create_user(s, "henry", "pw12345", display_name="Henry")
+
+
+class _FakeRiskGuard:
+    """R2-4：帳戶頁的 Agent Token 卡片沿用下單頁原本的 owner-only 判定
+    （`risk_guard.is_owner`／簽發端點的 `risk_guard.assert_owner`）；這裡只需要最小的
+    假物件，不需要 kill switch/cooldown 那些下單子系統的行為。"""
+
+    def __init__(self, owner_ids):
+        self._owner_ids = set(owner_ids)
+
+    def is_owner(self, user_id) -> bool:
+        return user_id in self._owner_ids
+
+    def assert_owner(self, user_id) -> None:
+        from quanquant.broker.base import AuthorizationError
+
+        if user_id not in self._owner_ids:
+            raise AuthorizationError("not owner")
+
+
+@pytest.fixture
+def owner_client(client, user):
+    """`client` fixture 預設沒有 `app.state.order_risk_guard`（get_order_risk_guard 回
+    None），比照下單子系統停用；owner_client 額外把當前登入的 `user` 標成 owner，供
+    R2-4 帳戶頁 Agent Token 卡片的測試使用。"""
+    client.app.state.order_risk_guard = _FakeRiskGuard({user.id})
+    return client
 
 
 def test_login_page_renders(anon_client):
@@ -106,6 +135,53 @@ def test_account_page_shows_color_scheme_radio(client):
     body = client.get("/account").text
     assert 'name="scheme"' in body
     assert "green_up" in body and "red_up" in body
+
+
+# ---------------------------------------------------------------------------
+# R2-4：Agent Token 產生/重置整塊 UI 從下單頁搬到帳戶設定頁（行為與授權不變，仍是
+# owner-only；下單頁對應的「已搬走」驗收見 test_orders_routes.py::
+# test_orders_page_no_longer_shows_agent_token_control）。
+# ---------------------------------------------------------------------------
+
+def test_account_page_shows_agent_token_card_for_owner(owner_client):
+    text = owner_client.get("/account").text
+    assert 'hx-post="/orders/agent-token"' in text
+    assert "尚未產生 agent token" in text
+
+
+def test_account_page_hides_agent_token_card_for_non_owner(client):
+    """`client` fixture 未設 `order_risk_guard`（比照下單子系統停用/一般登入者非
+    owner）——帳戶頁不應顯示 Agent Token 卡片。"""
+    text = client.get("/account").text
+    assert 'hx-post="/orders/agent-token"' not in text
+    assert "Agent Token" not in text
+
+
+def test_account_page_agent_token_issue_shows_plaintext_once(owner_client, session, user):
+    resp = owner_client.post("/orders/agent-token")
+    assert resp.status_code == 200
+    assert "<code" in resp.text
+    assert "尚未產生" not in resp.text
+
+
+def test_account_page_reload_does_not_leak_plaintext_after_issue(owner_client):
+    """R2-4 搬家後的等效驗收（原本在 /orders 頁的同名測試已隨 Agent Token 卡片搬到這裡）：
+    簽發當下的回應才看得到明文；重新整理 /account 頁只看得到 expires_at/last_used_at，
+    看不到明文（DB 本就只存 hash，route 只在簽發那次回應塞 raw_token）。"""
+    issue_resp = owner_client.post("/orders/agent-token")
+    plaintext = re.search(r"<code[^>]*>([^<]+)</code>", issue_resp.text).group(1)
+
+    reload_text = owner_client.get("/account").text
+    assert plaintext not in reload_text
+    assert "尚未使用" in reload_text  # 剛簽發、還沒被 WS 握手用過
+
+
+def test_account_page_error_paths_still_show_agent_token_card_for_owner(owner_client):
+    """搬家副作用檢查：色調/密碼表單驗證失敗時重繪 account.html，Agent Token 卡片不能
+    因為新 context 沒補齊而憑空消失（見 auth.py::_account_context 的三處共用）。"""
+    resp = owner_client.post("/account/color-scheme", data={"scheme": "bad"})
+    assert resp.status_code == 200
+    assert 'hx-post="/orders/agent-token"' in resp.text
 
 
 def test_set_color_scheme_via_account_form(client):

@@ -341,6 +341,30 @@ def test_stage_deal_non_replay_integrity_error_is_raised(session):
         brepo.stage_deal(session, **_deal_kwargs(fill_id="F-BAD", price=None))
 
 
+# ---- list_deals（006：成交頁資料源） ----
+
+def test_list_deals_scoped_by_user_and_mode_newest_first(session):
+    brepo.stage_deal(session, **_deal_kwargs(fill_id="D-SIM-OLD", user_id=1, mode="sim", ts=1000))
+    brepo.stage_deal(session, **_deal_kwargs(fill_id="D-SIM-NEW", user_id=1, mode="sim", ts=2000))
+    brepo.stage_deal(session, **_deal_kwargs(fill_id="D-REAL", user_id=1, mode="real", ts=3000))
+    brepo.stage_deal(session, **_deal_kwargs(fill_id="D-OTHER-USER", user_id=2, mode="sim", ts=4000))
+    session.commit()
+
+    rows = brepo.list_deals(session, user_id=1, mode="sim")
+    assert [r.fill_id for r in rows] == ["D-SIM-NEW", "D-SIM-OLD"]  # 新到舊，僅本人＋本 mode
+
+
+def test_list_deals_excludes_orphan_deals_with_no_user_id(session):
+    """quarantine 中尚未比對到 user 的孤兒成交（user_id=None）不可洩漏到任何 user 的成交頁。"""
+    brepo.stage_deal(session, **_deal_kwargs(fill_id="D-ORPHAN", user_id=None, mode="sim"))
+    session.commit()
+    assert brepo.list_deals(session, user_id=1, mode="sim") == []
+
+
+def test_list_deals_empty_when_no_deals(session):
+    assert brepo.list_deals(session, user_id=1, mode="sim") == []
+
+
 def test_deal_mode_check_constraint_rejects_illegal_value(session):
     bad = Deal(
         broker="shioaji", account="F1", mode="paper", trading_day="2026-07-24", fill_id="D-BAD",

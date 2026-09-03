@@ -1,0 +1,22 @@
+{# 006：成交頁——逐筆成交（時間/商品/方向/口數/價格/手續費），資料源既有 Deal 表
+   （見 broker/repository.py::list_deals），零 schema 變更。 #}
+<table>
+  <thead>
+    <tr><th>時間</th><th>商品</th><th>方向</th><th class="numcell">口數</th><th class="numcell">價格</th><th class="numcell">手續費</th></tr>
+  </thead>
+  <tbody>
+    {% if not deals %}
+    <tr class="empty"><td colspan="6">尚無成交紀錄。</td></tr>
+    {% endif %}
+    {% for d in deals %}
+    <tr>
+      <td>{{ d.ts | ms_dt }}</td>
+      <td>{{ d.symbol }}</td>
+      <td><span class="dir {{ 'long' if d.action == 'Buy' else 'short' }}">{{ '買' if d.action == 'Buy' else '賣' }}</span></td>
+      <td class="numcell">{{ d.qty }}</td>
+      <td class="numcell">{{ d.price | num }}</td>
+      <td class="numcell">{{ d.fee | num }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>

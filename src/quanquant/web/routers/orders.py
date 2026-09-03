@@ -20,6 +20,7 @@ round3 #6：`positions` 非 owner 一律 403（不吞成 200 空表）；cancel/
 交給 `OrderService`（adapter 內部已用 (user_id,broker,mode,broker_order_id) 複合 scope
 驗證），本檔只負責把 `AuthorizationError` 映射成 HTTP 403。
 """
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -32,11 +33,14 @@ from sse_starlette.sse import EventSourceResponse
 from quanquant.auth import agent_tokens as agent_token_service
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
+from quanquant.broker.position_tracker import point_value
 from quanquant.broker.redaction import redact_secrets
-from quanquant.broker.types import OrderRequest, canonical_payload_hash
+from quanquant.broker.types import OrderRequest, Position, canonical_payload_hash
 from quanquant.config import get_settings
 from quanquant.db.models import User
-from quanquant.web.deps import get_agent_slot, get_current_user, get_order_service, get_session
+from quanquant.journal.pnl import unrealized_pnl
+from quanquant.poller import QuotePoller
+from quanquant.web.deps import get_agent_slot, get_current_user, get_order_service, get_poller, get_session
 from quanquant.web.templating import render_partial, templates
 
 router = APIRouter()
@@ -219,36 +223,90 @@ def _edit_form_error(session: Session, service, broker_order_id: str, message: s
 
 
 @router.get("/orders", response_class=HTMLResponse)
-async def orders_page(
+def orders_page(
     request: Request,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
     service=Depends(get_order_service),
     risk_guard=Depends(get_order_risk_guard),
-    mode: str | None = Query(None),
 ):
-    resolved_mode = _mode(mode or (service.mode if service is not None else None))
-    # kill switch／agent token 管理段只給 owner 看（server 端切換/簽發仍一律經
-    # assert_owner，非只靠前端隱藏）；risk_guard 可能為 None（下單子系統停用）——此時無
-    # owner、也不顯示控制。
-    is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
-    # kill switch＋手動斷開 Agent 收歸 admin-only（2026-08-27）：非 admin 測試者不得操作全站/
-    # 連線層控制，UI 亦不顯示（server 端已於各 route 強制）。冷靜期＋agent token 仍 owner。
-    is_admin = user.role == "admin"
+    """006：下單頁精簡化——只留報價列／表單／精簡條／agent 連線狀態／風控橫幅。委託表、
+    部位表、mode 檢視分頁、改單 modal、Agent Token 產生區塊全部搬到「交易」大類的其他頁面
+    （見 orders_queue_page/orders_deals_page/orders_holdings_page）或帳戶設定頁（R2-4，
+    見 web/routers/auth.py::account_page）。本頁不再接受 `mode` query（下單表單一律送給
+    server-side 決定的執行 mode，本來就不吃表單覆寫；委託列表的 mode 檢視已隨表格搬到
+    /orders/queue，該頁自己接 `mode` 參數）。
+
+    kill_switch／cooldown 仍需在這裡算出：R2-5 用來決定表單倉別是否鎖定「平倉」，
+    以及風控橫幅是否顯示——這兩者都不需要 owner/admin 身份（一般登入者也看得到自己的
+    急停/冷靜期狀態），故不再像搬家前那樣額外算 is_owner/is_admin/token_row/agent_blocked
+    （那些只服務已移出本頁的 Agent Token／連線控制區塊）。
+
+    終審必修 LOW-8：改回同步 `def`（FastAPI 會自動丟 threadpool 執行，離開 event
+    loop）——本頁現在對「所有登入使用者」（不再只有 owner）都無條件呼叫
+    `brepo.active_cooldown` 這個同步 DB 讀，`async def` 會讓這個同步呼叫直接卡在事件
+    迴圈上，與專案既有慣例（`/orders/list`／`/orders/positions`／`/api/candles` 一律
+    sync def 跑 threadpool，見本檔 `orders_list` 上方註解）牴觸。函式本體內沒有任何
+    `await`，改成 sync 是無痛轉換。"""
     kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
-    token_row = agent_token_service.get_active_token(session, user_id=user.id) if is_owner else None
-    # 冷靜期（self-lockout）owner 顯示；手動斷線狀態僅 admin（D9/D11）
     now_ms = brepo.now_epoch_ms()
-    cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms) if is_owner else None
-    gate = getattr(request.app.state, "agent_connection_gate", None)
-    agent_blocked = bool(is_admin and gate is not None and gate.is_blocked(user.id))
+    cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms)
     return templates.TemplateResponse(request, "orders.html", {
-        "active": "orders", "mode": resolved_mode,
+        "active": "orders",
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
-        "symbols": ["TXF"], "is_owner": is_owner, "is_admin": is_admin, "kill_switch": kill_switch,
-        "token_row": token_row, "raw_token": None,
+        "symbols": ["TXF"], "kill_switch": kill_switch,
         "cooldown": cooldown, "cooldown_until_text": _fmt_cst(cooldown.until_ts) if cooldown else None,
-        "agent_blocked": agent_blocked,
+    })
+
+
+# ---- 006：「交易」大類的其餘三頁——委託／成交／未平倉（承接原下單頁被搬出的區塊） ----
+
+@router.get("/orders/queue", response_class=HTMLResponse)
+async def orders_queue_page(
+    request: Request, user: User = Depends(get_current_user),
+    service=Depends(get_order_service), mode: str | None = Query(None),
+):
+    """006：「委託」頁——承接原下單頁委託表的全部既有功能（mode 檢視分頁、改單 modal、
+    取消、SSE 刷新）；改單/取消端點與 `/orders/list` partial 完全不變，本頁只是換了個
+    殼。P0-1（mode 分頁選中態）隨 R2-10 共用 macro 根治。"""
+    resolved_mode = _mode(mode or (service.mode if service is not None else None))
+    return templates.TemplateResponse(request, "orders_queue.html", {
+        "active": "orders_queue", "mode": resolved_mode,
+    })
+
+
+@router.get("/orders/deals", response_class=HTMLResponse)
+async def orders_deals_page(
+    request: Request, user: User = Depends(get_current_user),
+    service=Depends(get_order_service), mode: str | None = Query(None),
+):
+    """006：「成交」頁——逐筆成交（時間/商品/方向/口數/價格/手續費），資料源既有 `Deal`
+    表，零 schema 變更。"""
+    resolved_mode = _mode(mode or (service.mode if service is not None else None))
+    return templates.TemplateResponse(request, "orders_deals.html", {
+        "active": "orders_deals", "mode": resolved_mode,
+    })
+
+
+@router.get("/orders/deals-list", response_class=HTMLResponse)
+def orders_deals_list(
+    session: Session = Depends(get_session), user: User = Depends(get_current_user),
+    mode: str = Query("sim"),
+):
+    deals = brepo.list_deals(session, user_id=user.id, mode=_mode(mode))
+    return HTMLResponse(render_partial("partials/deal_table.html", deals=deals))
+
+
+@router.get("/orders/holdings", response_class=HTMLResponse)
+async def orders_holdings_page(
+    request: Request, user: User = Depends(get_current_user),
+    service=Depends(get_order_service), mode: str | None = Query(None),
+):
+    """006：「未平倉」頁——承接原下單頁部位表＋浮動損益欄（見 `orders_positions`/
+    `_positions_with_pnl`）。"""
+    resolved_mode = _mode(mode or (service.mode if service is not None else None))
+    return templates.TemplateResponse(request, "orders_holdings.html", {
+        "active": "orders_holdings", "mode": resolved_mode,
     })
 
 
@@ -579,15 +637,109 @@ def orders_list(
     return HTMLResponse(render_partial("partials/order_table.html", orders=orders, live_mode=live_mode))
 
 
+def _positions_with_pnl(
+    positions: list[Position], mark_price: Decimal | None
+) -> list[tuple[Position, Decimal | None]]:
+    """006：未平倉頁補浮動損益欄——重用 `unrealized_pnl`，不另寫數學；`mark_price` 為
+    None（無報價）時每筆一律 None（不可用陳舊或缺值報價捏造損益），模板照既有 `.pnl`
+    慣例把 None 顯示成「—」。"""
+    if mark_price is None:
+        return [(p, None) for p in positions]
+    return [
+        (p, unrealized_pnl(p.direction, p.avg_price, mark_price, p.qty, point_value(p.symbol)))
+        for p in positions
+    ]
+
+
 @router.get("/orders/positions", response_class=HTMLResponse)
-def orders_positions(user: User = Depends(get_current_user), service=Depends(get_order_service)):
+def orders_positions(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    service=Depends(get_order_service),
+    poller: QuotePoller | None = Depends(get_poller),
+    risk_guard=Depends(get_order_risk_guard),
+    mode: str | None = Query(None),
+):
+    """部位表（006 搬到獨立的「未平倉」頁）＋浮動損益欄。`mode` 省略或等於目前執行 mode
+    時，走原本 `service.positions_snapshot()` 路徑——owner 檢查、行為與既有測試涵蓋的
+    語意完全不變。R2-10：未平倉頁也套 mode 分頁，顯式指定為非目前執行 mode 時（如目前
+    real 在跑、想看 sim 過去留下的未平倉部位），改直接查 BrokerPosition（純讀，比照
+    `/orders/list` 對 `mode` 的既有慣例——mode 只過濾顯示範圍，不影響任何寫入路徑），
+    owner 檢查改走 `risk_guard.assert_owner`（存在時；risk_guard 為 None 代表下單子系統
+    停用，此時任一分支都回空清單，不需要驗證）。"""
     if service is None:
-        return HTMLResponse(render_partial("partials/position_table.html", positions=[]))
-    try:
-        positions = service.positions_snapshot(actor_user_id=user.id)
-    except AuthorizationError:
-        raise HTTPException(status_code=403, detail="not owner")
-    return HTMLResponse(render_partial("partials/position_table.html", positions=positions))
+        positions: list[Position] = []
+    elif mode is None or _mode(mode) == service.mode:
+        try:
+            positions = service.positions_snapshot(actor_user_id=user.id)
+        except AuthorizationError:
+            raise HTTPException(status_code=403, detail="not owner")
+    else:
+        if risk_guard is not None:
+            try:
+                risk_guard.assert_owner(user.id)
+            except AuthorizationError:
+                raise HTTPException(status_code=403, detail="not owner")
+        rows = brepo.list_open_positions(
+            session, user_id=user.id, broker=getattr(service, "broker", "shioaji"),
+            account=service.account, mode=_mode(mode), symbol=service.symbol,
+        )
+        positions = [
+            Position(symbol=r.symbol, direction=r.direction,
+                     qty=brepo.remaining_qty(r), avg_price=brepo.avg_entry_price(r))
+            for r in rows
+        ]
+    mark_price = poller.last.price if poller and poller.last else None
+    rows = _positions_with_pnl(positions, mark_price)
+    return HTMLResponse(render_partial("partials/position_table.html", rows=rows))
+
+
+def _real_margin_provider(service) -> Decimal | None:
+    """006/F4：real 模式可動用保證金——介面留好的縫，待 Shioaji margin API 查證（欄位/
+    快取頻率，見 docs 的「查證 1」）後在此接上。目前尚未實作，一律回 None；呼叫端
+    （`_available_margin`）與模板一律把 None 顯示成中性占位「—」，不可另外顯示 0 或
+    捏造數字。"""
+    return None
+
+
+def _available_margin(service) -> Decimal | None:
+    """006：精簡條「可動用保證金」是帳戶層級（不分商品）。sim 模式在虛擬保證金功能
+    （批次 4，D1-D5）上線前固定回 None——顯示中性占位，不可顯示錯誤數字；real 模式走
+    `_real_margin_provider` 這個介面縫，目前也回 None（同上）。子系統停用
+    （service is None）比照 sim，回 None。"""
+    if service is None or service.mode == "sim":
+        return None
+    return _real_margin_provider(service)
+
+
+@router.get("/orders/position-strip", response_class=HTMLResponse)
+def orders_position_strip(
+    symbol: str | None = Query(None),
+    user: User = Depends(get_current_user),
+    service=Depends(get_order_service),
+    poller: QuotePoller | None = Depends(get_poller),
+):
+    """006：下單頁「未平倉/浮動損益/可動用保證金」精簡條——symbol-scoped，跟著商品選擇器走。
+    比照 002 quote 的 symbol-scoping 邊界（`dashboard._resolve_snap`）：`symbol` 與
+    `service.symbol`（這個 adapter 追蹤的商品）不同時一律視為「未持有」，不可誤植別檔的
+    部位；未持有時模板把部位/浮損兩段整段不 render（partials/position_strip.html），不是
+    顯示 0。浮動損益重用 `journal/pnl.py::unrealized_pnl`，不另寫數學；point_value 重用
+    `broker/position_tracker.py::point_value`，與自動部位結算共用同一份點值表。"""
+    pos = None
+    if service is not None and symbol and symbol == service.symbol:
+        try:
+            positions = [p for p in service.positions_snapshot(actor_user_id=user.id) if p.symbol == symbol]
+        except AuthorizationError:
+            raise HTTPException(status_code=403, detail="not owner")
+        pos = positions[0] if positions else None  # 正常流程同一 symbol 只會有一個 open 方向
+    mark_price = poller.last.price if poller and poller.last else None
+    unrealized = None
+    if pos is not None and mark_price is not None:
+        unrealized = unrealized_pnl(pos.direction, pos.avg_price, mark_price, pos.qty, point_value(pos.symbol))
+    margin = _available_margin(service)
+    return HTMLResponse(render_partial(
+        "partials/position_strip.html", pos=pos, unrealized=unrealized, margin=margin,
+    ))
 
 
 @router.get("/orders/stream")
@@ -596,17 +748,28 @@ async def orders_stream(request: Request, user: User = Depends(get_current_user)
     主要發布者是 RawInboxWorker 的非同步成交落地（見 broker/inbox_worker.py）；動作當下的
     刷新仍由 place/cancel/update 回應的 `refreshorders` HX-Trigger 負責。hub 未接線
     （下單子系統停用或測試無 lifespan）時回空 stream、不 500。ping 不帶 per-user 資料，
-    瀏覽器收到後各自重抓 user-scoped 的委託/部位（本就以 user_id 過濾 + 驗所有權），無跨用戶洩漏。"""
+    瀏覽器收到後各自重抓 user-scoped 的委託/部位（本就以 user_id 過濾 + 驗所有權），無跨用戶洩漏。
+
+    007（批次 B-1）：這條連線同時訂閱 user-scoped 帶內容事件——`hub.subscribe(user.id)`
+    讓這個連線既收得到既有廣播 ping，也收得到只發給這個 user 的 `deal`/`order-report`
+    事件（見 broker/order_events.py）。同一顆 queue 兩種 item 並存：無資料 ping 是裸字串
+    "1"（沿用既有 `orders-changed` 事件名/data，行為完全不變）；scoped 事件是
+    `{"event": <str>, "payload": <dict>}`，依 `item["event"]` 分派成對應的 SSE 事件名，
+    payload 序列化用 `default=str`（Decimal 等非原生 JSON 型別安全轉字串，不因為某個
+    欄位型別意外炸掉整條串流）。"""
     hub = getattr(request.app.state, "order_events", None)
     if hub is None:
         return EventSourceResponse(iter(()))
-    queue = hub.subscribe()
+    queue = hub.subscribe(user.id)
 
     async def event_generator():
         try:
             while True:
-                await queue.get()
-                yield {"event": "orders-changed", "data": "1"}
+                item = await queue.get()
+                if isinstance(item, dict):
+                    yield {"event": item["event"], "data": json.dumps(item["payload"], default=str)}
+                else:
+                    yield {"event": "orders-changed", "data": item}  # 既有無資料 ping（恆為 "1"）
         finally:
             hub.unsubscribe(queue)
 
@@ -616,6 +779,7 @@ async def orders_stream(request: Request, user: User = Depends(get_current_user)
 @router.get("/orders/agent-status", response_class=HTMLResponse)
 def orders_agent_status(
     request: Request, user: User = Depends(get_current_user), slot=Depends(get_agent_slot),
+    risk_guard=Depends(get_order_risk_guard),
 ):
     """Task 9：agent 通道連線狀態 badge（僅 order_channel=="agent" 時顯示；inprocess 通道
     沒有「agent 連線」這個概念，partial 直接回空字串）。SSE `orders-changed`/`refreshorders`
@@ -624,16 +788,23 @@ def orders_agent_status(
     Task 7（D9）：per-user 化——`agent_registry` 已 wiring 時改讀**自己**這個 slot 的
     `session_state`（每個 user 只看得到自己的 agent 連線狀態，不是全站共用一份）；registry
     不存在（in-process 模式／agent 模式尚未成功 wiring）時 fallback 回舊的全站
-    `order_session_state`，與 Task 7 之前完全零改動的既有路徑（見 `get_agent_slot`）。"""
+    `order_session_state`，與 Task 7 之前完全零改動的既有路徑（見 `get_agent_slot`）。
+
+    終審必修 LOW-7：`is_owner` 一併算出——R2-4「未連線時提示到帳戶頁設定」的連結只對
+    owner 有意義（帳戶頁的 Agent Token 卡片本身就是 owner-only，見
+    web/routers/auth.py::_account_context／account.html）；非 owner 看到這個連結會是
+    死路（過去點了也看不到任何卡片）。"""
     if getattr(request.app.state, "agent_registry", None) is not None:
         state = slot.session_state if slot is not None else None
     else:
         state = getattr(request.app.state, "order_session_state", None)
+    is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
     return HTMLResponse(render_partial(
         "partials/agent_status.html",
         channel=get_settings().order_channel,
         ready=bool(state and state.ready),
         reason=(state.last_error if state else None),
+        is_owner=is_owner,
     ))
 
 

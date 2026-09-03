@@ -1,0 +1,26 @@
+{# 006：下單頁「未平倉/浮動損益/可動用保證金」精簡條——單列，symbol-scoped。
+   pos 為 None（切換商品後未持有該商品）時「未平倉」「浮動損益」兩段整段不 render，
+   不是顯示 0（見 web/routers/orders.py::orders_position_strip）。可動用保證金是帳戶
+   層級，一律顯示；margin 為 None（sim 上線前／real 待 F4 查證前）由 `num` filter
+   顯示中性占位「—」，不可另外顯示錯誤數字。損益色沿用既有 `.pnl.up/.pnl.down`
+   慣例（app.css，隨 --rise/--fall 紅綠偏好翻轉，同 partials/trade_table.html）。 #}
+<div class="pos-strip" id="pos-strip">
+  {% if pos %}
+  <span class="pos-strip-seg pos-strip-position">
+    未平倉
+    <span class="dir {{ 'long' if pos.direction == 'long' else 'short' }}">{{ '多' if pos.direction == 'long' else '空' }}</span>
+    {{ pos.qty }} 口 @{{ pos.avg_price | num }}
+  </span>
+  <span class="pos-strip-seg pos-strip-pnl">
+    浮動損益
+    <!-- 終審必修 LOW-6：unrealized 為 None（無報價）時不可落到 .down（警示色）——那是
+         「賠錢」的顏色，不是「不知道」的顏色。三態：None → 無方向 class（中性字色），
+         有值才依正負套 up/down。 -->
+    {% set pnl_class = ('up' if unrealized >= 0 else 'down') if unrealized is not none else '' %}
+    <span class="pnl{% if pnl_class %} {{ pnl_class }}{% endif %}">{{ unrealized | signed }}</span>
+  </span>
+  {% endif %}
+  <span class="pos-strip-seg pos-strip-margin">
+    可動用保證金 {{ margin | num }}
+  </span>
+</div>

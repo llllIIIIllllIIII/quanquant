@@ -606,6 +606,19 @@ def has_unresolved_update_command(session: Session, *, client_order_id: str) -> 
 
 # ---- Deal（fill 去重帳本） ----
 
+def list_deals(session: Session, *, user_id: int, mode: str, limit: int = 200) -> list[Deal]:
+    """006：成交頁資料源——比照 `list_orders` 的既有慣例（mode 純過濾顯示範圍，不影響任何
+    寫入路徑），按時間新到舊排序。`user_id` 為 None 的列（quarantine 中、尚未比對到 Order/
+    user 的孤兒成交）一律不回，避免把別人的成交（或無主成交）洩漏到這個 user 的成交頁。"""
+    stmt = (
+        select(Deal)
+        .where(Deal.user_id == user_id, Deal.mode == mode)
+        .order_by(Deal.ts.desc())  # type: ignore[union-attr]
+        .limit(limit)
+    )
+    return list(session.exec(stmt))
+
+
 def _find_deal(
     session: Session, *, broker: str, mode: str, account: str, trading_day: str, fill_id: str
 ) -> Deal | None:

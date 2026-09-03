@@ -53,7 +53,9 @@ class PositionMismatchError(Exception):
     """
 
 
-def _point_value(symbol: str) -> Decimal:
+def point_value(symbol: str) -> Decimal:
+    """公開版：供本模組（round-trip 結算）與 web/routers/orders.py（006 精簡條浮動損益，
+    重用同一份點值表，不另寫）共用。"""
     return _POINT_VALUES.get(symbol, Decimal("200"))
 
 
@@ -274,7 +276,7 @@ class PositionTracker:
                 exit_time=_utc_dt_to_cst(_to_dt(fill.ts)),
                 exit_price=exit_,
                 size=pos.total_opened_qty,
-                point_value=_point_value(pos.symbol),
+                point_value=point_value(pos.symbol),
                 fee=fee,
                 mode=pos.mode,
                 source="shioaji",

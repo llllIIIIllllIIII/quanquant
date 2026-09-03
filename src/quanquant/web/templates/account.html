@@ -31,5 +31,13 @@
       <button type="submit">儲存配色</button>
     </form>
   </article>
+  {% if is_owner %}
+  <!-- R2-4：Agent Token 產生/重置整塊 UI 從下單頁搬到這裡（一次性設定、不屬交易流程）；
+       行為與授權不變——仍是 owner-only、明文只在簽發當下顯示一次。partial 自帶標題與
+       版面，不再重複包一層 <h3>。 -->
+  <article class="settings-card">
+    {% include "partials/agent_token_control.html" with context %}
+  </article>
+  {% endif %}
 </div>
 {% endblock %}

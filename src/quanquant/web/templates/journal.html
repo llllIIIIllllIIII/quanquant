@@ -1,4 +1,5 @@
 {% extends "base.html" %}
+{% from "macros/segmented.html" import mode_tabs %}
 {% block content %}
 <div x-data="{ open: false }" @closemodal.window="open = false">
 
@@ -9,10 +10,7 @@
     </button>
   </div>
 
-  <div class="mode-tabs" role="tablist">
-    <a role="button" class="{{ '' if f.mode == 'sim' else 'contrast' }}" href="/journal?mode=real">正式</a>
-    <a role="button" class="{{ 'contrast' if f.mode == 'sim' else '' }}" href="/journal?mode=sim">模擬</a>
-  </div>
+  {{ mode_tabs(f.mode, '/journal') }}
 
   <form class="filterbar card-bar" hx-get="/trades" hx-target="#trade-tbody" hx-swap="innerHTML"
         hx-trigger="change, submit, refreshtable from:body" @submit.prevent>

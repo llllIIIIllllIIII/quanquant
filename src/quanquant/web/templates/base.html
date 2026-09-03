@@ -34,11 +34,23 @@
         <line x1="4" y1="17" x2="20" y2="17"/>
       </svg>
     </button>
+    {% set trade_pages = ("orders", "orders_queue", "orders_deals", "orders_holdings") %}
     <div class="nav-links" :class="{ open: navOpen }">
       <a href="/" class="nav-link {% if active == 'dashboard' %}active{% endif %}">儀表板</a>
       <a href="/journal" class="nav-link {% if active == 'journal' %}active{% endif %}">交易日記</a>
       <a href="/stats" class="nav-link {% if active == 'stats' %}active{% endif %}">績效統計</a>
-      <a href="/orders" class="nav-link {% if active == 'orders' %}active{% endif %}">下單</a>
+      <!-- 006：「交易」大類下拉——下單/委託/成交/未平倉。導覽結構（下拉 vs 平鋪）依現有
+           topnav 慣例自行決定，沿用 user-menu 已經在用的 Pico <details class="dropdown">
+           元件，不另外引入新的下拉套件。 -->
+      <details class="dropdown nav-trade">
+        <summary class="{% if active in trade_pages %}active{% endif %}">交易</summary>
+        <ul dir="rtl">
+          <li><a href="/orders" class="{% if active == 'orders' %}active{% endif %}">下單</a></li>
+          <li><a href="/orders/queue" class="{% if active == 'orders_queue' %}active{% endif %}">委託</a></li>
+          <li><a href="/orders/deals" class="{% if active == 'orders_deals' %}active{% endif %}">成交</a></li>
+          <li><a href="/orders/holdings" class="{% if active == 'orders_holdings' %}active{% endif %}">未平倉</a></li>
+        </ul>
+      </details>
       <a href="/risk" class="nav-link {% if active == 'risk' %}active{% endif %}">風險控管</a>
     </div>
     <div class="nav-right">

@@ -7,5 +7,13 @@
 <strong>🟢 agent 已連線</strong>
   {% else %}
 <strong style="color:#c0392b;">🔴 agent 未連線{% if reason and reason != "agent 未連線" %}（{{ reason }}）{% endif %}</strong>
+  <!-- R2-4：Agent Token 產生/重置整塊 UI 已搬到帳戶設定頁；未連線時提示往那裡設定
+       （行為與授權不變，這裡純粹是導覽提示）。終審必修 LOW-7：帳戶頁的 Agent Token
+       卡片是 owner-only（見 auth.py::_account_context），非 owner 點這個連結只會看到
+       一個沒有該卡片的頁面——死路。只對 owner 顯示連結；非 owner 顯示不帶連結的中性
+       提示文字。 -->
+  {% if is_owner %}
+  <a href="/account">前往帳戶設定頁產生／檢查 Agent Token</a>
+  {% endif %}
   {% endif %}
 {% endif %}

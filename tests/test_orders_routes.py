@@ -11,9 +11,12 @@ ShioajiAdapter（注入 _FakeApi，不連真網路）」測 round3 #1 的關鍵�
 - #9：委託列表除取消鈕外另有「改單」控制（GET .../edit 開表單，PUT 送出，real 兩步確認）。
 - #6：positions 非 owner 403（非 200 空表）；place/update/cancel 非 owner 一律 403。
 """
+import asyncio
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,6 +26,7 @@ from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, RiskError
 from quanquant.broker.connection_gate import AgentConnectionGate
+from quanquant.broker.order_events import OrderEventHub
 from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
@@ -30,7 +34,11 @@ from quanquant.broker.types import OrderAck, Position
 from quanquant.db.models import AgentToken, Cooldown
 from quanquant.web.app import create_app
 from quanquant.web.deps import get_poller, get_session
-from quanquant.web.routers.orders import _parse_optional_update_price, _parse_order_price
+from quanquant.web.routers.orders import (
+    _parse_optional_update_price,
+    _parse_order_price,
+    orders_stream,
+)
 
 
 def _hidden(text: str, name: str) -> str | None:
@@ -48,6 +56,7 @@ class _FakeService:
     def __init__(self, mode="sim"):
         self.mode = mode
         self.account = "F1"
+        self.symbol = "TXF"
         self.placed = []
         self._deny_user = None
 
@@ -263,16 +272,27 @@ def test_order_form_still_submits_symbol_via_form_attribute(order_client, fake_s
 
 
 def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
-    """委託/部位改用 SSE 推送（sse:orders-changed）取代每 2s 盲輪詢：頁面要有 sse-connect
-    容器、三個 div 的 trigger 含 sse:orders-changed（agent 狀態 badge + 委託 + 部位，Task 9
-    加了第一個）、且不再有 every 2s 盲輪詢（消除對 event loop / supervisor 鎖的壓力）。保留
-    refreshorders（本分頁動作當下即時刷新）與防連點。"""
+    """006 精簡化後：委託表／部位表已搬到 /orders/queue、/orders/holdings（另見對應測試），
+    下單頁只留 agent 狀態（掛在 /orders/stream 的 sse:orders-changed，agent 連線/斷線時
+    agent_ws.py 會 hub.publish()）與精簡條（掛在 /quote/stream 的既有報價心跳，見
+    orders.html 內的實作理由註解）。頁面不得再出現盲輪詢、不得再直接嵌委託表／部位表的
+    hx-get 掛載點；送出鈕仍保留 hx-disabled-elt 防連點。"""
     text = order_client.get("/orders").text
-    assert 'sse-connect="/orders/stream"' in text  # SSE 連線容器
-    assert text.count("sse:orders-changed") == 3  # agent 狀態 + 委託 + 部位 三個 div 都靠 SSE 觸發
-    assert "every 2s" not in text  # 不再盲輪詢
-    assert "refreshorders from:body" in text  # 動作當下本分頁仍即時刷新
-    assert 'hx-get="/orders/list' in text and 'hx-get="/orders/positions"' in text
+    assert 'sse-connect="/orders/stream"' in text  # agent 狀態的 SSE 連線容器仍在
+    assert 'sse-connect="/quote/stream' in text  # 精簡條/報價共用的 SSE 連線容器
+    # 只剩 agent 狀態 div 的 hx-trigger 掛 sse:orders-changed（比對 hx-trigger 屬性本身，
+    # 不比對整頁原始文字——避免被模板內解說用的中文註解一併算進去）。
+    assert len(re.findall(r'hx-trigger="[^"]*sse:orders-changed[^"]*"', text)) == 1
+    # 不盲輪詢：比對 hx-trigger 屬性本身有沒有裸的 `every Ns`，不比對整頁原始文字
+    # （模板內解說用的中文註解會提到「every 2s」這個詞本身，直接找整頁字串會誤判）。
+    assert not re.search(r'hx-trigger="[^"]*every \d+s[^"]*"', text)
+    assert "refreshorders from:body" in text  # 本分頁下單動作當下精簡條/agent 狀態仍即時刷新
+    assert 'hx-get="/orders/list' not in text  # 委託表已搬到 /orders/queue
+    assert 'hx-get="/orders/positions"' not in text  # 部位表已搬到 /orders/holdings
+    assert 'hx-get="/orders/position-strip"' in text  # 精簡條掛載點仍在
+    # 精簡條掛在報價 SSE 的 message 事件上，但實測心跳是每 ~1 秒，未節流會變成每秒打
+    # 這支端點；用 htmx 的 throttle:5s 修飾詞把實際觸發頻率壓回「5 秒源」的節奏。
+    assert "sse:message throttle:5s" in text
     assert "hx-disabled-elt" in text  # 送出期間停用送出鈕（防 double-submit）
 
 
@@ -281,6 +301,32 @@ def test_orders_stream_without_hub_returns_empty_stream_not_500(order_client):
     不 500——與 alerts_stream 同慣例，端點在無 lifespan 的測試/停用情境不壞。"""
     resp = order_client.get("/orders/stream")
     assert resp.status_code == 200
+
+
+def test_orders_stream_dispatches_scoped_events_and_keeps_orders_changed_unchanged():
+    """007（批次 B-1）：/orders/stream 依 queue item 型別分派 SSE 事件名——scoped 事件
+    （dict）依 `item["event"]` 分派（如 'deal'），payload 序列化成 JSON data；既有無資料
+    廣播 ping（裸字串 "1"）維持 'orders-changed' 事件名與 data 不變（④）。直接呼叫路由
+    函式本身＋讀 `EventSourceResponse.body_iterator`，繞開 TestClient 對無限串流的同步限制。
+    """
+    async def _run():
+        hub = OrderEventHub()
+        request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(order_events=hub)))
+        user = SimpleNamespace(id=1)
+        resp = await orders_stream(request, user)
+
+        hub.publish_deal(user_id=1, payload={"symbol": "TXF", "action": "Buy", "qty": 1, "price": "18000"})
+        deal_event = await resp.body_iterator.__anext__()
+        assert deal_event["event"] == "deal"
+        assert json.loads(deal_event["data"]) == {
+            "symbol": "TXF", "action": "Buy", "qty": 1, "price": "18000",
+        }
+
+        hub.publish()  # 既有無資料 ping：event 名與 data 逐位元不變
+        broadcast_event = await resp.body_iterator.__anext__()
+        assert broadcast_event == {"event": "orders-changed", "data": "1"}
+
+    asyncio.run(_run())
 
 
 def test_place_order_sim_sends_directly(order_client, fake_service, user):
@@ -443,8 +489,16 @@ def test_orders_page_no_longer_shows_kill_switch_control_moved_to_risk_page(orde
 def test_orders_page_shows_red_banner_and_disables_submit_when_kill_switch_blocked(
     order_client, fake_guard
 ):
-    """005：緊急停止下單啟動時，下單頁必須顯示明確狀態（紅色橫幅，連到 /risk）並停用
-    送出鈕；正常狀態下不佔任何版面（見另一測試）。"""
+    """005（終審必修 CRITICAL-2，還原）：緊急停止下單啟動時，下單頁必須顯示明確狀態
+    （紅色橫幅，連到 /risk）並停用送出鈕；正常狀態下不佔任何版面（見另一測試）。
+
+    R2-5 不適用於急停：R2-5 原文的前提是「F0 改成『只擋開倉』後」才把急停套進鎖倉別＋
+    送出鈕保留可用的那套 UI；`broker/risk.py::check_place` 目前對急停仍是全擋（kill
+    switch 檢查在 octype 判斷之前），F0 尚未實作。若讓送出鈕維持可用，使用者填完「平倉」
+    單送出仍會被伺服器拒絕——這正是 R2-5 想消滅的「按了才知道」，只是換了個地方發生。
+    急停生效時繼續維持 005 已驗收的「整顆停用送出鈕」，見
+    test_octype_not_locked_when_kill_switch_blocked（倉別本身不鎖，因為鎖了也沒用——
+    整顆都按不了）。"""
     fake_guard.global_on = True
     text = order_client.get("/orders").text
     assert "緊急停止下單已啟動" in text
@@ -456,6 +510,42 @@ def test_orders_page_shows_no_risk_banner_when_kill_switch_and_cooldown_are_off(
     """正常狀態下不佔任何版面：無緊急停止、無冷靜期時，下單頁不出現風控橫幅。"""
     text = order_client.get("/orders").text
     assert "risk-banner" not in text
+
+
+def test_orders_page_octype_not_locked_by_default(order_client):
+    """R2-5 邊界：無急停、無冷靜期時，倉別選單維持原狀——三個選項都不 disabled，沒有鎖定
+    說明文字，行為完全不變。"""
+    text = order_client.get("/orders").text
+    assert re.search(r'<option value="New"[^>]*disabled', text) is None
+    assert re.search(r'<option value="Auto"[^>]*disabled', text) is None
+    assert "僅能平倉" not in text
+
+
+def test_octype_not_locked_when_kill_switch_blocked(order_client, fake_guard, user):
+    """終審必修 CRITICAL-2：「我的緊急停止」生效時，`check_place` 目前仍全擋（F0「只擋
+    開倉」尚未實作），倉別欄位不鎖 Cover——鎖了也沒用，因為連平倉單都會被伺服器拒絕；
+    真正誠實的 UI 是整顆停用送出鈕（見
+    test_orders_page_shows_red_banner_and_disables_submit_when_kill_switch_blocked）。
+    等 F0 把急停改成 octype-aware（只擋開倉）後，才把 kill_switch.blocked 併入
+    octype_locked 判斷。"""
+    fake_guard.per_user[user.id] = True
+    text = order_client.get("/orders").text
+    assert re.search(r'<option value="New"[^>]*disabled', text) is None
+    assert re.search(r'<option value="Auto"[^>]*disabled', text) is None
+    assert "冷靜期中僅能平倉" not in text
+
+
+def test_octype_locked_to_cover_when_cooldown_active(order_client, session, user):
+    """R2-5：冷靜期中同樣鎖倉別「平倉」＋顯示「冷靜期中僅能平倉」，送出鈕維持可用。"""
+    now = brepo.now_epoch_ms()
+    brepo.create_cooldown(session, user_id=user.id, until_ms=now + 3_600_000, now_ms=now)
+    session.commit()
+    text = order_client.get("/orders").text
+    assert re.search(r'<option value="New"[^>]*disabled', text) is not None
+    assert re.search(r'<option value="Auto"[^>]*disabled', text) is not None
+    assert re.search(r'<option value="Cover"[^>]*selected', text) is not None
+    assert "冷靜期中僅能平倉" in text
+    assert re.search(r'<button type="submit"[^>]*disabled', text) is None  # 送出鈕維持可用
 
 
 def _demote_to_non_admin(session, user):
@@ -577,16 +667,46 @@ def test_agent_token_without_risk_guard_does_not_500(engine, user):
     assert "未啟用" in resp.text
 
 
-def test_orders_page_shows_agent_token_control_for_owner(order_client):
-    text = order_client.get("/orders").text
-    assert 'hx-post="/orders/agent-token"' in text
-    assert "尚未產生 agent token" in text  # 尚未簽發過
-
-
-def test_orders_page_hides_agent_token_control_for_non_owner(order_client, fake_guard):
-    fake_guard._owner_ids = set()  # user 非 owner
+def test_orders_page_no_longer_shows_agent_token_control(order_client):
+    """R2-4：Agent Token 產生/重置整塊 UI 搬到帳戶設定頁（見 test_auth_routes.py 的等效
+    測試）；下單頁不再顯示這塊——即使是 owner。"""
     text = order_client.get("/orders").text
     assert 'hx-post="/orders/agent-token"' not in text
+    assert "尚未產生 agent token" not in text
+
+
+def test_agent_status_shows_account_link_for_owner_when_disconnected(order_client, monkeypatch):
+    """終審必修 LOW-7：R2-4「未連線時提示到帳戶頁設定」的連結只對 owner 顯示——帳戶頁
+    的 Agent Token 卡片本身是 owner-only，非 owner 點了會是死路。`order_client` 的
+    `fake_guard` 預設 `_owner_ids=None`（視為所有人皆 owner）。"""
+    from quanquant.config import get_settings
+
+    monkeypatch.setenv("ORDER_CHANNEL", "agent")
+    get_settings.cache_clear()
+    try:
+        text = order_client.get("/orders/agent-status").text
+        assert "agent 未連線" in text
+        assert 'href="/account"' in text
+    finally:
+        get_settings.cache_clear()
+
+
+def test_agent_status_hides_account_link_for_non_owner_when_disconnected(
+    order_client, fake_guard, monkeypatch
+):
+    """終審必修 LOW-7 邊界：非 owner 看到「agent 未連線」狀態，但不顯示帳戶頁連結
+    （或任何連結）——那頁的 Agent Token 卡片對非 owner 不會顯示，連過去也看不到東西。"""
+    from quanquant.config import get_settings
+
+    fake_guard._owner_ids = set()  # 目前 user 非 owner
+    monkeypatch.setenv("ORDER_CHANNEL", "agent")
+    get_settings.cache_clear()
+    try:
+        text = order_client.get("/orders/agent-status").text
+        assert "agent 未連線" in text
+        assert 'href="/account"' not in text
+    finally:
+        get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------
@@ -852,17 +972,6 @@ def test_cooldown_text_states_five_minute_revoke_window_everywhere(order_client,
     assert "5 分鐘" in text
     assert "只有管理員能提前解除" not in text
     assert "只有管理員" not in text
-
-
-def test_orders_page_reload_does_not_leak_plaintext_after_issue(order_client):
-    """簽發當下的回應才看得到明文；重新整理 /orders 頁只看得到 expires_at/last_used_at，
-    看不到明文（DB 本就只存 hash，route 只在簽發那次回應塞 raw_token）。"""
-    issue_resp = order_client.post("/orders/agent-token")
-    plaintext = re.search(r"<code[^>]*>([^<]+)</code>", issue_resp.text).group(1)
-
-    reload_text = order_client.get("/orders").text
-    assert plaintext not in reload_text
-    assert "尚未使用" in reload_text  # 剛簽發、還沒被 WS 握手用過
 
 
 # ---------------------------------------------------------------------------
@@ -1211,12 +1320,12 @@ def test_order_table_shows_avg_fill_price_not_committed_zero_price_for_filled_mk
     session.commit()
 
     text = order_client.get("/orders/list?mode=sim").text
-    assert "18500" in text  # 未成交委託仍顯示委託價
+    assert "18,500" in text  # 未成交委託仍顯示委託價（P1-10：套 num filter，千分位）
 
     # 精準定位 FILLED1 那一列（id="order-{id}"），確認成交均價顯示出來、不是裸的委託價 0。
     rows = re.findall(rf'<tr id="order-{filled_order.id}">.*?</tr>', text, re.DOTALL)
     assert len(rows) == 1
-    assert "43737" in rows[0]
+    assert "43,737" in rows[0]
     assert re.search(r"<td[^>]*>0(\.0+)?</td>", rows[0]) is None  # 不再顯示裸的委託價 0
 
 
@@ -1551,3 +1660,321 @@ def test_edit_order_form_prefills_existing_qty_and_price(engine, user):
     assert resp.status_code == 200
     assert _hidden(resp.text, "qty") == "4"
     assert _hidden(resp.text, "price") == "18300"
+
+
+# ---------------------------------------------------------------------------
+# 006：主導覽「交易」大類——下單/委託/成交/未平倉
+# ---------------------------------------------------------------------------
+
+def test_topnav_shows_trade_dropdown_with_all_four_pages(order_client):
+    """驗收只看「找得到、點得到」：主導覽出現「交易」，其下含下單/委託/成交/未平倉四個
+    連結。"""
+    text = order_client.get("/orders").text
+    assert ">交易<" in text
+    assert 'href="/orders"' in text
+    assert 'href="/orders/queue"' in text
+    assert 'href="/orders/deals"' in text
+    assert 'href="/orders/holdings"' in text
+
+
+def test_topnav_trade_summary_marked_active_on_any_trade_subpage(order_client):
+    for path in ("/orders", "/orders/queue", "/orders/deals", "/orders/holdings"):
+        text = order_client.get(path).text
+        assert '<summary class="active">交易</summary>' in text, path
+
+
+# ---------------------------------------------------------------------------
+# 006：委託頁（/orders/queue）——承接原委託表全部既有功能
+# ---------------------------------------------------------------------------
+
+def test_orders_queue_page_renders_mode_tabs_and_table_mount_point(order_client):
+    text = order_client.get("/orders/queue?mode=sim").text
+    assert 'role="radiogroup"' in text  # R2-10 共用 macro
+    assert 'hx-get="/orders/list?mode=sim"' in text
+    assert 'sse-connect="/orders/stream"' in text
+    assert "sse:orders-changed" in text
+    assert "refreshorders from:body" in text
+    assert 'class="table-wrap"' in text  # P1-11
+
+
+def test_orders_queue_page_has_edit_modal_and_error_slot(order_client):
+    """搬家後既有功能（改單 modal、取消失敗的錯誤顯示掛載點）必須都還在。"""
+    text = order_client.get("/orders/queue").text
+    assert 'id="order-edit-modal"' in text
+    assert 'class="form-error-slot"' in text
+
+
+def test_orders_queue_page_default_mode_follows_service_mode(order_client, fake_service):
+    fake_service.mode = "real"
+    text = order_client.get("/orders/queue").text
+    assert 'hx-get="/orders/list?mode=real"' in text
+
+
+def _selected_mode_tab(html: str, label: str) -> bool:
+    tag = html.split(label)[0].rsplit("<a", 1)[-1]
+    return "is-selected" in tag
+
+
+def test_orders_queue_page_p0_1_mode_tab_selected_state_is_correct(order_client):
+    """P0-1 根治的直接證據——這裡就是原本 bug 所在的委託表搬到的新頁面：mode=real 時
+    「正式」被選中、「模擬」不被選中，反之亦然（原 orders.html 第一顆分頁的條件寫反）。"""
+    real_html = order_client.get("/orders/queue?mode=real").text
+    assert _selected_mode_tab(real_html, "正式") is True
+    assert _selected_mode_tab(real_html, "模擬") is False
+
+    sim_html = order_client.get("/orders/queue?mode=sim").text
+    assert _selected_mode_tab(sim_html, "正式") is False
+    assert _selected_mode_tab(sim_html, "模擬") is True
+
+
+def test_orders_list_still_reachable_and_shows_edit_cancel_from_queue_page(
+    order_client, session, user
+):
+    """搬家後既有的改單/取消端點與委託列表資料完全不變——只是換了個外殼頁面嵌它。"""
+    brepo.set_order_ack(
+        session,
+        brepo.create_order(session, client_order_id="Q-OPEN", request_hash="HQ1", user_id=user.id, mode="sim",
+                            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+                            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+                            trading_day="2026-06-16").id,
+        broker_order_id="B-Q-OPEN", ordno="O-Q-OPEN", status="submitted",
+    )
+    session.commit()
+    order_client.get("/orders/queue?mode=sim")  # 掛載頁存在，不 404
+    text = order_client.get("/orders/list?mode=sim").text
+    assert 'hx-get="/orders/B-Q-OPEN/edit"' in text
+    assert 'hx-delete="/orders/B-Q-OPEN"' in text
+
+
+# ---------------------------------------------------------------------------
+# 006（P1-8/P1-9/P1-10）：委託列表補時間/類型欄、狀態中文化、價格千分位／市價顯示
+# ---------------------------------------------------------------------------
+
+def test_order_table_shows_time_and_type_badge_columns(order_client, session, user):
+    brepo.create_order(
+        session, client_order_id="P1-8", request_hash="H1", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+        trading_day="2026-06-16",
+    )
+    session.commit()
+    text = order_client.get("/orders/list?mode=sim").text
+    assert "<th>時間</th>" in text
+    assert "LMT・ROD・新倉" in text
+
+
+def test_order_table_time_column_shows_taiwan_local_not_utc(order_client, session, user):
+    """終審必修 HIGH-3：`Order.created_at` 是 naive-UTC（db/models.py::_utcnow）；委託頁
+    的「時間」欄必須顯示台灣本地時間（+8），不是裸印 UTC 時刻——造一筆已知 UTC 時間，
+    斷言頁面上出現的是 +8 之後的字串，且不出現原始 UTC 字串。"""
+    order = brepo.create_order(
+        session, client_order_id="P1-8-TZ", request_hash="H1", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+        trading_day="2026-06-16",
+    )
+    order.created_at = datetime(2026, 6, 16, 10, 0, 0)  # naive UTC
+    session.add(order)
+    session.commit()
+
+    text = order_client.get("/orders/list?mode=sim").text
+    row = re.search(rf'<tr id="order-{order.id}">.*?</tr>', text, re.DOTALL).group(0)
+    assert "2026-06-16 18:00:00" in row  # UTC 10:00 + 8 小時 = 台灣本地 18:00
+    assert "2026-06-16 10:00:00" not in row  # 不可裸印 UTC 時刻
+
+
+def test_order_table_status_shown_in_chinese_not_raw_english(order_client, session, user):
+    order = brepo.create_order(
+        session, client_order_id="P1-9", request_hash="H1", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+        trading_day="2026-06-16",
+    )
+    brepo.set_order_ack(session, order.id, broker_order_id="B-P1-9", ordno="O-P1-9", status="submitted")
+    session.commit()
+    text = order_client.get("/orders/list?mode=sim").text
+    assert "已委託" in text
+    assert ">submitted<" not in text
+
+
+def test_order_table_mkt_unfilled_order_shows_market_price_label_not_zero(
+    order_client, session, user
+):
+    """P1-10：市價單（MKT）未成交時價格欄顯示「市價」，不是委託價恆為 0 的裸數字。"""
+    order = brepo.create_order(
+        session, client_order_id="P1-10", request_hash="H1", user_id=user.id, mode="sim",
+        broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+        price=Decimal("0"), price_type="MKT", order_type="IOC", octype="New",
+        trading_day="2026-06-16",
+    )
+    brepo.set_order_ack(session, order.id, broker_order_id="B-P1-10", ordno="O-P1-10", status="submitted")
+    session.commit()
+    text = order_client.get("/orders/list?mode=sim").text
+    row = re.search(rf'<tr id="order-{order.id}">.*?</tr>', text, re.DOTALL).group(0)
+    assert "市價" in row
+    assert re.search(r"<td[^>]*>0(\.0+)?</td>", row) is None
+
+
+# ---------------------------------------------------------------------------
+# 006：成交頁（/orders/deals）——逐筆成交，資料源既有 Deal 表
+# ---------------------------------------------------------------------------
+
+def test_orders_deals_page_renders_mode_tabs_and_list_mount_point(order_client):
+    text = order_client.get("/orders/deals?mode=sim").text
+    assert 'role="radiogroup"' in text
+    assert 'hx-get="/orders/deals-list?mode=sim"' in text
+    assert 'class="table-wrap"' in text
+
+
+def test_orders_deals_list_shows_time_symbol_direction_qty_price_fee(order_client, session, user):
+    brepo.stage_deal(
+        session, broker="shioaji", account="F1", mode="sim", trading_day="2026-06-16",
+        fill_id="D-PAGE-1", ordno="O1", broker_order_id="B1", order_id=None, user_id=user.id,
+        symbol="TXF", action="Buy", price=Decimal("18050"), qty=2, fee=Decimal("60"),
+        octype="New", ts=1_781_604_000_000, raw_inbox_id=None,
+    )
+    session.commit()
+    text = order_client.get("/orders/deals-list?mode=sim").text
+    assert "TXF" in text
+    assert "買" in text
+    assert "18,050" in text  # num filter 千分位
+    assert "60" in text  # 手續費
+
+
+def test_orders_deals_list_empty_state_not_500(order_client):
+    resp = order_client.get("/orders/deals-list?mode=sim")
+    assert resp.status_code == 200
+    assert "尚無成交紀錄" in resp.text
+
+
+def test_orders_deals_list_scoped_by_mode_and_user(order_client, session, user):
+    brepo.stage_deal(
+        session, broker="shioaji", account="F1", mode="sim", trading_day="2026-06-16",
+        fill_id="D-SIM", ordno="O1", broker_order_id="B1", order_id=None, user_id=user.id,
+        symbol="TXF", action="Buy", price=Decimal("18000"), qty=1, fee=Decimal("20"),
+        octype="New", ts=1000, raw_inbox_id=None,
+    )
+    brepo.stage_deal(
+        session, broker="shioaji", account="F1", mode="real", trading_day="2026-06-16",
+        fill_id="D-REAL", ordno="O2", broker_order_id="B2", order_id=None, user_id=user.id,
+        symbol="TXF", action="Sell", price=Decimal("18100"), qty=1, fee=Decimal("20"),
+        octype="Cover", ts=2000, raw_inbox_id=None,
+    )
+    session.commit()
+    sim_text = order_client.get("/orders/deals-list?mode=sim").text
+    real_text = order_client.get("/orders/deals-list?mode=real").text
+    assert "18,000" in sim_text and "18,100" not in sim_text
+    assert "18,100" in real_text and "18,000" not in real_text
+
+
+# ---------------------------------------------------------------------------
+# 006：未平倉頁（/orders/holdings）——承接原部位表＋浮動損益欄
+# ---------------------------------------------------------------------------
+
+def test_orders_holdings_page_renders_mode_tabs_and_positions_mount_point(order_client):
+    text = order_client.get("/orders/holdings?mode=sim").text
+    assert 'role="radiogroup"' in text
+    assert 'hx-get="/orders/positions?mode=sim"' in text
+    assert 'class="table-wrap"' in text
+
+
+def test_orders_positions_adds_unrealized_pnl_column(order_client, fake_service):
+    """未平倉頁補浮動損益欄（重用 unrealized_pnl，同精簡條）：多單 18000 進場、現價
+    18100，TXF 點值 200，1 口 → (18100-18000)*1*200 = 20000。"""
+    fake_service.mode = "real"
+
+    # 直接覆寫 poller 依賴回傳一顆固定現價（order_client fixture 已把 get_poller 設 None，
+    # 這裡針對本測試單獨覆寫）。
+    from quanquant.web.deps import get_poller
+
+    class _P:
+        class _Last:
+            price = Decimal("18100")
+        last = _Last()
+
+    order_client.app.dependency_overrides[get_poller] = lambda: _P()
+    try:
+        text = order_client.get("/orders/positions").text
+    finally:
+        order_client.app.dependency_overrides[get_poller] = lambda: None
+    assert "浮動損益" in text  # 表頭
+    assert "20,000" in text
+    assert 'class="pnl up"' in text
+
+
+def test_orders_positions_no_mark_price_shows_dash_with_neutral_class_not_pnl_down(order_client):
+    """終審必修 LOW-6：未平倉頁同樣不可把「無報價」（unrealized None）誤上警示色 .down——
+    `order_client` fixture 預設 get_poller 回 None，`_FakeService.positions_snapshot`
+    固定回傳一筆部位，故本測試天然落在「有部位、無現價」這個組合。"""
+    text = order_client.get("/orders/positions").text
+    assert "TXF" in text
+    assert 'class="pnl"' in text
+    assert 'class="pnl down"' not in text
+    assert 'class="pnl up"' not in text
+
+
+def test_orders_positions_mode_query_reads_other_mode_via_db(order_client, session, user):
+    """R2-10：未平倉頁 mode 分頁——service 目前在 sim 執行（`_FakeService.positions_snapshot`
+    固定回傳「TXF 多 1 口」），切到 real 分頁時必須改直接查 BrokerPosition（純讀，不影響
+    任何寫入路徑），看到的是 DB 裡真正的 real 部位（口數不同，藉此證明不是走到 fake 的
+    固定回傳值），不是 sim 那份。"""
+    from quanquant.db.models import BrokerPosition
+
+    pos = BrokerPosition(
+        user_id=user.id, broker="shioaji", account="F1", mode="real", symbol="TXF",
+        direction="long", status="open", total_opened_qty=5, closed_qty=0,
+        entry_notional=Decimal("90000"), exit_notional=Decimal("0"),
+        open_fee_total=Decimal("0"), close_fee_total=Decimal("0"),
+    )
+    session.add(pos)
+    session.commit()
+
+    sim_text = order_client.get("/orders/positions?mode=sim").text
+    real_text = order_client.get("/orders/positions?mode=real").text
+    assert "<td class=\"numcell\">1</td>" in sim_text  # fake 固定回傳的 1 口（走 positions_snapshot）
+    assert "<td class=\"numcell\">5</td>" in real_text  # DB 直查看到的 5 口（顯式切到非目前執行 mode）
+    assert "<td class=\"numcell\">5</td>" not in sim_text
+    assert "<td class=\"numcell\">1</td>" not in real_text
+
+
+def test_orders_positions_non_owner_still_403_for_other_mode_path(order_client, fake_guard, user):
+    """R2-10 邊界：非 owner 切到非目前執行 mode 分頁一樣要 403，不能繞過既有的授權判定。"""
+    fake_guard._owner_ids = set()
+    resp = order_client.get("/orders/positions?mode=real")
+    assert resp.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 006：下單子系統停用（service is None）時，交易大類四頁一律優雅降級、不 500
+# ---------------------------------------------------------------------------
+
+def _bare_client(engine, user):
+    """比照既有 `test_kill_switch_without_risk_guard_does_not_500`：刻意不設
+    `app.state.order_service`／`order_risk_guard`，模擬下單子系統未啟用的真實情境。"""
+    def _session_override():
+        with Session(engine) as s:
+            yield s
+
+    app = create_app()
+    app.dependency_overrides[get_session] = _session_override
+    app.dependency_overrides[get_poller] = lambda: None
+    c = TestClient(app)
+    c.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
+    return c
+
+
+def test_orders_queue_page_without_service_does_not_500(engine, user):
+    resp = _bare_client(engine, user).get("/orders/queue")
+    assert resp.status_code == 200
+
+
+def test_orders_deals_page_without_service_does_not_500(engine, user):
+    resp = _bare_client(engine, user).get("/orders/deals")
+    assert resp.status_code == 200
+    assert "尚無成交紀錄" in _bare_client(engine, user).get("/orders/deals-list").text
+
+
+def test_orders_holdings_page_without_service_does_not_500(engine, user):
+    resp = _bare_client(engine, user).get("/orders/holdings")
+    assert resp.status_code == 200
+    assert "目前無部位" in _bare_client(engine, user).get("/orders/positions").text

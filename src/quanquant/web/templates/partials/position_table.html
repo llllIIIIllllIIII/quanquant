@@ -1,15 +1,25 @@
+{# 006：未平倉頁部位表——補浮動損益欄（重用 journal/pnl.py::unrealized_pnl，見
+   web/routers/orders.py::_positions_with_pnl，不另寫數學）。`rows` 為 [(position,
+   unrealized_or_None), ...] 的配對清單；unrealized 為 None（無報價）時顯示「—」，
+   不可捏造數字。損益色沿用既有 .pnl.up/.pnl.down 慣例（隨 --rise/--fall 紅綠偏好翻轉，
+   同 partials/trade_table.html／position_strip.html）。 #}
 <table>
-  <thead><tr><th>商品</th><th>方向</th><th class="numcell">口數</th><th class="numcell">均價</th></tr></thead>
+  <thead>
+    <tr><th>商品</th><th>方向</th><th class="numcell">口數</th><th class="numcell">均價</th><th class="numcell">浮動損益</th></tr>
+  </thead>
   <tbody>
-    {% if not positions %}
-    <tr class="empty"><td colspan="4">目前無部位。</td></tr>
+    {% if not rows %}
+    <tr class="empty"><td colspan="5">目前無部位。</td></tr>
     {% endif %}
-    {% for p in positions %}
+    {% for p, unrealized in rows %}
     <tr>
       <td>{{ p.symbol }}</td>
       <td><span class="dir {{ 'long' if p.direction == 'long' else 'short' }}">{{ '多' if p.direction == 'long' else '空' }}</span></td>
       <td class="numcell">{{ p.qty }}</td>
-      <td class="numcell">{{ p.avg_price }}</td>
+      <td class="numcell">{{ p.avg_price | num }}</td>
+      <!-- 終審必修 LOW-6：同 position_strip.html——unrealized 為 None 時不落到 .down。 -->
+      {% set pnl_class = ('up' if unrealized >= 0 else 'down') if unrealized is not none else '' %}
+      <td class="numcell"><span class="pnl{% if pnl_class %} {{ pnl_class }}{% endif %}">{{ unrealized | signed }}</span></td>
     </tr>
     {% endfor %}
   </tbody>
