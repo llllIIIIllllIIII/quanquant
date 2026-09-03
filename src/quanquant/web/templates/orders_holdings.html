@@ -9,6 +9,7 @@
 {{ mode_tabs(mode, '/orders/holdings') }}
 
 <div hx-ext="sse" sse-connect="/orders/stream">
+  {% include "partials/banner_stack.html" %}
   <div class="table-wrap">
     <div hx-get="/orders/positions?mode={{ mode }}"
          hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>

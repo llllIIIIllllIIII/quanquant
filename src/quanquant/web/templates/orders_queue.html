@@ -18,6 +18,7 @@
        重抓自己 user-scoped 的委託。保留 load（首載）與 refreshorders from:body（本分頁
        改單/取消當下即時刷新）；不再每 2s 盲輪詢、不再壓 event loop/supervisor 鎖。 -->
   <div hx-ext="sse" sse-connect="/orders/stream">
+    {% include "partials/banner_stack.html" %}
     <div class="table-wrap">
       <div hx-get="/orders/list?mode={{ mode }}"
            hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>

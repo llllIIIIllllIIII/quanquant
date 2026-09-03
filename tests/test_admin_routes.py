@@ -1,4 +1,6 @@
 """/admin/users: admin-only management surface."""
+from datetime import datetime
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session
@@ -6,7 +8,7 @@ from sqlmodel import Session
 from quanquant.auth import service as auth_service
 from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker import repository as brepo
-from quanquant.db.models import Cooldown
+from quanquant.db.models import Cooldown, User
 
 from .conftest import _build_app
 
@@ -56,6 +58,23 @@ def test_toggle_active(client, engine):
                                       "password": "pw", "role": "user"})
     client.post(f"/admin/users/{_amy(engine).id}/toggle-active")
     assert _amy(engine).is_active is False
+
+
+def test_users_page_shows_created_at_in_taiwan_local_not_utc(client, engine):
+    """NEW-2：`created_at` 是 naive-UTC（db/models.py::_utcnow），改用 `dt_cst` 後畫面
+    應顯示台灣本地時間（+8 小時），不是裸印的 UTC 原始值。"""
+    client.post("/admin/users", data={"username": "amy", "display_name": "Amy",
+                                      "password": "pw", "role": "user"})
+    amy = _amy(engine)
+    with Session(engine) as s:
+        row = s.get(User, amy.id)
+        row.created_at = datetime(2026, 1, 1, 10, 0, 0)  # naive-UTC
+        s.add(row)
+        s.commit()
+    r = client.get("/admin/users")
+    assert r.status_code == 200
+    assert "2026-01-01 18:00:00" in r.text  # CST = UTC+8
+    assert "2026-01-01 10:00" not in r.text  # 不是裸印的 UTC 原始值
 
 
 def test_reset_password_bumps_tv(client, engine):

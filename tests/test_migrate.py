@@ -81,6 +81,29 @@ def test_theme_idempotent(tmp_path):
     assert "theme" in {c["name"] for c in insp.get_columns("users")}
 
 
+def test_adds_skip_sim_confirm_to_users(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_users5.db'}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)"
+        ))
+    ensure_columns(eng)
+    insp = inspect(eng)
+    assert "skip_sim_confirm" in {c["name"] for c in insp.get_columns("users")}
+
+
+def test_skip_sim_confirm_idempotent(tmp_path):
+    eng = create_engine(f"sqlite:///{tmp_path / 'old_users6.db'}")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)"
+        ))
+    ensure_columns(eng)
+    ensure_columns(eng)  # 第二次不得 raise
+    insp = inspect(eng)
+    assert "skip_sim_confirm" in {c["name"] for c in insp.get_columns("users")}
+
+
 def test_adds_mode_and_source_to_trades_with_defaults(tmp_path):
     eng = create_engine(f"sqlite:///{tmp_path / 'old_mode.db'}")
     with eng.begin() as conn:

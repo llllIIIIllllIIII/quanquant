@@ -86,26 +86,79 @@ def _count_open_orders_best_effort(session: Session, service) -> int:
         return 0
 
 
-def _form_error(message: str) -> HTMLResponse:
+# ---- 007：下單反饋橫幅（banner-stack）——HTTP 同步回應這半（P0-4/P0-5/P0-6）----
+#
+# 事件來源有兩種，互補不重疊：
+#   1. 這裡：place/cancel/update 的「使用者剛剛按下送出/取消/改單」這個動作本身的立即
+#      成敗——同步失敗（RiskError 不需確認／OrderError，如超過風控額度）永遠不會經過
+#      RawInboxWorker，SSE 的 order-report 事件不會發生，只能靠 HTTP 回應本身帶banner。
+#   2. static/banners.js 監聽的 SSE `deal`/`order-report`（見 broker/order_events.py，
+#      批次 B-1 已交付）——券商端非同步狀態變化（成交/委託狀態轉換）。
+# 兩者共用同一套視覺元件（.banner-stack／.order-banner），backend 只需要送純文字摘要
+# （title/detail），不需要結構化欄位——JS 端不必為兩種事件來源各寫一套渲染邏輯。
+_BANNER_FAIL_TITLES = {"place": "委託失敗", "cancel": "取消失敗", "update": "改單失敗"}
+
+
+def _banner_event(*, kind: str, ok: bool, title: str, detail: str = "") -> dict:
+    return {"kind": kind, "ok": ok, "title": title, "detail": detail}
+
+
+def _hx_trigger_header(events: dict) -> str:
+    """HTTP header 值只能是 latin-1（ASCII 子集）——`ensure_ascii=True`（預設）把中文
+    文案跳脫成 `\\uXXXX`，htmx 收到後照 JSON 語意解回原字串，畫面顯示不受影響。"""
+    return json.dumps(events)
+
+
+def _clear_form_error_oob() -> str:
+    """P0-4：成功時舊的錯誤 banner（`.form-error-slot`）沒有被清掉——htmx OOB swap 支援
+    任意 CSS selector 當目標（`innerHTML:<selector>`），送一段空內容就能清空既有殘留，
+    不需要知道裡面現在裝了什麼。"""
+    return '<div hx-swap-oob="innerHTML:.form-error-slot"></div>'
+
+
+def _form_error(message: str, *, banner_kind: str | None = None) -> HTMLResponse:
+    """`banner_kind` 為 None（預設）：純表單欄位驗證錯誤（打錯價格之類），只走既有
+    `.form-error-slot`、不進橫幅——見 007 規格「不要動到的部分」。帶 `banner_kind`
+    （'place'/'cancel'/'update'）：post-submission 失敗，額外用 HX-Trigger 觸發橫幅
+    （P0-4/P0-5/P0-6），與 `.form-error-slot` 的訊息並存（不是二選一）。"""
     html = render_partial("partials/form_error.html", message=message)
-    return HTMLResponse(
-        html, status_code=200, headers={"HX-Retarget": ".form-error-slot", "HX-Reswap": "innerHTML"}
-    )
+    headers = {"HX-Retarget": ".form-error-slot", "HX-Reswap": "innerHTML"}
+    if banner_kind is not None:
+        banner = _banner_event(kind=banner_kind, ok=False, title=_BANNER_FAIL_TITLES[banner_kind], detail=message)
+        headers["HX-Trigger"] = _hx_trigger_header({"order-banner": banner})
+    return HTMLResponse(html, status_code=200, headers=headers)
 
 
-def _orders_trigger(*, close_modal: bool = False) -> HTMLResponse:
-    events = "closeordermodal, refreshorders" if close_modal else "refreshorders"
-    return HTMLResponse("", headers={"HX-Trigger": events})
+def _orders_trigger(*, close_modal: bool = False, banner: dict | None = None) -> HTMLResponse:
+    events: dict = {"refreshorders": True}
+    if close_modal:
+        events["closeordermodal"] = True
+    if banner is not None:
+        events["order-banner"] = banner
+    # P0-4：成功時一併清掉舊的錯誤 banner（見 _clear_form_error_oob）。
+    return HTMLResponse(_clear_form_error_oob(), headers={"HX-Trigger": _hx_trigger_header(events)})
 
 
-def _place_success() -> HTMLResponse:
+def _place_success(req: OrderRequest) -> HTMLResponse:
     """下單成功：body 帶一個 out-of-band swap，把下單面板的 client_order_id hidden input
     換成全新 UUID——client_order_id 由 orders_page 首渲染時生成一次（round3 #7，同一張表單的
     HTTP retry 沿用同鍵才能冪等去重），但成功送出後若不換鍵，下一筆（尤其反向/不同 payload）
     會沿用同一顆鍵、被 repository 冪等防護擋成「同鍵不同 payload」。只在**成功**路徑換鍵，
-    失敗/需確認時不換（保留 retry 冪等）。同時觸發 refreshorders 刷新委託/部位列表。"""
-    html = render_partial("partials/client_order_id_input.html", client_order_id=str(uuid.uuid4()))
-    return HTMLResponse(html, headers={"HX-Trigger": "refreshorders"})
+    失敗/需確認時不換（保留 retry 冪等）。同時觸發 refreshorders 刷新委託/部位列表。
+
+    007（P0-4/P0-6）：額外帶一個「委託送出成功」橫幅（HTTP 層的立即回饋，內容含商品/方向/
+    口數/價格）＋清掉舊的錯誤 banner——這是券商 ack（SSE order-report）之外**唯一**保證
+    使用者按下送出後馬上看得到結果的路徑；SSE 事件隨後仍會依券商實際狀態（已委託/成交…）
+    再跳一條，兩者互補不衝突（見本檔 `_orders_trigger` 上方說明）。"""
+    price_text = "市價" if req.price_type == "MKT" else str(req.price)
+    detail = f"{req.symbol} {'買' if req.action == 'Buy' else '賣'} {req.qty} 口 @ {price_text}"
+    banner = _banner_event(kind="place", ok=True, title="委託送出成功", detail=detail)
+    html = (
+        render_partial("partials/client_order_id_input.html", client_order_id=str(uuid.uuid4()))
+        + _clear_form_error_oob()
+    )
+    events = {"refreshorders": True, "order-banner": banner}
+    return HTMLResponse(html, headers={"HX-Trigger": _hx_trigger_header(events)})
 
 
 def _parse_order_price(raw: str | None, *, price_type: str | None) -> Decimal:
@@ -206,20 +259,28 @@ def _update_confirm_dialog(session: Session, risk_guard, service, *, actor_user_
 
 
 def _edit_form_error(session: Session, service, broker_order_id: str, message: str, *,
-                     price=None, qty=None) -> HTMLResponse:
+                     price=None, qty=None, banner_kind: str | None = None) -> HTMLResponse:
     """改單表單驗證/送出失敗：重新渲染同一個改單表單並帶上錯誤訊息，讓使用者原地修正重試
     （不像 `_form_error` 那樣用 HX-Retarget 打到頁面共用的 `.form-error-slot`——那個共用
-    slot 在改單 modal 開著時仍可能被下單面板本身佔用，容易兩邊訊息互相打架）。"""
+    slot 在改單 modal 開著時仍可能被下單面板本身佔用，容易兩邊訊息互相打架）。
+
+    `banner_kind`（007，P0-6）：帶值時額外用 HX-Trigger 觸發橫幅——與 `_form_error` 的
+    `banner_kind` 同慣例，只在 post-submission 失敗（service.update() 拋出的
+    RiskError/OrderError）才傳，表單解析錯誤（呼叫端另一條路徑）不傳、不進橫幅。"""
     order = _find_order_for_service(session, service, broker_order_id)
     if order is None:
-        return _form_error(message)
+        return _form_error(message, banner_kind=banner_kind)
     html = render_partial(
         "partials/order_edit_form.html", order=order,
         qty=qty if qty is not None else order.qty,
         price=price if price is not None else order.price,
         error=message,
     )
-    return HTMLResponse(html, status_code=200)
+    headers = {}
+    if banner_kind is not None:
+        banner = _banner_event(kind=banner_kind, ok=False, title=_BANNER_FAIL_TITLES[banner_kind], detail=message)
+        headers["HX-Trigger"] = _hx_trigger_header({"order-banner": banner})
+    return HTMLResponse(html, status_code=200, headers=headers)
 
 
 @router.get("/orders", response_class=HTMLResponse)
@@ -251,11 +312,23 @@ def orders_page(
     kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
     now_ms = brepo.now_epoch_ms()
     cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms)
+    # 009：exec_mode 反映 server 執行 mode（`app.state.order_service.mode`），與任何
+    # `?mode=` 檢視參數無關；子系統停用（service is None）時 None，模板一律當非 sim
+    # 處理（不顯示「模擬單」徽章——沒有東西在跑，顯示模擬單反而誤導）。
+    exec_mode = service.mode if service is not None else None
+    # 007（sim 確認視窗偏好）：sim 且使用者未勾選「不再顯示」時，送出前預設要跳確認視窗；
+    # real 的兩階段確認是後端強制（見 broker/risk.py needs_confirm），完全不受這個偏好
+    # 影響，這裡的判斷只管 sim 這一支。
+    # F5（強制二次確認，尚未實作）預留：上線後這裡要在 `not user.skip_sim_confirm` 之前
+    # 短路——`or risk_guard.force_confirm(user.id)` 之類——讓 F5 生效時無視使用者的
+    # 「不再顯示」偏好，一律要求確認。
+    sim_confirm_required = exec_mode == "sim" and not user.skip_sim_confirm
     return templates.TemplateResponse(request, "orders.html", {
         "active": "orders",
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
         "symbols": ["TXF"], "kill_switch": kill_switch,
         "cooldown": cooldown, "cooldown_until_text": _fmt_cst(cooldown.until_ts) if cooldown else None,
+        "exec_mode": exec_mode, "sim_confirm_required": sim_confirm_required,
     })
 
 
@@ -835,10 +908,11 @@ async def place_order(
                 session, risk_guard, actor_user_id=user.id, req=req,
                 account=getattr(service, "account", ""), mode=service.mode,
             )
-        return _form_error(_safe_str(exc, service))
+        # 007（P0-4）：post-submission 失敗（如超過風控額度）——帶 banner_kind 觸發橫幅。
+        return _form_error(_safe_str(exc, service), banner_kind="place")
     except OrderError as exc:
-        return _form_error(_safe_str(exc, service))
-    return _place_success()
+        return _form_error(_safe_str(exc, service), banner_kind="place")
+    return _place_success(req)
 
 
 @router.get("/orders/{broker_order_id}/edit", response_class=HTMLResponse)
@@ -872,8 +946,11 @@ async def cancel_order(
     except AuthorizationError:
         raise HTTPException(status_code=403, detail="not owner")
     except OrderError as exc:
-        return _form_error(_safe_str(exc, service))
-    return _orders_trigger()
+        # 007（P0-5）：取消失敗過去完全看不到，現在額外帶 banner_kind 觸發橫幅。
+        return _form_error(_safe_str(exc, service), banner_kind="cancel")
+    # 007（P0-6）：取消成功過去沒有任何回饋，補一條橫幅。
+    banner = _banner_event(kind="cancel", ok=True, title="取消成功", detail=f"委託 {broker_order_id}")
+    return _orders_trigger(banner=banner)
 
 
 @router.put("/orders/{broker_order_id}", response_class=HTMLResponse)
@@ -913,7 +990,12 @@ async def update_order(
                 session, risk_guard, service, actor_user_id=user.id,
                 broker_order_id=broker_order_id, price=price, qty=qty,
             )
-        return _edit_form_error(session, service, broker_order_id, _safe_str(exc, service), price=price, qty=qty)
+        # 007（P0-6）：post-submission 失敗——帶 banner_kind 觸發橫幅。
+        return _edit_form_error(session, service, broker_order_id, _safe_str(exc, service), price=price, qty=qty,
+                                banner_kind="update")
     except OrderError as exc:
-        return _edit_form_error(session, service, broker_order_id, _safe_str(exc, service), price=price, qty=qty)
-    return _orders_trigger(close_modal=True)
+        return _edit_form_error(session, service, broker_order_id, _safe_str(exc, service), price=price, qty=qty,
+                                banner_kind="update")
+    # 007（P0-6）：改單成功過去沒有任何回饋，補一條橫幅。
+    banner = _banner_event(kind="update", ok=True, title="改單成功", detail=f"委託 {broker_order_id}")
+    return _orders_trigger(close_modal=True, banner=banner)

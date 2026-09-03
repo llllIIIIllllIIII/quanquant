@@ -1,7 +1,11 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="journal-head">
-  <h3>下單</h3>
+  {# 009：sim 執行模式標題旁掛橘黃「模擬單」徽章（同 .badge.open 色族 #f0b90b）；real
+     或子系統停用時不顯示任何徽章。反映 server 執行 mode（exec_mode），與任何 ?mode=
+     檢視參數無關。用 Jinja 註解（不是 HTML 註解）——real 頁面驗收「不顯示任何 mode
+     徽章」，HTML 註解裡提到「模擬單」三個字也會被瀏覽器/測試斷言的原始文字掃到。 #}
+  <h3>下單{% if exec_mode == 'sim' %} <span class="badge open exec-mode-badge">模擬單</span>{% endif %}</h3>
 </div>
 
 {% if not service_available %}
@@ -28,6 +32,7 @@
      一列。這條連線同時掛在 /orders/stream 的 sse:orders-changed 上——agent WS 連線/斷線
      時 agent_ws.py 會 hub.publish()，狀態列因此能即時反映，不必等下一次本分頁動作。 -->
 <div hx-ext="sse" sse-connect="/orders/stream">
+  {% include "partials/banner_stack.html" %}
   <div id="agent-status-box"
        hx-get="/orders/agent-status"
        hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
@@ -91,8 +96,14 @@
 
 <!-- hx-disabled-elt：送出期間停用送出鈕，杜絕「回應還沒回來前的 double-submit」——連點的
      第二下會帶同一顆 client_order_id（成功回應才會 OOB 換鍵），撞 repository 冪等短路而靜默
-     回既有委託、不建新單，使用者感覺「沒反應」。 -->
+     回既有委託、不建新單，使用者感覺「沒反應」。
+
+     007（sim 確認視窗）：`data-sim-confirm` 由伺服器算好（sim 且未勾「不再顯示」時為
+     "1"），static/order_confirm.js 監聽 htmx 的 `htmx:confirm` 事件、依這個旗標決定
+     要不要攔截送出改跳確認視窗（#sim-confirm-dialog）——real 完全不吃這個旗標，一律
+     不攔截，走既有的後端強制兩階段確認（confirm_dialog.html）。 -->
 <form id="order-form" hx-post="/orders" hx-swap="none" hx-disabled-elt="find button[type='submit']"
+      data-sim-confirm="{{ '1' if sim_confirm_required else '0' }}"
       x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
   <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
   <div class="grid">
@@ -170,4 +181,33 @@
 </form>
 
 <div class="confirm-slot"></div>
+
+{# 007：sim 下單確認視窗——內容同 real 確認框的完整委託摘要（static/order_confirm.js
+   於 htmx:confirm 攔截送出時填入 #sim-confirm-summary，讀當下表單欄位值，不需要伺服器
+   額外回應）；明示「模擬單」橘黃徽章（009）。勾選「不再顯示」送出後即時把
+   `data-sim-confirm` 改成 "0"（這個分頁立即生效）並非同步存回 User（PUT
+   /api/user/skip-sim-confirm，比照 QQTheme.toggle 既有慣例：失敗只影響下次載入）。
+
+   只在 exec_mode == 'sim' 時渲染這個 dialog：real 模式下 order_confirm.js 的
+   htmx:confirm 攔截本來就不會觸發它（`data-sim-confirm` 恆為 "0"），但 009 驗收
+   「real 頁面不顯示任何 mode 徽章」看的是整頁原始碼，不只是可見區域——不渲染這段
+   對 real 沒有任何行為影響（本來就用不到），卻讓「real 無標」這個承諾對頁面原始碼
+   同樣成立。 #}
+{% if exec_mode == 'sim' %}
+<dialog id="sim-confirm-dialog" aria-labelledby="sim-confirm-title">
+  <article class="modal-card">
+    <header>
+      <strong id="sim-confirm-title">確認送出 <span class="badge open exec-mode-badge">模擬單</span></strong>
+    </header>
+    <p id="sim-confirm-summary"></p>
+    <label>
+      <input type="checkbox" id="sim-confirm-skip-checkbox"> 不再顯示（之後模擬單直接送出）
+    </label>
+    <footer class="form-actions">
+      <button type="button" class="secondary" id="sim-confirm-cancel-btn">取消</button>
+      <button type="button" id="sim-confirm-submit-btn">確認送出</button>
+    </footer>
+  </article>
+</dialog>
+{% endif %}
 {% endblock %}

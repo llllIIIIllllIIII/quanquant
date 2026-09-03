@@ -1,0 +1,12 @@
+{# 007：下單反饋橫幅容器——右上堆疊，aria-live 播報成功/失敗委託回報與逐筆成交回報。
+
+   必須放在頁面既有 `hx-ext="sse" sse-connect="/orders/stream"` 容器內（不新開連線，
+   比照精簡條/agent 狀態既有慣例）：`hx-trigger` 宣告 `sse:deal`／`sse:order-report`
+   兩個具名事件，htmx-ext-sse（sse.js）看到某元素的 hx-trigger 含 `sse:<name>` spec，
+   會對該具名事件呼叫 `source.addEventListener(<name>, ...)`，收到時 `htmx.trigger(elt,
+   "sse:<name>", event)`（event 是原始 SSE MessageEvent）——這個 CustomEvent 會冒泡到
+   document，static/banners.js 在 document 上監聽 'sse:deal'/'sse:order-report' 取
+   `evt.detail.data`（SSE payload 字串）組橫幅內容，不需要另開一條 EventSource 連線、
+   也不會對這兩個事件發出任何 HTTP 請求（本身沒有 hx-get/hx-post）。 #}
+<div class="banner-stack" aria-live="polite" aria-atomic="false"
+     hx-trigger="sse:deal, sse:order-report" data-order-banner-stack></div>

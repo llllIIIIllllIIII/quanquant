@@ -483,6 +483,45 @@ button.risk-btn-danger:is(:hover, :focus), [role="button"].risk-btn-danger:is(:h
    慣例，scoped 到 `#cooldown-control`，讓快捷列維持一行 chip。 */
 #cooldown-control .mini { margin: 0; width: auto; padding: 0.15rem 0.5rem; font-size: 0.78rem; }
 
+/* ---- 007：下單反饋橫幅（banner-stack）----
+   右上堆疊，約一列高、不佔版面（spec：約 1/10 畫面）。滑入/滑出動畫；prefers-reduced-motion
+   由 tokens.css 的全域規則接管（`*{animation:none!important}`），移除動畫後元素直接以
+   最終狀態（opacity:1/transform:none）出現，不需要另外覆寫。 */
+.banner-stack {
+  position: fixed; top: calc(var(--qq-topnav-h, 3.5rem) + 0.75rem); right: 1rem; z-index: 1200;
+  display: flex; flex-direction: column; gap: 0.5rem;
+  width: min(22rem, calc(100vw - 2rem));
+  pointer-events: none; /* 容器本身不擋點擊；個別橫幅再開放 */
+}
+.order-banner {
+  pointer-events: auto; cursor: pointer;
+  background: var(--qq-surface); border: 1px solid var(--qq-border);
+  border-left: 4px solid var(--qq-border-strong);
+  border-radius: var(--qq-radius-sm); box-shadow: var(--qq-shadow-2);
+  padding: 0.55rem 0.8rem; font-size: 0.85rem; color: var(--qq-text);
+  animation: qq-banner-in 220ms ease-out;
+}
+.order-banner .banner-title { font-weight: 700; display: flex; align-items: center; gap: 0.3rem; }
+.order-banner .banner-detail { color: var(--qq-text-muted); margin-top: 0.15rem; }
+/* 成交：左側粗邊隨下單方向色（--rise/--fall，隨紅綠偏好翻轉，同 001 語意）。 */
+.order-banner.fill-long { border-left-color: var(--rise); }
+.order-banner.fill-short { border-left-color: var(--fall); }
+/* 失敗：固定警示紅（--down）實心底＋粗框＋✕圖示——不用方向色系，型式＋圖示＋文字三重
+   訊號，兼顧色弱使用者一眼可辨（與成交橫幅絕不混淆）。 */
+.order-banner.fail {
+  border: 2px solid var(--down); border-left-width: 2px;
+  background: color-mix(in srgb, var(--down) 20%, var(--qq-surface));
+  color: var(--down);
+}
+.order-banner.fail .banner-title::before { content: "✕"; }
+.order-banner.leaving { animation: qq-banner-out 200ms ease-in forwards; }
+@keyframes qq-banner-in { from { transform: translateX(120%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+@keyframes qq-banner-out { from { transform: translateX(0); opacity: 1; } to { transform: translateX(120%); opacity: 0; } }
+
+/* ---- 009：sim/real 執行模式識別——有橘標＝模擬、無標＝正式。直接重用 .badge.open
+   （夜盤徽章同色族 #f0b90b），不另開一組色票。 ---- */
+.exec-mode-badge { margin-left: 0.4rem; vertical-align: middle; }
+
 /* ---- responsive polish ---- */
 @media (max-width: 767px) {
   .chart-toolbar { gap: 0.4rem; }

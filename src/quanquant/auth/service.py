@@ -139,3 +139,13 @@ def set_theme(db: Session, user: User, theme: str) -> bool:
     db.add(user)
     db.commit()
     return True
+
+
+def set_skip_sim_confirm(db: Session, user: User, skip: bool) -> None:
+    """007：sim 下單確認視窗「不再顯示」偏好，跨裝置（存 User，比照 chart_color_scheme/
+    theme 的既有做法，不用 localStorage）。純 bool，沒有非法值可拒絕，故不像
+    set_color_scheme/set_theme 回傳成功與否。"""
+    user.skip_sim_confirm = bool(skip)
+    user.updated_at = _utcnow()
+    db.add(user)
+    db.commit()

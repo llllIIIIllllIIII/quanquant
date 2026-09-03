@@ -209,6 +209,7 @@ def test_deal_landing_also_publishes_order_report_reflecting_new_status(session,
     order_evt = next(e for e in events if e["event"] == "order-report")
     assert order_evt["payload"]["status"] == "filled"
     assert order_evt["payload"]["symbol"] == "TXF"
+    assert order_evt["payload"]["price_type"] == "LMT"  # LOW-6：payload schema 帶 price_type
 
 
 def test_multiple_deals_in_one_batch_each_publish_a_separate_scoped_event(session, engine):
@@ -276,6 +277,31 @@ def test_order_report_status_change_publishes_scoped_order_report_event(session,
     assert item["event"] == "order-report"
     assert item["payload"]["status"] == "cancelled"
     assert item["payload"]["symbol"] == "TXF"
+    assert item["payload"]["price_type"] == "LMT"  # LOW-6：payload schema 帶 price_type
+
+
+def test_order_report_event_payload_includes_price_type_for_unfilled_mkt_order(session, engine):
+    """LOW-6（fresh-context 終審修復）：未成交的 MKT 委託，`order.price`／
+    `avg_fill_price` 皆是 0/None，過去的 payload 沒有 price_type，前端只能看到裸的 "0"
+    字串顯示成「@ 0」——與 CRITICAL-1（confirm_dialog.html）同病。payload 現在必須帶
+    `price_type: "MKT"`，前端才能據此改顯示「市價」。"""
+    _seed_order(session, price=Decimal("0"), price_type="MKT", order_type="IOC")
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(s, kind="order_report", broker="shioaji", payload=json.dumps(dict(
+            broker="shioaji", account="F1", mode="sim", ordno="O1", broker_order_id="B1", status="submitted",
+        )))
+        s.commit()
+
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    queue = hub.subscribe(user_id=1)
+    assert worker.process_batch_once() == 1
+    worker._flush_pending_events()
+
+    item = queue.get_nowait()
+    assert item["event"] == "order-report"
+    assert item["payload"]["price_type"] == "MKT"
+    assert item["payload"]["price"] == "0"  # 欄位本身仍是 "0"——前端要靠 price_type 判斷顯示文字，不是靠這裡改值
 
 
 def test_replayed_deal_report_does_not_republish_events(session, engine):

@@ -3,7 +3,9 @@
   畫面顯示的完全一致——<strong>代碼不一致就不要核准</strong>。
 </p>
 <p>裝置代碼：<strong>{{ confirm.user_code }}</strong></p>
-<p class="muted" style="font-size:.85em;">請求建立時間：{{ confirm.created_at | dt }}</p>
+<!-- NEW-2：安全比對畫面，created_at 是 naive-UTC，`dt` 不轉時區會誤導使用者（UTC 差
+     8 小時）——改用 `dt_cst`。 -->
+<p class="muted" style="font-size:.85em;">請求建立時間：{{ confirm.created_at | dt_cst }}</p>
 <form method="post" action="/agent/authorize/decide">
   <input type="hidden" name="device_code_id" value="{{ confirm.device_code_id }}">
   <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

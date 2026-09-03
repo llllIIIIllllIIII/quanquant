@@ -24,7 +24,7 @@ from sqlmodel import Session, select
 
 from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker import repository as brepo
-from quanquant.broker.base import AuthorizationError, RiskError
+from quanquant.broker.base import AuthorizationError, OrderError, RiskError
 from quanquant.broker.connection_gate import AgentConnectionGate
 from quanquant.broker.order_events import OrderEventHub
 from quanquant.broker.risk import RiskGuard
@@ -59,10 +59,17 @@ class _FakeService:
         self.symbol = "TXF"
         self.placed = []
         self._deny_user = None
+        # 007：可控注入 place/cancel/update 的 post-submission 失敗（OrderError/RiskError
+        # 不需確認），供橫幅（banner_kind）行為測試用——預設 None 不影響既有任何測試。
+        self.place_error: Exception | None = None
+        self.cancel_error: Exception | None = None
+        self.update_error: Exception | None = None
 
     async def place(self, req, *, actor_user_id, confirm_token=None):
         if self._deny_user == actor_user_id:
             raise AuthorizationError("not owner")
+        if self.place_error is not None:
+            raise self.place_error
         if self.mode == "real" and not confirm_token:
             raise RiskError("需要確認", needs_confirm=True)
         self.placed.append(req)
@@ -71,11 +78,15 @@ class _FakeService:
     async def cancel(self, broker_order_id, *, actor_user_id):
         if self._deny_user == actor_user_id:
             raise AuthorizationError("not owner")
+        if self.cancel_error is not None:
+            raise self.cancel_error
         return OrderAck(client_order_id="", broker_order_id=broker_order_id, ordno="O1", status="cancelled")
 
     async def update(self, broker_order_id, *, actor_user_id, price=None, qty=None, confirm_token=None):
         if self._deny_user == actor_user_id:
             raise AuthorizationError("not owner")
+        if self.update_error is not None:
+            raise self.update_error
         return OrderAck(client_order_id="", broker_order_id=broker_order_id, ordno="O1", status="submitted")
 
     async def positions(self, *, actor_user_id):
@@ -1978,3 +1989,287 @@ def test_orders_holdings_page_without_service_does_not_500(engine, user):
     resp = _bare_client(engine, user).get("/orders/holdings")
     assert resp.status_code == 200
     assert "目前無部位" in _bare_client(engine, user).get("/orders/positions").text
+
+
+# ---------------------------------------------------------------------------
+# 007：下單反饋橫幅（banner-stack）——批次 B-3
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("path", ["/orders", "/orders/queue", "/orders/deals", "/orders/holdings"])
+def test_trade_pages_have_banner_stack_with_sse_wiring_and_aria_live(order_client, path):
+    """①②：banner-stack 容器在「交易」大類每一頁都出現，帶 aria-live 播報，且掛在既有
+    sse-connect 作用域內（`hx-trigger="sse:deal, sse:order-report"`，不新開連線）。"""
+    text = order_client.get(path).text
+    assert 'class="banner-stack"' in text
+    assert 'aria-live="polite"' in text
+    assert 'hx-trigger="sse:deal, sse:order-report"' in text
+    # 容器必須在既有 sse-connect="/orders/stream" 容器「之後」出現在原始碼裡才算掛在
+    # 同一個作用域內（partials/banner_stack.html 是 include 進那個 div 的第一個子元素）。
+    sse_idx = text.index('sse-connect="/orders/stream"')
+    banner_idx = text.index('class="banner-stack"')
+    assert sse_idx < banner_idx
+
+
+def test_app_css_defines_fail_and_fill_banner_classes_distinct_from_base():
+    """③（CSS 佐證）：失敗樣式 class 與成功（基底 `.order-banner`，中性配色）不同，
+    成交依方向各有獨立變體。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    css = (STATIC_DIR / "app.css").read_text(encoding="utf-8")
+    assert ".order-banner {" in css
+    assert ".order-banner.fail" in css
+    assert ".order-banner.fill-long" in css
+    assert ".order-banner.fill-short" in css
+
+
+def test_place_success_and_failure_banners_are_distinguishable(order_client, fake_service, user):
+    """③（行為佐證）：成功／失敗橫幅的 HX-Trigger payload 明確可辨（ok 旗標＋不同
+    title），JS 據此套用不同 class（.order-banner vs .order-banner.fail）。"""
+    ok_resp = order_client.post("/orders", data={
+        "client_order_id": "C-BANNER-OK", "symbol": "TXF", "action": "Buy", "qty": "1",
+        "price": "18000", "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert ok_resp.status_code == 200
+    ok_events = json.loads(ok_resp.headers["HX-Trigger"])
+    assert ok_events["order-banner"]["ok"] is True
+    assert ok_events["order-banner"]["title"] == "委託送出成功"
+    assert "TXF" in ok_events["order-banner"]["detail"]
+
+    fake_service.place_error = OrderError("超過單筆上限 5 口")
+    fail_resp = order_client.post("/orders", data={
+        "client_order_id": "C-BANNER-FAIL", "symbol": "TXF", "action": "Buy", "qty": "1",
+        "price": "18000", "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert fail_resp.status_code == 200
+    fail_events = json.loads(fail_resp.headers["HX-Trigger"])
+    assert fail_events["order-banner"]["ok"] is False
+    assert fail_events["order-banner"]["title"] == "委託失敗"
+    assert "超過單筆上限 5 口" in fail_events["order-banner"]["detail"]
+    assert fail_events["order-banner"] != ok_events["order-banner"]
+
+
+def test_place_form_validation_error_does_not_trigger_banner(order_client, fake_service, user):
+    """規格「不要動到的部分」：表單欄位驗證錯誤（打錯價格）就地顯示在表單旁，不進橫幅。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-FORMERR", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "not-a-number",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert "order-banner" not in (resp.headers.get("HX-Trigger") or "")
+
+
+def test_place_success_clears_stale_form_error_banner(order_client, fake_service, user):
+    """P0-4：成功不清除舊錯誤——成功回應要帶一個把 `.form-error-slot` 清空的 OOB swap。"""
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-CLEAR", "symbol": "TXF", "action": "Buy", "qty": "1", "price": "18000",
+        "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert 'hx-swap-oob="innerHTML:.form-error-slot"' in resp.text
+
+
+def test_cancel_success_triggers_banner(order_client, fake_service, user, session):
+    """P0-6：取消成功過去完全沒有回饋，現在要帶橫幅。"""
+    _seed_order(session, user, client_order_id="CX1", request_hash="CXH1", status="submitted",
+                broker_order_id="CX-B1", ordno="CXO1")
+    resp = order_client.delete("/orders/CX-B1")
+    assert resp.status_code == 200
+    events = json.loads(resp.headers["HX-Trigger"])
+    assert events["order-banner"]["ok"] is True
+    assert events["order-banner"]["title"] == "取消成功"
+
+
+def test_cancel_failure_triggers_fail_banner(order_client, fake_service, user, session):
+    """P0-5：取消失敗過去看不到，現在要帶失敗橫幅（且仍走 .form-error-slot）。"""
+    fake_service.cancel_error = OrderError("委託已成交，無法取消")
+    resp = order_client.delete("/orders/CX-B2")
+    assert resp.status_code == 200
+    assert resp.headers.get("HX-Retarget") == ".form-error-slot"
+    events = json.loads(resp.headers["HX-Trigger"])
+    assert events["order-banner"]["ok"] is False
+    assert events["order-banner"]["title"] == "取消失敗"
+    assert "委託已成交，無法取消" in events["order-banner"]["detail"]
+
+
+def test_update_success_triggers_banner(order_client, fake_service, user, session):
+    """P0-6：改單成功過去沒有回饋，現在要帶橫幅（且仍照舊觸發 closeordermodal）。"""
+    _seed_order(session, user, client_order_id="UX1", request_hash="UXH1", status="submitted",
+                broker_order_id="UX-B1", ordno="UXO1")
+    resp = order_client.put("/orders/UX-B1", data={"qty": "2"})
+    assert resp.status_code == 200
+    events = json.loads(resp.headers["HX-Trigger"])
+    assert events["order-banner"]["ok"] is True
+    assert events["order-banner"]["title"] == "改單成功"
+    assert events.get("closeordermodal") is True
+
+
+def test_update_failure_triggers_fail_banner(order_client, fake_service, user, session):
+    fake_service.update_error = OrderError("改單數量必須大於 0")
+    resp = order_client.put("/orders/UX-B2", data={"qty": "2"})
+    assert resp.status_code == 200
+    events = json.loads(resp.headers["HX-Trigger"])
+    assert events["order-banner"]["ok"] is False
+    assert events["order-banner"]["title"] == "改單失敗"
+
+
+# ---------------------------------------------------------------------------
+# 007：sim 下單確認視窗偏好——伺服器端計算出的 data-sim-confirm 旗標
+# ---------------------------------------------------------------------------
+
+def test_orders_page_sim_mode_default_requires_confirm(order_client):
+    """④：sim 模式、使用者未設定偏好（預設 None）時，下單頁應標記需要確認。"""
+    text = order_client.get("/orders").text
+    assert 'data-sim-confirm="1"' in text
+
+
+def test_orders_page_sim_mode_skips_confirm_after_preference_saved(order_client, session, user):
+    """⑥：偏好落定（skip_sim_confirm=True）後，下單頁不再標記需要確認。"""
+    from quanquant.db.models import User
+
+    row = session.get(User, user.id)
+    row.skip_sim_confirm = True
+    session.add(row)
+    session.commit()
+    text = order_client.get("/orders").text
+    assert 'data-sim-confirm="0"' in text
+
+
+def test_orders_page_real_mode_never_requires_sim_confirm_marker_regardless_of_preference(
+    order_client, fake_service, session, user
+):
+    """⑧：real 完全不受這個偏好影響——即使 skip_sim_confirm 明確設為 False（『每次都要
+    跳確認』的最強偏好），real 模式下 data-sim-confirm 仍必須是 "0"（real 走後端強制的
+    兩階段確認，不是這個客戶端 gate）。"""
+    from quanquant.db.models import User
+
+    row = session.get(User, user.id)
+    row.skip_sim_confirm = False
+    session.add(row)
+    session.commit()
+    fake_service.mode = "real"
+    text = order_client.get("/orders").text
+    assert 'data-sim-confirm="0"' in text
+
+
+def test_real_two_step_confirm_unaffected_by_skip_sim_confirm_preference(engine, user):
+    """⑧（端到端）：real 的伺服器強制兩階段確認，不論 skip_sim_confirm 為何值都必須照樣
+    要求 confirm_token——這個偏好只管 sim 的客戶端確認 gate。"""
+    with Session(engine) as s:
+        from quanquant.db.models import User
+
+        row = s.get(User, user.id)
+        row.skip_sim_confirm = True
+        s.add(row)
+        s.commit()
+
+    guard = _real_guard(engine, owner_user_ids=frozenset({user.id}))
+    adapter = _real_adapter(engine, guard)
+    client = _real_client(engine, user, adapter, guard)
+    form = {
+        "client_order_id": "C-SKIP-REAL", "symbol": "TXF", "action": "Buy", "qty": "1",
+        "price": "18000", "price_type": "LMT", "order_type": "ROD", "octype": "New",
+    }
+    first = client.post("/orders", data=form)
+    assert first.status_code == 200
+    token = _hidden(first.text, "confirm_token")
+    assert token is not None  # 依然回確認框，沒有因為 skip_sim_confirm=True 被跳過
+
+
+# ---------------------------------------------------------------------------
+# 009：sim/real 執行模式識別——有橘標＝模擬、無標＝正式
+# ---------------------------------------------------------------------------
+
+def test_orders_page_sim_mode_shows_badge(order_client):
+    """⑨：sim 執行模式在下單頁標題旁顯示「模擬單」橘黃徽章。"""
+    text = order_client.get("/orders").text
+    assert "模擬單" in text
+    assert 'class="badge open exec-mode-badge"' in text
+
+
+def test_orders_page_real_mode_shows_no_badge(order_client, fake_service):
+    """⑩：real 執行模式不顯示任何 mode 徽章。"""
+    fake_service.mode = "real"
+    text = order_client.get("/orders").text
+    assert "模擬單" not in text
+    assert "exec-mode-badge" not in text
+
+
+def test_orders_page_without_service_shows_no_sim_badge(engine, user):
+    """service 未啟用（exec_mode 為 None）時不應誤顯示「模擬單」——沒有東西在跑。"""
+    resp = _bare_client(engine, user).get("/orders")
+    assert "模擬單" not in resp.text
+
+
+def test_real_confirm_dialog_shows_full_order_content_and_formal_label(order_client, fake_service, user):
+    """⑪：real 兩階段確認框明示「正式單」，並帶完整委託內容（商品/方向/口數/價格/倉別）
+    （併 P1-15）。"""
+    fake_service.mode = "real"
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-REAL-CONFIRM", "symbol": "TXF", "action": "Sell", "qty": "3",
+        "price": "18200", "price_type": "LMT", "order_type": "ROD", "octype": "Cover",
+    })
+    assert resp.status_code == 200
+    assert "正式單" in resp.text
+    assert "TXF" in resp.text
+    assert "賣" in resp.text
+    assert "3" in resp.text
+    assert "18200" in resp.text
+    assert "平倉" in resp.text  # octype=Cover 的中文標籤
+
+
+def test_real_confirm_dialog_mkt_order_shows_market_price_label_not_zero(order_client, fake_service, user):
+    """CRITICAL-1（fresh-context 終審修復）：MKT 委託的 price 恆為 0——確認框過去裸印
+    `@ {{ price }}` 會顯示「@ 0」，這正是 P1-15 點名要修的問題，且發生在真錢送出前最後
+    一道辨識畫面上。改用 price_type 判斷後應顯示「市價」，不得出現「@ 0」；同時應帶出
+    price_type/order_type（此前傳進 context 卻只進 hidden input，畫面上完全看不到）。"""
+    fake_service.mode = "real"
+    resp = order_client.post("/orders", data={
+        "client_order_id": "C-REAL-MKT-CONFIRM", "symbol": "TXF", "action": "Buy", "qty": "3",
+        "price": "", "price_type": "MKT", "order_type": "IOC", "octype": "New",
+    })
+    assert resp.status_code == 200
+    assert "正式單" in resp.text
+    assert "市價" in resp.text
+    assert "@ 0" not in resp.text
+    assert "MKT" in resp.text
+    assert "IOC" in resp.text
+
+
+def test_banners_js_shows_market_price_label_for_mkt_order_report_not_zero():
+    """LOW-6（fresh-context 終審修復）：banners.js 對未成交 MKT 委託的 order-report 事件
+    要靠 payload.price_type 顯示「市價」，不能裸用 payload.price（"0" 是非空字串，原本
+    的判斷式會誤判成「有價格」而顯示「@ 0」）。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    js = (STATIC_DIR / "banners.js").read_text(encoding="utf-8")
+    assert 'payload.price_type === "MKT"' in js
+    assert "市價" in js
+
+
+def test_medium5_position_strip_bridges_only_deal_event_with_debounce():
+    """MEDIUM-5（收尾）＋MEDIUM-3（fresh-context 終審修復）：精簡條除既有 quote-stream
+    節流心跳外，另外橋接 orders-stream 的 `deal` 事件驅動即時刷新（見 static/app.js）——
+    不新開連線、不新增 hx-trigger 修飾詞，只是讓這個既有具名事件補發一次 `refreshorders`
+    （position-strip 本來就在監聽 `refreshorders from:body`）。
+
+    MEDIUM-3：不得再橋接 `sse:orders-changed`——那個事件已經被各頁需要它的元素直接監聽
+    （如 #agent-status-box），再橋接只會讓同一個 ping 造成雙倍請求；`sse:deal` 必須帶
+    debounce（clearTimeout/setTimeout 合併同批成交），避免一批多筆成交在毫秒內併發出
+    對應筆數的 `refreshorders`（等於重新引入輪詢式壓力，違背當初拔掉 `every 2s` 的初衷）。
+    """
+    from quanquant.web.templating import STATIC_DIR
+
+    js = (STATIC_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'addEventListener("sse:orders-changed"' not in js  # 不再橋接（已直達各元素）
+    assert 'addEventListener("sse:deal"' in js
+    assert 'htmx.trigger(document.body, "refreshorders")' in js
+    assert "setTimeout" in js and "clearTimeout" in js  # debounce 標記
+    assert "300" in js  # ~300ms debounce 時窗
+
+
+def test_sim_confirm_dialog_markup_shows_sim_badge(order_client):
+    """009／007：sim 確認視窗（前端在送出前攔截彈出）本體同樣要明示「模擬單」。"""
+    text = order_client.get("/orders").text
+    assert 'id="sim-confirm-dialog"' in text
+    assert "模擬單" in text
+    assert 'id="sim-confirm-skip-checkbox"' in text

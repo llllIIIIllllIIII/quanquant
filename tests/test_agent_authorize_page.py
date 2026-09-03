@@ -9,6 +9,7 @@ fake risk_guard，比照 `tests/test_orders_routes.py` 的 `_FakeRiskGuard`/`ord
 『無限制放行』。新增：`non_owner_client`（owner 名單不含目前使用者）與繼續使用 `client`
 （risk_guard 未接線）分別驗證 fail-closed 的兩種情境。"""
 import hashlib
+from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -107,6 +108,21 @@ def test_lookup_shows_confirmation_for_valid_pending_code(owner_client, session)
     resp = owner_client.post("/agent/authorize", data={"user_code": row.user_code, "csrf_token": csrf})
     assert resp.status_code == 200 and row.user_code in resp.text
     assert "核准" in resp.text and "拒絕" in resp.text
+
+
+def test_lookup_confirmation_shows_created_at_in_taiwan_local_not_utc(owner_client, session):
+    """NEW-2：安全比對畫面（核對裝置代碼），`created_at` 是 naive-UTC，改用 `dt_cst`
+    後應顯示台灣本地時間，不是裸印的 UTC 原始值（差 8 小時會誤導核對）。"""
+    raw, row = _pending_code(session)
+    row.created_at = datetime(2026, 1, 1, 10, 0, 0)  # naive-UTC
+    session.add(row)
+    session.commit()
+    get_resp = owner_client.get("/agent/authorize")
+    csrf = get_resp.cookies.get("qq_csrf_authorize")
+    resp = owner_client.post("/agent/authorize", data={"user_code": row.user_code, "csrf_token": csrf})
+    assert resp.status_code == 200
+    assert "2026-01-01 18:00:00" in resp.text  # CST = UTC+8
+    assert "2026-01-01 10:00" not in resp.text  # 不是裸印的 UTC 原始值
 
 
 def test_lookup_unknown_code_shows_generic_error(owner_client):

@@ -78,12 +78,18 @@ def _order_report_event_payload(order: Order) -> dict:
     見 ShioajiAdapter._map_order_report），留著這個欄位是為了讓 payload shape 穩定、
     B-3 前端不用等後續補欄位就能先接線；同步下單失敗（RiskError/OrderError）的訊息走既有
     HTTP 回應本身，不經這條 SSE 路徑，見本檔模組 docstring 與 007 規格「不要動到的部分」。
+
+    LOW-6（fresh-context 終審修復）：補 `price_type`——MKT 委託未成交時 `avg_fill_price`
+    為 None、`order.price` 恆為 0（`_parse_order_price` 送單當下就定的，同 confirm_dialog
+    的 CRITICAL-1），沒有這個欄位時前端（static/banners.js）只看得到裸的 "0" 這個字串，
+    會顯示成「@ 0」（`"0"` 是非空字串，truthy）；帶上 price_type 讓前端能比照
+    confirm_dialog.html 的判斷式改顯示「市價」。
     """
     price = order.avg_fill_price if order.avg_fill_price is not None else order.price
     return {
         "symbol": order.symbol, "action": order.action, "qty": order.qty,
-        "filled_qty": order.filled_qty, "price": str(price), "status": order.status,
-        "octype": order.octype, "broker_order_id": order.broker_order_id,
+        "filled_qty": order.filled_qty, "price": str(price), "price_type": order.price_type,
+        "status": order.status, "octype": order.octype, "broker_order_id": order.broker_order_id,
         "error_message": None,
     }
 

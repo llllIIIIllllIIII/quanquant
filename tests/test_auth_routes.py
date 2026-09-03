@@ -268,6 +268,65 @@ def test_base_theme_defaults_dark(client):
     assert 'data-theme="dark"' in r.text
 
 
+# ---------------------------------------------------------------------------
+# 007：sim 下單確認視窗偏好——skip_sim_confirm（⑤ 勾選後 User 欄位落 DB／⑦ 帳戶頁可改回）
+# ---------------------------------------------------------------------------
+
+def test_account_page_shows_sim_confirm_checkbox_unchecked_by_default(client):
+    r = client.get("/account")
+    assert r.status_code == 200
+    assert 'name="skip_sim_confirm"' in r.text
+    assert 'name="skip_sim_confirm" value="1" checked' not in r.text
+
+
+def test_put_skip_sim_confirm_api_persists_to_user_row(client, engine, user):
+    """⑤：勾選後（前端的「不再顯示」checkbox 觸發這支 API）User 欄位要真的落 DB，不是只
+    在畫面上假裝生效。"""
+    r = client.put("/api/user/skip-sim-confirm", json={"skip": True})
+    assert r.status_code == 204
+    with Session(engine) as s:
+        from quanquant.db.models import User
+
+        row = s.get(User, user.id)
+        assert row.skip_sim_confirm is True
+
+
+def test_put_skip_sim_confirm_api_rejects_non_bool(client):
+    r = client.put("/api/user/skip-sim-confirm", json={"skip": "yes"})
+    assert r.status_code == 422
+
+
+def test_put_skip_sim_confirm_api_requires_auth(anon_client):
+    r = anon_client.put("/api/user/skip-sim-confirm", json={"skip": True}, follow_redirects=False)
+    assert r.status_code in (401, 303, 307)
+
+
+def test_put_skip_sim_confirm_api_bad_body(client):
+    r = client.put("/api/user/skip-sim-confirm", content=b"not json",
+                   headers={"Content-Type": "application/json"})
+    assert r.status_code == 422
+
+
+def test_account_page_sim_confirm_form_can_turn_preference_back_on_and_off(client, engine, user):
+    """⑦：帳戶頁可改回——勾選存成 True 之後，再用未勾選（表單不送這個欄位）的請求送出，
+    要能改回 False。"""
+    r_on = client.post("/account/sim-confirm", data={"skip_sim_confirm": "1"}, follow_redirects=False)
+    assert r_on.status_code == 303
+    with Session(engine) as s:
+        from quanquant.db.models import User
+
+        assert s.get(User, user.id).skip_sim_confirm is True
+    assert 'name="skip_sim_confirm" value="1" checked' in client.get("/account").text
+
+    r_off = client.post("/account/sim-confirm", data={}, follow_redirects=False)  # 未勾選：不送欄位
+    assert r_off.status_code == 303
+    with Session(engine) as s:
+        from quanquant.db.models import User
+
+        assert s.get(User, user.id).skip_sim_confirm is False
+    assert 'name="skip_sim_confirm" value="1" checked' not in client.get("/account").text
+
+
 def test_dashboard_loads_indicators_module(client):
     body = client.get("/").text
     assert "/static/indicators.js" in body

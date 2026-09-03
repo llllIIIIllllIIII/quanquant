@@ -188,6 +188,11 @@ class User(SQLModel, table=True):
     telegram_chat_id: str | None = None                   # 第二階段深度連結綁定用
     chart_color_scheme: str | None = None                 # "green_up"(綠漲紅跌,預設) | "red_up"(紅漲綠跌)
     theme: str | None = None                              # "dark"(預設) | "light" — 介面主題
+    # 007：sim 下單確認視窗「不再顯示」偏好——跨裝置（存 User，不用 localStorage）。
+    # None/False＝每次跳出確認（安全預設）；True＝略過。real 的兩階段確認完全不受這個欄位
+    # 影響（後端強制，見 broker/risk.py needs_confirm）。F5「強制二次確認」上線後，該旗標
+    # 開啟時呼叫端要無視這裡的值、一律視為 False（見 web/routers/orders.py 的計算處註解）。
+    skip_sim_confirm: bool | None = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

@@ -69,6 +69,7 @@ def _account_context(session: Session, user: User, *, error: str | None, risk_gu
     return {
         "active": "account", "error": error, "color_scheme": user.chart_color_scheme or "green_up",
         "is_owner": is_owner, "token_row": token_row, "raw_token": None,
+        "skip_sim_confirm": bool(user.skip_sim_confirm),  # 007：帳戶頁可改回
     }
 
 
@@ -95,6 +96,19 @@ def change_color_scheme(
             request, "account.html",
             _account_context(session, user, error="配色設定無效", risk_guard=risk_guard),
         )
+    return RedirectResponse("/account", status_code=303)
+
+
+@router.post("/account/sim-confirm")
+def change_sim_confirm(
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+    skip_sim_confirm: str | None = Form(None),
+):
+    """007：帳戶頁可改回 sim 下單確認視窗偏好——checkbox 未勾選時瀏覽器根本不會送出這個
+    欄位（`Form(None)`），送出即代表勾選，故「有沒有這個欄位」本身就是 skip 與否的答案，
+    不需要另外檢查值內容。"""
+    service.set_skip_sim_confirm(session, user, skip_sim_confirm is not None)
     return RedirectResponse("/account", status_code=303)
 
 
