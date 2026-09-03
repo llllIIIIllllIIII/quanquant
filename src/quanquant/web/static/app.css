@@ -274,6 +274,12 @@ html[data-theme="light"] .theme-toggle .icon-sun { display: none; }
   border: 1px solid var(--qq-border); border-radius: var(--qq-radius-lg);
 }
 .filterbar select, .filterbar input { margin: 0; width: auto; min-width: 9rem; font-size: 0.85rem; }
+.filterbar input[type="date"], .filterbar input[type="checkbox"] { min-width: 0; }
+.checkbox-inline { display: flex; align-items: center; gap: 0.4rem; width: auto; font-size: 0.85rem; }
+.checkbox-inline input[type="checkbox"] { margin: 0; }
+/* 008：套用鈕恢復正常尺寸——Pico 預設 button 是 width:100%，.filterbar 是 flex row，
+   不覆寫的話送出鈕會撐滿整行（正是舊版「套用鈕整條全寬」那個 bug 的成因）。 */
+.filterbar button { width: auto; margin: 0; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--qq-border); border-radius: var(--qq-radius-lg); }
 table { font-size: 0.88rem; margin-bottom: 0; }
@@ -396,6 +402,9 @@ a.mini { padding: 0.15rem 0.5rem; font-size: 0.78rem; }
 .cards .big.down { color: var(--fall); }
 .export-actions { display: flex; gap: 0.5rem; }
 .export-actions [role="button"] { font-size: 0.82rem; padding: 0.35rem 0.8rem; }
+/* 008：匯出鈕旁的口徑註腳（終審 LOW-5）——匯出範圍＝當下篩選，含手動補記的規則同上方統計。 */
+.export-actions-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 0.3rem; }
+.export-actions-wrap small { font-size: 0.72rem; }
 
 /* ---- Form ---- */
 .modal-card { max-width: 640px; }
@@ -629,4 +638,70 @@ html[data-theme] .flatpickr-time input:hover,
 html[data-theme] .flatpickr-time input:focus { background: var(--qq-surface-2); }
 html[data-theme] .flatpickr-calendar .numInputWrapper:hover { background: var(--qq-surface-2); }
 html[data-theme] .flatpickr-calendar .numInputWrapper span.arrowUp::after { border-bottom-color: var(--qq-text-muted); }
+
+/* ---- 008：交易績效頁——指標分層（常駐一列＋「更多指標」摺疊） ---- */
+.quick-range { display: flex; gap: 0.25rem; }
+.quick-range .segmented-option, .quick-range button.segmented-option {
+  border: none; background: transparent; font: inherit; cursor: pointer;
+}
+.perf-row {
+  display: flex; flex-wrap: wrap; align-items: flex-start; justify-content: space-between;
+  gap: 0.5rem 1.5rem; margin: 1rem 0;
+}
+.perf-stats { display: flex; flex-wrap: wrap; align-items: baseline; gap: 1.5rem; }
+.perf-stats .stat-primary .big { font-size: 2.1rem; font-weight: 700; }
+.perf-stats .stat-item .big { font-size: 1.3rem; font-weight: 700; }
+.perf-stats small { display: block; color: var(--qq-text-muted); margin-bottom: 0.15rem; }
+details.more-metrics { margin: 0; }
+details.more-metrics[open] { flex-basis: 100%; }
+details.more-metrics summary {
+  cursor: pointer; color: var(--qq-accent); font-size: 0.85rem; font-weight: 600;
+  list-style: none; user-select: none;
+}
+details.more-metrics summary::-webkit-details-marker { display: none; }
+details.more-metrics summary::before { content: "▸ "; }
+details.more-metrics[open] summary::before { content: "▾ "; }
+.more-metrics-body { margin-top: 0.75rem; width: 100%; }
+.more-metrics-body h4 { margin-bottom: 0.4rem; }
+
+/* 標籤・備註欄：chips 常駐、備註鈕低調（有內容才亮，其餘 hover 才明顯）。 */
+.tagnote-cell { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem; }
+.note-btn {
+  border: 1px solid var(--qq-border); border-radius: var(--qq-radius-sm); background: transparent;
+  color: var(--qq-text-muted); font-size: 0.72rem; padding: 0.05rem 0.4rem; opacity: 0.35;
+  cursor: pointer; text-decoration: none;
+}
+.note-btn:hover, .note-btn:focus-visible { opacity: 1; }
+.note-btn.has-note { opacity: 0.9; color: var(--qq-accent); border-color: var(--qq-accent); }
+
+/* 010：今日復盤區塊 */
+.review-block { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--qq-border); }
+.review-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+.review-head h4 { margin: 0; }
+.review-objective {
+  display: flex; flex-wrap: wrap; gap: 1.25rem; margin: 0.75rem 0 1rem; padding: 0.6rem 0.9rem;
+  background: var(--qq-surface); border: 1px solid var(--qq-border); border-radius: var(--qq-radius-lg);
+  font-size: 0.85rem;
+}
+.review-objective b { font-family: var(--qq-font-mono); }
+.review-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 1rem; }
+.review-fields label { font-size: 0.85rem; font-weight: 600; margin-bottom: 0.3rem; display: block; }
+.review-fields textarea { width: 100%; min-height: 4.5rem; resize: vertical; font-size: 0.85rem; }
+.badge.review-pending { background: rgba(240, 185, 11, 0.18); color: #f0b90b; border-color: transparent; }
+.badge.review-done { background: color-mix(in srgb, var(--up) 16%, transparent); color: var(--up); border-color: transparent; }
+
+.pager { display: flex; align-items: center; gap: 0.75rem; margin: 0.75rem 0; font-size: 0.85rem; }
+.pager .muted { font-size: 0.82rem; }
+
+/* 010：交易日記頁——每日復盤讀入口（與逐筆交易並存） */
+.review-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.review-entry {
+  border: 1px solid var(--qq-border); border-radius: var(--qq-radius-lg);
+  background: var(--qq-surface); padding: 0.5rem 0.9rem;
+}
+.review-entry summary { cursor: pointer; font-weight: 600; list-style: none; }
+.review-entry summary::-webkit-details-marker { display: none; }
+.review-entry summary small { font-weight: 400; margin-left: 0.5rem; }
+.review-entry-body { margin-top: 0.6rem; font-size: 0.85rem; }
+.review-entry-body p { margin: 0.3rem 0; }
 html[data-theme] .flatpickr-calendar .numInputWrapper span.arrowDown::after { border-top-color: var(--qq-text-muted); }

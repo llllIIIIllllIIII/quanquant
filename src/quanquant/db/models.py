@@ -694,3 +694,52 @@ class Cooldown(SQLModel, table=True):
     lifted_ts: int | None = Field(                                          # 解除 epoch-ms UTC；NULL=未解除
         default=None, sa_column=Column(BigInteger, nullable=True)
     )
+
+
+class DailyReview(SQLModel, table=True):
+    """010：每日復盤（日層級交易日記）。`(user_id, mode, trading_day)` 唯一——sim/real
+    各自的交易日各自一則（見 web/routers/stats.py 寫入口、web/routers/trades.py 讀入口）。
+
+    只存主觀三欄（結構化提示，非空白框）＋客觀數據快照。**快照語意**：`snapshot_*` 欄位
+    只在**首次建立**（INSERT）時由呼叫端帶入當時算出的客觀事實，之後的編輯
+    （`update_review`）只碰主觀三欄，不重算/不覆寫快照——避免「事後補單改寫歷史」
+    （見 journal/review_repository.py::save_review 的 create-or-update 語意）。
+
+    `snapshot_kill_switch_count`：`None` 代表「查無資料源」（`RiskGuard.KillSwitchState`
+    目前是純 in-memory、未落 DB，見 broker/risk.py 開頭註解，2026-09-02 查證確認無持久化
+    記錄）——畫面顯示「—」，不可顯示假 0（010 驗收條件明訂）。
+
+    走 SQLModel.metadata.create_all 自動建（同上方既有新表範式，兩方言通用，不需要
+    db/migrate.py 的 ensure_columns）。"""
+
+    __tablename__ = "daily_reviews"
+    __table_args__ = (
+        UniqueConstraint("user_id", "mode", "trading_day", name="uq_daily_reviews_user_mode_day"),
+        CheckConstraint("mode IS NOT NULL AND mode IN ('sim','real')", name="ck_daily_reviews_mode"),
+    )
+
+    id: int | None = Field(default=None, primary_key=True)
+    user_id: int = Field(index=True)
+    mode: str = Field(default="real", index=True)
+    trading_day: str = Field(index=True)  # "YYYY-MM-DD"（journal.trading_day.trading_day_of）
+
+    # 主觀三欄（結構化提示，見 web/templates/stats.html 的 placeholder 文案）
+    discipline_note: str | None = None   # 執行紀律：今天有照計畫走嗎？
+    emotion_note: str | None = None      # 情緒狀態
+    tomorrow_focus: str | None = None    # 明天要調整的一件事
+
+    # 客觀數據快照（首次儲存時凍結，之後編輯主觀欄位不改動）
+    snapshot_pnl: Decimal | None = Field(default=None, sa_column=Column(DecimalText))
+    snapshot_trade_count: int | None = None
+    # 終審 MEDIUM-2（2026-09-04）：欄位保留供未來使用，但 web/routers/stats.py 目前一律
+    # 寫 None——已平倉 round-trip 筆數（trading_day、夜盤跨日）與委託次數日配額
+    # （settings.order_max_orders_per_day，計數基準是日曆日 trading_day_for，非
+    # trading_day）口徑不同，不可硬塞成同一個數字顯示；真的要接「今日委託數／配額」
+    # 需另外算，不是這裡。
+    snapshot_daily_quota: int | None = None
+    snapshot_win_rate: float | None = None       # 0..1
+    snapshot_max_losing_streak: int | None = None
+    snapshot_kill_switch_count: int | None = None  # None＝查無資料源（顯示「—」，見上方類別註解）
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)

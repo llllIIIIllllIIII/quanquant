@@ -46,6 +46,30 @@
     </table>
   </div>
 
+  <!-- 010 讀入口：每日復盤，按交易日新到舊讀回顧，與上方逐筆交易並存（不影響逐筆列表／
+       手動補記表單）。寫入口在交易績效頁（區間＝單日時才出現）。 -->
+  {% if reviews %}
+  <h4>每日復盤</h4>
+  <div class="review-list">
+    {% for r in reviews %}
+    <details class="review-entry">
+      <summary>
+        {{ r.trading_day }}
+        <small class="muted">
+          損益 {{ r.snapshot_pnl | signed }}・{{ r.snapshot_trade_count }} 筆・
+          勝率 {% if r.snapshot_win_rate is not none %}{{ (r.snapshot_win_rate * 100) | round(1) }}%{% else %}—{% endif %}
+        </small>
+      </summary>
+      <div class="review-entry-body">
+        <p><strong>執行紀律：</strong>{{ r.discipline_note or '（未填寫）' }}</p>
+        <p><strong>情緒狀態：</strong>{{ r.emotion_note or '（未填寫）' }}</p>
+        <p><strong>明天要調整的一件事：</strong>{{ r.tomorrow_focus or '（未填寫）' }}</p>
+      </div>
+    </details>
+    {% endfor %}
+  </div>
+  {% endif %}
+
   <!-- modal -->
   <dialog :open="open">
     <article class="modal-card">

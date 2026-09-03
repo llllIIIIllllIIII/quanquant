@@ -1,11 +1,8 @@
 {% extends "base.html" %}
 {% from "macros/segmented.html" import mode_tabs %}
 
-{% macro metric_cards(m) %}
+{% macro more_metrics(m) %}
 <div class="cards">
-  <article class="stat-card focus {{ 'up' if m.total_pnl >= 0 else 'down' }}"><small>總損益</small><div class="big {{ 'up' if m.total_pnl >= 0 else 'down' }}">{{ m.total_pnl | signed }}</div></article>
-  <article class="stat-card"><small>交易次數</small><div class="big">{{ m.count }}</div></article>
-  <article class="stat-card"><small>勝率</small><div class="big">{{ (m.win_rate * 100) | round(1) }}%</div><small class="muted">{{ m.wins }} 勝 / {{ m.losses }} 負</small></article>
   <article class="stat-card up"><small>平均獲利</small><div class="big up">{{ m.avg_win | num }}</div></article>
   <article class="stat-card down"><small>平均虧損</small><div class="big down">{{ m.avg_loss | num }}</div></article>
   <article class="stat-card up"><small>最大單筆獲利</small><div class="big up">{{ m.max_win | num }}</div></article>
@@ -40,35 +37,177 @@
 {% endmacro %}
 
 {% block content %}
-{% set qs = 'mode=' ~ f.mode ~ '&symbol=' ~ (f.symbol | urlencode) ~ '&tag=' ~ (f.tag | urlencode) ~ '&date_from=' ~ f.date_from ~ '&date_to=' ~ f.date_to %}
+{% set base_qs = 'mode=' ~ f.mode ~ '&symbol=' ~ (f.symbol | urlencode) ~ '&tag=' ~ (f.tag | urlencode) ~ '&result=' ~ (f.result | urlencode) ~ (('&include_manual=1') if f.include_manual else '') %}
+{% set qs = base_qs ~ '&date_from=' ~ f.date_from ~ '&date_to=' ~ f.date_to %}
 
 <div class="journal-head">
-  <h3>績效統計</h3>
-  <div class="export-actions">
-    <a role="button" class="outline" href="/stats/export.csv?{{ qs }}">匯出 CSV</a>
-    <a role="button" class="outline" href="/stats/export.xlsx?{{ qs }}">匯出 Excel</a>
+  <h3>交易績效</h3>
+  <div class="export-actions-wrap">
+    <div class="export-actions">
+      <a role="button" class="outline" href="/stats/export.csv?{{ qs }}">匯出 CSV</a>
+      <a role="button" class="outline" href="/stats/export.xlsx?{{ qs }}">匯出 Excel</a>
+    </div>
+    <small class="muted">＊手動補記單預設不計入（可用「含手動補記」納入）</small>
   </div>
 </div>
 
 {{ mode_tabs(f.mode, '/stats') }}
 
+<div x-data="{ open: false, custom: {{ 'true' if quick == 'custom' else 'false' }} }" @closemodal.window="open = false">
+
 <form class="filterbar card-bar" method="get" action="/stats">
   <input type="hidden" name="mode" value="{{ f.mode }}">
+  <div class="quick-range" role="group" aria-label="快捷區間">
+    <a class="segmented-option{{ ' is-selected' if quick == 'today' else '' }}"
+       href="/stats?{{ base_qs }}&date_from={{ ranges.today[0] }}&date_to={{ ranges.today[1] }}">今日</a>
+    <a class="segmented-option{{ ' is-selected' if quick == 'week' else '' }}"
+       href="/stats?{{ base_qs }}&date_from={{ ranges.week[0] }}&date_to={{ ranges.week[1] }}">本週</a>
+    <a class="segmented-option{{ ' is-selected' if quick == 'month' else '' }}"
+       href="/stats?{{ base_qs }}&date_from={{ ranges.month[0] }}&date_to={{ ranges.month[1] }}">本月</a>
+    <button type="button" class="segmented-option{{ ' is-selected' if quick == 'custom' else '' }}"
+            @click="custom = true">自訂</button>
+  </div>
+  <input type="date" name="date_from" value="{{ f.date_from }}" aria-label="開始日期" x-show="custom">
+  <input type="date" name="date_to" value="{{ f.date_to }}" aria-label="結束日期" x-show="custom">
   <select name="symbol" aria-label="商品">
     <option value="">全部商品</option>
-    {% for s in symbols %}<option value="{{ s }}" {% if f.symbol == s %}selected{% endif %}>{{ s }}</option>{% endfor %}
+    {% for s in symbols %}<option value="{{ s }}" {% if f.symbol == s %}selected{% endif %}>{{ s | symbol_label }}</option>{% endfor %}
   </select>
   <select name="tag" aria-label="標籤">
     <option value="">全部標籤</option>
     {% for t in all_tags %}<option value="{{ t }}" {% if f.tag == t %}selected{% endif %}>{{ t }}</option>{% endfor %}
   </select>
-  <input type="date" name="date_from" value="{{ f.date_from }}" aria-label="開始日期">
-  <input type="date" name="date_to" value="{{ f.date_to }}" aria-label="結束日期">
+  <select name="result" aria-label="結果">
+    <option value="" {% if f.result == '' %}selected{% endif %}>全部結果</option>
+    <option value="win" {% if f.result == 'win' %}selected{% endif %}>只看獲利</option>
+    <option value="loss" {% if f.result == 'loss' %}selected{% endif %}>只看虧損</option>
+  </select>
+  {% if f.mode == 'sim' %}
+  <select disabled aria-label="輪次（規劃中，尚未開放篩選）" title="輪次篩選規劃於後續批次">
+    <option>第 N 輪（當前）</option>
+  </select>
+  {% endif %}
+  <label class="checkbox-inline">
+    <input type="checkbox" name="include_manual" value="1" {% if f.include_manual %}checked{% endif %}>
+    含手動補記
+  </label>
   <button type="submit">套用</button>
 </form>
 
-<small class="muted">統計僅計入已平倉交易。</small>
-{{ metric_cards(stats.overall) }}
-{{ breakdown('依標籤', stats.by_tag) }}
-{{ breakdown('依商品', stats.by_symbol) }}
+<div class="perf-row">
+  <div class="perf-stats">
+    <div class="stat-primary"><small>總損益</small><div class="big {{ 'up' if stats.overall.total_pnl >= 0 else 'down' }}">{{ stats.overall.total_pnl | signed }}</div></div>
+    <div class="stat-item"><small>交易次數</small><div class="big">{{ stats.overall.count }}</div></div>
+    <div class="stat-item"><small>勝率</small><div class="big">{{ (stats.overall.win_rate * 100) | round(1) }}%</div><small class="muted">{{ stats.overall.wins }} 勝 / {{ stats.overall.losses }} 負</small></div>
+  </div>
+  <details class="more-metrics" {{ 'open' if expanded }}>
+    <summary>更多指標</summary>
+    <div class="more-metrics-body">
+      {{ more_metrics(stats.overall) }}
+      {{ breakdown('依標籤', stats.by_tag) }}
+      {{ breakdown('依商品', stats.by_symbol) }}
+    </div>
+  </details>
+</div>
+
+<h4>已平倉交易 <small class="muted">{{ f.date_from }}{% if f.date_from != f.date_to %} ~ {{ f.date_to }}{% endif %}</small></h4>
+<div class="table-wrap">
+  <table>
+    <thead>
+      <tr>
+        <th>平倉時間</th><th>商品</th><th>方向</th><th>口數</th><th>進場均價</th><th>出場均價</th>
+        <th>損益</th><th>來源</th><th>標籤・備註</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if not closed_rows %}
+      <tr class="empty"><td colspan="9">此區間沒有已平倉交易。</td></tr>
+      {% endif %}
+      {% for r in closed_rows %}
+      <tr id="trade-{{ r.t.id }}">
+        <td class="nowrap">{{ r.t.exit_time | dt }}</td>
+        <td>{{ r.t.symbol | symbol_label }}</td>
+        <td><span class="dir {{ 'long' if r.t.direction == 'long' else 'short' }}">{{ '多' if r.t.direction == 'long' else '空' }}</span></td>
+        <td class="numcell">{{ r.t.size }}</td>
+        <td class="numcell">{{ r.t.entry_price | num }}</td>
+        <td class="numcell">{{ r.t.exit_price | num }}</td>
+        <td class="numcell"><span class="pnl {{ 'up' if r.t.pnl >= 0 else 'down' }}">{{ r.t.pnl | signed }}</span></td>
+        <td>{% if r.t.source == 'shioaji' %}<span class="badge">自動</span>{% else %}<span class="badge open">手動</span>{% endif %}</td>
+        <td class="tagnote-cell">
+          {% for tag in r.tags %}<span class="tag">{{ tag }}</span>{% endfor %}
+          <a href="#" role="button" class="note-btn{{ ' has-note' if r.t.note else '' }}"
+             hx-get="/trades/{{ r.t.id }}/edit" hx-target="#modal-body" hx-swap="innerHTML"
+             @click="open = true" title="編輯標籤／備註">{% if r.t.note %}備註{% else %}＋標籤／備註{% endif %}</a>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="pager">
+  <span class="muted">共 {{ total }} 筆、第 {{ page }} / {{ total_pages }} 頁</span>
+  {% if page > 1 %}<a role="button" class="outline mini" href="/stats?{{ qs }}&page={{ page - 1 }}">上一頁</a>{% endif %}
+  {% if page < total_pages %}<a role="button" class="outline mini" href="/stats?{{ qs }}&page={{ page + 1 }}">下一頁</a>{% endif %}
+</div>
+
+{% if show_review %}
+<section class="review-block">
+  <div class="review-head">
+    <h4>今日復盤 <small class="muted">{{ review_trading_day }}（交易日）</small></h4>
+    {% if review %}<span class="badge review-done">已填寫</span>{% else %}<span class="badge review-pending">尚未填寫</span>{% endif %}
+  </div>
+  <div class="review-objective">
+    <span class="muted">系統帶入（只計自動回寫）</span>
+    <span>損益 <b class="{{ 'pnl up' if review_snapshot.pnl is not none and review_snapshot.pnl >= 0 else 'pnl down' }}">{{ review_snapshot.pnl | signed }}</b></span>
+    <span>已平倉 <b>{{ review_snapshot.trade_count }}</b> 筆</span>
+    <span>勝率 <b>{% if review_snapshot.win_rate is not none %}{{ (review_snapshot.win_rate * 100) | round(1) }}%{% else %}—{% endif %}</b></span>
+    <span>最長連續虧損 <b>{{ review_snapshot.max_losing_streak }}</b> 筆</span>
+    <span>緊急停止 <b>{% if review_snapshot.kill_switch_count is not none %}{{ review_snapshot.kill_switch_count }} 次{% else %}—{% endif %}</b></span>
+  </div>
+  <form method="post" action="/stats/review">
+    <input type="hidden" name="mode" value="{{ f.mode }}">
+    <input type="hidden" name="trading_day" value="{{ review_trading_day }}">
+    <input type="hidden" name="symbol" value="{{ f.symbol }}">
+    <input type="hidden" name="tag" value="{{ f.tag }}">
+    <input type="hidden" name="result" value="{{ f.result }}">
+    <input type="hidden" name="include_manual" value="{{ '1' if f.include_manual else '' }}">
+    <div class="review-fields">
+      <label>執行紀律：今天有照計畫走嗎？
+        <textarea name="discipline_note" placeholder="例：10:05 那筆逆勢單不在計畫內，是看到跳空手癢">{{ review.discipline_note if review else '' }}</textarea>
+      </label>
+      <label>情緒狀態
+        <textarea name="emotion_note" placeholder="例：早盤穩，午後連兩筆後開始想凹">{{ review.emotion_note if review else '' }}</textarea>
+      </label>
+      <label>明天要調整的一件事
+        <textarea name="tomorrow_focus" placeholder="只寫一件，寫得到做得到的">{{ review.tomorrow_focus if review else '' }}</textarea>
+      </label>
+    </div>
+    <button type="submit">儲存今日復盤</button>
+    <small class="muted">復盤內容會出現在「交易日記」頁，可按時間讀回顧。</small>
+  </form>
+</section>
+{% endif %}
+
+<small class="muted">＊夜盤跨日：交易日以 <code>trading_day</code> 計，昨晚的夜盤單算今日。手動補記單預設不計入上方統計（可用「含手動補記」納入）。</small>
+
+<!-- modal（重用交易日記頁的編輯表單：標籤／備註同一份欄位） -->
+<dialog :open="open">
+  <article class="modal-card">
+    <header>
+      <button aria-label="Close" rel="prev" @click="open = false"></button>
+      <strong>交易紀錄</strong>
+    </header>
+    <div id="modal-body"></div>
+  </article>
+</dialog>
+
+</div>
+<script>
+  // 本頁的已平倉表是整頁 GET 渲染（非 HTMX 片段，不像交易日記頁有 #trade-tbody 可局部
+  // 換）：modal 的編輯表單成功後（見 partials/trade_form.html）會送出 HX-Trigger:
+  // "closemodal, refreshtable"，這裡監聽 refreshtable 做整頁重新載入，讓剛加的標籤／
+  // 備註立刻反映在表格上。
+  document.body.addEventListener("refreshtable", () => window.location.reload());
+</script>
 {% endblock %}

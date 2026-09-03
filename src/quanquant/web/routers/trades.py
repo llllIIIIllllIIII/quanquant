@@ -8,6 +8,7 @@ from sqlmodel import Session
 
 from quanquant.db.models import User
 from quanquant.journal import repository as repo
+from quanquant.journal import review_repository as review_repo
 from quanquant.journal.pnl import unrealized_pnl
 from quanquant.journal.schemas import TradeCreate, TradeUpdate, split_tags
 from quanquant.poller import QuotePoller
@@ -106,6 +107,11 @@ async def journal_page(
             "all_tags": repo.list_all_tags(session, user_id=user.id),
             "f": {"symbol": symbol or "", "tag": tag or "", "date_from": date_from or "",
                   "date_to": date_to or "", "status": status, "mode": mode},
+            # 010 讀入口：按時間（trading_day 新到舊）讀每日復盤，與逐筆交易並存；沿用本頁
+            # 既有的 date_from/date_to 篩選字串直接比對 trading_day（皆為 ISO 日期字串）。
+            "reviews": review_repo.list_reviews(
+                session, user_id=user.id, mode=mode, date_from=date_from or None, date_to=date_to or None
+            ),
         },
     )
 
