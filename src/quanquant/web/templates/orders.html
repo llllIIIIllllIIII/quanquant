@@ -104,7 +104,7 @@
      不攔截，走既有的後端強制兩階段確認（confirm_dialog.html）。 -->
 <form id="order-form" hx-post="/orders" hx-swap="none" hx-disabled-elt="find button[type='submit']"
       data-sim-confirm="{{ '1' if sim_confirm_required else '0' }}"
-      x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
+      x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '{{ prefill_price if prefill_price is not none else '' }}' }">
   <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
   <div class="grid">
     <fieldset class="side-field">
@@ -129,10 +129,18 @@
            （見下方 price_type 的 x-on:change），讓後端一律收得到明確的 price=0，不需要
            再依賴「有沒有送出這個欄位」。空值/None 後端 _parse_order_price 仍有防線
            （見 web/routers/orders.py），這裡是前端層再多一道保險。 -->
-      <input name="price" type="text" placeholder="18000" x-model="priceValue" x-bind:readonly="priceType === 'MKT'">
+      <!-- 2026-09-05（使用者拍板，需求 A）：LMT 初值預填「當下市價」（orders_page 算好
+           的 prefill_price，見 web/routers/orders.py）；`data-qq-prefilled` 標記這個
+           初值是系統填的、不是使用者手改——static/order_price_prefill.js 用這個旗標
+           判斷之後（切商品／MKT 切回 LMT）要不要跟著更新現價；使用者真的手改過（原生
+           input 事件）就把旗標清掉，之後不再自動覆寫。這只是表單初值，送出契約／驗證
+           （_parse_order_price）／tick 規則完全不變。 -->
+      <input name="price" id="order-price" type="text" placeholder="18000" x-model="priceValue"
+             x-bind:readonly="priceType === 'MKT'"
+             {% if prefill_price is not none %}data-qq-prefilled="1"{% endif %}>
     </label>
     <label>價格類型
-      <select name="price_type" x-model="priceType"
+      <select name="price_type" id="order-price-type" x-model="priceType"
               x-on:change="if (priceType === 'MKT') { priceValue = '0'; if (orderType === 'ROD') orderType = 'IOC'; }">
         <option value="LMT">限價</option><option value="MKT">市價</option>
       </select>
@@ -210,4 +218,25 @@
   </article>
 </dialog>
 {% endif %}
+
+<!-- 2026-09-05（使用者拍板，需求 B）：對 006「部位表移出下單頁」的有意識部分還原——
+     精簡條（quote-panel 旁的 #pos-strip-box，symbol-scoped）維持不動，這裡另外在頁面
+     最下方掛回「全部」未平倉部位（不只當前商品），放在「報價→表單→送出」動線之後，
+     不擠壓原本一屏能完成下單的體驗。重用既有 `/orders/positions` endpoint 與
+     `partials/position_table.html`（未平倉頁 /orders/holdings 在用的那套，含浮損欄），
+     不帶 `?mode=`——本頁本來就不接受 mode 檢視參數，一律反映 server-side 執行 mode
+     （同精簡條/agent 狀態）。掛載寫法（hx-get＋`refreshorders from:body`／
+     `sse:orders-changed` 雙 trigger）比照 orders_queue.html／orders_holdings.html
+     既有寫法，自成一個 sse-connect 範圍（不與頁首 agent 狀態共用同一條連線，維持各
+     區塊獨立、互不牽動）。 -->
+<div class="journal-head">
+  <h3>未平倉部位</h3>
+  <small class="muted"><a href="/orders/holdings">查看未平倉頁 →</a></small>
+</div>
+<div hx-ext="sse" sse-connect="/orders/stream">
+  <div class="table-wrap">
+    <div hx-get="/orders/positions"
+         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+  </div>
+</div>
 {% endblock %}

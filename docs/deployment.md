@@ -291,7 +291,8 @@ git grep -nE "SHIOAJI_(TRADE_)?(API_KEY|SECRET_KEY)\s*=\s*['\"][A-Za-z0-9]" -- .
    Token」段按「產生 Agent Token」複製明文 token（只顯示一次），再跑 `quanquant-agent` 依提示輸入 token
    與自己的永豐 simtrade API Key/Secret；或用環境變數 `QQ_AGENT_TOKEN`/`QQ_AGENT_API_KEY`/
    `QQ_AGENT_SECRET_KEY` 免互動。此路徑憑證 **session-only、不落地、不進 log**（與 GUI 勾「記住」會落地
-   到 OS keychain 不同）。
+   到 OS keychain 不同）。**產生 token 需管理員帳號**（2026-09-05 拍板：手動產生/重置改
+   admin-only，一般使用者請改用 (A) GUI 精靈）。
 
    兩種方式皆遵守 **一個永豐帳號只能綁定一位使用者**（先綁先贏，見 D10）。
 4. 回 `/orders` 頁（GUI 則看 `/status`）確認 badge 轉綠（🟢 agent 已連線）即完成。

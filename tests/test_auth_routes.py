@@ -138,12 +138,19 @@ def test_account_page_shows_color_scheme_radio(client):
 
 
 # ---------------------------------------------------------------------------
-# R2-4：Agent Token 產生/重置整塊 UI 從下單頁搬到帳戶設定頁（行為與授權不變，仍是
-# owner-only；下單頁對應的「已搬走」驗收見 test_orders_routes.py::
-# test_orders_page_no_longer_shows_agent_token_control）。
+# R2-4：Agent Token 產生/重置整塊 UI 從下單頁搬到帳戶設定頁；下單頁對應的「已搬走」
+# 驗收見 test_orders_routes.py::test_orders_page_no_longer_shows_agent_token_control。
+#
+# 2026-09-05（使用者拍板）：手動產生/重置改 admin-only——原本「owner-only」的授權在此
+# 變更為「owner 且 admin」兩者皆要。`client`/`owner_client` 底下的 `user` 均沿用
+# conftest 預設 role=admin，故既有「owner 可見卡片」測試在新語意下天然也是
+# 「admin+owner 可見」，不必改內容；新增的測試才需要額外把 role 降回一般 user，驗證
+# 「owner 但非 admin」這個新邊界。
 # ---------------------------------------------------------------------------
 
-def test_account_page_shows_agent_token_card_for_owner(owner_client):
+def test_account_page_shows_agent_token_card_for_admin_owner(owner_client):
+    """admin 且 owner（`owner_client` 預設狀態，`user` 角色沿用 conftest 的 role=admin）
+    → 卡片顯示。"""
     text = owner_client.get("/account").text
     assert 'hx-post="/orders/agent-token"' in text
     assert "尚未產生 agent token" in text
@@ -155,6 +162,28 @@ def test_account_page_hides_agent_token_card_for_non_owner(client):
     text = client.get("/account").text
     assert 'hx-post="/orders/agent-token"' not in text
     assert "Agent Token" not in text
+
+
+def test_account_page_hides_agent_token_card_for_owner_who_is_not_admin(owner_client, session, user):
+    """2026-09-05（使用者拍板）：owner 身份不足以看到卡片——`owner_client` 預設
+    admin+owner，這裡把角色降回一般 user（owner 身份不變），卡片必須跟著消失，證明
+    gate 真的是「owner 且 admin」而非單看 owner。"""
+    user.role = "user"
+    session.add(user)
+    session.commit()
+    text = owner_client.get("/account").text
+    assert 'hx-post="/orders/agent-token"' not in text
+    assert "Agent Token" not in text
+
+
+def test_account_page_agent_token_post_403_for_owner_who_is_not_admin(owner_client, session, user):
+    """卡片被藏起來不代表端點本身安全——server 端仍要擋（UI 隱藏≠授權，2026-08-27
+    b9f2511 的教訓）：owner 但非 admin 直接 POST 端點一樣 403。"""
+    user.role = "user"
+    session.add(user)
+    session.commit()
+    resp = owner_client.post("/orders/agent-token")
+    assert resp.status_code == 403
 
 
 def test_account_page_agent_token_issue_shows_plaintext_once(owner_client, session, user):

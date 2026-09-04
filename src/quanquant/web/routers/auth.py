@@ -58,17 +58,26 @@ def logout():
 
 
 def _account_context(session: Session, user: User, *, error: str | None, risk_guard) -> dict:
-    """R2-4：Agent Token 產生/重置整塊 UI 從下單頁搬到帳戶設定頁——行為與授權不變
-    （仍是 owner-only，見 orders.py::issue_agent_token 的 `risk_guard.assert_owner`）；
-    這裡只是把畫面渲染需要的 `is_owner`/`token_row`/`raw_token` 湊齊，供三個 account
-    路由（GET /account 與兩個表單的錯誤重繪路徑）共用，避免各自漏塞欄位讓卡片在錯誤
-    重繪時憑空消失。`raw_token` 一律 None——明文只在 `POST /orders/agent-token` 簽發
-    當下的回應顯示一次，這裡（一般頁面渲染）永遠不帶明文。"""
+    """R2-4：Agent Token 產生/重置整塊 UI 從下單頁搬到帳戶設定頁；這裡把畫面渲染需要的
+    `is_owner`/`is_admin`/`token_row`/`raw_token` 湊齊，供三個 account 路由（GET /account
+    與兩個表單的錯誤重繪路徑）共用，避免各自漏塞欄位讓卡片在錯誤重繪時憑空消失。
+    `raw_token` 一律 None——明文只在 `POST /orders/agent-token` 簽發當下的回應顯示一次，
+    這裡（一般頁面渲染）永遠不帶明文。
+
+    2026-09-05（使用者拍板）：手動產生/重置改 admin-only——R2-4 搬家時「授權不變（仍是
+    owner-only）」這句話就此變更為「owner 且 admin」兩者皆要（見
+    orders.py::issue_agent_token 同步加的 `user.role != "admin"` 檢查）。`is_admin` 只
+    影響卡片是否渲染（UI 隱藏），伺服器端授權判定的唯一真相仍在 `issue_agent_token`
+    本身——這裡算錯不會造成越權，頂多卡片顯示與後端行為不一致。"""
     is_owner = risk_guard is not None and risk_guard.is_owner(user.id)
-    token_row = agent_token_service.get_active_token(session, user_id=user.id) if is_owner else None
+    is_admin = user.role == "admin"
+    token_row = (
+        agent_token_service.get_active_token(session, user_id=user.id)
+        if (is_owner and is_admin) else None
+    )
     return {
         "active": "account", "error": error, "color_scheme": user.chart_color_scheme or "green_up",
-        "is_owner": is_owner, "token_row": token_row, "raw_token": None,
+        "is_owner": is_owner, "is_admin": is_admin, "token_row": token_row, "raw_token": None,
         "skip_sim_confirm": bool(user.skip_sim_confirm),  # 007：帳戶頁可改回
     }
 

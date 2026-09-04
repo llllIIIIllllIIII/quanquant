@@ -290,6 +290,7 @@ def orders_page(
     user: User = Depends(get_current_user),
     service=Depends(get_order_service),
     risk_guard=Depends(get_order_risk_guard),
+    poller: QuotePoller | None = Depends(get_poller),
 ):
     """006：下單頁精簡化——只留報價列／表單／精簡條／agent 連線狀態／風控橫幅。委託表、
     部位表、mode 檢視分頁、改單 modal、Agent Token 產生區塊全部搬到「交易」大類的其他頁面
@@ -308,7 +309,16 @@ def orders_page(
     `brepo.active_cooldown` 這個同步 DB 讀，`async def` 會讓這個同步呼叫直接卡在事件
     迴圈上，與專案既有慣例（`/orders/list`／`/orders/positions`／`/api/candles` 一律
     sync def 跑 threadpool，見本檔 `orders_list` 上方註解）牴觸。函式本體內沒有任何
-    `await`，改成 sync 是無痛轉換。"""
+    `await`，改成 sync 是無痛轉換。
+
+    2026-09-05（使用者拍板，需求 A）：LMT 價格欄初值預填「當下市價」——省去每次手打
+    5 位數，使用者只需微調；`prefill_price` 重用既有 `poller.last.price`（與
+    `orders_positions`/`orders_position_strip` 的 mark_price 同一份報價源，不另開
+    來源）。poller 不存在或尚未有任何一筆快照時一律 None，模板把 Alpine `priceValue`
+    初值留空——不可填 0 或假值（0 是合法的畸形送出值，填 0 會讓使用者誤以為已經打好
+    價、直接送出）。這只是表單初值，送出契約／驗證（`_parse_order_price`）／tick 規則
+    完全不變。之後「切商品」「MKT 切回 LMT」的預填由前端接手（見
+    static/order_price_prefill.js），伺服器端只負責首次渲染這一次。"""
     kill_switch = risk_guard.kill_switch_view(user.id) if risk_guard is not None else _DISABLED_KILL_SWITCH_VIEW
     now_ms = brepo.now_epoch_ms()
     cooldown = brepo.active_cooldown(session, user_id=user.id, now_ms=now_ms)
@@ -323,12 +333,14 @@ def orders_page(
     # 短路——`or risk_guard.force_confirm(user.id)` 之類——讓 F5 生效時無視使用者的
     # 「不再顯示」偏好，一律要求確認。
     sim_confirm_required = exec_mode == "sim" and not user.skip_sim_confirm
+    prefill_price = poller.last.price if poller and poller.last else None
     return templates.TemplateResponse(request, "orders.html", {
         "active": "orders",
         "client_order_id": str(uuid.uuid4()), "service_available": service is not None,
         "symbols": ["TXF"], "kill_switch": kill_switch,
         "cooldown": cooldown, "cooldown_until_text": _fmt_cst(cooldown.until_ts) if cooldown else None,
         "exec_mode": exec_mode, "sim_confirm_required": sim_confirm_required,
+        "prefill_price": prefill_price,
     })
 
 
@@ -389,14 +401,25 @@ async def issue_agent_token(
     user: User = Depends(get_current_user),
     risk_guard=Depends(get_order_risk_guard),
 ):
-    """owner-only：簽發／rotation agent WS token（D2）。明文只在這次回應顯示一次——DB
-    只存 hash，離開這個回應後無法再取得明文，只能重新產生（rotation，舊枚立即作廢）。
-    子系統停用（risk_guard 為 None）時優雅回一個停用片段（比照 kill switch），不 500——
-    按鈕正常情況下只在 is_owner 時才會渲染，這裡是防呆（如子系統在使用者開著頁面時被關）。"""
+    """owner 且 admin 才能簽發／rotation agent WS token（D2）。明文只在這次回應顯示一次
+    ——DB 只存 hash，離開這個回應後無法再取得明文，只能重新產生（rotation，舊枚立即
+    作廢）。子系統停用（risk_guard 為 None）時優雅回一個停用片段（比照 kill switch），
+    不 500——按鈕正常情況下只在 is_owner 且 is_admin 時才會渲染，這裡是防呆（如子系統
+    在使用者開著頁面時被關）。
+
+    2026-09-05（使用者拍板）：手動產生/重置改 admin-only——R2-4 搬家時「授權不變（仍是
+    owner-only）」這句話就此變更為「owner 且 admin」兩者皆要。查證確認手動 token UI
+    唯一正當用途是 headless 部署與憑證撤銷，皆屬管理員操作；一般使用者一律走 .app GUI
+    精靈（device-flow 自動下發 token，見 auth/device_flow.py，本次完全不動）。伺服器端
+    強制（UI 隱藏≠授權，見 2026-08-27 b9f2511 的教訓——那次也是先只改 UI 隱藏，
+    server 端沒同步跟上）：先擋 role，owner 檢查維持不變（比照 `toggle_kill_switch` 對
+    scope=global 的既有寫法，role 檢查優先於 owner 檢查）。"""
     if risk_guard is None:
         return HTMLResponse(render_partial(
             "partials/agent_token_control.html", token_row=None, raw_token=None, disabled=True,
         ))
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
     try:
         risk_guard.assert_owner(user.id)  # 非 owner → AuthorizationError → 403（比照 kill switch）
     except AuthorizationError:

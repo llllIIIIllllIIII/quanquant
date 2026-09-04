@@ -226,6 +226,61 @@ def test_place_form_price_input_uses_readonly_not_disabled_for_mkt(order_client)
     assert "disabled" not in tag  # 不再用 disabled（會被排除在 FormData 之外）
 
 
+# ---------------------------------------------------------------------------
+# 需求 A（2026-09-05 使用者拍板）：LMT 價格欄伺服器端預填「當下市價」
+# ---------------------------------------------------------------------------
+
+def test_orders_page_prefills_lmt_price_with_current_quote_when_available(order_client):
+    """①：頁面初載、price_type 預設為 LMT 時，價格欄初值要帶當下市價（poller.last.price）
+    ——省去每次手打 5 位數，使用者只需微調。伺服器端算好放進 Alpine `priceValue` 初值，
+    price input 同時帶 `data-qq-prefilled` 標記這個初值是系統填的（不是使用者手改），
+    供 static/order_price_prefill.js 判斷之後要不要跟著更新（見對應測試）。"""
+    from quanquant.web.deps import get_poller
+
+    class _P:
+        class _Last:
+            price = Decimal("18055")
+        last = _Last()
+
+    order_client.app.dependency_overrides[get_poller] = lambda: _P()
+    try:
+        text = order_client.get("/orders").text
+    finally:
+        order_client.app.dependency_overrides[get_poller] = lambda: None
+    assert "priceValue: '18055'" in text
+    price_tag = re.search(r'<input name="price"[^>]*>', text)
+    assert price_tag is not None, text
+    assert 'data-qq-prefilled="1"' in price_tag.group(0)
+
+
+def test_orders_page_leaves_lmt_price_empty_when_quote_unavailable(order_client):
+    """②：報價服務尚未就緒（poller 為 None，`order_client` fixture 預設狀態）時，價格欄
+    預填必須留空——絕不可填 0 或任何假值（0 是合法的畸形送出值，填 0 會讓使用者誤以為
+    已經打好價、直接送出）。"""
+    text = order_client.get("/orders").text
+    assert "priceValue: ''" in text
+    price_tag = re.search(r'<input name="price"[^>]*>', text)
+    assert price_tag is not None, text
+    assert "data-qq-prefilled" not in price_tag.group(0)
+
+
+def test_orders_page_leaves_lmt_price_empty_when_poller_has_no_snapshot_yet(order_client):
+    """②的另一種「拿不到報價」情境：poller 存在但尚未收到任何一筆快照（`last` 為
+    None，剛開機、上游還沒推第一筆時的真實狀態）——同樣必須留空、不可填 0。"""
+    from quanquant.web.deps import get_poller
+
+    class _P:
+        last = None
+
+    order_client.app.dependency_overrides[get_poller] = lambda: _P()
+    try:
+        text = order_client.get("/orders").text
+    finally:
+        order_client.app.dependency_overrides[get_poller] = lambda: None
+    assert "priceValue: ''" in text
+    assert "priceValue: '0'" not in text
+
+
 def test_direction_field_is_radio_toggle_not_select(order_client):
     """001：方向改成左右分段開關（radio + fieldset），不再是 <select name="action">；
     name/value 契約不變（"Buy"/"Sell"），buy 預設 checked。"""
@@ -283,28 +338,63 @@ def test_order_form_still_submits_symbol_via_form_attribute(order_client, fake_s
 
 
 def test_orders_page_uses_sse_push_not_polling_and_guards_double_submit(order_client):
-    """006 精簡化後：委託表／部位表已搬到 /orders/queue、/orders/holdings（另見對應測試），
-    下單頁只留 agent 狀態（掛在 /orders/stream 的 sse:orders-changed，agent 連線/斷線時
-    agent_ws.py 會 hub.publish()）與精簡條（掛在 /quote/stream 的既有報價心跳，見
-    orders.html 內的實作理由註解）。頁面不得再出現盲輪詢、不得再直接嵌委託表／部位表的
-    hx-get 掛載點；送出鈕仍保留 hx-disabled-elt 防連點。"""
+    """006 精簡化後：委託表已搬到 /orders/queue（另見對應測試），下單頁留 agent 狀態
+    （掛在 /orders/stream 的 sse:orders-changed，agent 連線/斷線時 agent_ws.py 會
+    hub.publish()）、精簡條（掛在 /quote/stream 的既有報價心跳，見 orders.html 內的
+    實作理由註解）。
+
+    2026-09-05（使用者拍板，需求 B）：對 006「部位表移出下單頁」的**有意識部分還原**
+    ——頁面最下方重新掛回全部未平倉部位（見 test_orders_page_shows_all_open_positions_
+    section_at_bottom），精簡條（symbol-scoped）維持不動、不受影響。委託表／mode 檢視
+    分頁／改單 modal 仍不在下單頁（那些搬去 /orders/queue，沒有被這次還原牽動）。頁面
+    仍不得出現盲輪詢；送出鈕仍保留 hx-disabled-elt 防連點。"""
     text = order_client.get("/orders").text
     assert 'sse-connect="/orders/stream"' in text  # agent 狀態的 SSE 連線容器仍在
     assert 'sse-connect="/quote/stream' in text  # 精簡條/報價共用的 SSE 連線容器
-    # 只剩 agent 狀態 div 的 hx-trigger 掛 sse:orders-changed（比對 hx-trigger 屬性本身，
-    # 不比對整頁原始文字——避免被模板內解說用的中文註解一併算進去）。
-    assert len(re.findall(r'hx-trigger="[^"]*sse:orders-changed[^"]*"', text)) == 1
+    # agent 狀態 div／頁尾未平倉區塊各自的 hx-trigger 都掛 sse:orders-changed（比對
+    # hx-trigger 屬性本身，不比對整頁原始文字——避免被模板內解說用的中文註解一併算進去）。
+    assert len(re.findall(r'hx-trigger="[^"]*sse:orders-changed[^"]*"', text)) == 2
     # 不盲輪詢：比對 hx-trigger 屬性本身有沒有裸的 `every Ns`，不比對整頁原始文字
     # （模板內解說用的中文註解會提到「every 2s」這個詞本身，直接找整頁字串會誤判）。
     assert not re.search(r'hx-trigger="[^"]*every \d+s[^"]*"', text)
     assert "refreshorders from:body" in text  # 本分頁下單動作當下精簡條/agent 狀態仍即時刷新
-    assert 'hx-get="/orders/list' not in text  # 委託表已搬到 /orders/queue
-    assert 'hx-get="/orders/positions"' not in text  # 部位表已搬到 /orders/holdings
+    assert 'hx-get="/orders/list' not in text  # 委託表已搬到 /orders/queue，未被拍板還原
+    assert 'hx-get="/orders/positions"' in text  # 需求 B：頁尾全部位區塊已還原
     assert 'hx-get="/orders/position-strip"' in text  # 精簡條掛載點仍在
     # 精簡條掛在報價 SSE 的 message 事件上，但實測心跳是每 ~1 秒，未節流會變成每秒打
     # 這支端點；用 htmx 的 throttle:5s 修飾詞把實際觸發頻率壓回「5 秒源」的節奏。
     assert "sse:message throttle:5s" in text
     assert "hx-disabled-elt" in text  # 送出期間停用送出鈕（防 double-submit）
+
+
+# ---------------------------------------------------------------------------
+# 需求 B（2026-09-05 使用者拍板）：下單頁最下方顯示「全部」未平倉部位
+# ---------------------------------------------------------------------------
+
+def test_orders_page_shows_all_open_positions_section_at_bottom(order_client):
+    """對 006 的有意識部分還原：下單頁最下方掛回全部未平倉部位（不只當前商品），重用既有
+    `/orders/positions` endpoint 與 `partials/position_table.html`（未平倉頁在用的那套，
+    含浮損欄），hx-get 掛載＋`refreshorders from:body` 與 `sse:orders-changed` 雙 trigger
+    刷新，比照委託頁（/orders/queue）既有寫法。小標題「未平倉部位」＋一個連到
+    /orders/holdings 的低調連結。掛載點本身不帶 `?mode=`——本頁本來就不接受 mode 檢視
+    參數（一律反映 server-side 執行 mode），與精簡條、agent 狀態同慣例。"""
+    text = order_client.get("/orders").text
+    assert "未平倉部位" in text
+    assert 'href="/orders/holdings"' in text
+    mount = re.search(r'<div[^>]*hx-get="/orders/positions"[^>]*>', text)
+    assert mount is not None, text
+    tag = mount.group(0)
+    assert "refreshorders from:body" in tag
+    assert "sse:orders-changed" in tag
+    assert "load" in tag
+
+
+def test_orders_page_bottom_positions_mount_renders_all_open_positions(order_client, fake_service):
+    """掛載點打的就是既有 `/orders/positions`（無 `?mode=` → 走 service.positions_snapshot()
+    的既有語意，未被本次改動更動）——`_FakeService.positions_snapshot` 固定回傳一筆 TXF
+    多單，驗證是真的接得到資料、不是空殼掛載點。"""
+    text = order_client.get("/orders/positions").text
+    assert "TXF" in text and "多" in text
 
 
 def test_orders_stream_without_hub_returns_empty_stream_not_500(order_client):
@@ -625,10 +715,16 @@ def test_kill_switch_scope_self_non_owner_still_gets_403(
 
 
 # ---------------------------------------------------------------------------
-# D2：POST /orders/agent-token（owner-only 簽發/rotation）＋ orders 頁 token 管理段
+# D2：POST /orders/agent-token（簽發/rotation）＋ orders 頁 token 管理段
+#
+# 2026-09-05（使用者拍板）：手動產生/重置改 admin-only——R2-4 搬家時「授權不變（仍是
+# owner-only）」這句話就此變更為「owner 且 admin」兩者皆要。`order_client` fixture 用的
+# `user` 預設 role=admin，故既有的「owner 可簽發」測試在新語意下天然也是「admin+owner
+# 可簽發」，不必改內容；新增的 403 邊界測試才需要額外把 role 降回一般 user。
 # ---------------------------------------------------------------------------
 
-def test_agent_token_owner_can_issue_and_sees_plaintext_once(order_client, session, user):
+def test_agent_token_admin_owner_can_issue_and_sees_plaintext_once(order_client, session, user):
+    """admin 且 owner（`order_client` 預設狀態）→ 簽發成功，明文只顯示這一次。"""
     resp = order_client.post("/orders/agent-token")
     assert resp.status_code == 200
     assert "<code" in resp.text  # 明文有渲染出來
@@ -655,7 +751,20 @@ def test_agent_token_rotation_revokes_previous_row_and_shows_new_plaintext(order
 
 
 def test_agent_token_non_owner_gets_403_and_does_not_issue(order_client, fake_guard, session, user):
+    """admin 但非 owner（role 檢查先過，owner 檢查沒過）→ 403，owner 授權判定本身沒有
+    被拿掉，只是額外多加了 admin 這一層。"""
     fake_guard._owner_ids = set()  # 沒有任何 owner → 目前 user 不是 owner
+    resp = order_client.post("/orders/agent-token")
+    assert resp.status_code == 403
+    assert session.exec(select(AgentToken).where(AgentToken.user_id == user.id)).first() is None
+
+
+def test_agent_token_non_admin_owner_gets_403_and_does_not_issue(order_client, session, user):
+    """2026-09-05（使用者拍板）：手動產生/重置改 admin-only——非 admin（即使是 owner，
+    `order_client` 預設 fake_guard 的 `_owner_ids=None` 讓所有人都是 owner）POST 一律
+    403、不簽發，維持 admin-only（server 端強制，非只靠 UI 隱藏；同 2026-08-27
+    b9f2511 的教訓）。"""
+    _demote_to_non_admin(session, user)
     resp = order_client.post("/orders/agent-token")
     assert resp.status_code == 403
     assert session.exec(select(AgentToken).where(AgentToken.user_id == user.id)).first() is None
@@ -2273,3 +2382,71 @@ def test_sim_confirm_dialog_markup_shows_sim_badge(order_client):
     assert 'id="sim-confirm-dialog"' in text
     assert "模擬單" in text
     assert 'id="sim-confirm-skip-checkbox"' in text
+
+
+# ---------------------------------------------------------------------------
+# 需求 A（2026-09-05）：static/order_price_prefill.js 前端「切商品／MKT切回LMT」預填邏輯
+# ---------------------------------------------------------------------------
+
+def test_order_price_prefill_js_wired_into_base_template(order_client):
+    """新增的 JS 檔必須實際被載入頁面，不是孤兒檔案（比照 app.js/banners.js/
+    order_confirm.js 既有的載入慣例）。"""
+    text = order_client.get("/orders").text
+    assert '<script src="/static/order_price_prefill.js"></script>' in text
+
+
+def test_order_price_prefill_js_reads_price_from_quote_row_data_attribute():
+    """報價列已隨既有 quote SSE/hx-get 更新，JS 直接讀它身上的 `data-qq-price`——不新增
+    報價來源、不另外打 /quote。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    js = (STATIC_DIR / "order_price_prefill.js").read_text(encoding="utf-8")
+    assert "data-qq-price" in js
+    assert 'getElementById("order-price")' in js
+
+
+def test_order_price_prefill_js_never_falls_back_to_zero_or_fake_price():
+    """報價拿不到時一律不填（不可填 0 或假值）——JS 對「讀不到值」的分支要有明確 return，
+    不能有任何 `|| "0"` 這類補假值的 fallback。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    js = (STATIC_DIR / "order_price_prefill.js").read_text(encoding="utf-8")
+    assert '|| "0"' not in js
+    assert "'0'" not in js  # 不得出現任何把價格 fallback 成字面 0 的寫法
+    # 兩個預填分支（MKT→LMT／商品切換）都要在「拿不到報價」時提早 return，不繼續往下填值。
+    assert js.count("if (!price) return;") >= 2
+
+
+def test_order_price_prefill_js_only_active_in_lmt_mode():
+    """③（MKT 模式不預填）：MKT 時價格欄 readonly 鎖 0，不需要也不可以被本檔預填邏輯
+    覆寫——兩個預填分支都要先檢查 price_type 是 LMT 才繼續。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    js = (STATIC_DIR / "order_price_prefill.js").read_text(encoding="utf-8")
+    assert js.count('!== "LMT"') >= 2
+
+
+def test_order_price_prefill_js_uses_dataset_flag_and_trusted_input_to_track_manual_edit():
+    """④（切商品後「預填 vs 手改」不覆寫）：用 dataset 旗標記這個值是系統填的還是使用者
+    手改的；只有 `isTrusted` 為 true 的原生 input 事件（真人打字/貼上，排除本檔自己用
+    `dispatchEvent` 合成的同步事件）才能清掉旗標，之後任何自動預填都必須尊重這個旗標、
+    不覆寫使用者已手改的值。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    js = (STATIC_DIR / "order_price_prefill.js").read_text(encoding="utf-8")
+    assert "dataset.qqPrefilled" in js
+    assert "evt.isTrusted" in js
+    assert "dispatchEvent" in js  # 合成 input 事件讓 Alpine x-model 同步，且不誤判成手改
+    assert 'qqPrefilled !== "1"' in js  # 手改過（旗標已清）就不覆寫的判斷式仍在
+
+
+def test_order_price_prefill_js_treats_zero_as_empty_when_returning_to_lmt():
+    """終審 MEDIUM-1（2026-09-05）：既有 Alpine handler 切到 MKT 時把 priceValue 設成
+    "0"（非空字串），切回 LMT 時欄位停在 "0" 而非 ""——守衛只認空字串會讓補值永遠不
+    觸發（Node harness 實證）。釘住「"" 與 "0" 都視同未填、可被現價覆寫」的守衛：
+    LMT 下 0 本來就是 server 端 __post_init__ 會拒絕的非法價，覆寫它不會蓋掉任何
+    有效的使用者輸入。"""
+    from quanquant.web.templating import STATIC_DIR
+
+    js = (STATIC_DIR / "order_price_prefill.js").read_text(encoding="utf-8")
+    assert 'input.value !== "" && input.value !== "0"' in js
