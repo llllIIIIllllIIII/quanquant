@@ -357,13 +357,23 @@ td.note { max-width: 14rem; }
 
 /* ---- 006：主導覽「交易」大類下拉（Pico .dropdown，同 .user-menu 慣例） ---- */
 .nav-trade { position: relative; }
-.nav-trade summary {
+/* 二修（2026-09-05）：一修用 .nav-trade summary（0,1,1）永遠打輸 Pico 實際套用的
+   `nav details.dropdown>summary:not([role])`（0,3,2）與 `details.dropdown>summary:not([role])`
+   （0,2,2）——select 外觀（height calc／padding／border／radius／background）全來自
+   這兩條（已 curl pico@2 原始碼證實），`details{margin-bottom:var(--pico-spacing)}`
+   則是垂直錯位元兇。以下選擇器（0,3,3）靠 specificity 穩贏，不賭載入順序。 */
+nav.topnav details.nav-trade { margin: 0; }
+nav.topnav details.nav-trade.dropdown > summary {
   list-style: none; cursor: pointer;
+  background: none; box-shadow: none; border: none; border-radius: 0;
+  height: auto; width: auto; margin: 0; line-height: inherit;
   padding: 0.55rem 0.8rem; color: var(--qq-text-muted); font-size: 0.92rem;
   border-bottom: 2px solid transparent;
 }
+nav.topnav details.nav-trade.dropdown > summary:hover { color: var(--qq-text); }
+nav.topnav details.nav-trade.dropdown > summary:focus { background: none; box-shadow: none; }
 .nav-trade summary::-webkit-details-marker { display: none; }
-.nav-trade summary.active { color: var(--qq-text); font-weight: 700; border-bottom-color: var(--qq-accent); }
+nav.topnav details.nav-trade.dropdown > summary.active { color: var(--qq-text); font-weight: 700; border-bottom-color: var(--qq-accent); }
 .nav-trade ul { min-width: 8rem; }
 .nav-trade ul a.active { color: var(--qq-accent); font-weight: 700; }
 
