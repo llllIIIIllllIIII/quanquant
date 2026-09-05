@@ -86,7 +86,11 @@ class Settings(BaseSettings):
     shioaji_ca_passwd: str = ""
     shioaji_person_id: str = ""
     order_mode: str = "sim"                          # "sim" | "real"；拼錯拒絕啟動下單子系統
-    order_sim_fee_per_lot: str = "20"                 # sim 成交 fee 缺值時的估算基準（Decimal 字串）
+    order_sim_fee_per_lot: str = "20"                 # sim fee 的 flat fallback（商品不在下方映射時用；Decimal 字串）
+    # sim 成交成本改實算（2026-09-05）：fee＝商品別券商手續費（本映射，單邊每口）＋期交稅
+    # （成交價×契約乘數×10萬分之2 實算，四捨五入到元）。格式 "SYMBOL:金額" 逗號分隔，
+    # 空字串＝停用實算、全部退回 flat order_sim_fee_per_lot。
+    order_sim_commission_per_lot: str = "TXF:50,MXF:25,TMF:10"
     order_watchdog_interval_seconds: float = 15.0
     order_login_min_interval_seconds: float = 30.0    # login 節流（配額 5連線/1000 login/day）
     order_unquarantine_after_seconds: float = 300.0   # 較慢週期：多久沒解隔離的 raw_inbox 再重試

@@ -232,7 +232,7 @@ async def _start_agent_channel_subsystem(
     from quanquant.broker.lifecycle import run_confirm_token_cleanup
     from quanquant.broker.repository import BackfillConflictError, backfill_account_bindings
     from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
-    from quanquant.broker.shioaji_adapter import ShioajiAdapter
+    from quanquant.broker.shioaji_adapter import ShioajiAdapter, parse_sim_commission_map
     from quanquant.broker.supervisor import BrokerSupervisor
     from quanquant.broker.watchdog import run_agent_watchdog
 
@@ -286,6 +286,7 @@ async def _start_agent_channel_subsystem(
             symbol=settings.symbol, mode="sim", session_factory=_order_session,
             supervisor=slot_supervisor, risk_guard=risk_guard,
             sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+            sim_commission_per_lot=parse_sim_commission_map(settings.order_sim_commission_per_lot),
             ops_alerter=ops_alerter, remote_gateway=gateway,
             agent_user_id=uid,  # D5：per-slot scope 蓋章——沒有這行 _stage_reconcile_results/
             # _persist_raw 落地的 RawInbox.user_id 恆為 None，per-slot RawInboxWorker（WHERE
@@ -388,7 +389,7 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
 
     from quanquant.broker.inbox_worker import RawInboxWorker
     from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
-    from quanquant.broker.shioaji_adapter import ShioajiAdapter
+    from quanquant.broker.shioaji_adapter import ShioajiAdapter, parse_sim_commission_map
     from quanquant.broker.supervisor import BrokerSupervisor
 
     supervisor = BrokerSupervisor()
@@ -412,6 +413,7 @@ async def _start_order_subsystem(app: FastAPI, settings: Settings, tasks: list) 
         person_id=settings.shioaji_person_id or None, symbol=settings.symbol,
         mode=settings.order_mode, session_factory=_order_session, supervisor=supervisor,
         risk_guard=risk_guard, sim_fee_per_lot=Decimal(settings.order_sim_fee_per_lot),
+            sim_commission_per_lot=parse_sim_commission_map(settings.order_sim_commission_per_lot),
         ops_alerter=ops_alerter,
     )
     inbox_worker = RawInboxWorker(

@@ -47,7 +47,7 @@ import logging
 import re
 from collections.abc import Callable
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Protocol
 
 from sqlalchemy.exc import IntegrityError
@@ -75,6 +75,34 @@ from quanquant.broker.types import Fill, Mode, OrderAck, OrderRequest, Position,
 from quanquant.db.models import Order
 
 log = logging.getLogger(__name__)
+
+# 台灣期貨交易成本（sim 成交 fee 缺值時的估算基準，2026-09-05 使用者拍板）：
+# fee ＝ 券商手續費（單邊每口，商品別由設定給）＋ 期交稅。期交稅是法定值：股價指數期貨
+# 稅率＝契約金額 × 10 萬分之 2（期貨交易稅條例），契約金額＝成交價 × 契約乘數，
+# 買賣各課一次、隨成交價浮動——所以不能用固定每口值，必須逐筆實算。
+# 契約乘數是 TAIFEX 契約規格（每點台幣值），不是商業參數，直接寫死。
+_CONTRACT_MULTIPLIER = {"TXF": Decimal(200), "MXF": Decimal(50), "TMF": Decimal(10)}
+_FUTURES_TAX_RATE = Decimal("0.00002")  # 股價指數期貨期交稅率（單邊）
+
+
+def parse_sim_commission_map(raw: str) -> dict[str, Decimal]:
+    """解析 `ORDER_SIM_COMMISSION_PER_LOT` 的 "TXF:50,MXF:25" 逗號映射（key 大寫化）。
+    空字串→{}；格式/數值錯誤 raise ValueError——在 lifespan 建構 adapter 當下就炸，
+    與 `Decimal(order_sim_fee_per_lot)` 對設定錯誤的既有處理等級一致。"""
+    result: dict[str, Decimal] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        sym, sep, val = part.partition(":")
+        if not sep or not sym.strip() or not val.strip():
+            raise ValueError(f"sim 手續費映射格式錯誤: {part!r}（應為 SYMBOL:金額）")
+        try:
+            result[sym.strip().upper()] = Decimal(val.strip())
+        except InvalidOperation as exc:
+            raise ValueError(f"sim 手續費映射金額不是合法數字: {part!r}") from exc
+    return result
+
 
 # 券商「明確拒絕」偵測（本次精進）：HTTP 慣例的 4xx 代表「請求已被伺服器端處理、且明確
 # 拒絕」（例如 400 Bad Request、401/403 認證/授權失敗、404 Not Found、406 Not Acceptable、
@@ -194,6 +222,7 @@ class ShioajiAdapter:
         risk_guard: "_RiskGuardLike | None" = None,
         broker: str = "shioaji",
         sim_fee_per_lot: Decimal | None = None,
+        sim_commission_per_lot: dict[str, Decimal] | None = None,
         ops_alerter=None,
         remote_gateway: "_NativeGatewayLike | None" = None,
         agent_user_id: int | None = None,
@@ -223,6 +252,10 @@ class ShioajiAdapter:
         self._supervisor = supervisor
         self._risk_guard = risk_guard
         self._sim_fee_per_lot = sim_fee_per_lot  # A6：sim 成交 fee 缺值時依口數估算，不留 None/0
+        # 台灣實際成本模式（商品別券商手續費，單邊每口）：非 None 且商品可辨識時，
+        # sim fee ＝ (手續費 + 期交稅實算) × qty；None 或商品不在映射時退回 flat
+        # sim_fee_per_lot（既有行為，測試/舊部署不受影響）。
+        self._sim_commission_per_lot = sim_commission_per_lot
         self._ops = ops_alerter  # T0.3：營運告警（fire-and-forget、絕不 raise），純疊加
         # Task 6：三段切——None 時維持 in-process 行為零變化（原路徑）；非 None 時所有
         # native 呼叫（place/cancel/update/reconcile 的 trades_snapshot）改經這個 gateway
@@ -1199,6 +1232,23 @@ class ShioajiAdapter:
     #     PartFilled 狀態一律由成交回報（deal_report）驅動的 `PositionTracker.apply_fill`→
     #     `brepo.apply_order_fill` 更新，不經這個 mapper。
 
+    def _estimate_sim_fee(self, *, symbol: str, price: Decimal, qty: int) -> Decimal | None:
+        """sim 成交 fee 估算（單邊）：每口＝券商手續費＋期交稅（成交價×契約乘數×10萬分之2，
+        四捨五入到元），再 × qty。`symbol` 是具體月合約代碼（如 "TXFH6"），前 3 碼是商品根。
+        手續費映射未設、或商品根不在映射/乘數表時，退回 flat `sim_fee_per_lot × qty`
+        （既有行為）；兩者皆無 → None（維持「缺值就是缺值」，不靜默記 0）。"""
+        root = (symbol or "")[:3].upper()
+        commission = (self._sim_commission_per_lot or {}).get(root)
+        multiplier = _CONTRACT_MULTIPLIER.get(root)
+        if commission is not None and multiplier is not None:
+            tax_per_lot = (price * multiplier * _FUTURES_TAX_RATE).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+            return (commission + tax_per_lot) * qty
+        if self._sim_fee_per_lot is not None:
+            return self._sim_fee_per_lot * qty
+        return None
+
     def _map_deal_report(self, payload: dict, *, account: str | None = None) -> Fill:
         """`account` 是 RawInbox 列上蓋章的值（Inc1 D5，呼叫端見
         `RawInboxWorker._process_deal`）——只在非 None 時才驗證 `payload["account_id"]` 與它
@@ -1243,12 +1293,13 @@ class ShioajiAdapter:
             )
         account = payload_account
 
-        if fee is None and self.mode == "sim" and self._sim_fee_per_lot is not None:
-            # A6：sim 模擬單成交 fee 常缺值/零，依設定的「每口」估算，按 qty 分批累計時自然正確
-            # （每筆 fill 各自算 qty*sim_fee_per_lot，PositionTracker 累加 open_fee_total/close_fee_total
-            # 時就是「已成交口數 * 每口 fee」的正確累計，不需要另外處理批次）。real 模式缺值一律
+        if fee is None and self.mode == "sim":
+            # A6：sim 模擬單成交 fee 常缺值/零，依「每口」估算，按 qty 分批累計時自然正確
+            # （每筆 fill 各自算每口成本×qty，PositionTracker 累加 open_fee_total/close_fee_total
+            # 時就是「已成交口數 × 每口成本」的正確累計，不需要另外處理批次）。real 模式缺值一律
             # 保持 None（round3 HIGH：不得靜默記 0，那會讓正式 PnL 永久低估成本）。
-            fee = self._sim_fee_per_lot * qty
+            # 2026-09-05 起優先用台灣實際成本（券商手續費＋期交稅實算），見 _estimate_sim_fee。
+            fee = self._estimate_sim_fee(symbol=symbol, price=price, qty=qty)
 
         return Fill(
             broker=self.broker, fill_id=str(fill_id), ordno=ordno, broker_order_id=broker_order_id,

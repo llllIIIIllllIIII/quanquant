@@ -1089,11 +1089,12 @@ def test_cancel_rejects_non_owner_of_order_even_when_actor_is_a_different_owner(
 
 # ---- mapper：嚴格驗證 ----
 
-def _adapter_stub_for_mapper(*, sim_fee_per_lot=None, mode="sim"):
+def _adapter_stub_for_mapper(*, sim_fee_per_lot=None, mode="sim", sim_commission_per_lot=None):
     return ShioajiAdapter(
         api_key="k", secret_key="s", ca_path=None, ca_passwd=None, person_id=None,
         symbol="TXF", mode=mode, session_factory=lambda: None,
         supervisor=BrokerSupervisor(), sim_fee_per_lot=sim_fee_per_lot,
+        sim_commission_per_lot=sim_commission_per_lot,
     )
 
 
@@ -1114,6 +1115,64 @@ def test_map_deal_report_fills_sim_fee_from_setting_when_missing():
     })  # payload 無 "fee" 欄位、無 "octype"（真實 FuturesDealEvent 沒有這個欄位）
     assert fill.fee == Decimal("60")  # 20 * 3 口
     assert fill.ts == 1_780_000_000_000  # 秒→毫秒
+
+
+def _taiwan_cost_payload(**over):
+    base = {"trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+            "price": "45000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
+            "code": "TXFH6"}
+    base.update(over)
+    return base
+
+
+def test_sim_fee_taiwan_cost_txf_commission_plus_tax():
+    """台灣實際成本（2026-09-05 拍板）：fee＝手續費＋期交稅（成交價×乘數×10萬分之2）。
+    大台 45000 點：稅 45000×200×0.00002＝180，手續費 50 → 每口 230；2 口＝460。"""
+    adapter = _adapter_stub_for_mapper(
+        sim_commission_per_lot={"TXF": Decimal("50"), "MXF": Decimal("25"), "TMF": Decimal("10")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(quantity=2))
+    assert fill.fee == Decimal("460")
+
+
+def test_sim_fee_taiwan_cost_mxf_uses_smaller_multiplier():
+    """小台乘數 50：稅 45000×50×0.00002＝45，手續費 25 → 每口 70。"""
+    adapter = _adapter_stub_for_mapper(sim_commission_per_lot={"MXF": Decimal("25")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(code="MXFH6"))
+    assert fill.fee == Decimal("70")
+
+
+def test_sim_fee_taiwan_cost_tax_rounds_half_up_to_dollar():
+    """期交稅四捨五入到元：微台 44875 點→44875×10×0.00002＝8.975→9，手續費 10 → 19。"""
+    adapter = _adapter_stub_for_mapper(sim_commission_per_lot={"TMF": Decimal("10")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(code="TMFH6", price="44875"))
+    assert fill.fee == Decimal("19")
+
+
+def test_sim_fee_unknown_symbol_root_falls_back_to_flat_per_lot():
+    """商品根不在映射/乘數表 → 退回 flat sim_fee_per_lot（既有行為），不猜乘數。"""
+    adapter = _adapter_stub_for_mapper(
+        sim_fee_per_lot=Decimal("20"), sim_commission_per_lot={"TXF": Decimal("50")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(code="ZZZH6", quantity=3))
+    assert fill.fee == Decimal("60")  # 20 × 3
+
+
+def test_sim_fee_broker_supplied_fee_not_overridden_by_estimation():
+    """payload 自帶 fee → 一律用券商值，不進估算。"""
+    adapter = _adapter_stub_for_mapper(sim_commission_per_lot={"TXF": Decimal("50")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(fee="33"))
+    assert fill.fee == Decimal("33")
+
+
+def test_parse_sim_commission_map_valid_empty_and_errors():
+    parse = shioaji_adapter_module.parse_sim_commission_map
+    assert parse("TXF:50,MXF:25,TMF:10") == {
+        "TXF": Decimal("50"), "MXF": Decimal("25"), "TMF": Decimal("10")}
+    assert parse("") == {}
+    assert parse(" txf : 50 ") == {"TXF": Decimal("50")}  # 空白容忍、key 大寫化
+    with pytest.raises(ValueError):
+        parse("TXF=50")  # 少了冒號
+    with pytest.raises(ValueError):
+        parse("TXF:abc")  # 金額不是數字
 
 
 def test_map_deal_report_real_missing_fee_stays_none_no_sim_substitution():
