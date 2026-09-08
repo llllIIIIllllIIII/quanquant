@@ -333,3 +333,5 @@ def save_review_route(
     if include_manual:
         qs += "&include_manual=1"
     return RedirectResponse(f"/stats?{qs}", status_code=303)
+
+# CI smoke：後端檔案異動，預期被 pr-guard 擋下
