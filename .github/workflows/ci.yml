@@ -1,0 +1,218 @@
+# .github/workflows/ci.yml
+#
+# 用途：
+#   QuanQuant 公開 repo 後的 CI 硬牆。沒有軟體工程背景、習慣 vibe coding 的
+#   協作者 fork 後開 PR 只該動 templates/static；這個 workflow 確保：
+#     1. test        — 任何 PR / push main 都要全套 pytest 跑過（無 secrets 依賴，
+#                       fork PR 也能完整跑）。
+#     2. pr-guard    — PR 變更檔案守門（scripts/ci/check_paths.py）與簡體字
+#                       掃描（scripts/ci/check_simplified.py），把摘要寫進
+#                       GitHub Actions 的 Job Summary。
+#     3. test-count  — 防止 PR 悄悄刪測試：比對 base/head 兩邊 pytest 收集到
+#                       的測試數量，head 變少就擋下。
+#
+#   全程不使用任何 secrets（fork PR 拿不到 repo secrets，所以本 workflow
+#   刻意不宣告、不讀取任何 secret，確保 fork PR 也能完整跑完整套檢查）。
+#
+# 本機等價指令（沒有 act 可用時，用這些指令手動模擬）：
+#   uv sync --extra dev && uv run pytest -q -p no:cacheprovider
+#   uv run python scripts/ci/check_paths.py origin/main HEAD
+#   uv run python scripts/ci/check_simplified.py
+#   uv run pytest --collect-only -q     # 用來手動比對 test-count 的收集數量
+#
+# 注意（維護者）：
+#   - pyproject.toml 目前有 [tool.ruff] 設定，但 `uv run ruff check .` 尚未
+#     全綠（有既有 lint 錯誤），所以這裡刻意不加 ruff 檢查步驟，避免 CI 一
+#     上就是紅的。等 ruff 清乾淨後可以自行加一個 step。
+#   - Python 版本統一從 pyproject.toml 的 requires-python 動態讀取，不寫死，
+#     避免兩邊漂移。
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# 讓新 push 自動取消同一 PR/分支上還在跑的舊 run，省 CI 分鐘數。
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read Python version from pyproject.toml
+        id: pyver
+        run: |
+          PYVER=$(grep -m1 'requires-python' pyproject.toml | sed -E 's/.*>=[[:space:]]*([0-9]+\.[0-9]+).*/\1/')
+          echo "偵測到 requires-python -> $PYVER"
+          echo "version=$PYVER" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          python-version: ${{ steps.pyver.outputs.version }}
+
+      - name: uv sync
+        run: uv sync --extra dev
+
+      - name: pytest
+        run: uv run pytest -q -p no:cacheprovider
+
+      # ruff 尚未全綠（pyproject.toml 已有 [tool.ruff] 設定），刻意不在此加入
+      # lint 步驟，避免既有的 12 個錯誤讓 CI 一開始就是紅的。清乾淨後可加：
+      #   - name: ruff
+      #     run: uv run ruff check .
+
+  pr-guard:
+    name: PR 路徑守門 + 簡體字掃描
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout（含完整歷史，供 diff 用）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read Python version from pyproject.toml
+        id: pyver
+        run: |
+          PYVER=$(grep -m1 'requires-python' pyproject.toml | sed -E 's/.*>=[[:space:]]*([0-9]+\.[0-9]+).*/\1/')
+          echo "version=$PYVER" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          python-version: ${{ steps.pyver.outputs.version }}
+
+      - name: check_paths.py（白名單/敏感檔/永遠禁區）
+        id: check_paths
+        env:
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+          set +e
+          uv run python scripts/ci/check_paths.py "origin/${{ github.base_ref }}" "${{ github.event.pull_request.head.sha }}"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: check_simplified.py（簡體字掃描，僅掃 PR 變更檔）
+        if: always()
+        id: check_simplified
+        run: |
+          set +e
+          mapfile -t changed_files < <(git -c core.quotePath=false diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...${{ github.event.pull_request.head.sha }}")
+          if [ "${#changed_files[@]}" -eq 0 ]; then
+            echo "無新增/修改檔案需要掃描。"
+            echo "exit_code=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          uv run python scripts/ci/check_simplified.py "${changed_files[@]}"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit $code
+
+      - name: 寫入 Job Summary
+        if: always()
+        run: |
+          {
+            echo ""
+            echo "## pr-guard 總結"
+            echo "- check_paths.py exit code: ${{ steps.check_paths.outputs.exit_code }}"
+            echo "- check_simplified.py exit code: ${{ steps.check_simplified.outputs.exit_code }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 依檢查結果決定 job 成敗
+        if: always()
+        run: |
+          paths_code="${{ steps.check_paths.outputs.exit_code }}"
+          simplified_code="${{ steps.check_simplified.outputs.exit_code }}"
+          if [ "$paths_code" != "0" ] || [ "$simplified_code" != "0" ]; then
+            echo "::error::pr-guard 檢查未通過（check_paths=$paths_code, check_simplified=$simplified_code）"
+            exit 1
+          fi
+
+  test-count:
+    name: 測試數量不可減少
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR head（含完整歷史）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read Python version from pyproject.toml
+        id: pyver
+        run: |
+          PYVER=$(grep -m1 'requires-python' pyproject.toml | sed -E 's/.*>=[[:space:]]*([0-9]+\.[0-9]+).*/\1/')
+          echo "version=$PYVER" >> "$GITHUB_OUTPUT"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          enable-cache: true
+          python-version: ${{ steps.pyver.outputs.version }}
+
+      - name: 統計 PR head 測試數量
+        id: head_count
+        run: |
+          uv sync --extra dev
+          set -o pipefail
+          COUNT=$(uv run pytest --collect-only -q 2>/dev/null | grep -oE '^[0-9]+ tests? collected' | grep -oE '^[0-9]+')
+          if [ -z "$COUNT" ]; then
+            echo "::error::無法從 pytest --collect-only 解析出測試數量（head），可能是收集階段就出錯。"
+            exit 1
+          fi
+          echo "head 測試數量：$COUNT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: 用 git worktree 取出 base ref
+        # checkout 已用 fetch-depth: 0（等於抓齊所有分支的完整歷史），
+        # origin/<base_ref> 理論上已存在；這裡仍保險性地 fetch 一次，
+        # 且刻意不加 --depth，避免對已 unshallow 的 repo 混入 shallow fetch。
+        run: |
+          git fetch origin "${{ github.base_ref }}"
+          git worktree add ../base-ref "origin/${{ github.base_ref }}"
+
+      - name: 統計 base ref 測試數量
+        id: base_count
+        working-directory: ../base-ref
+        run: |
+          uv sync --extra dev
+          set -o pipefail
+          COUNT=$(uv run pytest --collect-only -q 2>/dev/null | grep -oE '^[0-9]+ tests? collected' | grep -oE '^[0-9]+')
+          if [ -z "$COUNT" ]; then
+            echo "::error::無法從 pytest --collect-only 解析出測試數量（base），可能是收集階段就出錯。"
+            exit 1
+          fi
+          echo "base 測試數量：$COUNT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: 比較數量（允許相等或增加，禁止減少）
+        run: |
+          head="${{ steps.head_count.outputs.count }}"
+          base="${{ steps.base_count.outputs.count }}"
+          echo "base=$base head=$head"
+          {
+            echo ""
+            echo "## test-count 總結"
+            echo "- base（${{ github.base_ref }}）測試數量：$base"
+            echo "- head（PR）測試數量：$head"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$head" -lt "$base" ]; then
+            echo "::error::PR 讓測試數量變少了：head=$head < base=$base，請勿刪除或停用測試。"
+            exit 1
+          fi
