@@ -715,3 +715,5 @@ details.more-metrics[open] summary::before { content: "▾ "; }
 .review-entry-body { margin-top: 0.6rem; font-size: 0.85rem; }
 .review-entry-body p { margin: 0.3rem 0; }
 html[data-theme] .flatpickr-calendar .numInputWrapper span.arrowDown::after { border-top-color: var(--qq-text-muted); }
+
+/* CI smoke test：前端白名單改動，驗證 pr-guard／test-count 流程後即移除 */
