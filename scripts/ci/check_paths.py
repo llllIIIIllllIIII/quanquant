@@ -25,6 +25,8 @@
     影響）。
 
 環境變數：
+    PR_AUTHOR / REPO_OWNER  PR 作者與 repo owner 帳號；相同即維護者模式（守門只提示不擋）。
+                            本機模擬：PR_AUTHOR=me REPO_OWNER=me
     PR_LABELS   逗號分隔的 PR label 清單（CI 中由
                 `${{ join(github.event.pull_request.labels.*.name, ',') }}` 傳入）。
                 含 "backend-change" 時，白名單外的變更降級為警告（exit 0 可能），
@@ -74,6 +76,8 @@ FOREVER_FORBIDDEN_PATTERNS = [
 ]
 
 BACKEND_CHANGE_LABEL = "backend-change"
+MAINTAINER_CHANGE_LABEL = "maintainer-change"  # 維護者（或協同維護者）PR：守門只提示不擋
+
 
 
 def matches_any(path: str, patterns: list[str]) -> bool:
@@ -163,6 +167,12 @@ def main(argv: list[str]) -> int:
     labels_raw = os.environ.get("PR_LABELS", "")
     labels = {label.strip() for label in labels_raw.split(",") if label.strip()}
     has_backend_label = BACKEND_CHANGE_LABEL in labels
+    # 維護者模式：PR 作者就是 repo owner（branch protection 下 owner 也得走 PR），
+    # 或維護者掛了 maintainer-change label（fork 貢獻者無權掛 label）。
+    # 此模式下永遠禁區與白名單外都降為 warning，敏感檔照樣示警。
+    pr_author = os.environ.get("PR_AUTHOR", "").strip().lower()
+    repo_owner = os.environ.get("REPO_OWNER", "").strip().lower()
+    is_maintainer = (bool(pr_author) and pr_author == repo_owner) or (MAINTAINER_CHANGE_LABEL in labels)
 
     exit_code = 0
     summary: list[str] = ["## check_paths 檔案路徑守門結果"]
@@ -174,7 +184,7 @@ def main(argv: list[str]) -> int:
             summary.append(f"- `{f}` — {reason}")
 
     if outside_whitelist:
-        if has_backend_label:
+        if has_backend_label or is_maintainer:
             summary.append(f"### 白名單外異動（已掛 `{BACKEND_CHANGE_LABEL}` label，降級為警告）")
             for f in outside_whitelist:
                 print(f"::warning file={f}::白名單外變更（已核准 {BACKEND_CHANGE_LABEL} label）：{f}")
@@ -188,16 +198,23 @@ def main(argv: list[str]) -> int:
                 summary.append(f"- `{f}`")
             exit_code = 1
 
-    if forever_hits:
-        summary.append("### 永遠禁區異動（label 也無法放行，需維護者自行在 main 上修改）")
+    if forever_hits and is_maintainer:
+        summary.append("### 永遠禁區異動（維護者 PR，降為提示；請自行複查）")
         for f in forever_hits:
-            print(f"::error file={f}::永遠禁區變更，任何 PR（含 backend-change label）都不可觸碰：{f}")
+            print(f"::warning file={f}::永遠禁區變更（維護者 PR，僅提示）：{f}")
+            summary.append(f"- `{f}`（維護者）")
+    elif forever_hits:
+        summary.append("### 永遠禁區異動（label 也無法放行，只有維護者本人的 PR 可通過）")
+        for f in forever_hits:
+            print(f"::error file={f}::永遠禁區變更，貢獻者 PR（含 backend-change label）不可觸碰：{f}")
             summary.append(f"- `{f}`")
         exit_code = 1
 
-    if exit_code == 0 and not sensitive_hits and not outside_whitelist:
+    if exit_code == 0 and not sensitive_hits and not outside_whitelist and not forever_hits:
         summary.append("全部變更檔案皆在白名單內，無異常。")
         print("check_paths: 全部變更檔案皆在白名單內，通過。")
+    elif exit_code == 0 and is_maintainer and (outside_whitelist or forever_hits):
+        print("check_paths: 通過（維護者 PR，守門僅提示；請自行複查上方 warning）。")
     elif exit_code == 0 and outside_whitelist:
         print(f"check_paths: 通過（白名單外變更已由 {BACKEND_CHANGE_LABEL} label 核准降級，請維護者複查）。")
     elif exit_code == 0:

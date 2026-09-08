@@ -119,6 +119,8 @@ jobs:
         id: check_paths
         env:
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          REPO_OWNER: ${{ github.repository_owner }}
         run: |
           set +e
           uv run python scripts/ci/check_paths.py "origin/${{ github.base_ref }}" "${{ github.event.pull_request.head.sha }}"

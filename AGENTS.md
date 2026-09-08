@@ -35,7 +35,7 @@ git commit → git push → ./scripts/deploy.sh
 
 ## 前端協作邊界（fork＋PR 貢獻者與其 AI 助手必讀）
 
-本節只約束非維護者的貢獻（fork 後開 PR 回 main）。維護者不受此節限制。流程細節見 `CONTRIBUTING.md`，CI 會機械執行下列規則。
+本節只約束非維護者的貢獻（fork 後開 PR 回 main）。維護者不受此節限制：PR 作者是 repo owner、或維護者掛上 `maintainer-change` label 時，pr-guard 只提示不擋。流程細節見 `CONTRIBUTING.md`，CI 會機械執行下列規則。
 
 - **可以動**：`src/quanquant/web/templates/**`、`src/quanquant/web/static/**`、`docs/**/*.md`。
 - **永遠不可動**（CI 直接擋，即使有 label）：`.github/**`、`CLAUDE.md`／`AGENTS.md`（前者是後者的 symlink）、`CONTRIBUTING.md`、`scripts/**`、`pyproject.toml`、`uv.lock`、`tests/**`、docker／Caddy 設定檔。
