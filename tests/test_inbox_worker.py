@@ -1172,14 +1172,31 @@ def test_deal_landing_publish_runs_on_loop_thread_safe_under_asyncio_debug_mode(
 def test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effective(engine):
     """驗收條件2（有效性那一半）：從另一個沒有 event loop 的執行緒（比照 Shioaji SDK
     callback thread）呼叫 request_wake 必須安全、且真的把 worker 喚醒——用
-    `threading.Thread`（非 asyncio 任何東西）呼叫，不能假設呼叫端在 loop 執行緒上。"""
+    `threading.Thread`（非 asyncio 任何東西）呼叫，不能假設呼叫端在 loop 執行緒上。
+
+    flaky 修復備忘（fix/flaky-timing-tests）：原本用另開 `Session(engine)` 輪詢
+    `row.processed` 確認處理完——但 `engine` fixture 是 `StaticPool`＋
+    `check_same_thread=False`（單一實體連線共用），這個輪詢會在主執行緒跟 worker
+    背景執行緒（`run()` 內 `asyncio.to_thread(process_batch_once)`）真正併發碰同一條
+    SQLite 連線；CPU 壓力下（本機 8 個 `yes` 壓力源重現：30 次 14 敗）幾乎每次失敗都是
+    `mark_raw_inbox_processed`／`session.flush()` 炸出 `StaleDataError`（0 rows
+    matched），把「還沒處理完」誤判成「處理失敗」——診斷版（拿掉併發輪詢改純
+    `sleep`）失敗率從 47% 掉到 10%、且不再出現 StaleDataError，證實輪詢本身的併發
+    存取才是主因，不是 `request_wake`/worker 的正式碼有 race。改訂閱
+    `OrderEventHub` 的廣播 ping（`run()` 迴圈 handled>0 時只在 event loop 執行緒發布，
+    見 `inbox_worker.py::run`）取代輪詢——等待期間完全不對這個共享連線開新
+    Session；等待上限放寬到 10 秒只是讓 CPU 壓力下的合理處理延遲不被錯殺，條件本身
+    不變（仍是「真的處理完」才算數，最後仍用一次性 Session 讀回 `row.processed`
+    覆核）。"""
     with Session(engine) as s:
         _seed_order(s)
-    worker = _worker(engine, idle_interval=5.0)
+    hub = OrderEventHub()
+    worker = _worker(engine, idle_interval=5.0, order_events=hub)
 
     async def scenario():
         run_task = asyncio.create_task(worker.run())
         await _wait_until_loop_captured(worker)
+        queue = hub.subscribe()
 
         with Session(engine) as s:
             brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
@@ -1196,21 +1213,20 @@ def test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effect
 
         t = threading.Thread(target=_call_from_thread)
         t.start()
-        t.join(timeout=2.0)
-        assert not t.is_alive()
-        assert errors == []
+        t.join(timeout=10.0)
 
-        for _ in range(100):
-            with Session(engine) as s:
-                row = s.exec(select(RawInbox)).first()
-                if row is not None and row.processed:
-                    break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("跨執行緒 request_wake 逾時仍未喚醒 worker 處理新列")
-
-        await worker.stop_and_drain(timeout=1.0)
-        await run_task
+        try:
+            assert not t.is_alive()
+            assert errors == []
+            await asyncio.wait_for(queue.get(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise AssertionError("跨執行緒 request_wake 逾時仍未喚醒 worker 處理新列") from None
+        finally:
+            # try/finally：即使上面逾時失敗也要把 worker 收乾淨，避免背景執行緒
+            # 的 process_batch_once 帶著同一個 engine 連線繼續孤兒式跑，殘留輸出
+            # 干擾到後面的測試（原本失敗路徑不會走到這兩行，是本次修復一併補上的）。
+            await worker.stop_and_drain(timeout=1.0)
+            await run_task
 
     asyncio.run(scenario())
     with Session(engine) as s:

@@ -560,7 +560,16 @@ def _place_msg(cmd_id: str) -> dict:
 
 async def test_child_failstop_notice_latches_agent_bumps_epoch_and_reports_status(tmp_path):
     """G2①/⑤：child 經專用 IPC 通知落地失敗 → agent latch＋epoch+=1＋寫 sentinel，並經
-    單一序列化 health sender 回報 status="failstop"。"""
+    單一序列化 health sender 回報 status="failstop"。
+
+    flaky 修復備忘（fix/flaky-timing-tests）：`AgentRunner._latch()`（runner.py）拿到
+    `_recovery_lock` 後先同步設 `self._latched = True`／`self._health_epoch += 1`，
+    「之後」才 `await asyncio.to_thread(self._buffer.write_sentinel, ...)`——sentinel
+    落地是 offload 到 thread pool 執行的獨立步驟，不是跟 `_latched` 翻轉同一瞬間完成。
+    原本只等 `r._latched` 就直接斷言 `buf.has_sentinel()`，CPU 壓力下 thread pool
+    排程延後、sentinel 檔還沒寫出，斷言就會偶發撲空（CI 兩次 PR run 各紅過一次）。
+    改成連 `buf.has_sentinel()` 一起等，等到才代表 `_latch()` 這個原子轉移真正走完，
+    不是放寬條件——最後仍原樣斷言 `_health_epoch`／`has_sentinel()`。"""
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
     r.ensure_child()
@@ -569,7 +578,7 @@ async def test_child_failstop_notice_latches_agent_bumps_epoch_and_reports_statu
     assert tr.healths()[0] == {"type": "health", "status": "ok", "detail": None, "health_epoch": 0}
 
     child.push_failstop("buffer 落地失敗")
-    await _until(lambda: r._latched)
+    await _until(lambda: r._latched and buf.has_sentinel())
     assert r._health_epoch == 1
     assert buf.has_sentinel()
 
