@@ -1,6 +1,5 @@
 import hashlib
 
-from quanquant.auth import service as auth_service
 
 
 def _initiate(client, verifier="v" * 43):
@@ -75,7 +74,8 @@ def test_poll_pending_then_approved_flow(anon_client, session, user):
     from sqlmodel import select
     row = session.exec(select(AgentDeviceCode).where(AgentDeviceCode.user_code == body["user_code"])).first()
     row.status, row.user_id, row.current_interval = "approved", user.id, 0
-    session.add(row); session.commit()
+    session.add(row)
+    session.commit()
 
     poll2 = anon_client.post("/api/agent/device-token",
                               json={"device_code": body["device_code"], "code_verifier": verifier})

@@ -61,14 +61,16 @@ def test_poll_after_consumed_is_readonly_idempotent(session, user):
 def test_poll_expired_terminal_state(session, user):
     raw, row, verifier = _approved_row(session, user, interval=0)
     row.expires_at = _utcnow() - dt.timedelta(seconds=1)
-    session.add(row); session.commit()
+    session.add(row)
+    session.commit()
     assert poll_device_token(session, device_code=raw, code_verifier=verifier, ttl_days=30) == {"state": "expired"}
 
 
 def test_poll_denied_terminal_state(session, user):
     raw, row, verifier = _approved_row(session, user, interval=0)
     row.status = "denied"
-    session.add(row); session.commit()
+    session.add(row)
+    session.commit()
     assert poll_device_token(session, device_code=raw, code_verifier=verifier, ttl_days=30) == {"state": "denied"}
 
 

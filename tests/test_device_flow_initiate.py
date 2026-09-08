@@ -1,6 +1,5 @@
 import datetime as dt
 
-import pytest
 from sqlmodel import select
 
 from quanquant.auth.device_flow import (

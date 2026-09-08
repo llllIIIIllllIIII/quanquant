@@ -57,8 +57,10 @@ def test_concurrent_upserts_from_multiple_threads_do_not_corrupt_registry(_isola
         pr.upsert_profile(site_origin="https://q.example", profile_id=str(i),
                            username=f"user{i}", buffer_path=f"/x{i}")
     threads = [threading.Thread(target=_worker, args=(i,)) for i in range(20)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     data = json.loads((_isolated_home / "profiles.json").read_text())
     assert len(data["https://q.example"]) == 20  # 無互蓋、無遺失
 

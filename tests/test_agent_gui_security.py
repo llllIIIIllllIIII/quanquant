@@ -1,5 +1,4 @@
 import httpx
-import pytest
 
 from quanquant.agent.gui.security import GUI_SESSION_COOKIE, GuiSecurityState, bootstrap_url, install_security_headers, require_gui_session
 from fastapi import Depends, FastAPI

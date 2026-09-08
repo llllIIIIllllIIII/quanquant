@@ -184,7 +184,8 @@ def test_decide_deny_sets_denied(owner_client, session):
 def test_decide_already_processed_is_rejected_not_overwritten(owner_client, session, user):
     raw, row = _pending_code(session)
     row.status, row.user_id = "approved", user.id
-    session.add(row); session.commit()
+    session.add(row)
+    session.commit()
     get_resp = owner_client.get("/agent/authorize")
     csrf = get_resp.cookies.get("qq_csrf_authorize")
     resp = owner_client.post("/agent/authorize/decide",

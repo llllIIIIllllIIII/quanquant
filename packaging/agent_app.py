@@ -13,7 +13,6 @@
 """
 import multiprocessing
 import os
-import sys
 
 SITE = "https://quant.35-221-233-118.sslip.io"
 

@@ -42,7 +42,7 @@ async def test_initiate_builds_approval_url_from_builtin_constant_not_server_val
     transport, calls = _mock_transport([resp])
     async with httpx.AsyncClient(transport=transport, base_url="https://quant.example") as http:
         client = DeviceFlowClient(site_origin="https://quant.example", http_client=http)
-        state = await client.initiate()
+        await client.initiate()
         assert client.approval_url == f"https://quant.example{AGENT_AUTHORIZE_PATH}"
     body = calls[0].content
     import json

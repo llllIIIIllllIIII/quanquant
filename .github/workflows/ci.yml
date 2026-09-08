@@ -65,13 +65,11 @@ jobs:
       - name: uv sync
         run: uv sync --extra dev
 
+      - name: ruff（靜態檢查：未用 import、一行多敘述等）
+        run: uv run ruff check .
+
       - name: pytest
         run: uv run pytest -q -p no:cacheprovider
-
-      # ruff 尚未全綠（pyproject.toml 已有 [tool.ruff] 設定），刻意不在此加入
-      # lint 步驟，避免既有的 12 個錯誤讓 CI 一開始就是紅的。清乾淨後可加：
-      #   - name: ruff
-      #     run: uv run ruff check .
 
   pr-guard:
     name: PR 路徑守門 + 簡體字掃描
@@ -95,6 +93,27 @@ jobs:
         with:
           enable-cache: true
           python-version: ${{ steps.pyver.outputs.version }}
+
+      - name: diff base 自檢（fork PR 也必須取到正確的 base）
+        run: |
+          BASE_REF="origin/${{ github.base_ref }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          BASE_SHA=$(git rev-parse "$BASE_REF")
+          MB=$(git merge-base "$BASE_SHA" "$HEAD_SHA")
+          N_LOCAL=$(git -c core.quotePath=false diff --name-only "$BASE_REF...$HEAD_SHA" | wc -l | tr -d ' ')
+          N_GITHUB="${{ github.event.pull_request.changed_files }}"
+          echo "base=$BASE_REF@$BASE_SHA head=$HEAD_SHA merge-base=$MB"
+          echo "本地 diff 檔案數=$N_LOCAL；GitHub 回報 PR 變更檔案數=$N_GITHUB"
+          {
+            echo "## diff base 自檢"
+            echo "- base: \`$BASE_REF\` @ \`$BASE_SHA\`"
+            echo "- head: \`$HEAD_SHA\`（來源 repo：${{ github.event.pull_request.head.repo.full_name }}）"
+            echo "- merge-base: \`$MB\`"
+            echo "- 本地 diff 檔案數 $N_LOCAL vs GitHub 回報 $N_GITHUB"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$N_LOCAL" != "$N_GITHUB" ]; then
+            echo "::warning::本地 diff 檔案數（$N_LOCAL）與 GitHub 回報（$N_GITHUB）不一致，pr-guard 可能取錯 base，請人工核對 PR 的 Files changed 分頁"
+          fi
 
       - name: check_paths.py（白名單/敏感檔/永遠禁區）
         id: check_paths
