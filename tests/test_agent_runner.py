@@ -61,7 +61,11 @@ class _FakeChild:
         return True
 
 
-async def _until(cond, timeout=3.0):
+async def _until(cond, timeout=10.0):
+    # B：3.0 → 10.0（慢 CI runner 下的預設等待上限）。純粹是「條件終將成立」的正向等待
+    # 的上限——沒有任何測試把這個預設值本身的逾時當作預期結果（已逐一核對，無
+    # pytest.raises(TimeoutError) 包住 `_until` 的用法），放寬只會讓等待更有餘裕，
+    # 不改變任何斷言的語意。
     async def _poll():
         while not cond():
             await asyncio.sleep(0.01)
@@ -137,15 +141,24 @@ class _ImmediateAckTransport(_FakeTransport):
 
 async def test_pump_drains_backlog_across_batches_without_waiting_per_batch(tmp_path):
     """紅測試前提：sleep-first 版本每批（`pending(50)`）處理前都要先睡滿一輪
-    `pump_interval`——120 筆需要 3 批（50+50+20），舊版至少 3*pump_interval=1.5s 才送完，
-    遠超下面的 0.3s 上限；check-first/drain-until-empty 版本應該幾乎零等待送完（送出
-    即視為已 ack，buffer 立刻露出下一批，不必等下一輪 pump_interval 才繼續 drain）。"""
+    `pump_interval`——120 筆需要 3 批（50+50+20），舊版至少 3*pump_interval=1.5s 才送完；
+    check-first/drain-until-empty 版本應該幾乎零等待送完（送出即視為已 ack，buffer 立刻
+    露出下一批，不必等下一輪 pump_interval 才繼續 drain）。
+
+    C（上限推導，慢 CI runner flaky 修復）：固定 0.3s 上限在慢 runner 上餘裕不足。改用
+    相對於 pump_interval／批數推導的上限——batches=ceil(120/50)=3，sleep-first 舊版
+    最快也要 batches*pump_interval=1.5s 才送完 120 筆；取其一半（0.5 安全係數）當上限
+    =0.75s：正確版本幾乎零等待，慢機器上仍有數十倍餘裕；任何回歸到「每批睡一輪」的
+    錯誤實作（>=1.5s）仍會確實超時，語意不變、不放寬。"""
     buf = DurableBuffer(tmp_path / "o.db")
     tr = _ImmediateAckTransport(buf)
-    ids = [buf.append("deal_report", {"n": i}) for i in range(120)]
-    r = _runner(tr, _FakeChild(), buf, pump_interval=0.5)  # 沿用舊預設值，驗證修好後仍快
+    n_rows, batch_size, pump_interval = 120, 50, 0.5
+    batches = -(-n_rows // batch_size)                     # ceil(120/50) = 3
+    timeout = pump_interval * batches * 0.5                # 0.75s（見上方推導）
+    ids = [buf.append("deal_report", {"n": i}) for i in range(n_rows)]
+    r = _runner(tr, _FakeChild(), buf, pump_interval=pump_interval)  # 沿用舊預設值，驗證修好後仍快
     task = asyncio.create_task(r._pump())
-    await _until(lambda: len(tr.reports()) >= 120, timeout=0.3)
+    await _until(lambda: len(tr.reports()) >= n_rows, timeout=timeout)
     assert [m["event_id"] for m in tr.reports()] == ids
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
@@ -435,7 +448,10 @@ async def test_watchdog_ping_fallback_elevates_parent_latch_when_ipc_unavailable
     r = _runner(tr, child, buf, child_ping_interval=0.05, child_ping_timeout=1)
     task = asyncio.create_task(r.run_forever())
 
-    await _until(lambda: r._latched is True)     # ping 備援獨立偵測到 latch、提升 parent latch
+    # race 修復（A）：_latch() 先同步設 _latched=True 才 await to_thread 寫 sentinel（見
+    # runner.py::_latch），只等 r._latched 就斷言 has_sentinel() 是競態——等待條件併入
+    # has_sentinel()（斷言本身不動），只會讓等待更嚴格，不會削弱這支測試要驗的事。
+    await _until(lambda: r._latched is True and buf.has_sentinel())
     assert buf.has_sentinel()                     # durable sentinel 補寫（不只是記憶體旗標）
 
     await _until(lambda: child.starts >= 2)       # 既有行為不變：respawn 過
@@ -725,7 +741,10 @@ def test_lock_rechecks_poisoned_before_touching_conn(tmp_path):
     finally:
         child._lock.release()
 
-    t.join(timeout=2)
+    # E：正向等待（等背景執行緒跑完，不是「應該逾時」的否定用途）——2s 在慢 runner 上
+    # 餘裕不足，拉到 10s；執行緒本身受 child.request(timeout=1) 等內部逾時拘束，正常
+    # 情況下遠早於 10s 就會完成，只是把誤判的安全邊界放寬。
+    t.join(timeout=10)
     assert isinstance(results.get("exc"), TimeoutError)
     assert conn.sent == []       # 從未碰過 conn
 
@@ -769,7 +788,10 @@ def test_generation_mismatch_after_concurrent_respawn_discards_stale_rpc_without
     child._generation = 2
     child._lock.release()   # 放行——過期呼叫這才拿得到鎖
 
-    t.join(timeout=2)
+    # E：正向等待（等背景執行緒跑完，不是「應該逾時」的否定用途）——2s 在慢 runner 上
+    # 餘裕不足，拉到 10s；執行緒本身受 child.request(timeout=1) 等內部逾時拘束，正常
+    # 情況下遠早於 10s 就會完成，只是把誤判的安全邊界放寬。
+    t.join(timeout=10)
     assert isinstance(results.get("exc"), TimeoutError)
     assert new_conn.sent == []            # 完全沒碰新 conn
     assert new_process.killed is False    # 新 child 沒有被誤殺（_poison 也沒被觸發到它）
@@ -847,7 +869,10 @@ def test_terminate_generation_mismatch_after_concurrent_respawn_is_noop_for_new_
     child._generation = 2
     child._lock.release()   # 放行——過期的 terminate 呼叫這才拿得到鎖
 
-    t.join(timeout=2)
+    # E：正向等待（等背景執行緒跑完，不是「應該逾時」的否定用途）——2s 在慢 runner 上
+    # 餘裕不足，拉到 10s；執行緒本身受 child.request(timeout=1) 等內部逾時拘束，正常
+    # 情況下遠早於 10s 就會完成，只是把誤判的安全邊界放寬。
+    t.join(timeout=10)
     assert results["returned"] is None    # no-op，正常返回，不 raise
     assert new_process.killed is False    # 新 child 沒有被誤殺
     assert new_conn.closed is False       # 新 conn 也沒被碰

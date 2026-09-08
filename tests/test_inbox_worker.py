@@ -1008,23 +1008,46 @@ def test_stop_and_drain_returns_false_on_timeout_not_claiming_success(engine):
 
 def test_worker_run_processes_pending_row_then_idles(engine):
     """`run()` 走真正的 async 迴圈：拿鎖 → to_thread 跑 process_batch_once → 處理完停止旗標生效即結束。
-    驗證迴圈確實會呼叫 process_batch_once 並套用 supervisor 序列化，而非只是裝飾用的殼。"""
+    驗證迴圈確實會呼叫 process_batch_once 並套用 supervisor 序列化，而非只是裝飾用的殼。
+
+    D（flaky 修復，fix/flaky-timing-tests）：原本用固定 `for _ in range(200): sleep(0.01)`
+    輪詢——每輪都另開一個 `Session(engine)`，而 `engine` fixture 是 `StaticPool`＋
+    `check_same_thread=False`（單一實體連線共用），這個輪詢會跟 worker 背景執行緒
+    （`run()` 內 `asyncio.to_thread(process_batch_once)`）真正併發碰同一條 SQLite
+    連線——真正根因見 `test_request_wake_from_separate_thread_without_event_loop_is_safe_
+    and_effective` 的 docstring（CPU 壓力下 30 次 14 敗，`StaleDataError`）。改訂閱
+    `OrderEventHub` 的廣播 ping（`run()` 迴圈 handled>0 時只在 event loop 執行緒發布，見
+    `inbox_worker.py::run`）取代輪詢——等待期間完全不對這個共享連線開新 Session，條件
+    本身不變（仍是「真的處理完」才算數，最後仍用一次性 Session 讀回 `row.processed`
+    覆核）。
+
+    第二輪修復（用 `debug_inbox_hang.py` 加 trace log 逐行定位才抓到）：第一版在
+    `_wait_until_loop_captured(worker)` 之後才 `hub.subscribe()`——但這筆列在
+    `worker.run()` 啟動前就已經落地，本機 8 核心跑滿 8 個 `yes` 的極端排程延遲下，
+    `run()` 第一輪 `to_thread(process_batch_once)` 有時會在我們的輪詢迴圈拿回 CPU
+    之前就整批做完並呼叫過 `hub.publish()`（trace 證實：`hub.publish: CALLED` 早於
+    `loop captured: True` 印出）——等我們才 `subscribe()`，那唯一一次事件已經錯過，
+    之後沒有更多列可處理，`queue.get()` 永遠不會有第二次 publish，只會在逾時上限
+    原地掛滿（不管上限拉多高都一樣：10 秒 15 次 4 敗、30 秒 20 次 1 敗、60 秒 20 次
+    2 敗，全部卡在同一行——不是「太慢」，是「已經錯過」，加大逾時無法修正）。真正
+    修法：`subscribe()` 移到 `create_task(worker.run())` 之前——訂閱先於任何可能的
+    處理，結構上不可能再錯過這唯一一次 publish；比照
+    `test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effective`
+    的安全寫法（該測試把落地動作擺在 `subscribe()` 之後，天然沒有這個窗口）。上限
+    改回本檔其餘測試沿用的 10 秒——race 消除後不再需要用加大逾時去換餘裕。"""
     with Session(engine) as s:
         brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji", payload=json.dumps(_deal_payload()))
         s.commit()
     with Session(engine) as s:
         _seed_order(s)
 
-    worker = _worker(engine)
+    hub = OrderEventHub()
+    worker = _worker(engine, order_events=hub)
+    queue = hub.subscribe()  # 訂閱必須先於 create_task——見上方 docstring 的競態說明
 
     async def scenario():
         run_task = asyncio.create_task(worker.run())
-        for _ in range(200):
-            with Session(engine) as s:
-                row = s.exec(select(RawInbox)).first()
-                if row is not None and row.processed:
-                    break
-            await asyncio.sleep(0.01)
+        await asyncio.wait_for(queue.get(), timeout=10.0)
         await worker.stop_and_drain(timeout=1.0)
         await run_task
 
@@ -1172,14 +1195,31 @@ def test_deal_landing_publish_runs_on_loop_thread_safe_under_asyncio_debug_mode(
 def test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effective(engine):
     """驗收條件2（有效性那一半）：從另一個沒有 event loop 的執行緒（比照 Shioaji SDK
     callback thread）呼叫 request_wake 必須安全、且真的把 worker 喚醒——用
-    `threading.Thread`（非 asyncio 任何東西）呼叫，不能假設呼叫端在 loop 執行緒上。"""
+    `threading.Thread`（非 asyncio 任何東西）呼叫，不能假設呼叫端在 loop 執行緒上。
+
+    flaky 修復備忘（fix/flaky-timing-tests）：原本用另開 `Session(engine)` 輪詢
+    `row.processed` 確認處理完——但 `engine` fixture 是 `StaticPool`＋
+    `check_same_thread=False`（單一實體連線共用），這個輪詢會在主執行緒跟 worker
+    背景執行緒（`run()` 內 `asyncio.to_thread(process_batch_once)`）真正併發碰同一條
+    SQLite 連線；CPU 壓力下（本機 8 個 `yes` 壓力源重現：30 次 14 敗）幾乎每次失敗都是
+    `mark_raw_inbox_processed`／`session.flush()` 炸出 `StaleDataError`（0 rows
+    matched），把「還沒處理完」誤判成「處理失敗」——診斷版（拿掉併發輪詢改純
+    `sleep`）失敗率從 47% 掉到 10%、且不再出現 StaleDataError，證實輪詢本身的併發
+    存取才是主因，不是 `request_wake`/worker 的正式碼有 race。改訂閱
+    `OrderEventHub` 的廣播 ping（`run()` 迴圈 handled>0 時只在 event loop 執行緒發布，
+    見 `inbox_worker.py::run`）取代輪詢——等待期間完全不對這個共享連線開新
+    Session；等待上限放寬到 10 秒只是讓 CPU 壓力下的合理處理延遲不被錯殺，條件本身
+    不變（仍是「真的處理完」才算數，最後仍用一次性 Session 讀回 `row.processed`
+    覆核）。"""
     with Session(engine) as s:
         _seed_order(s)
-    worker = _worker(engine, idle_interval=5.0)
+    hub = OrderEventHub()
+    worker = _worker(engine, idle_interval=5.0, order_events=hub)
 
     async def scenario():
         run_task = asyncio.create_task(worker.run())
         await _wait_until_loop_captured(worker)
+        queue = hub.subscribe()
 
         with Session(engine) as s:
             brepo.stage_raw_inbox(s, kind="deal_report", broker="shioaji",
@@ -1196,21 +1236,20 @@ def test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effect
 
         t = threading.Thread(target=_call_from_thread)
         t.start()
-        t.join(timeout=2.0)
-        assert not t.is_alive()
-        assert errors == []
+        t.join(timeout=10.0)
 
-        for _ in range(100):
-            with Session(engine) as s:
-                row = s.exec(select(RawInbox)).first()
-                if row is not None and row.processed:
-                    break
-            await asyncio.sleep(0.01)
-        else:
-            raise AssertionError("跨執行緒 request_wake 逾時仍未喚醒 worker 處理新列")
-
-        await worker.stop_and_drain(timeout=1.0)
-        await run_task
+        try:
+            assert not t.is_alive()
+            assert errors == []
+            await asyncio.wait_for(queue.get(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise AssertionError("跨執行緒 request_wake 逾時仍未喚醒 worker 處理新列") from None
+        finally:
+            # try/finally：即使上面逾時失敗也要把 worker 收乾淨，避免背景執行緒
+            # 的 process_batch_once 帶著同一個 engine 連線繼續孤兒式跑，殘留輸出
+            # 干擾到後面的測試（原本失敗路徑不會走到這兩行，是本次修復一併補上的）。
+            await worker.stop_and_drain(timeout=1.0)
+            await run_task
 
     asyncio.run(scenario())
     with Session(engine) as s:

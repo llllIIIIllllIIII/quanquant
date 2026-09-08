@@ -17,6 +17,7 @@ import datetime as dt
 import json
 import multiprocessing as mp
 import sqlite3
+import threading
 import time
 from decimal import Decimal
 
@@ -533,7 +534,11 @@ class _FakeChild:
         self._failstop_queue.append({"type": "failstop", "detail": detail, "generation": gen})
 
 
-async def _until(cond, timeout=3.0):
+async def _until(cond, timeout=10.0):
+    # B：3.0 → 10.0（慢 CI runner 下的預設等待上限）。純粹是「條件終將成立」的正向等待
+    # 的上限——沒有任何測試把這個預設值本身的逾時當作預期結果（已逐一核對，無
+    # pytest.raises(TimeoutError) 包住 `_until` 的用法），放寬只會讓等待更有餘裕，
+    # 不改變任何斷言的語意。
     async def _poll():
         while not cond():
             await asyncio.sleep(0.01)
@@ -560,7 +565,16 @@ def _place_msg(cmd_id: str) -> dict:
 
 async def test_child_failstop_notice_latches_agent_bumps_epoch_and_reports_status(tmp_path):
     """G2①/⑤：child 經專用 IPC 通知落地失敗 → agent latch＋epoch+=1＋寫 sentinel，並經
-    單一序列化 health sender 回報 status="failstop"。"""
+    單一序列化 health sender 回報 status="failstop"。
+
+    flaky 修復備忘（fix/flaky-timing-tests）：`AgentRunner._latch()`（runner.py）拿到
+    `_recovery_lock` 後先同步設 `self._latched = True`／`self._health_epoch += 1`，
+    「之後」才 `await asyncio.to_thread(self._buffer.write_sentinel, ...)`——sentinel
+    落地是 offload 到 thread pool 執行的獨立步驟，不是跟 `_latched` 翻轉同一瞬間完成。
+    原本只等 `r._latched` 就直接斷言 `buf.has_sentinel()`，CPU 壓力下 thread pool
+    排程延後、sentinel 檔還沒寫出，斷言就會偶發撲空（CI 兩次 PR run 各紅過一次）。
+    改成連 `buf.has_sentinel()` 一起等，等到才代表 `_latch()` 這個原子轉移真正走完，
+    不是放寬條件——最後仍原樣斷言 `_health_epoch`／`has_sentinel()`。"""
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
     r.ensure_child()
@@ -569,7 +583,7 @@ async def test_child_failstop_notice_latches_agent_bumps_epoch_and_reports_statu
     assert tr.healths()[0] == {"type": "health", "status": "ok", "detail": None, "health_epoch": 0}
 
     child.push_failstop("buffer 落地失敗")
-    await _until(lambda: r._latched)
+    await _until(lambda: r._latched and buf.has_sentinel())
     assert r._health_epoch == 1
     assert buf.has_sentinel()
 
@@ -673,7 +687,10 @@ async def test_current_generation_failstop_notice_still_latches(tmp_path):
     await _until(lambda: len(tr.healths()) >= 1)
 
     child.push_failstop("目前這一代的真實故障", generation=1)
-    await _until(lambda: r._latched)
+    # race 修復（A）：_latch() 先同步設 _latched=True 才 await to_thread 寫 sentinel（見
+    # runner.py::_latch），只等 r._latched 就斷言 has_sentinel() 是競態——等待條件併入
+    # has_sentinel()（斷言本身不動），只會讓等待更嚴格，不會削弱這支測試要驗的事。
+    await _until(lambda: r._latched and buf.has_sentinel())
     assert buf.has_sentinel()
 
     task.cancel()
@@ -913,7 +930,8 @@ async def test_latch_never_auto_clears_during_running_session_only_next_process_
     await _until(lambda: len(tr.healths()) >= 1)
 
     child.push_failstop("boom")
-    await _until(lambda: r._latched)
+    # race 修復（A）：同上——併入 has_sentinel()，不只等記憶體旗標。
+    await _until(lambda: r._latched and buf.has_sentinel())
     assert buf.has_sentinel()
 
     # 存活期間持續跑一段時間（buffer 本身完好，若有任何背景重驗機制會通過）——舊版
@@ -934,7 +952,9 @@ async def test_latch_never_auto_clears_during_running_session_only_next_process_
     r2 = _runner(tr, _FakeChild(), buf)
     assert r2._latched is True   # 建構子照舊從 sentinel 恢復 latch 狀態
     task2 = asyncio.create_task(r2.run_forever())
-    await _until(lambda: not r2._latched, timeout=3)
+    # B：正向等待（等啟動探測清 latch），舊值 3 等於改前的預設——一併拉到與新預設
+    # 一致的 10，慢 runner 下給探測（DurableBuffer.probe 走 to_thread 真 I/O）更多餘裕。
+    await _until(lambda: not r2._latched, timeout=10)
     assert not buf.has_sentinel()
     r2.stop()
     task2.cancel()
@@ -1113,13 +1133,34 @@ def test_g2_full_chain_failstop_notready_alert_reject_recover_ready(ws_env, engi
 
         # ② latch 期間拒新指令 → server applier CAS 落 acked_error，依 D4 轉移表 place
         # 明確拒絕 → failed ＋ release quota。
-        ws.send_json({"type": "cmd_rejected", "cmd_id": "cmd-fs-1", "error_kind": "failstop"})
+        #
+        # flaky 修復備忘（fix/flaky-timing-tests，D 的變體）：原本用 `_wait(_resolved)`
+        # 從主執行緒開一個新 `Session(engine)` 輪詢 `resolved_at`——但落地寫入在
+        # `apply_command_ack`（`agent_ws.py` 經 `asyncio.to_thread` 派工）另一個執行緒上
+        # 跑，`engine` fixture 是 StaticPool＋check_same_thread=False（單一實體連線共
+        # 用），輪詢跟寫入因此真正併發碰同一條 SQLite 連線；CPU 壓力下重現出
+        # `IntegrityError: CHECK constraint failed:
+        # ck_agent_commands_ack_requires_transport_ack`——與 `test_inbox_worker.py::
+        # test_request_wake_from_separate_thread_without_event_loop_is_safe_and_effective`
+        # 診斷出的根因同一類（StaticPool 併發存取），不是正式碼邏輯本身的錯，這裡不改
+        # src。改法比照：等待期間完全不對這條共享連線開新 Session——`apply_command_ack`
+        # 回傳（含 commit）後 `agent_ws.py` 才呼叫 `channel.resolve_ack`，監看這個呼叫
+        # 當訊號，比輪詢 DB 更精確也更安全；訊號到才做「唯一一次」Session 讀回覆核，
+        # 讀到的必是已 commit 的終態。
+        resolved_event = threading.Event()
+        channel = _slot(ws_env).channel
+        original_resolve_ack = channel.resolve_ack
 
-        def _resolved():
-            with Session(engine) as s:
-                row = s.get(AgentCommand, "cmd-fs-1")
-                return row is not None and row.resolved_at is not None
-        assert _wait(_resolved)
+        def _resolve_ack_and_signal(ack):
+            original_resolve_ack(ack)
+            resolved_event.set()
+
+        channel.resolve_ack = _resolve_ack_and_signal
+        try:
+            ws.send_json({"type": "cmd_rejected", "cmd_id": "cmd-fs-1", "error_kind": "failstop"})
+            assert resolved_event.wait(timeout=10), "cmd_rejected 逾時未落地（resolve_ack 未被呼叫）"
+        finally:
+            channel.resolve_ack = original_resolve_ack
 
         with Session(engine) as s:
             cmd_row = s.get(AgentCommand, "cmd-fs-1")
