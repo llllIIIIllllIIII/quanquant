@@ -10,7 +10,10 @@
   <div class="market-banner closed">非交易時段</div>
   {% endif %}
   <div class="quote-main">
-    <span class="sym">{{ snap.symbol }}</span>
+    <span class="sym-code">{{ snap.symbol }}</span>
+    <!-- 003：顯示名＝品名＋期別（不含契約月，使用者定案）；「近」目前一律正確
+         （sources/taifex.py::_select_nearest_contract 恆選最近到期合約）。 -->
+    <span class="sym-name">{{ snap.symbol | symbol_label }}近</span>
     <span class="price">{{ snap.price | num }}</span>
     <span class="chg-pill">{{ '▲' if snap.change >= 0 else '▼' }} {{ snap.change | signed }} ({{ snap.change_pct | pct }}%)</span>
   </div>
@@ -24,6 +27,10 @@
     <span class="time">{{ (as_of or snap.fetched_at) | cst_time }} CST</span>
   </div>
 </div>
+{% elif unknown_symbol %}
+<!-- 002：所選商品沒有報價來源（未知/非 poller 追蹤的商品），明確顯示「無報價」——絕不可
+     繼續顯示上一檔／其他商品的價格（看著 A 的價下 B 的單比完全沒有報價更危險）。 -->
+<div class="quote no-source"><span>⚠ {{ req_symbol }} 無報價</span></div>
 {% elif error %}
 <div class="quote err"><span>⚠ 報價錯誤：{{ error }}</span></div>
 {% else %}

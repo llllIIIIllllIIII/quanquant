@@ -21,7 +21,9 @@
         </form>
       </td>
       <td>{{ '啟用' if u.is_active else '停用' }}</td>
-      <td>{{ u.created_at | dt }}</td>
+      <!-- NEW-2：created_at 是 naive-UTC（db/models.py::_utcnow），`dt` 只 strftime、不轉
+           時區，裸印會差 8 小時；改用 `dt_cst`（同 order_table.html 既有慣例）。 -->
+      <td>{{ u.created_at | dt_cst }}</td>
       <td>
         <form method="post" action="/admin/users/{{ u.id }}/toggle-active" style="display:inline">
           <button class="secondary" type="submit">{{ '停用' if u.is_active else '啟用' }}</button>

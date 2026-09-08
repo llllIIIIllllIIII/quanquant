@@ -1,11 +1,12 @@
 """CRUD + filtering for trades. P&L is auto-computed unless manually overridden."""
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from sqlmodel import Session, select
 
 from quanquant.db.models import Trade
 from quanquant.journal.pnl import compute_pnl
 from quanquant.journal.schemas import TradeCreate, TradeUpdate, join_tags, split_tags
+from quanquant.journal.trading_day import trading_day_bounds
 
 
 def _utcnow() -> datetime:
@@ -152,6 +153,53 @@ def list_for_stats(
         status="closed",
     )
     return sorted(trades, key=lambda t: (t.exit_time or t.entry_time))
+
+
+def list_closed_for_period(
+    session: Session,
+    *,
+    user_id: int,
+    mode: str = "real",
+    date_from: date,
+    date_to: date,
+    symbol: str | None = None,
+    tag: str | None = None,
+    result: str | None = None,  # "win" | "loss" | None（全部）
+    include_manual: bool = False,
+) -> list[Trade]:
+    """008 交易績效頁專用：已平倉逐筆明細，依 trading_day 區間（含前一夜盤，見
+    `journal.trading_day.trading_day_bounds`）篩選，排序為平倉時間新到舊（畫面順序）。
+
+    與 `list_for_stats`/`list_trades`（entry_time 為界、不分來源）刻意分開——那兩支供
+    交易日記頁與既有 `/stats/data` API 使用，語意不變；本函式是 008 新增的獨立查詢路徑，
+    避免任何一邊的行為被另一邊的新需求牽動（既有測試零回歸風險）。
+
+    來源規則（008）：預設 `include_manual=False` 只計 `source="shioaji"`；勾選後納入
+    `source="manual"`。結果篩選（008）：`result="win"` 只留 `pnl>0`，`"loss"` 只留
+    `pnl<0`，打平（`pnl==0`）與尚未平倉（不會出現於此查詢）兩者皆不計入任一邊。
+    """
+    lower, upper = trading_day_bounds(date_from, date_to)
+    stmt = select(Trade).where(
+        Trade.user_id == user_id,
+        Trade.mode == mode,
+        Trade.exit_time.is_not(None),  # type: ignore[union-attr]
+        Trade.exit_time >= lower,  # type: ignore[operator]
+        Trade.exit_time <= upper,  # type: ignore[operator]
+    )
+    if symbol:
+        stmt = stmt.where(Trade.symbol == symbol)
+    if not include_manual:
+        stmt = stmt.where(Trade.source == "shioaji")
+    stmt = stmt.order_by(Trade.exit_time.desc())  # type: ignore[union-attr]
+
+    trades = list(session.exec(stmt))
+    if tag:
+        trades = [t for t in trades if tag in split_tags(t.tags)]
+    if result == "win":
+        trades = [t for t in trades if t.pnl is not None and t.pnl > 0]
+    elif result == "loss":
+        trades = [t for t in trades if t.pnl is not None and t.pnl < 0]
+    return trades
 
 
 def list_symbols(session: Session, *, user_id: int) -> list[str]:

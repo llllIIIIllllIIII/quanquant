@@ -57,7 +57,7 @@ def test_bootstrap_claims_only_orphans(session, legacy_data, user):
     session.add(user_row)
     session.commit()
 
-    admin = bootstrap_admin(session, "henry", "pw12345")
+    bootstrap_admin(session, "henry", "pw12345")
     session.refresh(owned)
     assert owned.user_id == user.id  # untouched
 

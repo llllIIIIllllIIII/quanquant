@@ -31,5 +31,27 @@
       <button type="submit">儲存配色</button>
     </form>
   </article>
+  <article class="settings-card">
+    <h3>下單確認</h3>
+    <!-- 007：sim 送出前預設跳確認視窗；這裡可改回（勾選＝略過確認，之後 sim 直接送出）。
+         real 的兩階段確認由後端強制，不受這個偏好影響（見下單頁 orders.html 的說明）。 -->
+    <form method="post" action="/account/sim-confirm">
+      <label>
+        <input type="checkbox" name="skip_sim_confirm" value="1" {% if skip_sim_confirm %}checked{% endif %}>
+        模擬單送出前不再跳出確認視窗
+      </label>
+      <button type="submit">儲存</button>
+    </form>
+  </article>
+  {% if is_owner and is_admin %}
+  <!-- R2-4：Agent Token 產生/重置整塊 UI 從下單頁搬到這裡（一次性設定、不屬交易流程）；
+       明文只在簽發當下顯示一次。2026-09-05（使用者拍板）：手動產生/重置改
+       admin-only——原本「owner-only」的授權此處變更為「owner 且 admin」，一般使用者
+       改走 .app GUI 精靈（device-flow 自動下發 token，不受影響）。partial 自帶標題與
+       版面，不再重複包一層 <h3>。 -->
+  <article class="settings-card">
+    {% include "partials/agent_token_control.html" with context %}
+  </article>
+  {% endif %}
 </div>
 {% endblock %}

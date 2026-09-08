@@ -17,6 +17,7 @@ log = logging.getLogger(__name__)
 
 async def shutdown_order_subsystem(
     *, order_service, inbox_worker, state, timeout: float = 5.0,
+    registry=None, inbox_workers=None,
 ) -> bool:
     """round3 #17：原子關 ingress（先斷線登出，斷線後底層才不會再有新的 native callback
     落地）→ 等 `RawInboxWorker` 把已經落地的 batch 真正處理完（drain）。全程有 timeout，
@@ -26,24 +27,37 @@ async def shutdown_order_subsystem(
 
     `order_service`/`inbox_worker`/`state` 允許為 None（下單子系統本來就沒啟用時的
     no-op），呼叫端（web/app.py lifespan）不需要另外判斷。
+
+    Task 7（D1）：agent 模式改用 `AgentRegistry`——單一 `order_service`/`inbox_worker` 不再
+    代表全部 slot。`registry`（`AgentRegistry | None`）給定時，額外對每個 slot 的 adapter
+    各自 `close()`（各自獨立 try/except，一個 slot 失敗不影響其他 slot 收斂，同 I8）；
+    `inbox_workers`（`list[RawInboxWorker] | None`）給定時，每個 worker 各自
+    `stop_and_drain()`。`order_service`/`inbox_worker` 與 `registry`/`inbox_workers` 可同時
+    給值（雖然實務上 in-process／agent 兩分支互斥）——兩組互不影響，各自收斂各自的清單。
     """
     ok = True
 
-    if order_service is not None:
+    services = [order_service] if order_service is not None else []
+    if registry is not None:
+        services.extend(slot.adapter for slot in registry.slots())
+    for svc in services:
         try:
             async with asyncio.timeout(timeout):
-                await order_service.close()
+                await svc.close()
         except TimeoutError:
             ok = False
             log.error("shutdown_order_subsystem: order_service.close() 逾時（ingress 未確定關閉）")
         except Exception as exc:
             ok = False
             # F8：order_service.close() 內部呼叫 native logout，例外原文理論上可能夾帶秘密。
-            message = redact_secrets(str(exc), secrets=getattr(order_service, "secrets_to_redact", []))
+            message = redact_secrets(str(exc), secrets=getattr(svc, "secrets_to_redact", []))
             log.error("shutdown_order_subsystem: order_service.close() 失敗: %s", message)
 
-    if inbox_worker is not None:
-        drained = await inbox_worker.stop_and_drain(timeout=timeout)
+    workers = [inbox_worker] if inbox_worker is not None else []
+    if inbox_workers:
+        workers.extend(inbox_workers)
+    for worker in workers:
+        drained = await worker.stop_and_drain(timeout=timeout)
         if not drained:
             ok = False
 

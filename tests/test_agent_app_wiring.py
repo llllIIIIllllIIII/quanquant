@@ -11,7 +11,7 @@ from quanquant.web.deps import get_poller, get_session
 
 
 def _settings(**kw):
-    base = dict(order_channel="agent", order_mode="sim", agent_ws_token="tok",
+    base = dict(order_channel="agent", order_mode="sim",
                 order_owner_user_ids="1", session_secret="s")
     base.update(kw)
     return Settings(**base)
@@ -54,9 +54,13 @@ async def test_agent_mode_requires_sim(engine, monkeypatch):
     assert "僅支援" in (state.last_error or "") and tasks == []
 
 
-async def test_agent_mode_without_token_disabled(engine, monkeypatch):
-    _, state, tasks = await _run(_settings(agent_ws_token=""), engine, monkeypatch)
-    assert state.disabled and tasks == []                   # 刻意停用 → /healthz 200
+# D2：`agent_ws_token`（站台層級靜態密鑰）已整個移除，原
+# `test_agent_mode_without_token_disabled`（測「未設定 AGENT_WS_TOKEN → 通道停用」）連同
+# 這個機制一起消失——沒有站台層級的靜態密鑰可以「未設定」了，改成 per-user DB opaque
+# token（見 `auth/agent_tokens.py`），token 存在與否是每個 user 自己的事，不再是
+# channel 啟動與否的閘門。等價的「無效/缺席 token 一律拒絕連線」安全性保證改由
+# `tests/test_agent_ws.py::test_ws_rejects_when_token_header_missing_or_empty` 與
+# `test_bad_token_closed` 在 WS 握手層驗證（比啟動閘門更貼近真正的防線位置）。
 
 
 async def test_agent_mode_without_owner_disabled(engine, monkeypatch):
@@ -64,16 +68,126 @@ async def test_agent_mode_without_owner_disabled(engine, monkeypatch):
     assert state.disabled and "order_owner_user_ids" in (state.last_error or "")
 
 
+async def test_agent_mode_backfill_conflict_fail_closed_disabled_not_wired(engine, monkeypatch):
+    # Task 6（D10/R1-8/R2-7）：既有 Order 歷史 ownership 衝突（同帳號跨 user）→ backfill 讓
+    # 這個子系統拒啟——order_state 標 disabled（不是 mark_unhealthy，比照既有 preflight 軟
+    # 停用語意，/healthz 仍可回 200，不崩整站，屬於「需要人工裁決」而非「app 起不來」）；
+    # 且不得繼續往下 wiring registry/slot（拒啟＝真的沒有 wiring，不是半套）。
+    from decimal import Decimal
+
+    from quanquant.db.models import Order
+
+    with Session(engine) as s:
+        s.add(Order(
+            client_order_id="C1", request_hash="H1", user_id=1, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-06-16",
+        ))
+        s.add(Order(
+            client_order_id="C2", request_hash="H1", user_id=2, mode="real",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-06-16",
+        ))
+        s.commit()
+
+    app, state, tasks = await _run(_settings(), engine, monkeypatch)
+    assert state.disabled is True and state.ready is False
+    assert "backfill" in (state.last_error or "") and "衝突" in (state.last_error or "")
+    assert getattr(app.state, "agent_registry", None) is None      # 沒有繼續 wiring
+    assert getattr(app.state, "order_service", None) is None
+    assert tasks == []
+
+
 async def test_agent_mode_happy_path_wires_state(engine, monkeypatch):
     app, state, tasks = await _run(_settings(), engine, monkeypatch)
     from quanquant.broker.agent_channel import AgentChannel
+    from quanquant.broker.agent_registry import AgentRegistry
     from quanquant.broker.shioaji_adapter import ShioajiAdapter
-    assert isinstance(app.state.agent_channel, AgentChannel)
-    assert isinstance(app.state.order_service, ShioajiAdapter)
+    assert isinstance(app.state.agent_registry, AgentRegistry)
+    slot = app.state.agent_registry.get(1)     # order_owner_user_ids 預設 "1"
+    assert slot is not None and slot.user_id == 1
+    assert isinstance(slot.channel, AgentChannel)
+    assert isinstance(slot.adapter, ShioajiAdapter)
     assert app.state.order_risk_guard is not None
     assert callable(app.state.order_session_factory)
-    assert state.disabled and "agent 未連線" in (state.last_error or "")
-    assert len(tasks) >= 2                                  # inbox worker + agent watchdog
+    assert slot.session_state.disabled and "agent 未連線" in (slot.session_state.last_error or "")
+    # D9：healthz 語意——wiring 完成即 ready，不等任何 slot 連線（個別 slot 仍是 disabled，
+    # 上面那行已驗證）。
+    assert state.ready is True
+    assert len(slot.tasks) >= 2                             # 這個 slot 自己的 inbox worker + watchdog
+    assert len(tasks) >= 4                                  # +全域 confirm-token 清理 +孤兒掃描
+
+
+async def test_agent_mode_slot_adapter_uses_configured_command_expiry_seconds(engine, monkeypatch):
+    """Task 10：`_start_agent_channel_subsystem` 建 slot 的 `ShioajiAdapter` 必須傳
+    `agent_command_expiry_seconds=settings.agent_command_expiry_seconds`，否則會靜靜退回
+    `agent_commands.DEFAULT_COMMAND_EXPIRY_SECONDS` 這個模組層常數字面值——部署端調整設定
+    不會有任何實際效果。這裡刻意帶一個與預設值（120）不同的值，證明真的是讀設定而非常數。"""
+    app, state, tasks = await _run(_settings(agent_command_expiry_seconds=45), engine, monkeypatch)
+    slot = app.state.agent_registry.get(1)
+    assert slot.adapter._agent_command_expiry_seconds == 45
+
+
+async def test_agent_mode_two_owners_get_isolated_slot_runtimes(engine, monkeypatch):
+    """I8 釘樁測試（opus 驗收 MEDIUM）：`_start_agent_channel_subsystem` 的 slot 建置迴圈
+    必須為每個 owner 各建一份 `BrokerSupervisor`（見 `web/app.py` 迴圈內
+    `slot_supervisor = BrokerSupervisor()`），否則「A 慢不排隊 B」（I8：per-user 完全無共享
+    可變 runtime 狀態，見 `agent_registry.py` module docstring）會在多人場景下失效——A 的
+    reconcile 卡住會連帶佔住 B 的鎖。現有 wiring 測試只用單 owner
+    （`order_owner_user_ids="1"`），沒有測試斷言兩個 slot 的 runtime 物件互相獨立；e2e 測試
+    另外自建 fixture，不走這條迴圈。這裡開兩個 owner，斷言 supervisor/channel/adapter/
+    session_state 兩兩不同物件，把「per-slot 各自一份」釘死。"""
+    app, state, tasks = await _run(_settings(order_owner_user_ids="1,2"), engine, monkeypatch)
+    slot1 = app.state.agent_registry.get(1)
+    slot2 = app.state.agent_registry.get(2)
+    assert slot1 is not None and slot2 is not None
+    assert slot1.supervisor is not slot2.supervisor
+    assert slot1.channel is not slot2.channel
+    assert slot1.adapter is not slot2.adapter
+    assert slot1.session_state is not slot2.session_state
+
+
+async def test_agent_mode_slot_adapter_raw_committed_hook_wired_to_its_own_inbox_worker(engine, monkeypatch):
+    """事件喚醒佈線（agent 通道）：每個 slot 的 `adapter.raw_committed_hook` 必須接到
+    「這個 slot 自己」的 `RawInboxWorker.request_wake`（見 `web/app.py` 迴圈內
+    `adapter.raw_committed_hook = slot_inbox_worker.request_wake`）——`agent_ws` 的
+    UpReport handler commit 成功後讀 `slot.adapter.raw_committed_hook` 來喚醒正確的
+    worker，兩個 owner 的 hook 必須各自指向各自的 worker，不能共用/串線（I8）。"""
+    app, state, tasks = await _run(_settings(order_owner_user_ids="1,2"), engine, monkeypatch)
+    slot1 = app.state.agent_registry.get(1)
+    slot2 = app.state.agent_registry.get(2)
+    workers = app.state.agent_inbox_workers
+    assert len(workers) == 2
+    worker1, worker2 = workers[0], workers[1]  # 迴圈依 sorted(owner_ids) 建置，順序穩定
+    assert slot1.adapter.raw_committed_hook == worker1.request_wake
+    assert slot2.adapter.raw_committed_hook == worker2.request_wake
+    assert slot1.adapter.raw_committed_hook != slot2.adapter.raw_committed_hook
+
+
+async def test_agent_mode_slot_adapter_reconcile_stages_with_slot_user_id(engine, monkeypatch):
+    """Task 8 修復（round 1）驗收：`_start_agent_channel_subsystem` 建 slot 的 `ShioajiAdapter`
+    必須傳 `agent_user_id=uid`，否則 `_stage_reconcile_results`（agent 模式對帳落地路徑）用
+    `self._agent_user_id` 蓋章 `RawInbox.user_id` 時恆為 None——per-slot `RawInboxWorker`
+    （`WHERE user_id=slot.user_id`）永遠認領不到，資料孤兒化。這裡直接呼叫 slot 自己的
+    adapter 做一次真實 DB 落地，確認落列的 `RawInbox.user_id` 等於這個 slot 的 owner。"""
+    from sqlmodel import select
+
+    from quanquant.db.models import RawInbox
+
+    app, state, tasks = await _run(_settings(), engine, monkeypatch)
+    slot = app.state.agent_registry.get(1)
+    assert slot.adapter._agent_user_id == 1     # 本次修復的核心斷言：不再是 None
+
+    n = slot.adapter._stage_reconcile_results(
+        [{"ordno": "O1", "status": "Filled"}], newest=None,
+    )
+    assert n == 1
+    with Session(engine) as s:
+        rows = list(s.exec(select(RawInbox)))
+    assert len(rows) == 1
+    assert rows[0].user_id == 1                 # 沒蓋章的話這裡會是 None（資料孤兒）
 
 
 # ---------------------------------------------------------------------------

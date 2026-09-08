@@ -46,6 +46,42 @@
 - app/postgres 皆有 healthcheck；app `depends_on: service_healthy`。
 - SSE 經 Caddy 串流正常（`text/event-stream` 自動不緩衝）。
 
+### 2.1 反向代理信任鏈（Task 16，spec §4.3/§7）
+
+per-IP 限流（如 device-code 發起端點，見 `web/routers/agent_device.py::client_ip`）要看到
+「真實使用者」的來源 IP，必須讓信任鏈兩段都設定正確，否則全部請求會在 app 端合流成 Caddy
+容器自己的 IP（等於限流失效、還可能互相 DoS）：
+
+1. **Caddy 段（預設行為，不需額外設定）**：Caddy 的裸 `reverse_proxy app:8000`
+   （見 `Caddyfile`）預設**忽略**客戶端送入的 `X-Forwarded-For`，一律以真實 peer IP
+   覆寫後再轉發——所以外部使用者無法直接偽造這個標頭騙過 Caddy 這一段。
+2. **uvicorn 段（app 容器）**：app 與 Caddy 是**不同容器**，uvicorn 預設只信任
+   `127.0.0.1` 送來的轉發標頭；不設定的話，所有請求都會被記成 Caddy 容器的 IP。
+   部署時必須設定 `FORWARDED_ALLOW_IPS` 環境變數（對應 `Settings.forwarded_allow_ips`，
+   本機開發預設 `127.0.0.1`）＝**Caddy 容器的 IP/CIDR 字面值**，`web/app.py::run()` 會把
+   這個值原樣傳給 `uvicorn.run(forwarded_allow_ips=...)`，內部掛上
+   `ProxyHeadersMiddleware`，只有從這個字面值送來的連線，其 `X-Forwarded-For` 才會被
+   採信換算進 `request.client.host`。
+
+**為什麼不能用 Docker 服務別名（如 `caddy`）**：uvicorn 的 `forwarded_allow_ips`
+只做 IP/CIDR **字面比對**，不解析 DNS 名稱——填服務別名等於永遠比對不到，形同沒設定。
+因此 `docker-compose.yml` 額外固定了一個子網（`quanquant_net`，`172.28.0.0/24`）並把
+`caddy` 服務釘死在 `172.28.0.10`（`ipv4_address`），`app` 服務的 `FORWARDED_ALLOW_IPS`
+env 直接寫這個 IP 字面值。
+
+**換 Caddy 容器 IP 時**（例如手動調整 compose 的 `ipv4_address`，或改用不同子網）：
+`docker-compose.yml` 裡 `services.caddy.networks.quanquant_net.ipv4_address` 與
+`services.app.environment.FORWARDED_ALLOW_IPS` 這兩個值必須**同步更新**，兩者不一致時
+uvicorn 會拒信新 IP 送來的轉發標頭，per-IP 限流又會全部合流回 app 直接看到的連線 IP
+（即 Caddy 的新 IP）。`tests/test_deployment_trust_chain.py` 有靜態驗證兩值必須相等，
+可作為改動後的第一道防線；但仍建議改完後跑一次 `docker compose up -d` 並用兩個不同來源
+IP 打 `/api/agent/device-code` 人工確認限流沒有合流。
+
+本機開發（無 Caddy、無 proxy）：`forwarded_allow_ips` 保持預設 `127.0.0.1`，
+uvicorn 不會信任任何轉發標頭，`request.client.host` 就是直接連線的 socket peer IP；
+即使外部刻意帶假的 `X-Forwarded-For`，app 端也不會採信（見
+`tests/test_deployment_trust_chain.py::test_client_ip_reflects_direct_peer_when_no_proxy_trusted`）。
+
 ## 3. 規格選型依據
 
 實測工作負載（部署前量測）：
@@ -190,6 +226,85 @@ docker rm -f qq-pg-smoke
 git grep -nE "SHIOAJI_(TRADE_)?(API_KEY|SECRET_KEY)\s*=\s*['\"][A-Za-z0-9]" -- . ':!*.md' || echo "clean"
 ```
 確認除 `.env`（已在 `.gitignore`）外沒有其他檔案硬編碼真實金鑰樣式。
+
+### 10.6 Agent 模式（Increment 1，多人 simtrade）
+
+`ORDER_CHANNEL=agent` 時，Shioaji I/O 交給每位使用者自己電腦上跑的 `quanquant-agent`
+（經 `/ws/agent` 上下行），中央網站只做風控/冪等/配額決策；`ORDER_CHANNEL=inprocess`
+（預設）維持 Increment 0 之前的單機直連，行為完全不變。
+
+**新設定（3 枚，`src/quanquant/config.py`）**：
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `AGENT_TOKEN_TTL_DAYS` | `30` | agent WS 連線 token 的預設有效天數；簽發／rotation 皆套用此值 |
+| `AGENT_COMMAND_EXPIRY_SECONDS` | `120` | server 端 command ledger 每筆下行指令的 `expires_at = created_at + 這個秒數`；**server 不自主過期**，只有 agent 收到重播後自行判斷是否已過期才回拒，見下方「已知營運行為」 |
+| `AGENT_HEALTH_LEASE_SECONDS` | `90` | server heartbeat lease：超過這個秒數沒收到某使用者 agent 的 `UpHealth(status="ok")`，該使用者的 slot 標 not-ready 擋新單（WS 連線存活不等於健康） |
+
+**`AGENT_WS_TOKEN` 已移除**：Increment 0 的全站靜態密鑰整個刪除，改為每位使用者在 orders
+頁自行簽發 per-user DB opaque token（明文只顯示一次，DB 只存 hash，可個別撤銷／輪替）。
+舊版 `.env` 若仍留著 `AGENT_WS_TOKEN=...`，該值不再被讀取，可直接刪除。
+
+**healthz 語意變更（重要）**：agent 模式下，`/healthz` 的 `order_subsystem` 反映的是「下單
+子系統本身有沒有配線成功」（服務啟動時一次性判定），**不再**跟著任一位使用者的個別 agent
+連線狀態切換 200/503——某位使用者的 agent 離線（如關筆電）是常態，不觸發 503。若要看
+**個別使用者**的 agent 連線／健康狀態，改看：
+  - orders 頁的連線 badge（🟢 agent 已連線 / 🔴 agent 未連線）——每位使用者只看得到自己的；
+  - agent 儲存故障（G2 fail-stop latch）時，badge 會顯示固定訊息「agent 儲存故障，交易已
+    停止」；
+  - 若設定了 `OPS_TELEGRAM_BOT_TOKEN`/`OPS_TELEGRAM_CHAT_ID`，agent 進入／解除 fail-stop
+    會各推一則營運告警（連線/斷線本身不告警，只有健康語意真的轉換時才推）。
+  - `in-process` 模式（`ORDER_CHANNEL=inprocess`）healthz 判定完全不變（未 ready 仍 503）。
+
+**多人啟用步驟**：
+
+1. `.env` 設定 `ORDER_CHANNEL=agent`、`ORDER_MODE=sim`（Increment 1 仍鎖 sim，不支援
+   `real`）、`ORDER_OWNER_USER_IDS=<uid1>,<uid2>,...`（逗號分隔，每個 uid 對應一個既有
+   QuanQuant 帳號——先用 `quanquant-user list` 查 id）。
+2. 依固定三步部署／或本機 `uv run quanquant-web` 啟動——啟動時會自動：
+   - 對每個 owner uid 各建一個獨立的 `UserAgentSlot`（各自的連線／風控狀態／背景 worker，
+     互不影響，見 `docs/superpowers/specs/2026-08-06-local-broker-agent-inc1-design.md`
+     架構總覽）；
+   - 對既有 `orders` 資料做帳號↔使用者綁定 backfill——若同一個永豐帳號歷史上曾被多個
+     使用者下過單（正常情況下不會發生），下單子系統會**拒絕啟動**（fail closed，其餘
+     行情/日誌等功能仍正常），需人工核對 `orders`/`agent_account_bindings` 兩表裁決後才能
+     繼續，見該 spec 決策 D10。
+   - Postgres 環境：`raw_inbox` 會經既有 `ensure_columns` 機制自動補上 `user_id`/
+     `account`/`mode`/`quarantine_reason` 四個 nullable 欄位；`agent_tokens`/
+     `agent_commands`/`agent_account_bindings` 三張新表經 `create_all` 自動建立，無需手動
+     migration（比照 10.4 的既有慣例，首次啟用前仍建議照 10.4 的流程對一次真實 Postgres
+     smoke，尤其這次多了 `agent_commands` 的兩條 partial unique index）。
+3. 每位使用者各自在自己電腦上跑 `quanquant-agent` 連上來。兩種方式擇一：
+
+   **(A) GUI 設定精靈（推薦，非技術者友善）** — `quanquant-agent --gui --site https://<staging網域>`：
+   - 自動開瀏覽器進三步精靈；**裝置授權 token 由 device-code flow 自動取得，使用者不需手動複製 token**。
+   - 步驟①「連線授權」：精靈顯示一組 `XXXX-XXXX` 裝置代碼（10 分鐘有效），使用者按「開核准頁」到
+     正式站 `/agent/authorize` 輸入該代碼並核准（**必須先登入且為 owner**，否則該頁顯示「下單子系統
+     未啟用」或 403）；核准後精靈自動前進（同源 JS 背景輪詢，不整頁刷新）。
+   - 步驟②「永豐憑證」：輸入自己的永豐 **simtrade** API Key/Secret；可勾「記住永豐 API 憑證」／「記住
+     裝置授權」把兩者分別存進**該使用者自己電腦的 OS keychain**（`keyring`，不進 server）；不勾則僅存
+     記憶體、關掉即失效。
+   - 步驟③「確認啟動」：核對伺服器／模式（sim）／商品（TXF）／帳號後按「啟動」→ 導到 `/status` 儀表板。
+   - 完整逐步圖文（給非技術測試者）見 `docs/agent-tester-onboarding.md`。
+
+   **(B) headless（環境變數／互動，適合自動化或無桌面環境）** — 先各自登入網站到 `/orders` 頁「Agent
+   Token」段按「產生 Agent Token」複製明文 token（只顯示一次），再跑 `quanquant-agent` 依提示輸入 token
+   與自己的永豐 simtrade API Key/Secret；或用環境變數 `QQ_AGENT_TOKEN`/`QQ_AGENT_API_KEY`/
+   `QQ_AGENT_SECRET_KEY` 免互動。此路徑憑證 **session-only、不落地、不進 log**（與 GUI 勾「記住」會落地
+   到 OS keychain 不同）。**產生 token 需管理員帳號**（2026-09-05 拍板：手動產生/重置改
+   admin-only，一般使用者請改用 (A) GUI 精靈）。
+
+   兩種方式皆遵守 **一個永豐帳號只能綁定一位使用者**（先綁先贏，見 D10）。
+4. 回 `/orders` 頁（GUI 則看 `/status`）確認 badge 轉綠（🟢 agent 已連線）即完成。
+
+**已知營運行為（非故障，操作者需知悉）**：
+- `place` 逾時／agent 斷線導致的 unknown 委託，其配額保留**永不自動釋放**（只有券商端明確
+  拒絕、或事後人工核對後才會釋放）——配額按交易日計，跨日自然歸零；長期掛著的 unknown
+  place 委託需要人工終結，見人工測試流程文件的「place unknown 人工終結程序」。
+- 兩層 kill switch：orders 頁「我的急停」只擋操作者自己的新單；「全站急停」擋全部使用者
+  （沿用 Tier0「任一 owner 皆可翻」的火警拉桿語意）；兩者皆不擋取消單。
+- 本機既有 `quanquant.db` 若殘留 Increment 0 時代（`agent` 通道尚未支援 per-user scope 前）
+  的 `raw_inbox` quarantine 列，啟用多人前建議先清理，避免混淆——SQL 見人工測試流程文件。
 
 ## 帳戶系統部署（首次啟用）
 

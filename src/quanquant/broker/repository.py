@@ -30,9 +30,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from quanquant.db.models import (
+    AgentAccountBinding,
+    AgentCommand,
     BrokerPosition,
     BrokerReconcileCursor,
     ConfirmToken,
+    Cooldown,
     Deal,
     Order,
     OrderAudit,
@@ -320,22 +323,48 @@ def list_pending_orphans_older_than(
     return list(session.exec(stmt))
 
 
-# ---- RawInbox（durable callback spool，V3-2） ----
+# ---- RawInbox（durable callback spool，V3-2；Inc1 D5：per-user scope 蓋章） ----
 
-def stage_raw_inbox(session: Session, *, kind: str, broker: str, payload: str) -> RawInbox:
-    row = RawInbox(kind=kind, broker=broker, payload=payload)
+def stage_raw_inbox(
+    session: Session,
+    *,
+    kind: str,
+    broker: str,
+    payload: str,
+    user_id: int | None = None,
+    account: str | None = None,
+    mode: str | None = None,
+) -> RawInbox:
+    """Inc1 D5：`user_id`/`account`/`mode` 皆為上行來源在事件產生當下蓋章的 immutable scope
+    （見 `inbox_worker.stage_scoped_raw_inbox`/`commit_raw_callback`——唯一 scoped staging API，
+    本函式是它們共用的底層 insert）。預設全 None 以相容既有直接呼叫端（測試／尚未蓋章的呼叫
+    路徑），語意等同「未蓋章的舊列」，不強制呼叫端一定要指定。"""
+    row = RawInbox(kind=kind, broker=broker, payload=payload, user_id=user_id, account=account, mode=mode)
     session.add(row)
     session.flush()
     return row
 
 
-def list_unprocessed_raw_inbox(session: Session, *, limit: int = 200) -> list[RawInbox]:
-    stmt = (
-        select(RawInbox)
-        .where(RawInbox.processed.is_(False), RawInbox.quarantine.is_(False))  # type: ignore[union-attr]
-        .order_by(RawInbox.id)
-        .limit(limit)
+def find_account_binding(session: Session, *, broker: str, account: str) -> AgentAccountBinding | None:
+    """D10/D5：查 `(broker,account)` 目前綁定的 user（Task 6 才建立寫入/backfill 邏輯，本 task
+    只讀）。查無列＝該帳號尚未綁定任何人。"""
+    stmt = select(AgentAccountBinding).where(
+        AgentAccountBinding.broker == broker, AgentAccountBinding.account == account,
     )
+    return session.exec(stmt).first()
+
+
+def list_unprocessed_raw_inbox(
+    session: Session, *, limit: int = 200, user_id: int | None = None
+) -> list[RawInbox]:
+    """Inc1 D6/D9：`user_id=None`（預設）＝不加篩選，與既有 in-process 單一 worker 行為
+    位元級一致；agent 模式 per-slot `RawInboxWorker` 傳自己的 `slot.user_id` 精確篩
+    `RawInbox.user_id == user_id`（不是 `IS NULL OR =`）——歷史未蓋章的 NULL 列因此永遠不會
+    被 agent per-slot worker 撿走，只由 in-process worker（不帶 `user_id`）處理，見 D5。"""
+    conditions = [RawInbox.processed.is_(False), RawInbox.quarantine.is_(False)]  # type: ignore[union-attr]
+    if user_id is not None:
+        conditions.append(RawInbox.user_id == user_id)
+    stmt = select(RawInbox).where(*conditions).order_by(RawInbox.id).limit(limit)
     return list(session.exec(stmt))
 
 
@@ -346,33 +375,249 @@ def mark_raw_inbox_processed(session: Session, row: RawInbox) -> None:
     session.flush()
 
 
-def quarantine_raw_inbox(session: Session, row: RawInbox, *, error: str) -> None:
+# R2-6：三個永久 dead-letter reason——association_pending（預設，可重試）以外的都不進
+# unquarantine/重試迴圈，退出所有 unprocessed 計數與換帳號 guard（見 quarantine_raw_inbox）。
+DEAD_LETTER_QUARANTINE_REASONS = frozenset({"scope_violation", "payload_mismatch", "user_mismatch"})
+
+
+def quarantine_raw_inbox(
+    session: Session, row: RawInbox, *, error: str, reason: str = "association_pending"
+) -> None:
+    """R2-6 quarantine 分級：`reason="association_pending"`（預設，既有 ValueError/
+    PositionMismatchError 路徑）代表可重試——watchdog `unquarantine_stale_raw_inbox` 之後會
+    給它機會；`reason` 為 `DEAD_LETTER_QUARANTINE_REASONS` 三者之一時是**永久** dead-letter——
+    連同 `quarantine=True` 一併把 `processed=True`（＋`processed_at`）落地，讓這列同時退出
+    `unquarantine_stale_raw_inbox` 的重試迴圈與換帳號 guard 的 unprocessed 計數（那個計數只看
+    `processed==False`，不看 `quarantine`），但保留列本身（`error`/`reason`）供稽核，不是丟棄。"""
     row.quarantine = True
     row.error = error
+    row.quarantine_reason = reason
+    if reason in DEAD_LETTER_QUARANTINE_REASONS:
+        row.processed = True
+        row.processed_at = _utcnow()
     session.add(row)
     session.flush()
 
 
-def unquarantine_stale_raw_inbox(session: Session, *, older_than: datetime, limit: int = 200) -> int:
+def unquarantine_stale_raw_inbox(
+    session: Session, *, older_than: datetime, limit: int = 200, user_id: int | None = None
+) -> int:
     """把 quarantine 超過 older_than 的列解除隔離，回到一般佇列重新嘗試一次
     （Task 8 watchdog 以較慢週期呼叫——給「當時解不到委託關聯」的列一個補救機會，
-    不會無限重試：解除後若原因仍不變會再次被 quarantine，只是白工，不會誤判成功）。"""
-    stmt = (
-        select(RawInbox)
-        .where(RawInbox.quarantine.is_(True), RawInbox.received_at < older_than)  # type: ignore[union-attr]
-        .order_by(RawInbox.id)
-        .limit(limit)
-    )
+    不會無限重試：解除後若原因仍不變會再次被 quarantine，只是白工，不會誤判成功）。
+
+    R2-6：只解除 `quarantine_reason` 為 `NULL`（既有列／尚未蓋章 reason 的舊資料，保守視為可
+    重試）或 `'association_pending'` 的列——`DEAD_LETTER_QUARANTINE_REASONS` 三者是永久
+    dead-letter，永不進這個重試迴圈（否則會把已經 fail-closed 判定的列重新丟回處理管線，
+    製造無限重試/告警洪水）。
+
+    Inc1 D6：`user_id=None`（預設）＝不篩，與既有 in-process 單一 watchdog 行為位元級一致；
+    agent 模式 per-slot watchdog 傳自己的 `slot.user_id`——`RawInbox.user_id == user_id` 精確
+    比對（NULL 列不會被任何 user_id 值命中，天然把未蓋章的歷史殘留留給人工／in-process 處理，
+    不會被某個 agent slot 誤認領，同 `list_unprocessed_raw_inbox` 的篩選原則）。"""
+    conditions = [
+        RawInbox.quarantine.is_(True),  # type: ignore[union-attr]
+        RawInbox.received_at < older_than,
+        or_(
+            RawInbox.quarantine_reason.is_(None),  # type: ignore[union-attr]
+            RawInbox.quarantine_reason == "association_pending",
+        ),
+    ]
+    if user_id is not None:
+        conditions.append(RawInbox.user_id == user_id)
+    stmt = select(RawInbox).where(*conditions).order_by(RawInbox.id).limit(limit)
     rows = list(session.exec(stmt))
     for row in rows:
         row.quarantine = False
         row.error = None
+        row.quarantine_reason = None
         session.add(row)
     session.flush()
     return len(rows)
 
 
+# ---- AgentAccountBinding（D10：帳號↔使用者唯一綁定；Task 6：寫入/backfill/UpLogin guard v2）----
+#
+# I9 不變式：一個 (broker,account) 至多屬於一個 user（不分 mode，codex R2-7——Inc1 只會有
+# sim 登入，但綁定與檢查涵蓋全部 mode，避免「同 user 的 sim/real 兩列撞 PK」與 mode 欄語意
+# 含糊）。`find_account_binding`（見上方 RawInbox 段）是既有唯讀查詢（Task 5，供
+# `inbox_worker._validate_report_scope` 用）；以下補上寫入（`bind_account`/
+# `backfill_account_bindings`）與 UpLogin 專用 guard 查詢（`count_unprocessed_for_login`/
+# `has_unresolved_risky_commands_other_account`），供 `agent_ws._check_uplogin`（Task 6）使用。
+
+
+class BackfillConflictError(Exception):
+    """D10/R1-8/R2-7：backfill 掃到同一 `(broker,account)` 歷史上同時屬於多個 user（或既有
+    綁定列與 Order 歷史 owner 不符）——不能讓「先綁先贏」隨機挑一個覆蓋既有 ownership，必須
+    人工裁決。呼叫端（`web/app.py` agent 分支啟動）收到此例外應讓下單子系統整體拒啟
+    （fail closed），不可吞掉或忽略。"""
+
+
+def bind_account(session: Session, *, broker: str, account: str, user_id: int) -> bool:
+    """D10：UpLogin 用的先綁先贏寫入。查無列 → 建新綁定，回 True；已綁同一 user → no-op，
+    回 True（冪等，允許同帳號重連/重試）；已綁別的 user → 回 False（呼叫端據此拒登，不動
+    這一列）。
+
+    本函式只 flush，不 commit（見本檔頂部交易邊界政策）——是否真正落地由呼叫端的交易決定
+    （Task 6：`agent_ws._check_uplogin` 把這個 flush 跟後面幾步 guard 查詢包在同一個交易，
+    全過才 commit；任一步被擋，呼叫端 rollback，這裡的寫入不會留下殘影）。round3 B5 慣例：
+    撞唯一鍵時 rollback 後以該唯一鍵重新查詢，確認命中的正是這個鍵才決定 True/False；其餘
+    IntegrityError 不吞、往上拋。"""
+    existing = find_account_binding(session, broker=broker, account=account)
+    if existing is not None:
+        return existing.user_id == user_id
+    binding = AgentAccountBinding(broker=broker, account=account, user_id=user_id)
+    session.add(binding)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        existing = find_account_binding(session, broker=broker, account=account)
+        if existing is not None:
+            return existing.user_id == user_id
+        raise
+    return True
+
+
+def account_owned_by_other_user_in_orders(
+    session: Session, *, broker: str, account: str, user_id: int
+) -> bool:
+    """D10/R1-8：UpLogin 第二道防線——不只信 `agent_account_bindings` 新表，直接核對 `Order`
+    歷史紀錄：這個 `(broker,account)` 是否存在別的 user 建立過的委託（掃全部 mode）。
+    True → 呼叫端應拒登。正常情況下這個分支不該獨立命中（backfill 已在啟動時把歷史
+    ownership 灌進綁定表，`bind_account` 那一步就會先擋下）；這裡是「不能只信新表」的
+    belt-and-suspenders，涵蓋 backfill 未執行/資料落後等異常情境。"""
+    stmt = select(Order.id).where(
+        Order.broker == broker, Order.account == account, Order.user_id != user_id,
+    ).limit(1)
+    return session.exec(stmt).first() is not None
+
+
+def backfill_account_bindings(session_factory) -> None:
+    """D10/R1-8/R2-7：agent 模式啟動時呼叫（`web/app.py` `_start_agent_channel_subsystem`）。
+    掃描既有 `Order`（distinct `(broker,account)` → 該帳號歷史上出現過的所有 user_id，
+    **合併全部 mode**——R2-7 綁定不分 mode）灌進 `agent_account_bindings`。
+
+    Fail closed（R1-8）：任一 `(broker,account)` 歷史上同時屬於多個 user，或既有綁定列與
+    Order 歷史 owner 不符（如人工誤改 DB），一律 raise `BackfillConflictError`、**整批不寫入
+    任何一列**。實作上分兩層：跨 user 的 Order 歷史衝突在迴圈開始前**預掃**一次性抓出（見
+    下方 `conflicts` 計算）；既有綁定列與 Order 歷史 owner 不符則是在逐 `(broker,account)`
+    寫入迴圈中才發現（`elif existing.user_id != owner_user_id`）。兩者都只 `session.add`、
+    不逐筆 commit——真正落地靠迴圈結束後**單一次** `session.commit()`，衝突中途 raise 時
+    尚未 commit 的 add 都隨例外傳播、session 生命週期結束而失效，不會有「部分帳號已寫入、
+    衝突的那個沒寫」的半途狀態，呼叫端據此讓整個 agent 子系統拒啟，不能隨機挑一個 user
+    覆蓋既有 ownership。
+
+    冪等：已有正確綁定的 `(broker,account)` 重跑無副作用（no-op）；只在缺列時補寫。"""
+    with session_factory() as session:
+        rows = session.exec(sa_select(Order.broker, Order.account, Order.user_id).distinct()).all()
+        owners: dict[tuple[str, str], set[int]] = {}
+        for broker, account, uid in rows:
+            owners.setdefault((broker, account), set()).add(uid)
+
+        conflicts = {key: uids for key, uids in owners.items() if len(uids) > 1}
+        if conflicts:
+            detail = "; ".join(
+                f"{broker}/{account}→users={sorted(uids)}"
+                for (broker, account), uids in sorted(conflicts.items())
+            )
+            raise BackfillConflictError(
+                f"帳號綁定 backfill 偵測到跨 user 歷史 ownership 衝突，fail closed：{detail}"
+            )
+
+        for (broker, account), uids in owners.items():
+            (owner_user_id,) = uids
+            existing = find_account_binding(session, broker=broker, account=account)
+            if existing is None:
+                session.add(AgentAccountBinding(broker=broker, account=account, user_id=owner_user_id))
+            elif existing.user_id != owner_user_id:
+                raise BackfillConflictError(
+                    f"{broker}/{account} 既有綁定 user_id={existing.user_id} 與 Order 歷史 "
+                    f"owner user_id={owner_user_id} 不符，fail closed"
+                )
+        session.commit()
+
+
+def count_unprocessed_for_login(session: Session, *, user_id: int, account: str) -> int:
+    """Task 6（S2 per-user 化，取代舊版全域 `agent_ws._count_unprocessed_raw_inbox`）：這個
+    user 名下未處理（`processed==False`，不論 quarantine——同 codex round4 修正，dead-letter
+    已在 `quarantine_raw_inbox` 內把 processed 設 True，天然被排除，不需要另外濾 quarantine）
+    的 `RawInbox` 中，`account` 與這次登入帳號不同、或未蓋章（NULL）的列數。>0 代表這個 user
+    還有可能被之後 worker 用「已被新帳號覆蓋的 mutable adapter.account」錯配處理的殘留，
+    UpLogin 應拒登（codex round2 fix2 的原始理由，Task 6 改成 per-user scope）。同帳號重連
+    的殘留（account 與這次登入帳號相同）不計入——那是正常在途處理，不是換帳號風險。"""
+    stmt = select(func.count()).where(
+        RawInbox.processed == False,  # noqa: E712 - SQLAlchemy 表達式需字面 == 比較
+        RawInbox.user_id == user_id,
+        or_(RawInbox.account != account, RawInbox.account.is_(None)),
+    )
+    return session.exec(stmt).one()
+
+
+_RISKY_COMMAND_KINDS = ("place", "update")
+
+
+def has_unresolved_risky_commands_other_account(
+    session: Session, *, user_id: int, account: str
+) -> bool:
+    """R1-2：這個 user 在別的帳號（`account` 不等於這次登入帳號）是否還有未 resolved
+    （`resolved_at IS NULL`）的曝險指令——只算 `place`/`update`（cancel 不是新增曝險，讓
+    cancel 收斂不擋換帳號，R3-1 #29）。True → UpLogin 應拒登，要求先用原帳號連線收斂
+    （或走人工終結程序）。"""
+    stmt = select(AgentCommand.cmd_id).where(
+        AgentCommand.user_id == user_id,
+        AgentCommand.account != account,
+        AgentCommand.kind.in_(_RISKY_COMMAND_KINDS),
+        AgentCommand.resolved_at.is_(None),
+    ).limit(1)
+    return session.exec(stmt).first() is not None
+
+
+def unresolved_update_reservation_id(session: Session, *, client_order_id: str) -> str | None:
+    """C8（MEDIUM，codex 終審）：取得目前贏得 update 單飛鍵（`uq_agent_cmd_update_
+    singleflight`）的那筆未 resolved ledger 列的 `reservation_id`（可能是 None——純改價/
+    減量 update 不建立 delta 保留列）。呼叫端（`shioaji_adapter.update()` 撞鍵後的孤兒
+    reservation 清理，見 C8 修復）用來判斷這次撞鍵嘗試自己 reserve 的 reservation_id 是否
+    與贏家相同——相同代表同一內容重送（`reservation_id_for_update` 是 client_order_id+
+    request_hash 的確定性推導），不得誤釋放贏家仍在使用中的保留列；不同才代表這次嘗試的
+    保留列真的是孤兒，可以安全釋放。"""
+    stmt = select(AgentCommand.reservation_id).where(
+        AgentCommand.client_order_id == client_order_id,
+        AgentCommand.kind == "update",
+        AgentCommand.resolved_at.is_(None),
+    ).limit(1)
+    return session.exec(stmt).first()
+
+
+def has_unresolved_update_command(session: Session, *, client_order_id: str) -> bool:
+    """Task 8：`ShioajiAdapter.update` 的 ledger insert 撞到 `uq_agent_cmd_update_singleflight`
+    partial unique index 後，用這個查詢確認撞的正是這個單飛鍵（同一 `client_order_id` 已有
+    一筆 `kind='update' AND resolved_at IS NULL` 的列）——確認命中才轉「前一筆改單結果未定」
+    的友善訊息，查無則代表 IntegrityError 另有原因（如 cmd_id 這種天文數字機率的 uuid4
+    碰撞），呼叫端應原樣拋出（codex R6-3：精確辨認單飛 index，不可把所有 IntegrityError
+    都吞成同一句話）。"""
+    stmt = select(AgentCommand.cmd_id).where(
+        AgentCommand.client_order_id == client_order_id,
+        AgentCommand.kind == "update",
+        AgentCommand.resolved_at.is_(None),
+    ).limit(1)
+    return session.exec(stmt).first() is not None
+
+
 # ---- Deal（fill 去重帳本） ----
+
+def list_deals(session: Session, *, user_id: int, mode: str, limit: int = 200) -> list[Deal]:
+    """006：成交頁資料源——比照 `list_orders` 的既有慣例（mode 純過濾顯示範圍，不影響任何
+    寫入路徑），按時間新到舊排序。`user_id` 為 None 的列（quarantine 中、尚未比對到 Order/
+    user 的孤兒成交）一律不回，避免把別人的成交（或無主成交）洩漏到這個 user 的成交頁。"""
+    stmt = (
+        select(Deal)
+        .where(Deal.user_id == user_id, Deal.mode == mode)
+        .order_by(Deal.ts.desc())  # type: ignore[union-attr]
+        .limit(limit)
+    )
+    return list(session.exec(stmt))
+
 
 def _find_deal(
     session: Session, *, broker: str, mode: str, account: str, trading_day: str, fill_id: str
@@ -668,7 +913,7 @@ def reserve_quota(
         src,
     )
     try:
-        result = session.exec(stmt)  # type: ignore[call-overload]
+        session.exec(stmt)  # type: ignore[call-overload]
     except IntegrityError:
         # 競態：另一請求以相同 reservation_id 搶先插入（同一冪等鍵重送）。
         session.rollback()
@@ -678,7 +923,17 @@ def reserve_quota(
         if existing is not None:
             return existing.state in _ACTIVE_QUOTA_STATES
         raise
-    ok = result.rowcount == 1
+    # 不可用 result.rowcount 判定成功：Postgres(psycopg) 對 `INSERT ... FROM SELECT`（無
+    # RETURNING）回報 rowcount=-1（實測 staging），令每次保留都誤判失敗——即使 configured
+    # limit 未滿也回 False → 每張單都「今日口數配額已滿」（SQLite rowcount 可靠，故單元測試
+    # 從未抓到；雲端 Postgres 上 agent/inprocess 下單因此從未成功過）。改在同一交易內回查該
+    # reservation_id 是否已寫入（WHERE (used+qty)<=limit 為真才會有列，read-your-writes 看得到
+    # 剛插入的列），SQLite/Postgres 皆可靠。confirm/release 走 UPDATE，rowcount 在兩方言都正確
+    # （UPDATE rowcount=1 實測正常），不受此問題影響、不需更動。
+    inserted = session.exec(
+        select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
+    ).first()
+    ok = inserted is not None
     if ok:
         session.flush()
     return ok
@@ -716,6 +971,109 @@ def release_quota(session: Session, *, reservation_id: str) -> bool:
     if ok:
         session.flush()
     return ok
+
+
+# ---- 冷靜期（self-lockout，2026-08-22）----
+# 時間一律真 UTC epoch-ms（TZ 無關），與 web 端 until 解析同框可比；active 定義＝
+# lifted_ts IS NULL AND until_ts > now（見 db/models.py Cooldown docstring，D10：刻意不用
+# partial-unique index、改 app 層「已在冷靜期則拒建」擋自我縮短/重設）。統一政策：只 flush、
+# 不 commit（交易邊界由呼叫端定）。
+
+
+def now_epoch_ms() -> int:
+    """真 UTC epoch-ms（TZ 無關）：冷靜期 until/now 比較的統一時鐘（與 web 端 datetime-local
+    以 +08:00 解析出的 until_ms 同框；不走 _utcnow().timestamp() 那條 naive-local 換算）。"""
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def active_cooldown(session: Session, *, user_id: int, now_ms: int) -> Cooldown | None:
+    """該 user 目前 active 的冷靜期列（未解除且未到期）；多筆時取 until_ts 最大者，無則 None。
+    純讀取。"""
+    return session.exec(
+        select(Cooldown)
+        .where(
+            Cooldown.user_id == user_id,
+            Cooldown.lifted_ts.is_(None),  # type: ignore[union-attr]
+            Cooldown.until_ts > now_ms,
+        )
+        .order_by(Cooldown.until_ts.desc())  # type: ignore[attr-defined]
+    ).first()
+
+
+def create_cooldown(
+    session: Session, *, user_id: int, until_ms: int, now_ms: int
+) -> Cooldown | None:
+    """建立冷靜期。該 user 已有 active 冷靜期 → 回 None（拒絕：擋自我縮短/重設/重複建立，
+    D5「無法自行縮短/取消」）。成功回新列（只 flush 不 commit）。呼叫端須先驗
+    until_ms > now_ms 且在上限內（見 web 端）。"""
+    if active_cooldown(session, user_id=user_id, now_ms=now_ms) is not None:
+        return None
+    row = Cooldown(user_id=user_id, until_ts=until_ms, created_ts=now_ms)
+    session.add(row)
+    session.flush()
+    return row
+
+
+def lift_cooldown(session: Session, *, user_id: int, admin_user_id: int, now_ms: int) -> int:
+    """DEPRECATED（R2-2／D-2，2026-09-02）：這是「無時間窗、任何 admin_user_id 都能提前
+    解除」的舊版本，D-2 拍板後不得再接進任何 route——唯一的 production 呼叫者（admin.py
+    的 `POST /admin/cooling-off/{user_id}/lift`）已停用、一律回 403。反悔窗僅本人可在
+    啟動後 5 分鐘內自行取消，逾時後任何人（含 admin）都無法提前解除，正式路徑請走
+    `lift_cooldown_by_owner`（時間窗判定寫進 SQL WHERE）。這個函式保留純粹是因為
+    tests/test_cooldown.py、tests/test_risk_guard.py 仍直接呼叫它操縱測試資料（驗證
+    active_cooldown 對「已被解除」列的判定邏輯），僅供測試使用，不要重新接回任何
+    HTTP endpoint。把該 user 全部未解除列（lifted_ts IS NULL，含到期未解除的殘列）標為
+    已解除，回傳受影響列數（0＝無未解除列）。UPDATE rowcount 兩方言皆可靠（見 reserve_quota
+    註解）；只 flush 不 commit。"""
+    t = Cooldown.__table__
+    stmt = (
+        update(t)
+        .where(t.c.user_id == user_id, t.c.lifted_ts.is_(None))
+        .values(lifted_ts=now_ms, lifted_by=admin_user_id)
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    if result.rowcount:
+        session.flush()
+    return result.rowcount
+
+
+def lift_cooldown_by_owner(session: Session, *, user_id: int, now_ms: int, window_ms: int) -> int:
+    """R2-2（D-2，2026-09-02）：反悔窗——本人在啟動後 `window_ms` 內可自行取消
+    （`lifted_by=user_id` 本人，不是 admin；admin 提前解除的舊路徑已停用，見
+    web/routers/admin.py）。逾時後這裡不解除任何列——時間窗判定寫進 SQL WHERE
+    （`created_ts > now_ms-window_ms`），是最後一道判定，不是只信任呼叫端算好的布林值：
+    避免「route 層算過一次視窗仍在，UPDATE 真正落地前視窗剛好過期」的競態。回傳受影響
+    列數（0＝無可取消的 active 列，含「不存在」與「已逾時」兩種情況，呼叫端另查
+    `active_cooldown` 分辨訊息）。只 flush 不 commit（同 `lift_cooldown`）。"""
+    t = Cooldown.__table__
+    stmt = (
+        update(t)
+        .where(
+            t.c.user_id == user_id,
+            t.c.lifted_ts.is_(None),
+            t.c.until_ts > now_ms,
+            t.c.created_ts > now_ms - window_ms,
+        )
+        .values(lifted_ts=now_ms, lifted_by=user_id)
+    )
+    result = session.exec(stmt)  # type: ignore[call-overload]
+    if result.rowcount:
+        session.flush()
+    return result.rowcount
+
+
+def list_active_cooldowns(session: Session, *, now_ms: int) -> list[Cooldown]:
+    """admin 頁用：目前全部 active 冷靜期，依到期時間升序。純讀取。"""
+    return list(
+        session.exec(
+            select(Cooldown)
+            .where(
+                Cooldown.lifted_ts.is_(None),  # type: ignore[union-attr]
+                Cooldown.until_ts > now_ms,
+            )
+            .order_by(Cooldown.until_ts.asc())  # type: ignore[attr-defined]
+        ).all()
+    )
 
 
 def reservation_id_for_update(*, client_order_id: str, request_hash: str) -> str:

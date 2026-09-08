@@ -21,7 +21,7 @@ from quanquant.broker import repository as brepo
 from quanquant.broker.base import AuthorizationError, RiskError
 from quanquant.broker.risk import RiskGuard, parse_owner_ids, parse_whitelist
 from quanquant.broker.types import OrderRequest, canonical_payload_hash
-from quanquant.db.models import Order, OrderAudit, QuotaReservation
+from quanquant.db.models import Cooldown, Order, OrderAudit, QuotaReservation
 
 
 def _req(**over):
@@ -86,15 +86,97 @@ def test_check_place_owner_check_runs_first(session):
 
 
 def test_check_place_kill_switch_blocks_and_is_live_toggleable(session):
+    """D3：單一 owner 下兩層 kill switch 的 in-process 等價行為——scope='global' 翻閘
+    的效果與舊版單一 bool 完全相同（即時可切、非啟動快照）。"""
     guard = _guard(session_factory=lambda: session)
-    guard.set_kill_switch(True)
+    guard.set_kill_switch(True, scope="global", actor_user_id=1)
     req = _req()
     with pytest.raises(RiskError):
         guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
                           account="F1", request_hash=_hash_for(req))
-    guard.set_kill_switch(False)  # 即時可切，非啟動快照
+    guard.set_kill_switch(False, scope="global", actor_user_id=1)  # 即時可切，非啟動快照
     guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
                       account="F1", request_hash=_hash_for(req))
+
+
+# ---- D3：兩層 kill switch（per-user 開關 + 全站總閘，S#40） ----
+
+def test_kill_switch_self_scope_blocks_only_actor_not_other_owner(session):
+    """A 開自己的急停 → A 被擋，B（另一個 owner）不受影響（blocked(uid) = global_on OR
+    per_user.get(uid, False)，scope='self' 只落在 actor_user_id 自己身上）。"""
+    guard = _guard(session_factory=lambda: session, owner_user_ids=frozenset({1, 2}))
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+    req_a = _req(client_order_id="C-A", user_id=1)
+    with pytest.raises(RiskError):
+        guard.check_place(session, req_a, actor_user_id=1, mode="sim", broker="shioaji",
+                          account="F1", request_hash=_hash_for(req_a))
+    req_b = _req(client_order_id="C-B", user_id=2)
+    order_b = guard.check_place(session, req_b, actor_user_id=2, mode="sim", broker="shioaji",
+                                account="F1", request_hash=_hash_for(req_b))
+    assert order_b is not None  # user 2 完全不受 user 1 個人急停影響
+
+
+def test_kill_switch_global_scope_blocks_every_owner(session):
+    """全站總閘開啟 → 全員被擋（任一 owner 可翻，火警拉桿原則）。"""
+    guard = _guard(session_factory=lambda: session, owner_user_ids=frozenset({1, 2}))
+    guard.set_kill_switch(True, scope="global", actor_user_id=2)  # owner 2 翻的閘也擋 owner 1
+    for uid, cid in ((1, "C-G1"), (2, "C-G2")):
+        req = _req(client_order_id=cid, user_id=uid)
+        with pytest.raises(RiskError):
+            guard.check_place(session, req, actor_user_id=uid, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+
+
+def test_kill_switch_scope_self_cannot_affect_other_user_structurally(session):
+    """scope='self' 語意鐵則：介面完全沒有目標 user 參數——`set_kill_switch` 只接受
+    `actor_user_id`，效果必然只寫進該使用者自己在 per_user 的那一格，不可能替別人翻閘。"""
+    guard = _guard(session_factory=lambda: session, owner_user_ids=frozenset({1, 2}))
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+    assert guard.kill_switch_view(1)["self_on"] is True
+    assert guard.kill_switch_view(2)["self_on"] is False  # user 2 的 self_on 未被動到
+
+
+def test_kill_switch_update_admission_also_uses_two_layer_blocked(session):
+    """check_update 與 check_place 走同一套 blocked() 判定，非各自維護獨立狀態。"""
+    guard = _guard(session_factory=lambda: session, owner_user_ids=frozenset({1, 2}))
+    req = _req()
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+    with pytest.raises(RiskError):
+        guard.check_update(session, order, actor_user_id=1, new_qty=2, new_price=order.price,
+                           request_hash="n/a")
+
+
+def test_set_kill_switch_rejects_unknown_scope(session):
+    guard = _guard(session_factory=lambda: session)
+    with pytest.raises(ValueError):
+        guard.set_kill_switch(True, scope="bogus", actor_user_id=1)
+
+
+def test_set_kill_switch_requires_owner_for_both_scopes(session):
+    guard = _guard(session_factory=lambda: session)
+    with pytest.raises(AuthorizationError):
+        guard.set_kill_switch(True, scope="self", actor_user_id=99)
+    with pytest.raises(AuthorizationError):
+        guard.set_kill_switch(True, scope="global", actor_user_id=99)
+
+
+def test_kill_switch_view_reports_global_self_blocked_and_last_global_actor(session):
+    guard = _guard(session_factory=lambda: session, owner_user_ids=frozenset({1, 2}))
+    assert guard.kill_switch_view(1) == {
+        "global_on": False, "self_on": False, "blocked": False, "global_actor": None,
+    }
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+    assert guard.kill_switch_view(1) == {
+        "global_on": False, "self_on": True, "blocked": True, "global_actor": None,
+    }
+    assert guard.kill_switch_view(2) == {
+        "global_on": False, "self_on": False, "blocked": False, "global_actor": None,
+    }
+    guard.set_kill_switch(True, scope="global", actor_user_id=2)
+    assert guard.kill_switch_view(1)["global_actor"] == 2
+    assert guard.kill_switch_view(2)["global_actor"] == 2
 
 
 def test_check_place_symbol_not_whitelisted(session):
@@ -377,3 +459,90 @@ def test_cas_quota_blocks_one_of_two_concurrent_places(tmp_path):
 
     asyncio.run(scenario())
     assert sorted(results) == ["blocked", "ok"]  # 一過一擋，5+5>5 的日限額不被突破
+
+
+# ---- 冷靜期（self-lockout，2026-08-22，D1/D9）：只擋開新倉、放行平倉，到期/解除後恢復 ----
+
+
+def _put_active_cooldown(session, *, user_id=1, minutes=60):
+    now_ms = brepo.now_epoch_ms()
+    brepo.create_cooldown(
+        session, user_id=user_id, until_ms=now_ms + minutes * 60_000, now_ms=now_ms
+    )
+    session.commit()
+
+
+def test_check_place_cooldown_blocks_opening_new(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="New")
+    with pytest.raises(RiskError, match="冷靜期"):
+        guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                          account="F1", request_hash=_hash_for(req))
+    assert session.exec(select(Order)).first() is None            # 無半成品委託
+    assert session.exec(select(QuotaReservation)).first() is None  # 無半成品配額保留
+
+
+def test_check_place_cooldown_allows_closing_cover(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="Cover")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    assert order.octype == "Cover" and order.status == "pending"  # 平倉放行
+
+
+def test_check_place_cooldown_blocks_auto_octype(session):
+    """Auto 由券商自行判定開/平，保守視為可能開倉一併擋（D1/D9）。"""
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="Auto")
+    with pytest.raises(RiskError, match="冷靜期"):
+        guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                          account="F1", request_hash=_hash_for(req))
+
+
+def test_check_place_expired_cooldown_does_not_block(session):
+    """到期（until_ts <= now）以查詢時判定失效，不需背景 job。"""
+    guard = _guard(session_factory=lambda: session)
+    now_ms = brepo.now_epoch_ms()
+    session.add(Cooldown(user_id=1, until_ts=now_ms - 1_000, created_ts=now_ms - 61_000))
+    session.commit()
+    req = _req(octype="New")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    assert order.status == "pending"
+
+
+def test_check_place_admin_lifted_cooldown_does_not_block(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    brepo.lift_cooldown(session, user_id=1, admin_user_id=2, now_ms=brepo.now_epoch_ms())
+    session.commit()
+    req = _req(octype="New")
+    order = guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                              account="F1", request_hash=_hash_for(req))
+    assert order.status == "pending"
+
+
+def test_check_place_cooldown_records_risk_reject_audit(session):
+    guard = _guard(session_factory=lambda: session)
+    _put_active_cooldown(session)
+    req = _req(octype="New")
+    with pytest.raises(RiskError):
+        guard.check_place(session, req, actor_user_id=1, mode="sim", broker="shioaji",
+                          account="F1", request_hash=_hash_for(req))
+    rejects = session.exec(
+        select(OrderAudit).where(OrderAudit.action == "risk_reject")
+    ).all()
+    assert any(a.rule == "place" and a.result == "rejected" for a in rejects)
+
+
+def test_check_place_cooldown_is_per_user(session):
+    """一個 user 的冷靜期不影響其他 owner。"""
+    guard = _guard(session_factory=lambda: session, owner_user_ids=frozenset({1, 2}))
+    _put_active_cooldown(session, user_id=1)
+    req = _req(octype="New", user_id=2, client_order_id="C2")
+    order = guard.check_place(session, req, actor_user_id=2, mode="sim", broker="shioaji",
+                              account="F2", request_hash=_hash_for(req))
+    assert order.status == "pending"

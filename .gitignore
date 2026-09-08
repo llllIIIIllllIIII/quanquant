@@ -15,6 +15,12 @@ __pycache__/
 .env
 .env.local
 
+# Local secrets（staging 測試帳密等）——絕不進 git
+*.secret.md
+
+# PyInstaller build artifacts
+build/
+
 # Deployment artifacts (local-only)
 *.dump
 backups/

@@ -1,21 +1,64 @@
-<div id="kill-switch-control"
-     style="margin:0 0 1rem;padding:.6rem .9rem;border-radius:6px;border:1px solid {{ '#c0392b' if kill_switch else 'var(--pico-muted-border-color,#ccc)' }};{% if kill_switch %}background:rgba(192,57,43,.12);{% endif %}">
+{# 005：更名「Kill switch」→「緊急停止」（畫面上不再出現 Kill switch 字樣），搬到獨立
+   「風險控管」頁。R2-1（D-1，2026-09-02）：scope=self 開放帳號本人（owner）操作，
+   server 端於 toggle_kill_switch 強制（本檔只是呈現層，非授權來源）——`self_readonly`
+   控制「我的緊急停止」是否顯示切換表單；scope=global 維持 admin-only，`global_readonly`
+   控制「全站緊急停止」。兩者各自獨立，互不影響。
+   R2-7（2026-09-02）：警示紅收斂成 --down token＋class（.risk-status-box.is-active），
+   不再硬編 #c0392b／rgba(192,57,43,...)；按鈕層級——同頁最多一顆 contrast，只有
+   「啟動我的緊急停止」保持 contrast，全站啟動降為 .risk-btn-danger（outline，非實心）。 #}
+<div id="kill-switch-control" style="margin:0 0 1rem;display:flex;flex-direction:column;gap:.6rem;">
   {% if disabled|default(false) %}
-  <span class="muted">⚪ Kill switch 無法使用（下單子系統未啟用）</span>
+  <div class="risk-status-box">
+    <span class="muted">⚪ 緊急停止無法使用（下單子系統未啟用）</span>
+  </div>
   {% else %}
-  <div style="display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap;">
-    <strong style="{% if kill_switch %}color:#c0392b;{% endif %}">
-      {% if kill_switch %}🔴 Kill switch 已啟動 — 拒絕所有新單{% else %}🟢 下單正常{% endif %}
-    </strong>
-    <!-- 一鍵切到相反狀態；swap 自身（outerHTML）。翻 ON 只擋新單、不自動撤既有掛單。 -->
-    <form hx-post="/orders/kill-switch" hx-target="#kill-switch-control" hx-swap="outerHTML" style="margin:0;">
-      <input type="hidden" name="enabled" value="{{ 'false' if kill_switch else 'true' }}">
-      {% if kill_switch %}
-      <button type="submit" class="secondary" style="margin:0;">解除（恢復下單）</button>
-      {% else %}
-      <button type="submit" class="contrast" style="margin:0;">啟動 Kill switch（拒絕新單）</button>
+  <!-- 我的緊急停止：帳號本人（owner）即可啟動／解除（R2-1）。 -->
+  <div class="risk-status-box{{ ' is-active' if kill_switch.self_on else '' }}">
+    <div class="risk-status-row">
+      <strong class="risk-status-title">
+        {% if kill_switch.self_on %}🔴 我的緊急停止已啟動 — 拒絕我的新單{% else %}🟢 我的下單正常{% endif %}
+      </strong>
+      {% if not self_readonly|default(false) %}
+      <!-- 一鍵切到相反狀態；swap 整個外層容器（outerHTML），兩顆開關一起重繪。
+           刻意不掛 hx-confirm（終審 2026-09-03 拍板）：這是可逆的自救動作——誤觸成本
+           近乎零（本人可立刻再按一下解除，且只擋新單不擋平倉/撤單），漏按或按慢的成本
+           無上限；E-stop 慣例是單一動作、把審慎留給恢復端。全站急停（營運操作）與
+           冷靜期（逾時不可解）才需要確認。 -->
+      <form hx-post="/orders/kill-switch" hx-target="#kill-switch-control" hx-swap="outerHTML" style="margin:0;">
+        <input type="hidden" name="scope" value="self">
+        <input type="hidden" name="enabled" value="{{ 'false' if kill_switch.self_on else 'true' }}">
+        {% if kill_switch.self_on %}
+        <button type="submit" class="secondary" style="margin:0;">解除我的緊急停止</button>
+        {% else %}
+        <button type="submit" class="contrast" style="margin:0;">啟動我的緊急停止</button>
+        {% endif %}
+      </form>
       {% endif %}
-    </form>
+    </div>
+  </div>
+
+  <!-- 全站緊急停止：維持 admin-only（沿用 Tier0 語意，任一 admin/owner 可翻，火警拉桿原則）。 -->
+  <div class="risk-status-box{{ ' is-active' if kill_switch.global_on else '' }}">
+    <div class="risk-status-row">
+      <strong class="risk-status-title">
+        {% if kill_switch.global_on %}🔴 全站緊急停止已啟動 — 拒絕所有人新單{% else %}🟢 全站下單正常{% endif %}
+      </strong>
+      {% if not global_readonly|default(false) %}
+      <form hx-post="/orders/kill-switch" hx-target="#kill-switch-control" hx-swap="outerHTML" style="margin:0;"
+            {% if not kill_switch.global_on %}hx-confirm="確定要啟動全站緊急停止？啟動後將立即拒絕所有人的新委託（可再次點擊解除）。"{% endif %}>
+        <input type="hidden" name="scope" value="global">
+        <input type="hidden" name="enabled" value="{{ 'false' if kill_switch.global_on else 'true' }}">
+        {% if kill_switch.global_on %}
+        <button type="submit" class="secondary" style="margin:0;">解除全站緊急停止</button>
+        {% else %}
+        <button type="submit" class="risk-btn-danger" style="margin:0;">啟動全站緊急停止（拒絕所有人新單）</button>
+        {% endif %}
+      </form>
+      {% endif %}
+    </div>
+    {% if kill_switch.global_actor %}
+    <div class="muted risk-status-note">最後翻閘者：user #{{ kill_switch.global_actor }}</div>
+    {% endif %}
   </div>
   {% endif %}
 </div>

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <title>QuanQuant Agent 設定精靈 — 步驟 2／3</title>
+  <style>
+    body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 32rem; margin: 3rem auto; padding: 0 1rem; }
+    label { display: block; margin-top: 1rem; }
+    input[type="password"] { width: 100%; padding: 0.4rem; }
+    .checkbox-row { display: flex; align-items: center; gap: 0.5rem; }
+    .checkbox-row input { width: auto; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>設定精靈 — 步驟 2／3：永豐憑證</h1>
+
+  {% if error %}
+    <p class="error">{{ error }}</p>
+  {% endif %}
+
+  <form method="post" action="/setup/step2" autocomplete="off">
+    <label>
+      Shioaji API Key
+      <input type="password" name="api_key" autocomplete="off">
+    </label>
+    <label>
+      Shioaji Secret Key
+      <input type="password" name="secret_key" autocomplete="off">
+    </label>
+    <label class="checkbox-row">
+      <input type="checkbox" name="remember_device" value="on">
+      記住裝置授權
+    </label>
+    <label class="checkbox-row">
+      <input type="checkbox" name="remember_broker" value="on">
+      記住永豐 API 憑證
+    </label>
+    <p><a href="https://www.sinotrade.com.tw/newweb/Api/" target="_blank" rel="noopener noreferrer">如何取得永豐 API 憑證？</a></p>
+    <button type="submit">下一步</button>
+  </form>
+</body>
+</html>

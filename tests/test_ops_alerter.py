@@ -101,6 +101,36 @@ def test_kill_switch_wrapper_surfaces_open_orders_when_enabling():
     assert "kill switch 啟動" in fake.texts[0] and "3 筆未成交掛單" in fake.texts[0]
 
 
+def test_kill_switch_wrapper_records_scope_self_vs_global():
+    """D3：兩層 kill switch 的翻閘告警要能分辨 scope（個人急停 vs 全站總閘），供人工稽核。"""
+    fake_global = _FakeNotifier(configured=True)
+    alerter_global = OpsAlerter(fake_global)
+    _drain(alerter_global, lambda: alerter_global.kill_switch(
+        enabled=True, actor_user_id=7, scope="global", open_order_count=0))
+    assert "全站" in fake_global.texts[0]
+
+    fake_self = _FakeNotifier(configured=True)
+    alerter_self = OpsAlerter(fake_self)
+    _drain(alerter_self, lambda: alerter_self.kill_switch(
+        enabled=True, actor_user_id=7, scope="self", open_order_count=0))
+    assert "個人" in fake_self.texts[0]
+
+
+def test_failstop_wrapper_enabled_and_disabled_messages():
+    """Inc1 D9/G2（Task 12）：agent fail-stop latch 事件——進入/解除各自的文案與 severity。"""
+    fake = _FakeNotifier(configured=True)
+    alerter = OpsAlerter(fake)
+    _drain(alerter, lambda: alerter.failstop(user_id=7, enabled=True, detail="buffer 落地失敗"))
+    assert "進入 fail-stop" in fake.texts[0] and "user_id=7" in fake.texts[0]
+    assert "buffer 落地失敗" in fake.texts[0]
+    assert "🚨" in fake.texts[0]   # critical
+
+    fake2 = _FakeNotifier(configured=True)
+    alerter2 = OpsAlerter(fake2)
+    _drain(alerter2, lambda: alerter2.failstop(user_id=7, enabled=False))
+    assert "解除 fail-stop" in fake2.texts[0]
+
+
 def test_build_ops_alerter_token_fallback_and_configured_gate():
     # ops token 空 → 沿用 telegram_bot_token；chat_id 有值 → configured
     s = SimpleNamespace(ops_telegram_bot_token="", telegram_bot_token="MAINTOK",

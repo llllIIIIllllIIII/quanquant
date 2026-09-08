@@ -27,10 +27,16 @@ class _FakeTransport:
 class _FakeChild:
     def __init__(self):
         self.ops, self.starts, self.alive = [], 0, False
+        self.generation = 0
         self.ping_ok = True
+        self.latched = False           # N6: ping_detail() 模擬 watchdog 偵測 child latch
         self.request_exc = None
+        self.terminate_exc = None      # N6-1: 模擬 recovery 同步 terminate 失敗
+        self.refuse_to_die = False     # N6-1: terminate 不炸，但 alive 驗不死
+        self.terminate_calls: list[int | None] = []   # 記錄每次呼叫的 expected_generation
     def start(self):
         self.starts += 1
+        self.generation += 1
         self.alive = True
         return "F1"
     def request(self, op, *, timeout):
@@ -40,8 +46,19 @@ class _FakeChild:
         return {"ok": True, "result": {"ordno": "101AA1", "broker_order_id": "101AA1"}}
     def ping(self, *, timeout):
         return self.ping_ok
-    def terminate(self):
+    def ping_detail(self, *, timeout):
+        return {"ok": self.ping_ok, "latched": self.latched,
+                "generation": self.generation, "fault_seq": 1 if self.latched else 0}
+    def terminate(self, *, expected_generation: int | None = None):
+        self.terminate_calls.append(expected_generation)
+        if self.terminate_exc is not None:
+            raise self.terminate_exc
+        if self.refuse_to_die:
+            # N9-1: 比照真 ChildHandle.terminate() 的 False 語意——kill+join 後仍驗到
+            # 存活，呼叫端必須消費這個回傳值、不得假裝已清乾淨。
+            return False
         self.alive = False
+        return True
 
 
 async def _until(cond, timeout=3.0):
@@ -71,7 +88,9 @@ async def test_run_once_sends_login_first(tmp_path):
     assert tr.sent[0]["account"] == "F1" and tr.sent[0]["mode"] == "sim"
     # codex round2 fix1：protocol 版本必填化後，UpLogin 不再有 default——runner 必須顯式帶
     # protocol=PROTOCOL_VERSION，否則建構就會 ValidationError。
-    assert tr.sent[0]["protocol"] == 1
+    # Inc1 D7：硬升 v2，PROTOCOL_VERSION 現為 2。
+    assert tr.sent[0]["protocol"] == 2
+    assert tr.sent[0]["health_epoch"] == 0
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -103,6 +122,106 @@ async def test_pump_resends_when_no_ack(tmp_path):
     await asyncio.gather(task, return_exceptions=True)
 
 
+class _ImmediateAckTransport(_FakeTransport):
+    """模擬 transport 送出後立即視為已 ack（直接 mark_sent）——把 buffer 逼到需要不只
+    一次 `pending(50)` 才能耗盡（>50 筆），用來驗證 drain-until-empty：批次之間不會
+    多睡一輪 `pump_interval`，只有真的耗盡（`pending()` 回空）才睡。"""
+    def __init__(self, buf):
+        super().__init__()
+        self._buf = buf
+    async def send(self, msg):
+        await super().send(msg)
+        if msg.get("type") == "report":
+            self._buf.mark_sent(msg["event_id"])
+
+
+async def test_pump_drains_backlog_across_batches_without_waiting_per_batch(tmp_path):
+    """紅測試前提：sleep-first 版本每批（`pending(50)`）處理前都要先睡滿一輪
+    `pump_interval`——120 筆需要 3 批（50+50+20），舊版至少 3*pump_interval=1.5s 才送完，
+    遠超下面的 0.3s 上限；check-first/drain-until-empty 版本應該幾乎零等待送完（送出
+    即視為已 ack，buffer 立刻露出下一批，不必等下一輪 pump_interval 才繼續 drain）。"""
+    buf = DurableBuffer(tmp_path / "o.db")
+    tr = _ImmediateAckTransport(buf)
+    ids = [buf.append("deal_report", {"n": i}) for i in range(120)]
+    r = _runner(tr, _FakeChild(), buf, pump_interval=0.5)  # 沿用舊預設值，驗證修好後仍快
+    task = asyncio.create_task(r._pump())
+    await _until(lambda: len(tr.reports()) >= 120, timeout=0.3)
+    assert [m["event_id"] for m in tr.reports()] == ids
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+class _CountingEmptyBuffer:
+    """buffer 永遠空的假物件，只提供 `_pump` 用得到的 `pending()`（用呼叫次數證明空批
+    確實有 sleep 節流，不是每輪不停查 SQLite 的空轉 busy-loop）；另外補上建構
+    `AgentRunner` 時 `_load_persisted_health()` 會用到的最小介面（無 sentinel、
+    health_epoch=0，等同一顆全新 buffer）。"""
+    path = "<fake>"
+    def __init__(self):
+        self.calls = 0
+    def pending(self, limit=50):
+        self.calls += 1
+        return []
+    def read_sentinel(self):
+        return None
+    def get_health_epoch(self):
+        return 0
+
+
+async def test_pump_sleeps_between_polls_when_buffer_empty(tmp_path):
+    buf = _CountingEmptyBuffer()
+    tr = _FakeTransport()
+    r = _runner(tr, _FakeChild(), buf, pump_interval=0.05)
+    task = asyncio.create_task(r._pump())
+    await asyncio.sleep(0.22)          # ~4 個 pump_interval 的時間
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    # 沒有 busy-loop 的話呼叫次數應落在 ~4-5 次量級；真的空轉的話會是數千次以上。
+    assert 2 <= buf.calls <= 10
+
+
+class _CountingBuffer:
+    """包一層真 `DurableBuffer`，只加 `pending()` 呼叫計數——用來證明 `pending()` 非空
+    但全部列都卡在 `resend_after` 冷卻窗內時，`_pump` 仍然有睡、不是被『非空』騙成
+    busy-loop（回歸測試，審查發現：睡眠判準應該是『這輪有沒有實際送出東西』，不是
+    『這輪 pending() 是否為空』）。"""
+    def __init__(self, inner):
+        self._inner = inner
+        self.pending_calls = 0
+    def pending(self, limit=50):
+        self.pending_calls += 1
+        return self._inner.pending(limit)
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+async def test_pump_sleeps_when_all_pending_rows_are_in_resend_cooldown(tmp_path):
+    """回歸測試：3 筆都送出去了但沒收到 ack（`_FakeTransport` 不主動 ack，outbox 列的
+    `sent_at` 因此還是 NULL），resend_after=5.0 遠大於本測試觀察窗——所以第一輪之後，
+    每一輪 `pending(50)` 都會非空（3 列都還在 outbox 裡），但全部因為在冷卻窗內被
+    `continue` 跳過、這輪『沒有實際送出任何東西』。正確行為是照樣 `sleep(pump_interval)`
+    節流；有這個回歸的版本會把『pending() 非空』誤判成『有事做』，在冷卻窗內
+    （長達 resend_after）密集空轉查 SQLite。"""
+    inner = DurableBuffer(tmp_path / "o.db")
+    buf = _CountingBuffer(inner)
+    for i in range(3):
+        inner.append("deal_report", {"n": i})
+    tr = _FakeTransport()  # 不主動 ack：送出後 outbox 列仍是未送達（sent_at IS NULL）
+    r = _runner(tr, _FakeChild(), buf, pump_interval=0.02, resend_after=5.0)
+    task = asyncio.create_task(r._pump())
+    await _until(lambda: len(tr.reports()) >= 3, timeout=0.3)  # 第一輪先把 3 筆都送出去
+    calls_at_first_send = buf.pending_calls
+    await asyncio.sleep(0.15)   # ~7 個 pump_interval；busy-loop 的話會是數千次呼叫
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    # 冷卻窗內（resend_after=5.0 遠大於這段觀察窗）不該有新的送出——沒有收到 ack 也沒有
+    # 逾時，補送邏輯本身不該被本次改動影響。
+    assert len(tr.reports()) == 3
+    # 呼叫次數應落在 pump_interval 節流量級（觀察窗 0.15s / 0.02s ≈ 7-8 次），
+    # 不是空轉才會出現的數千次。
+    assert buf.pending_calls - calls_at_first_send <= 20
+
+
 async def test_crash_before_ack_resent_by_next_session(tmp_path):
     """零丟單核心測試：送出未 ack 就崩潰 → 重啟後補送。"""
     tr1, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
@@ -122,12 +241,35 @@ async def test_crash_before_ack_resent_by_next_session(tmp_path):
     await asyncio.gather(t2, return_exceptions=True)
 
 
+async def test_reconnect_on_same_runner_resends_inflight_immediately_without_cooldown(tmp_path):
+    """F3（opus 終審發現）：`run_forever` 重用同一個 `AgentRunner` 實例，斷線重連後，斷線前
+    送出但未 ack 的列不該被冷卻窗（`resend_after`）擋住——新連線上 server 根本沒收過那些
+    訊息，等冷卻窗只是白白拖慢零丟單的補送。這裡直接在同一個 runner 實例上呼叫兩次
+    `run_once()`（模擬重連，不建立新 runner），驗證第二個 session 立刻重送、不必等
+    `resend_after`（本測試刻意設得很大，若 `_inflight` 沒有在重連時清掉就會逾時失敗）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    eid = buf.append("deal_report", {"n": 1})
+    r = _runner(tr, child, buf, resend_after=5.0)  # 遠大於下面的觀察窗
+    r.ensure_child()
+    t1 = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.reports()) >= 1)
+    t1.cancel()  # 模擬斷線（未收到 ack）
+    await asyncio.gather(t1, return_exceptions=True)
+
+    tr.sent.clear()  # 只看第二個 session（重連）送了什麼；重用同一個 runner + transport 物件
+    t2 = asyncio.create_task(r.run_once())
+    await _until(lambda: any(m["event_id"] == eid for m in tr.reports()), timeout=1.0)
+    t2.cancel()
+    await asyncio.gather(t2, return_exceptions=True)
+
+
 async def test_downlink_place_dispatched_to_child_and_acked(tmp_path):
     tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
     r = _runner(tr, child, buf)
     r.ensure_child()
     task = asyncio.create_task(r.run_once())
-    tr.incoming.put_nowait({"type": "place", "cmd_id": "c1", "mode": "sim",
+    tr.incoming.put_nowait({"type": "place", "cmd_id": "c1", "account": "F1", "mode": "sim",
+                            "expires_at": "2099-01-01T00:00:00",
                             "native": {"action": "Buy", "price": "0", "qty": 1,
                                        "price_type": "MKT", "order_type": "IOC",
                                        "octype": "Auto"}})
@@ -145,11 +287,74 @@ async def test_child_timeout_yields_error_ack(tmp_path):
     r = _runner(tr, child, buf)
     r.ensure_child()
     task = asyncio.create_task(r.run_once())
-    tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c2", "mode": "sim",
-                            "ordno": "101AA1"})
+    tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c2", "account": "F1", "mode": "sim",
+                            "expires_at": "2099-01-01T00:00:00", "ordno": "101AA1"})
     await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
     ack = next(m for m in tr.sent if m.get("type") == "cmd_ack")
     assert ack["ok"] is False and ack["error_kind"] == "timeout"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+# ---- Task 11（G3/D8）：DownQueryQty＋reconcile 改回 volatile UpQueryResult ----
+
+
+async def test_downlink_query_qty_dispatched_to_child_and_returns_query_result(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request = lambda op, *, timeout: {"ok": True, "result": {"qty": 7}}
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "query_qty", "cmd_id": "q1", "ordno": "101AA1", "mode": "sim"})
+    await _until(lambda: any(m.get("type") == "query_result" for m in tr.sent))
+    reply = next(m for m in tr.sent if m.get("type") == "query_result")
+    assert reply["cmd_id"] == "q1" and reply["result"] == {"qty": 7}
+    assert "event_id" not in reply  # volatile：不進 outbox，無 event_id（D7）
+    assert not any(m.get("type") == "cmd_ack" for m in tr.sent)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_downlink_reconcile_now_returns_query_result_not_cmd_ack(tmp_path):
+    """Task 11：reconcile 從 Inc0 的 UpCmdAck 切到 volatile UpQueryResult（D4/D7）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request = lambda op, *, timeout: {"ok": True, "result": {"payloads": [], "newest": None}}
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "reconcile", "cmd_id": "r1", "mode": "sim", "after": None})
+    await _until(lambda: any(m.get("type") == "query_result" for m in tr.sent))
+    reply = next(m for m in tr.sent if m.get("type") == "query_result")
+    assert reply["cmd_id"] == "r1" and reply["result"] == {"payloads": [], "newest": None}
+    assert not any(m.get("type") == "cmd_ack" for m in tr.sent)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_readonly_command_failure_sends_no_reply(tmp_path):
+    """唯讀冪等：child 執行失敗一律不回覆（server 端自然逾時，下輪重試），不猜測失敗原因
+    ——UpQueryResult 刻意沒有錯誤欄位可攜帶（D7 R1-7）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request = lambda op, *, timeout: {"ok": False, "error_kind": "exception", "message": "boom"}
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "query_qty", "cmd_id": "q2", "ordno": "101AA1", "mode": "sim"})
+    await asyncio.sleep(0.15)
+    assert not any(m.get("cmd_id") == "q2" for m in tr.sent)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_readonly_command_child_timeout_sends_no_reply(tmp_path):
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.request_exc = TimeoutError()
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "query_qty", "cmd_id": "q3", "ordno": "101AA1", "mode": "sim"})
+    await asyncio.sleep(0.15)
+    assert not any(m.get("cmd_id") == "q3" for m in tr.sent)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
 
@@ -196,6 +401,62 @@ async def test_child_frozen_triggers_respawn_and_relogin(tmp_path):
     await asyncio.gather(task, return_exceptions=True)
 
 
+async def test_child_watchdog_uses_ping_detail_and_treats_latched_as_frozen(tmp_path):
+    """N6（順帶，codex 終審 round6）：`_child_watchdog` 改用 `ping_detail()`（不再只看
+    `ping()` 的 bool）——child 本地 latch 已 tripped（即使 `ok=True`，pipe 本身仍活著、
+    仍能正常回應）時，watchdog 仍必須視為不健康，觸發既有 `ChildFrozenError` 處理
+    （terminate 目前這個 child + 下一輪 respawn 出全新、未 latch 的 child）。這是
+    `ping_detail` 目前唯一的 production caller（解掉先前的 dead code diagnostic）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.latched = True   # pipe 本身仍活著（ok=True），但 child 本地 latch 已 tripped
+    r = _runner(tr, child, buf)
+    task = asyncio.create_task(r.run_forever())
+    await _until(lambda: child.starts >= 2)   # watchdog 經 ping_detail 偵測到 latch → respawn
+    child.latched = False                     # 新 child（全新 process）本地未 latch
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2)
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_watchdog_ping_fallback_elevates_parent_latch_when_ipc_unavailable(tmp_path):
+    """N9-2（HIGH，codex 終審 round9）：本檔 `_FakeChild` 沒有 `poll_failstop`——
+    `_failstop_watchdog` 的既有 `getattr` 容錯讓那個 task 直接不啟用（見其 docstring），
+    等同模擬「sentinel 落地也可能已經壞掉、failstop IPC 通知也失敗」的雙失敗情境：child
+    本地 latch 只能靠 `_child_watchdog` 的 `ping_detail` 安全網獨立偵測到。
+
+    舊版這裡只 raise `ChildFrozenError` → respawn，父程序自己從未真正 latch——新 child
+    起來後上報 `status="ok"`，假 healthy，故障被悄悄吞掉。修法後：watchdog 見
+    `latched=True` 必須先 `await self._latch(...)`（parent in-memory latch＋epoch++＋
+    durable sentinel 補寫）才 raise，之後的 respawn／新 session 天然維持 failstop（G2
+    「session 進行中永不自動解除」的既有保證），全鏈不假 healthy。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.latched = True   # child 本地 latch 已 tripped；沒有 poll_failstop → IPC 路徑不啟用
+    r = _runner(tr, child, buf, child_ping_interval=0.05, child_ping_timeout=1)
+    task = asyncio.create_task(r.run_forever())
+
+    await _until(lambda: r._latched is True)     # ping 備援獨立偵測到 latch、提升 parent latch
+    assert buf.has_sentinel()                     # durable sentinel 補寫（不只是記憶體旗標）
+
+    await _until(lambda: child.starts >= 2)       # 既有行為不變：respawn 過
+    child.latched = False                         # 新 child（模擬全新 process）本地未 latch
+
+    await _until(lambda: len([m for m in tr.sent if m["type"] == "login"]) >= 2)
+    await asyncio.sleep(0.1)   # 讓新 session 的健康回報有機會送出
+
+    healths = [m for m in tr.sent if m["type"] == "health"]
+    assert healths, "應至少有一筆健康回報"
+    assert healths[-1]["status"] == "failstop"     # 新 session 依然 failstop，不假 healthy
+    # 第一筆是第一個 session 的 login 觸發，latch 生效前，狀態如實是 "ok"（不是本測試要
+    # 堵的洞）；latch 生效（epoch 進位）之後的每一筆，一律不得再是 "ok"——這才是全鏈斷言：
+    # 新 child／respawn 之後不會假 healthy。
+    assert not any(h["status"] == "ok" and h["health_epoch"] >= r._health_epoch for h in healths)
+
+    r.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_ensure_child_respawns_when_alive_but_account_lost(tmp_path):
     """接手他人 child 的邊界：child.alive 為 True 但 runner 尚無 _account →
     視同需要重啟（terminate+start），保證 ensure_child() 返回後 _account 非空。"""
@@ -216,17 +477,23 @@ async def test_ensure_child_respawns_when_alive_but_account_lost(tmp_path):
 # request()/ping() 一律直接 fail，不再碰這條不可信的 pipe，交給 ensure_child() respawn。
 
 class _FakeProcess:
-    def __init__(self, alive: bool = True):
+    def __init__(self, alive: bool = True, refuse_kill: bool = False):
         self._alive = alive
         self.killed = False
         self.joined = False
+        # R7-1（HIGH，codex 終審 round7）：模擬「kill()+join(timeout=5) 後 process 仍然
+        # 存活」——`refuse_kill=True` 時 `kill()` 不翻轉 `_alive`，讓 `terminate()` 的
+        # `is_alive()` 驗證真的驗到「還活著」，用來測 join-timeout 路徑。預設 False，
+        # 既有測試（`kill()` 即視為死亡）行為不變。
+        self._refuse_kill = refuse_kill
 
     def is_alive(self) -> bool:
         return self._alive
 
     def kill(self) -> None:
         self.killed = True
-        self._alive = False
+        if not self._refuse_kill:
+            self._alive = False
 
     def join(self, timeout=None) -> None:
         self.joined = True
@@ -463,6 +730,289 @@ def test_lock_rechecks_poisoned_before_touching_conn(tmp_path):
     assert conn.sent == []       # 從未碰過 conn
 
 
+# ---------- R3-1（HIGH，codex 終審 round3）：lifecycle generation fencing——recovery
+# respawn（terminate 舊 child、start 新 child）與併發中仍在等舊 pipe 回覆的 RPC（watchdog
+# ping、唯讀指令，皆經 asyncio.to_thread）之間，舊版完全無互斥：respawn 可能被舊 RPC
+# 逾時後的 _poison() 誤殺；asyncio.to_thread 取消後遲到的 worker 也可能誤碰新 child 的
+# conn。修法：start/terminate/_rpc/poll_failstop 共用同一把 threading.RLock，且每筆 RPC
+# 在進入鎖之前先捕捉當下的 generation，拿到鎖之後重新核對，不符即丟棄。----------
+
+def test_generation_mismatch_after_concurrent_respawn_discards_stale_rpc_without_touching_new_child(
+    tmp_path,
+):
+    """barrier/事件精確控制「舊 RPC 遲到 vs 新 child」不互殺：一個 RPC 呼叫在捕捉
+    generation=1 之後、真正拿到鎖之前，若併發的 respawn（模擬 terminate 舊 child、start
+    新 child）已經搶先換代——這筆呼叫拿到鎖後必須發現過期，直接丟棄，完全不碰新一代的
+    process/conn（不誤殺、不誤送），也不會碰舊 conn（它從未真正送出過）。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬「respawn 正在進行中」，佔住鎖
+    results: dict[str, Exception] = {}
+
+    def _stale_caller():
+        try:
+            child.request({"op": "ping"}, timeout=1)
+        except TimeoutError as exc:
+            results["exc"] = exc
+
+    t = threading.Thread(target=_stale_caller)
+    t.start()
+    time.sleep(0.1)   # 讓呼叫端跑過「捕捉 generation=1」，卡在等鎖
+
+    # respawn 在鎖內完成：換上新一代 process/conn（terminate 舊的、start 新的都要拿同一把
+    # 鎖，所以這裡直接模擬「respawn 已完成」的最終狀態）。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()   # 放行——過期呼叫這才拿得到鎖
+
+    t.join(timeout=2)
+    assert isinstance(results.get("exc"), TimeoutError)
+    assert new_conn.sent == []            # 完全沒碰新 conn
+    assert new_process.killed is False    # 新 child 沒有被誤殺（_poison 也沒被觸發到它）
+    assert old_conn.sent == []            # 舊 conn 也沒被碰（呼叫從頭到尾都卡在等鎖）
+
+
+async def test_cancelled_to_thread_worker_late_arrival_after_respawn_is_discarded(tmp_path):
+    """`asyncio.to_thread` 的取消不會真的停止底層執行緒——呼叫端（watchdog）已經放棄
+    等待，但那個 worker thread 仍在背景跑，直到它真的走完（可能卡在等respawn 持有的鎖）。
+    這支測試證明：即使這個「孤兒」worker 是在 respawn 完成之後才真正拿到鎖執行到
+    `_rpc()` 的核對段，generation 比對仍能攔下它，不會把它的（遲到的）執行結果套用到
+    新 child 身上——新 conn 沒被送過任何東西、新 process 沒被殺、`child.alive` 仍正常
+    反映新 child 存活。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬 respawn 正在進行、佔住鎖
+
+    async def _orphan_ping():
+        return await asyncio.to_thread(child.request, {"op": "ping"}, timeout=5)
+
+    task = asyncio.create_task(_orphan_ping())
+    await asyncio.sleep(0.05)   # 讓底層 thread pool worker 真的排進去、卡在 acquire()
+
+    task.cancel()   # 呼叫端取消——底層 thread 不受影響，仍在背景卡著等鎖
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # respawn 完成：換上新一代 process/conn，放鎖——孤兒 worker 這才拿得到鎖。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()
+
+    await asyncio.sleep(0.2)   # 給孤兒 worker 執行緒時間跑完（它會發現 generation 不符、丟棄）
+
+    assert new_conn.sent == []          # 孤兒呼叫完全沒碰到新 conn
+    assert new_process.killed is False  # 也沒有被誤殺
+    assert child.alive is True          # 新 child 仍正常存活
+
+
+# ---------- N6-1（HIGH，codex 終審 round6）：`ChildHandle.terminate(expected_generation=)`
+# fencing——同步 terminate 呼叫（原本主要供 `_recover()` 使用，2026-08-08 已隨 G2 恢復
+# 降級移除；`ensure_child()` 的 respawn 路徑仍會受益）若被取消，底層 thread pool worker
+# 仍可能跑完、很久之後才真正拿到鎖執行到這裡；沒有 fencing 會誤殺已經換代的新 child。----
+
+def test_terminate_generation_mismatch_after_concurrent_respawn_is_noop_for_new_child(
+    tmp_path,
+):
+    """barrier/事件精確控制「舊 terminate 呼叫遲到 vs 新 child」不互殺：呼叫端在捕捉
+    generation=1 之後、真正拿到鎖之前，若併發的 respawn（模擬 `ensure_child()` 的
+    terminate 舊 child、start 新 child）已經搶先換代——這筆 terminate 呼叫拿到鎖後必須
+    發現過期，直接 no-op，完全不碰新一代的 process/conn（不誤殺）。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬「respawn 正在進行中」，佔住鎖
+    results: dict[str, object] = {}
+
+    def _stale_terminate_caller():
+        results["returned"] = child.terminate(expected_generation=1)
+
+    t = threading.Thread(target=_stale_terminate_caller)
+    t.start()
+    time.sleep(0.1)   # 讓呼叫端跑過「捕捉 generation=1」，卡在等鎖
+
+    # respawn 在鎖內完成：換上新一代 process/conn（terminate 舊的、start 新的都要拿同一把
+    # 鎖，所以這裡直接模擬「respawn 已完成」的最終狀態）。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()   # 放行——過期的 terminate 呼叫這才拿得到鎖
+
+    t.join(timeout=2)
+    assert results["returned"] is None    # no-op，正常返回，不 raise
+    assert new_process.killed is False    # 新 child 沒有被誤殺
+    assert new_conn.closed is False       # 新 conn 也沒被碰
+    assert child.alive is True            # 新 child 仍正常存活
+    assert old_process.killed is False    # 舊 process 也沒被碰（呼叫從頭到尾都卡在等鎖）
+
+
+# ---------- R7-1（HIGH，codex 終審 round7，好衛生，shutdown/frozen 路徑仍在用）：
+# terminate() 沒有真正 verify-dead——舊版 kill()+join(timeout=5) 後未檢查
+# process.is_alive() 就無條件把 self._process 設 None，讓 alive 屬性此後永遠回報 False
+# （即使底層真的還活著）。原本這道二次確認主要是給 `_recover()`（2026-08-08 已隨 G2 恢復
+# 降級移除）用來判斷要不要清 sentinel/latch，現在保留下來是單純的正確性/衛生修復。----------
+
+
+def test_terminate_returns_false_and_keeps_handle_when_process_refuses_to_die(tmp_path):
+    """真 `ChildHandle.terminate()` 的 join-timeout 路徑：kill()+join(timeout=5) 後
+    `process.is_alive()` 仍回 True（用 `_FakeProcess(refuse_kill=True)` 精確控制，不依賴
+    真的能製造出一個吃 SIGKILL 不死的程序）——terminate() 必須回傳 False、**不清**
+    `self._process`（handle 保留），`child.alive` 也必須誠實回報 True，不能因為呼叫過
+    terminate() 就被錯誤地永遠判定成「已死」。"""
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(refuse_kill=True), _FakeConn()
+    child._process, child._conn = process, conn
+
+    result = child.terminate()
+
+    assert result is False
+    assert process.killed is True        # kill() 確實被呼叫過
+    assert process.joined is True        # join() 也確實被呼叫過
+    assert child._process is process     # R7-1 核心：handle 未被清掉
+    assert child._conn is conn           # conn 同樣未被清掉（不確認死亡就不清任何資源）
+    assert child.alive is True           # 誠實反映「其實還活著」，不是誤報 False
+
+
+def test_terminate_returns_true_and_clears_handle_when_process_actually_dies(tmp_path):
+    """回歸：process 正常死亡（`_FakeProcess()` 預設行為）時，terminate() 仍必須回傳
+    True 並清掉 handle——R7-1 的修法只在「驗不死」時保留狀態，不影響既有的正常成功路徑。"""
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = process, conn
+
+    result = child.terminate()
+
+    assert result is True
+    assert child._process is None
+    assert child._conn is None
+    assert child.alive is False
+
+
+async def test_cancelled_terminate_worker_late_arrival_after_respawn_is_discarded(tmp_path):
+    """`asyncio.to_thread` 的取消不會真的停止底層執行緒——一個 `expected_generation` 化的
+    terminate 呼叫（原本主要供 `_recover()` 使用，2026-08-08 已隨 G2 恢復降級移除；
+    `ensure_child()` 的 respawn 路徑仍會受益）若在等鎖期間被取消，底層 worker thread 仍在
+    背景跑，直到真的走完（可能卡在等 respawn 持有的鎖）。即使這個「孤兒」worker 是在
+    respawn 完成之後才真正拿到鎖執行到 fencing 核對，generation 比對仍能攔下它，不會誤殺
+    新 session 的 child。"""
+    child = _bare_child_handle(tmp_path)
+    old_process, old_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = old_process, old_conn
+    child._generation = 1
+
+    child._lock.acquire()   # 模擬 respawn 正在進行、佔住鎖
+
+    async def _orphan_terminate():
+        return await asyncio.to_thread(child.terminate, expected_generation=1)
+
+    task = asyncio.create_task(_orphan_terminate())
+    await asyncio.sleep(0.05)   # 讓底層 thread pool worker 真的排進去、卡在 acquire()
+
+    task.cancel()   # 呼叫端取消——底層 thread 不受影響
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # respawn 完成：換上新一代 process/conn，放鎖——孤兒 worker 這才拿得到鎖。
+    new_process, new_conn = _FakeProcess(), _FakeConn()
+    child._process, child._conn = new_process, new_conn
+    child._generation = 2
+    child._lock.release()
+
+    await asyncio.sleep(0.2)   # 給孤兒 worker 執行緒時間跑完（它會發現 generation 不符、丟棄）
+
+    assert new_process.killed is False  # 沒有被誤殺
+    assert new_conn.closed is False
+    assert child.alive is True          # 新 child 仍正常存活
+
+
+# ---------- N9-1（HIGH，codex 終審 round9）：terminate 三態在其餘生命週期路徑仍未消費＋
+# poisoned 遮蔽 alive——`process_alive`（純 process 存活，不受 poisoned 影響）與 `alive`
+# （RPC 可用，poisoned-aware）拆開後，`ensure_child()`/`start()` 連線失敗清理/
+# `run_forever()` 的 ChildFrozenError 分支都必須消費 `terminate()` 的三態回傳值，驗死失敗
+# 時一律拒絕再 start() 出第二個 child，改以明確的 fatal 錯誤停止（不得雙 child）。----------
+
+
+def test_ensure_child_refuses_second_child_when_poisoned_process_refuses_to_die(tmp_path):
+    """核心情境：child 是「poisoned=True 但底層 process 仍存活」這個狀態（例如 RPC 逾時
+    → `_poison()` → `terminate()`，但 process 拒死）——`alive` 因為 poisoned 已經回
+    False。舊版 `ensure_child()` 只在 `alive` 為 True 時才呼叫 `terminate()`，會被這個
+    False 遮蔽，誤判「本來就沒有 child」，直接 `start()` 出第二個 child——舊 process 其實
+    還活著，變成雙 child 併發碰同一個 buffer/broker 帳號。
+
+    修法後：`ensure_child()` 改用 `process_alive`（不受 poisoned 影響）判斷要不要
+    terminate；terminate 驗死失敗（`refuse_kill=True`）必須 raise `FatalAgentError`，
+    絕不呼叫 `start()`。"""
+    from quanquant.agent.runner import FatalAgentError
+
+    child = _bare_child_handle(tmp_path)
+    process, conn = _FakeProcess(refuse_kill=True), _FakeConn()
+    child._process, child._conn = process, conn
+    child._poisoned = True   # RPC 判死（poison）但底層 process 拒死
+
+    assert child.alive is False           # poisoned 遮蔽：RPC 不可用
+    assert child.process_alive is True    # 但底層 process 其實還活著
+
+    tr, buf = _FakeTransport(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+
+    start_calls = {"n": 0}
+
+    def _fake_start():
+        start_calls["n"] += 1
+        return "F1"
+
+    child.start = _fake_start
+
+    with pytest.raises(FatalAgentError):
+        r.ensure_child()
+
+    assert start_calls["n"] == 0      # 絕不 start 第二個 child
+    assert child._process is process  # 舊 handle 原封不動保留（未被清掉、未被取代）
+    assert child._conn is conn
+
+
+async def test_run_forever_stops_fatal_when_child_frozen_and_terminate_refuses_to_die(tmp_path):
+    """`run_forever()` 的 `except ChildFrozenError:` 分支必須消費 `terminate()` 的回傳
+    值——child 驗死失敗（`refuse_to_die=True`）時不得照舊 respawn（下一輪 `ensure_child()`
+    會在舊 process 還活著時又 start() 出第二個 child），改以明確的 fatal 錯誤停止整個
+    agent 程序，需要人工處理。"""
+    from quanquant.agent.runner import FatalAgentError
+
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    child.ping_ok = False          # 觸發 watchdog ChildFrozenError
+    child.refuse_to_die = True     # terminate() 呼叫後回 False（驗不死）
+
+    r = _runner(tr, child, buf)
+
+    with pytest.raises(FatalAgentError):
+        await r.run_forever()
+
+    assert child.starts == 1                 # 沒有 respawn 第二個 child
+    assert child.terminate_calls == [None]    # 只被 terminate 過一次
+
+
+# ---------- Round5（codex 終審 round5 收斂）：`ChildHandle.respawn(expected_generation)`
+# （R4-a 加的 generation-scoped terminate+start transaction）已隨 `AgentRunner.
+# _respawn_child()` 一併移除——child 不會被原地換血，respawn 一律走結束整個 session、交給
+# `run_forever()`→`ensure_child()` 這條既有硬化路徑重新 spawn。上面兩支
+# `test_generation_mismatch_after_concurrent_respawn_discards_stale_rpc_without_touching_new_child`
+# /`test_cancelled_to_thread_worker_late_arrival_after_respawn_is_discarded` 測的是
+# `start()`/`terminate()`/`_rpc()` 共用的 `_lock`＋`_generation` fencing 本身（R3-1，保護
+# 「併發 RPC vs. 任何一次 terminate+start 交替」，`ensure_child()` 本來就會呼叫這兩個
+# 方法）——這道防線保留不動，繼續有效；只有 `.respawn()` 這個方法本身連同其專屬測試被
+# 移除。
+# ----------
+
+
 # ---------- codex round2 fix4：帳號不符 → fatal 停止，不進 run_forever 的無限 backoff
 # 重試迴圈（每輪重試都是一次真的券商登入，會燒 Shioaji 每日 1000 次配額）----------
 
@@ -505,3 +1055,176 @@ def test_child_handle_start_raises_fatal_agent_error_on_account_mismatch(tmp_pat
         child.start()
     assert "F1" in str(exc_info.value) and "F2" in str(exc_info.value)
     assert child.alive is False
+
+
+# ---------- N6-3（MEDIUM，codex 終審 round6）：session 結束原因確定性優先序 ----------
+# asyncio.wait(FIRST_EXCEPTION) 的 done set 可能同時收攏多個例外——set 迭代順序不保證，
+# 「取第一個」等同碰運氣。改用 _select_session_end_exception() 依確定性優先序（
+# FatalAgentError ＞ 其他）挑一個 raise。2026-08-08（設計降級，使用者拍板）：這裡原本還有
+# 第二層優先序 SessionRestartRequested（in-session recovery 的受控重啟訊號）——隨 G2 恢復
+# 降級為啟動時 probe，`_recover()`/`_recovery_prober()` 整組移除，`SessionRestartRequested`
+# 已無任何生產路徑會 raise，一併刪除（以簡為準），下面兩支整合驗證測試（原本靠
+# monkeypatch `r._recovery_prober` 讓它跟 `run_once()` 的其他 task 同時完成）隨之失去掛載
+# 點，一併移除——優先序函式本身仍由 `test_select_session_end_exception_priority_order`
+# 直測覆蓋。
+
+
+def test_select_session_end_exception_priority_order(tmp_path):
+    """直測優先序函式本身（快速、決定性，不受 asyncio 排程時序影響）：
+    FatalAgentError ＞ 其他一般例外，任意組合/順序都成立。"""
+    from quanquant.agent.runner import FatalAgentError, _select_session_end_exception
+
+    fatal = FatalAgentError("fatal")
+    other1 = RuntimeError("other1")
+    other2 = ConnectionError("other2")
+
+    assert _select_session_end_exception([fatal]) is fatal
+    assert _select_session_end_exception([other1, fatal]) is fatal
+    assert _select_session_end_exception([fatal, other1]) is fatal
+    assert _select_session_end_exception([other1, other2]) is other1
+    assert _select_session_end_exception([other2, other1]) is other2
+    assert _select_session_end_exception([fatal, other1, other2]) is fatal
+    assert _select_session_end_exception([other1, other2, fatal]) is fatal
+
+
+# ---------- Task 9（D11/G1 agent 側）：buffer v2＋command_ledger 執行去重 ----------
+# spec D4 agent 端①-④，順序即正確性：①ledger 命中→不重執行，確保 outbox 有未送 ack
+# （無則以存檔 result 補 append）；②scope 核對不符→scope_mismatch；③expiry 過期→
+# expired（①先於③，S#4）；④執行 native→record_execution 同交易→泵送。
+
+_FAR_FUTURE = "2099-01-01T00:00:00"
+_PAST = "2000-01-01T00:00:00"
+
+
+def _place_msg(cmd_id: str, *, account: str = "F1", mode: str = "sim",
+               expires_at: str = _FAR_FUTURE) -> dict:
+    return {"type": "place", "cmd_id": cmd_id, "account": account, "mode": mode,
+            "expires_at": expires_at,
+            "native": {"action": "Buy", "price": "0", "qty": 1, "price_type": "MKT",
+                       "order_type": "IOC", "octype": "Auto"}}
+
+
+async def test_resend_same_cmd_id_after_ack_confirmed_does_not_reexecute_native(tmp_path):
+    """S#3：重連補送指令 → agent ledger 命中不重執行、重回存檔 ack。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    msg = _place_msg("c1")
+    tr.incoming.put_nowait(msg)
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    first_ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert len(child.ops) == 1
+
+    tr.incoming.put_nowait({"type": "report_ack", "event_id": first_ack["event_id"]})
+    await _until(lambda: buf.unsent_count() == 0)  # 第一筆 ack 已被 server 收到
+
+    tr.incoming.put_nowait(msg)  # 重連補送：server 重送同一 cmd_id
+    await _until(lambda: len([m for m in tr.sent if m.get("type") == "cmd_ack"]) >= 2)
+
+    assert len(child.ops) == 1  # 沒有再打 native——ledger 命中不重執行
+    second_ack = [m for m in tr.sent if m["type"] == "cmd_ack"][-1]
+    assert second_ack["cmd_id"] == "c1" and second_ack["ok"] is True
+    assert second_ack["result"]["ordno"] == "101AA1"
+    assert second_ack["event_id"] != first_ack["event_id"]  # 補的是新一筆 outbox 列
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_scope_mismatch_command_rejected_without_calling_child(tmp_path):
+    """R1-2/S#16 agent 側：指令 account/mode 與目前登入 scope 不符 → scope_mismatch，
+    不進 native、不落 outbox（best-effort 直送，非 durable——遺失靠重送自然收斂）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait(_place_msg("c1", account="OTHER"))
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert ack["ok"] is False and ack["error_kind"] == "scope_mismatch"
+    assert child.ops == []
+    assert buf.pending() == []
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_expired_command_rejected_without_calling_child(tmp_path):
+    """S#4：過期指令 → agent 拒執行回 expired，不進 native、不落 outbox。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "cancel", "cmd_id": "c1", "account": "F1", "mode": "sim",
+                            "expires_at": _PAST, "ordno": "101AA1"})
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert ack["ok"] is False and ack["error_kind"] == "expired"
+    assert child.ops == []
+    assert buf.pending() == []
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_expired_but_ledger_hit_still_resends_cached_ack_not_expired(tmp_path):
+    """S#4 關鍵順序：①先於③——已經真的執行過的指令，重送時就算附帶的 expires_at 已過期，
+    也不能被③攔下改判 expired（那會誤導 server 判 failed+release，但其實已執行過一次，
+    存檔 ack 才是唯一誠實的答案）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    msg = _place_msg("c1")
+    tr.incoming.put_nowait(msg)
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    first_ack = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    tr.incoming.put_nowait({"type": "report_ack", "event_id": first_ack["event_id"]})
+    await _until(lambda: buf.unsent_count() == 0)
+
+    expired_resend = dict(msg, expires_at=_PAST)
+    tr.incoming.put_nowait(expired_resend)
+    await _until(lambda: len([m for m in tr.sent if m.get("type") == "cmd_ack"]) >= 2)
+
+    assert len(child.ops) == 1  # 仍然沒有重打 native
+    second_ack = [m for m in tr.sent if m["type"] == "cmd_ack"][-1]
+    assert second_ack["ok"] is True and second_ack.get("error_kind") != "expired"
+    assert second_ack["result"]["ordno"] == "101AA1"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_update_scope_mismatch_and_expired_do_not_touch_child(tmp_path):
+    """S#21 agent 側：update 指令的 scope_mismatch／expired 分支同樣不碰 native。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    tr.incoming.put_nowait({"type": "update", "cmd_id": "u1", "account": "WRONG",
+                            "mode": "sim", "expires_at": _FAR_FUTURE,
+                            "ordno": "101AA1", "qty": 2})
+    await _until(lambda: any(m.get("type") == "cmd_ack" for m in tr.sent))
+    ack1 = next(m for m in tr.sent if m["type"] == "cmd_ack")
+    assert ack1["error_kind"] == "scope_mismatch"
+
+    tr.incoming.put_nowait({"type": "update", "cmd_id": "u2", "account": "F1", "mode": "sim",
+                            "expires_at": _PAST, "ordno": "101AA1", "qty": 2})
+    await _until(lambda: len([m for m in tr.sent if m.get("type") == "cmd_ack"]) >= 2)
+    ack2 = [m for m in tr.sent if m["type"] == "cmd_ack"][-1]
+    assert ack2["error_kind"] == "expired"
+    assert child.ops == []
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_pump_uses_row_stamped_account_over_session_account(tmp_path):
+    """I7 來源端蓋章：callback 落 outbox 當下已蓋的 account/mode 優先於 runner 目前
+    session 的帳號（同一 buffer 檔本受 assert_account tripwire 保護，這裡只驗證
+    _pump 的欄位來源優先序本身）。"""
+    tr, child, buf = _FakeTransport(), _FakeChild(), DurableBuffer(tmp_path / "o.db")
+    buf.append("deal_report", {"n": 1}, account="STAMPED", mode="sim")
+    r = _runner(tr, child, buf)
+    r.ensure_child()
+    task = asyncio.create_task(r.run_once())
+    await _until(lambda: len(tr.reports()) >= 1)
+    assert tr.reports()[0]["account"] == "STAMPED"
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)

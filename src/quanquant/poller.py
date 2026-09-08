@@ -42,6 +42,12 @@ class QuotePoller:
         self._freshness = FreshnessTracker()
 
     @property
+    def symbol(self) -> str:
+        """The single commodity this poller tracks (002：/quote 的 symbol-scoped 驗證
+        依此判斷所選商品是否有報價來源)。"""
+        return self._symbol
+
+    @property
     def last(self) -> FuturesSnapshot | None:
         """The most recent successful snapshot, for late-joining subscribers."""
         return self._last

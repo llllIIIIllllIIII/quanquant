@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-Hant-TW">
+<head>
+  <meta charset="utf-8">
+  <title>QuanQuant Agent 狀態</title>
+  {% if not stopped %}
+  <meta http-equiv="refresh" content="1;url=/status">
+  {% endif %}
+  <style>
+    body { font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", sans-serif; max-width: 36rem; margin: 3rem auto; padding: 0 1rem; }
+    dt { font-weight: 700; margin-top: 0.5rem; }
+    dd { margin-left: 0; margin-bottom: 0.25rem; }
+    .badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 0.25rem; background: #eee; }
+    .badge-connected { background: #d4f5d4; }
+    .badge-connecting, .badge-reconnecting { background: #fff3cd; }
+    .badge-offline, .badge-rejected { background: #eee; color: #666; }
+    .failstop-banner { background: #b00020; color: #fff; padding: 1rem; border-radius: 0.5rem; margin: 1rem 0; }
+    .failstop-banner h2 { margin-top: 0; }
+    .token-warning { color: #b06000; font-weight: 700; }
+    .banner { padding: 0.75rem 1rem; border-radius: 0.5rem; margin: 1rem 0; background: #eef; }
+    .banner-error { background: #ffe0e0; color: #b00020; }
+    section { margin: 1.5rem 0; padding-top: 1rem; border-top: 1px solid #ddd; }
+    button[disabled] { opacity: 0.5; cursor: not-allowed; }
+    .hint { color: #666; font-size: 0.85em; }
+    .user-code { font-size: 2rem; letter-spacing: 0.15em; font-weight: 700; }
+    .error { color: #b00020; }
+  </style>
+</head>
+<body>
+  <h1>Agent 狀態</h1>
+
+  {% if banner %}
+  <div class="banner {{ 'banner-error' if banner_error else '' }}">{{ banner }}</div>
+  {% endif %}
+
+  {% if snap.latched %}
+  <div class="failstop-banner">
+    <h2>⚠ FAIL-STOP：Agent 已停止下單／改單／刪單</h2>
+    <p>{{ snap.latch_detail }}</p>
+    <p>{{ failstop_guidance }}</p>
+  </div>
+  {% endif %}
+
+  <dl>
+    <dt>連線狀態</dt>
+    <dd><span class="badge badge-{{ snap.connection }}">{{ connection_label }}（{{ snap.connection }}）</span></dd>
+
+    <dt>模式</dt>
+    <dd>{{ snap.mode }}{% if snap.mode == "sim" %}（模擬單）{% endif %}</dd>
+
+    <dt>帳號</dt>
+    <dd>{{ snap.account or "（尚未登入）" }}</dd>
+
+    <dt>暫存箱（buffer）待送出</dt>
+    <dd>{{ snap.buffer_pending }} 筆</dd>
+
+    <dt>資料更新時間</dt>
+    <dd>{{ snap.updated_at }}{% if not stopped %}（本頁每 1 秒自動更新）{% endif %}</dd>
+
+    {% if token_expires_at %}
+    <dt>裝置授權到期</dt>
+    <dd class="{{ 'token-warning' if token_expiring_soon else '' }}">
+      {{ token_expires_at }}
+      {% if token_days_left is not none %}（剩餘 {{ token_days_left }} 天）{% endif %}
+      {% if token_expiring_soon %}——即將到期，請儘快重新授權{% endif %}
+    </dd>
+    {% endif %}
+  </dl>
+
+  <section>
+    <h2>重新授權</h2>
+    {% if reauth_in_progress %}
+      {% if reauth_user_code %}
+        <p>重新授權進行中：請在瀏覽器另開分頁（或使用手機）開啟核准頁，輸入以下代碼完成授權：</p>
+        <p class="user-code">{{ reauth_user_code }}</p>
+        <p><a href="{{ reauth_approval_url }}" target="_blank" rel="noopener noreferrer">開核准頁</a></p>
+        <p class="hint">等待核准中……（本頁每 1 秒自動更新）</p>
+      {% else %}
+        <p class="hint">正在與伺服器建立連線……</p>
+      {% endif %}
+    {% else %}
+      {% if reauth_success %}
+        <p class="hint">已重新授權，新的裝置授權已寫入本機憑證庫；請「停止 Agent」後重新啟動套用。</p>
+      {% elif reauth_error_message %}
+        <p class="error">{{ reauth_error_message }}</p>
+      {% endif %}
+      <form method="post" action="/status/reauth">
+        <label>
+          <input type="checkbox" name="remember_device" {% if remember_device_auth %}checked{% endif %}>
+          記住裝置授權
+        </label>
+        <p class="hint">勾選後按下方按鈕會立即重新進行一次裝置授權，核准後新的 token 會寫入本機憑證庫（套用仍需「停止 Agent」後重新啟動）；未勾選則只顯示重啟指引，不會預先取得 token。</p>
+        <button type="submit">重新授權</button>
+      </form>
+    {% endif %}
+  </section>
+
+  <section>
+    <h2>清除已存憑證／刪除 profile</h2>
+    <form method="post" action="/status/clear-credential?which=token">
+      <button type="submit">清除已存登入 token</button>
+    </form>
+    <form method="post" action="/status/clear-credential?which=broker">
+      <button type="submit">清除已存永豐 API 憑證</button>
+    </form>
+    <p class="hint">清除已存憑證只影響下次啟動，不影響目前這個正在執行的連線。刪除 profile 前會先確認暫存箱是否已全部送出，避免尚未送達的資料遺失。</p>
+    <form method="post" action="/status/delete-profile">
+      <button type="submit">刪除 profile（含已存憑證）</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>停止 Agent</h2>
+    <p class="hint">停止後會關閉與伺服器的連線並結束這個視窗；尚未送出的暫存箱資料下次啟動會自動補送。</p>
+    <form method="post" action="/status/stop">
+      <button type="submit">停止 Agent</button>
+    </form>
+  </section>
+</body>
+</html>

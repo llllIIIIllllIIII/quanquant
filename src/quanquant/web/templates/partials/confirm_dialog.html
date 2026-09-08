@@ -1,4 +1,18 @@
-<p>確認送出（正式環境，真實成交）：{{ symbol }} {{ '買' if side == 'Buy' else '賣' }} {{ qty }} 口 @ {{ price }}</p>
+{# 009（併 P1-15）：real 兩階段確認框明示「正式單」＋完整委託內容（商品/方向/口數/價格/
+   倉別）——警示紅（--down）不得用於 mode 識別，這裡用中性 .badge（無 .open 修飾），與
+   下單頁/sim 確認視窗的橘黃「模擬單」徽章視覺對比但不搶眼。
+
+   CRITICAL-1（fresh-context 終審修復）：MKT 委託的 price 恆為 0（_parse_order_price 送單
+   當下就定的），過去裸印 price 會出現「@ 0」——這正是 P1-15 點名要修的問題，且發生在
+   真錢送出前最後一道辨識畫面。改用 price_type 判斷顯示「市價」；price_type/order_type
+   早就有傳進 context（此前只進 hidden input，畫面上完全看不到），這裡一併顯示（格式同
+   委託表 order_type_badge：type・order_type・octype）。改用 Jinja 註解（不是 HTML
+   註解）——HTML 註解會原樣進到瀏覽器收到的原始碼裡，這段說明文字裡提到的「正式單」／
+   價格範例字串也會被以整頁原始文字比對的測試斷言掃到。 #}
+<p><span class="badge">正式單</span> 確認送出（真實成交，請核對以下內容）：</p>
+<p>{{ symbol }} {{ '買' if side == 'Buy' else '賣' }} {{ qty }} 口 @
+   {{ '市價' if price_type == 'MKT' else price | num }}
+   （{{ price_type }}・{{ order_type }}・{{ octype | octype_label }}）</p>
 <form {% if kind == 'place' %}hx-post="/orders" hx-swap="none"{% else %}hx-put="/orders/{{ broker_order_id }}" hx-target="this" hx-swap="outerHTML"{% endif %}>
   {% if kind == 'place' %}
   <input type="hidden" name="client_order_id" value="{{ client_order_id }}">

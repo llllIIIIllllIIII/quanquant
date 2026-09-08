@@ -1,22 +1,39 @@
+{# 006（委託頁搬家順修 P1-8/P1-9/P1-10）：
+   P1-8 補「委託時間」與「LMT/MKT・ROD/IOC/FOK・新倉/平倉」縮成一格的小標籤（order_type_badge）。
+   P1-9 狀態中文化（status_label），沿用既有 .badge 樣式延伸出 .badge-status。
+   P1-10 價格套 num filter（千分位）；MKT 委託未成交時顯示「市價」而非委託價恆為 0。
+   P1-11（table-wrap）由外層頁面包（orders_queue.html），本 partial 只負責表格本身。 #}
 <table>
-  <thead><tr><th>商品</th><th>方向</th><th class="numcell">口數</th><th class="numcell">價格</th><th>狀態</th><th class="numcell">成交</th><th>操作</th></tr></thead>
+  <thead>
+    <tr>
+      <th>時間</th><th>商品</th><th>方向</th><th class="numcell">口數</th><th class="numcell">價格</th>
+      <th>類型</th><th>狀態</th><th class="numcell">成交</th><th>操作</th>
+    </tr>
+  </thead>
   <tbody>
     {% if not orders %}
-    <tr class="empty"><td colspan="7">尚無委託紀錄。</td></tr>
+    <tr class="empty"><td colspan="9">尚無委託紀錄。</td></tr>
     {% endif %}
     {% for o in orders %}
     <tr id="order-{{ o.id }}">
+      <!-- 終審必修 HIGH-3：created_at 是 naive-UTC（db/models.py::_utcnow），`dt` filter
+           只 strftime、不轉時區——直接套用會裸印 UTC 時刻（跟成交頁的 `ms_dt` 差 8 小時）。
+           改用 `dt_cst`（同一套 CST 轉換管道，見 templating.py::_dt_cst）。 -->
+      <td>{{ o.created_at | dt_cst }}</td>
       <td>{{ o.symbol }}</td>
       <td><span class="dir {{ 'long' if o.action == 'Buy' else 'short' }}">{{ '買' if o.action == 'Buy' else '賣' }}</span></td>
       <td class="numcell">{{ o.qty }}</td>
       <td class="numcell">
         {%- if o.status in ("filled", "partfilled") and o.avg_fill_price is not none -%}
-        {{ o.avg_fill_price }}
+        {{ o.avg_fill_price | num }}
+        {%- elif o.price_type == "MKT" -%}
+        市價
         {%- else -%}
-        {{ o.price }}
+        {{ o.price | num }}
         {%- endif -%}
       </td>
-      <td>{{ o.status }}</td>
+      <td class="nowrap"><span class="badge">{{ o.price_type | order_type_badge(o.order_type, o.octype) }}</span></td>
+      <td><span class="badge badge-status-{{ o.status }}">{{ o.status | status_label }}</span></td>
       <td class="numcell">{{ o.filled_qty }}/{{ o.qty }}</td>
       <td class="nowrap">
         {% if o.status in ("submitted", "partfilled") and o.broker_order_id and o.mode == live_mode %}

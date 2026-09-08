@@ -1,11 +1,13 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
 from quanquant.candles.builder import CandleBuilder
 from quanquant.candles.market_calendar import (
     is_trading_day,
     is_trading_session,
+    resolve_market_status,
     session_anchor_date,
+    session_now,
 )
 from quanquant.candles import market_calendar
 from quanquant.config import get_settings
@@ -131,10 +133,6 @@ def test_parse_holidays_skips_malformed():
 
 
 # --- session_now / resolve_market_status ---
-
-from datetime import timedelta
-
-from quanquant.candles.market_calendar import resolve_market_status, session_now
 
 
 def test_session_now_normal_and_holiday():

@@ -4,6 +4,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, StrictBool, StrictStr
 from sqlmodel import Session, select
 
 from quanquant.auth import service
@@ -16,6 +17,27 @@ router = APIRouter()
 
 _MAX_STATE_BYTES = 256 * 1024
 _STATE_KINDS = ("indicators", "drawings")
+
+
+# LOW-4（fresh-context 終審修復）：三支 `PUT /api/user/*` 偏好端點改回同步 `def`（FastAPI
+# 丟 threadpool 執行，離開 event loop，比照本檔 candle 端點與 orders.py 的既有慣例——
+# 原本用 `async def` + `await request.json()` 手動解析，但 sync def 不能 await；改用
+# Pydantic body model 當參數（比照 web/routers/alerts.py::AlertCreate 的既有寫法），
+# FastAPI 會在呼叫這支 sync 函式之前就非同步解析好 body——JSON 格式錯誤時自動回 422，
+# 行為與原本手動 try/except 一致，不需要在函式體內再 await 任何東西。用 Strict* 型別
+# （不是裸 str/bool）：Pydantic v2 預設對 bool/str 會寬鬆轉型（如 "yes"/"1" 會被轉成
+# True），原本手寫的 `isinstance(x, bool)` 是嚴格型別檢查，換成 Pydantic model 若不強制
+# strict 會讓行為變寬鬆（`{"skip": "yes"}` 從原本 422 變成悄悄轉成 True 通過）。
+class _ColorSchemeBody(BaseModel):
+    scheme: StrictStr
+
+
+class _ThemeBody(BaseModel):
+    theme: StrictStr
+
+
+class _SkipSimConfirmBody(BaseModel):
+    skip: StrictBool
 
 
 def _validate_tf(tf: str) -> str:
@@ -126,33 +148,35 @@ async def put_chart_state(
 
 
 @router.put("/api/user/color-scheme")
-async def put_color_scheme(
-    request: Request,
+def put_color_scheme(
+    body: _ColorSchemeBody,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    scheme = body.get("scheme") if isinstance(body, dict) else None
-    if not isinstance(scheme, str) or not service.set_color_scheme(session, user, scheme):
+    if not service.set_color_scheme(session, user, body.scheme):
         raise HTTPException(status_code=422, detail="invalid color scheme")
     return Response(status_code=204)
 
 
 @router.put("/api/user/theme")
-async def put_theme(
-    request: Request,
+def put_theme(
+    body: _ThemeBody,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
 ):
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    theme = body.get("theme") if isinstance(body, dict) else None
-    if not isinstance(theme, str) or not service.set_theme(session, user, theme):
+    if not service.set_theme(session, user, body.theme):
         raise HTTPException(status_code=422, detail="invalid theme")
+    return Response(status_code=204)
+
+
+@router.put("/api/user/skip-sim-confirm")
+def put_skip_sim_confirm(
+    body: _SkipSimConfirmBody,
+    session: Session = Depends(get_session),
+    user: User = Depends(get_current_user),
+):
+    """007：sim 下單確認視窗「不再顯示」勾選時，即時（JS fire-and-forget，比照
+    QQTheme.toggle 的既有慣例）把偏好存回 User——跨裝置一致，不用 localStorage。"""
+    service.set_skip_sim_confirm(session, user, body.skip)
     return Response(status_code=204)
 

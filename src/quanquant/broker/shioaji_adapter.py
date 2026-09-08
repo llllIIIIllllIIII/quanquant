@@ -47,12 +47,13 @@ import logging
 import re
 from collections.abc import Callable
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Protocol
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session
 
-from quanquant.broker import repository as brepo
+from quanquant.broker import agent_commands, repository as brepo
 from quanquant.broker.base import (
     AgentCommandTimeoutError,
     AgentUnavailableError,
@@ -61,7 +62,12 @@ from quanquant.broker.base import (
     RiskError,
     TradeNotFoundError,
 )
-from quanquant.broker.inbox_worker import OrderReport, commit_raw_callback
+from quanquant.broker.inbox_worker import (
+    OrderReport,
+    RawInboxDeadLetterError,
+    commit_raw_callback,
+    stage_scoped_raw_inbox,
+)
 from quanquant.broker.native import ShioajiNativeClient
 from quanquant.broker.redaction import redact_secrets as _redact_secrets
 from quanquant.broker.supervisor import BrokerSupervisor
@@ -69,6 +75,34 @@ from quanquant.broker.types import Fill, Mode, OrderAck, OrderRequest, Position,
 from quanquant.db.models import Order
 
 log = logging.getLogger(__name__)
+
+# 台灣期貨交易成本（sim 成交 fee 缺值時的估算基準，2026-09-05 使用者拍板）：
+# fee ＝ 券商手續費（單邊每口，商品別由設定給）＋ 期交稅。期交稅是法定值：股價指數期貨
+# 稅率＝契約金額 × 10 萬分之 2（期貨交易稅條例），契約金額＝成交價 × 契約乘數，
+# 買賣各課一次、隨成交價浮動——所以不能用固定每口值，必須逐筆實算。
+# 契約乘數是 TAIFEX 契約規格（每點台幣值），不是商業參數，直接寫死。
+_CONTRACT_MULTIPLIER = {"TXF": Decimal(200), "MXF": Decimal(50), "TMF": Decimal(10)}
+_FUTURES_TAX_RATE = Decimal("0.00002")  # 股價指數期貨期交稅率（單邊）
+
+
+def parse_sim_commission_map(raw: str) -> dict[str, Decimal]:
+    """解析 `ORDER_SIM_COMMISSION_PER_LOT` 的 "TXF:50,MXF:25" 逗號映射（key 大寫化）。
+    空字串→{}；格式/數值錯誤 raise ValueError——在 lifespan 建構 adapter 當下就炸，
+    與 `Decimal(order_sim_fee_per_lot)` 對設定錯誤的既有處理等級一致。"""
+    result: dict[str, Decimal] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        sym, sep, val = part.partition(":")
+        if not sep or not sym.strip() or not val.strip():
+            raise ValueError(f"sim 手續費映射格式錯誤: {part!r}（應為 SYMBOL:金額）")
+        try:
+            result[sym.strip().upper()] = Decimal(val.strip())
+        except InvalidOperation as exc:
+            raise ValueError(f"sim 手續費映射金額不是合法數字: {part!r}") from exc
+    return result
+
 
 # 券商「明確拒絕」偵測（本次精進）：HTTP 慣例的 4xx 代表「請求已被伺服器端處理、且明確
 # 拒絕」（例如 400 Bad Request、401/403 認證/授權失敗、404 Not Found、406 Not Acceptable、
@@ -114,7 +148,16 @@ def _classify_place_failure(exc: Exception) -> str:
     # 保證 AgentCommandTimeoutError 一律 unknown（保留配額，留給 watchdog reconcile 決議）。
     if isinstance(exc, AgentCommandTimeoutError):
         return "unknown"
-    match = _BROKER_REJECT_CODE_RE.search(str(exc))
+    text = str(exc)
+    # SessionNotEstablished（券商 Solace/SolClient session 未建立就送單，2026-08 實測）：
+    # place_order 的請求因 session 建立不起來而**根本沒離開 SDK、沒送到券商**，與
+    # `AgentUnavailableError`/`code: 4xx` 同屬「確定沒送達券商」的安全 failed 訊號，可立即
+    # 標 failed 退配額（不必等 watchdog reconcile）。實測字串：`code: NotReady, ...
+    # sub_code: SubCode(SessionNotEstablished), error_str: "Unable to wait for session
+    # '(c0,s1)_sinopac' to be established"`。比對 sub_code 名（穩定、非秘密、不隨帳號變）。
+    if "SessionNotEstablished" in text:
+        return "failed"
+    match = _BROKER_REJECT_CODE_RE.search(text)
     if match is None:
         return "unknown"
     code = int(match.group(1))
@@ -131,11 +174,14 @@ _TradeNotFoundError = TradeNotFoundError
 
 
 class _RiskGuardLike(Protocol):
-    """Task 7 RiskGuard 的結構型別（避免對 Task 7 模組的 import-time 相依）。"""
+    """Task 7 RiskGuard 的結構型別（避免對 Task 7 模組的 import-time 相依）。
 
-    kill_switch: bool
+    D3（Inc1 兩層 kill switch）：`kill_switch: bool` 單一旗標改成 `blocked(user_id)`——
+    `_send_gate` 與 `check_place`/`check_update` 都改查這個，判定 = 全站總閘 OR 該
+    user 自己的個人急停。"""
 
     def assert_owner(self, actor_user_id: int) -> None: ...
+    def blocked(self, user_id: int) -> bool: ...
     def check_place(self, session: Session, req: OrderRequest, **kw) -> Order: ...
     def check_update(self, session: Session, order: Order, **kw) -> None: ...
 
@@ -148,12 +194,16 @@ class _NativeGatewayLike(Protocol):
 
     @property
     def ready(self) -> bool: ...
-    async def place(self, req: OrderRequest) -> dict: ...
-    async def cancel(self, ordno: str) -> None: ...
+    @property
+    def admission_ready(self) -> bool: ...
+    async def place(self, req: OrderRequest, *, cmd_id: str, expires_at: str | None = None) -> dict: ...
+    async def cancel(self, ordno: str, *, cmd_id: str, expires_at: str | None = None) -> None: ...
     async def update(
-        self, ordno: str, *, price, qty: int, price_type: str | None = None
+        self, ordno: str, *, price, qty: int, price_type: str | None = None, cmd_id: str,
+        expires_at: str | None = None,
     ) -> None: ...
     async def trades_snapshot(self, after): ...
+    async def query_qty(self, ordno: str) -> "int | None": ...
 
 
 class ShioajiAdapter:
@@ -172,9 +222,19 @@ class ShioajiAdapter:
         risk_guard: "_RiskGuardLike | None" = None,
         broker: str = "shioaji",
         sim_fee_per_lot: Decimal | None = None,
+        sim_commission_per_lot: dict[str, Decimal] | None = None,
         ops_alerter=None,
         remote_gateway: "_NativeGatewayLike | None" = None,
+        agent_user_id: int | None = None,
+        agent_command_expiry_seconds: int = agent_commands.DEFAULT_COMMAND_EXPIRY_SECONDS,
     ) -> None:
+        # Inc1 D5：這個 adapter instance「屬於誰」——in-process 與目前仍是單一共享 channel 的
+        # agent 模式一律不傳（None），callback/reconcile 落地的 RawInbox 蓋章 user_id=None，
+        # 行為與現行完全一致。Task 7 建 per-user `UserAgentSlot` 後，每個 slot 建構自己的
+        # adapter 時會傳 `agent_user_id=slot.user_id`，這個屬性才會真的生效——本 task 只負責
+        # 把這個 scope 一路傳進 commit_raw_callback/stage_scoped_raw_inbox，不改變任何現行呼叫端
+        # 的實際行為。
+        self._agent_user_id = agent_user_id
         self._api_key = api_key
         self._secret_key = secret_key
         self._ca_path = ca_path
@@ -192,12 +252,26 @@ class ShioajiAdapter:
         self._supervisor = supervisor
         self._risk_guard = risk_guard
         self._sim_fee_per_lot = sim_fee_per_lot  # A6：sim 成交 fee 缺值時依口數估算，不留 None/0
+        # 台灣實際成本模式（商品別券商手續費，單邊每口）：非 None 且商品可辨識時，
+        # sim fee ＝ (手續費 + 期交稅實算) × qty；None 或商品不在映射時退回 flat
+        # sim_fee_per_lot（既有行為，測試/舊部署不受影響）。
+        self._sim_commission_per_lot = sim_commission_per_lot
         self._ops = ops_alerter  # T0.3：營運告警（fire-and-forget、絕不 raise），純疊加
         # Task 6：三段切——None 時維持 in-process 行為零變化（原路徑）；非 None 時所有
         # native 呼叫（place/cancel/update/reconcile 的 trades_snapshot）改經這個 gateway
         # 下行，DB 決策/寫回/風控/冪等仍留在 adapter（server 端）不變。
         self._remote_gateway = remote_gateway
+        # Task 10：config.py `agent_command_expiry_seconds`（預設 120，唯一接線到 Settings
+        # 的權威來源，見該設定欄位註解）——`new_command(...)` 建 ledger 列時的
+        # `expires_at = created_at + 這個值`，取代 Task 8 的模組層常數字面值。
+        self._agent_command_expiry_seconds = agent_command_expiry_seconds
         self._fill_handler: Callable[[Fill], None] | None = None
+        # 事件喚醒（RawInboxWorker 從 idle_interval 純逾時輪詢改事件喚醒）：這個 adapter
+        # instance 構造當下還不知道之後會被哪個 RawInboxWorker 認領（app.py 兩個接線點都是
+        # adapter 先建、worker 後建，生命週期順序問題），故留一個可事後設定的 public 掛勾——
+        # 預設 None＝no-op，行為與現行完全一致；接線後（`adapter.raw_committed_hook =
+        # inbox_worker.request_wake`）`_persist_raw` commit 成功後才會呼叫。
+        self.raw_committed_hook: Callable[[], None] | None = None
         # Task 2 委派重構：所有直接碰 Shioaji SDK 的呼叫交給 native（`_api`/`_contract`/
         # `account` 三個 property 墊片委派讀寫 native 對應屬性，見下方）；`on_raw` 落地責任
         # 交回這個 adapter 的 `_persist_raw`（等價原本 `_on_order_cb` 直呼 commit_raw_callback
@@ -235,8 +309,21 @@ class ShioajiAdapter:
 
     def _persist_raw(self, kind: str, payload: dict) -> None:
         """`self._native` 的 `on_raw` callback：落地責任留在 adapter（DB/session 相依），
-        native 端零 DB 相依（見 native.py 模組頂部說明）。"""
-        commit_raw_callback(self._session_factory, kind=kind, broker=self.broker, payload=payload)
+        native 端零 DB 相依（見 native.py 模組頂部說明）。
+
+        Inc1 D5：在落地當下蓋章 `account=self.account, mode=self.mode`（事件產生瞬間的
+        immutable snapshot，S3 拆除的另一半——mapper 之後讀的是這個蓋章值，不是處理當下可能
+        已經被換帳號覆寫過的 `self.account`）；`user_id=self._agent_user_id`——in-process 與
+        目前仍未拆分的 agent 單例模式一律是 None，行為與現行完全一致。
+
+        事件喚醒：`on_committed=self.raw_committed_hook` 一路傳進 `commit_raw_callback`——
+        commit 成功後才可能觸發，未接線時是 None（no-op），行為與現行完全一致（見
+        `raw_committed_hook` 欄位註解／`commit_raw_callback` docstring）。"""
+        commit_raw_callback(
+            self._session_factory, kind=kind, broker=self.broker, payload=payload,
+            user_id=self._agent_user_id, account=self.account, mode=self.mode,
+            ops_alerter=self._ops, on_committed=self.raw_committed_hook,
+        )
 
     # ---- T0.3 營運告警（純疊加，絕不反噬既有 fail-closed/冪等/redaction 行為） ----
 
@@ -374,12 +461,24 @@ class ShioajiAdapter:
         """Task 6/8 依賴：把 native 端 `trades_snapshot()` 篩出的委託進展 payload 落地
         RawInbox + 推進 cursor（沿用原 `_reconcile_blocking` L326-333 的呼叫寫法與
         `newest is None` 時的 `_utcnow_naive()` fallback——`payloads` 非空時一律推進 cursor，
-        不留下「有新委託進展卻沒有記錄任何 cursor」的半殘狀態，行為與重構前完全一致）。"""
+        不留下「有新委託進展卻沒有記錄任何 cursor」的半殘狀態，行為與重構前完全一致）。
+
+        Inc1 D5（R1-6）：改走 `stage_scoped_raw_inbox`（唯一 scoped staging 邏輯，不是直接呼叫
+        `repository.stage_raw_inbox`），每筆 payload 都蓋章 `user_id=self._agent_user_id`（目前
+        單例模式下恆為 None，Task 7 per-slot adapter 才會帶真正的 user_id）、
+        `account=self.account`、`mode=self.mode`；整批落列與 cursor 推進**必須同一交易**——
+        中途任何一筆失敗（例如 DB 短暫故障）都要讓已落地的列與 cursor 推進一起回滾，不留下
+        「列已落地但 cursor 沒推進」或反過來的半殘狀態（同一個 `with ... as session:` 區塊、
+        直到最後才 `session.commit()` 一次，中途 raise 就整段不 commit，見呼叫端測試 S#18）。"""
         if not payloads:
             return 0
         with self._session_factory() as session:
             for p in payloads:
-                brepo.stage_raw_inbox(session, kind="order_report", broker=self.broker, payload=json.dumps(p))
+                stage_scoped_raw_inbox(
+                    session, kind="order_report", broker=self.broker, payload=json.dumps(p),
+                    user_id=self._agent_user_id, account=self.account, mode=self.mode,
+                    ops_alerter=self._ops,
+                )
             brepo.upsert_reconcile_cursor(
                 session, broker=self.broker, account=self.account, mode=self.mode,
                 at=newest if newest is not None else _utcnow_naive(),
@@ -418,18 +517,25 @@ class ShioajiAdapter:
 
     # ---- send gate（V3-2，鎖內、native 呼叫前的最後線性化點） ----
 
-    async def _send_gate(self) -> None:
+    async def _send_gate(self, user_id: int) -> None:
+        """D3：`user_id` 是這筆指令的 actor（呼叫端一律傳 place/update 當下的
+        `actor_user_id`，adapter 綁定的 owner 身分不再是唯一判準）——kill switch 判定
+        改查 `blocked(user_id)` = 全站總閘 OR 該 user 自己的個人急停。"""
         if self._remote_gateway is not None:
             # Task 6：remote 模式下「session 是否就緒」的問法變成「gateway 是否連線」——
             # 未連線視同 AgentUnavailableError（保證這筆委託沒有離開本機/送達券商，
             # `_classify_place_failure` 會判 failed 並安全退配額），語意對齊 native 模式
             # `_api is None` 那支「下單 session 尚未就緒」的 fail-fast，但用 agent 自己的
             # 例外型別，讓呼叫端的失敗分類邏輯自然落到既有 failed 分支，不必額外特判。
-            if not self._remote_gateway.ready:
+            # C2（HIGH，codex 終審）：這裡是 place/update 唯一會建新 DB 決策列的送單前
+            # 最後守門（_send_gate 只給 place/update 呼叫，cancel 不經這裡）——改查
+            # `admission_ready`（pending_health/failstop/lease 過期三態下皆 False），不再
+            # 用寬鬆的 `ready`（那個定義留給 reconcile/query_qty 等唯讀背景動作）。
+            if not self._remote_gateway.admission_ready:
                 raise AgentUnavailableError("agent 未連線或未登入")
         elif self._api is None:
             raise OrderError("下單 session 尚未就緒")
-        if self._risk_guard is not None and self._risk_guard.kill_switch:
+        if self._risk_guard is not None and self._risk_guard.blocked(user_id):
             raise RiskError("kill switch 已啟動，拒絕送出")
 
     # ---- place ----
@@ -460,8 +566,11 @@ class ShioajiAdapter:
             # 保證在跨網路後被削弱）。搬到這裡之後：existing 命中（無論 gateway 狀態）一律
             # 走上面冪等分支；只有「查無既有列、確定要建新委託」時才檢查 gateway 是否就緒，
             # 且仍在任何 `session.commit()` 之前，維持「連 Order/配額列都不建」的原始保證
-            # （行為矩陣「gateway.ready=False（place 進入時）」一列不變）。
-            if self._remote_gateway is not None and not self._remote_gateway.ready:
+            # （行為矩陣「gateway.ready=False（place 進入時）」一列不變）。C2（HIGH，codex
+            # 終審）：改查 `admission_ready`——pending_health/failstop/lease 過期三態下也
+            # 要在這裡 fail-fast，不得漏到下面才被 `_send_gate` 擋（那時 Order/reservation/
+            # ledger 已經建好，`_send_gate` 擋下後還要走例外分支釋放，不如在這裡就不建）。
+            if self._remote_gateway is not None and not self._remote_gateway.admission_ready:
                 raise OrderError("agent 未連線，無法下單")
 
             if self._risk_guard is not None:
@@ -469,6 +578,10 @@ class ShioajiAdapter:
                     session, req, actor_user_id=actor_user_id, mode=self.mode, broker=self.broker,
                     account=self.account, request_hash=request_hash, confirm_token=confirm_token,
                 )
+                # Task 8 已知落差（見 agent_commands.py 模組頂部說明）：check_place 內部已
+                # 自行 commit，故下面的 ledger insert 不是「同一次 SQL commit」，而是緊接著、
+                # 中間無任何 await/IO 的獨立小交易——與 spec D4「送單前持久化與決策段同一
+                # 交易」的字面要求有落差，殘留窗口只在純同步 Python 賦值間（行程崩潰）。
             else:
                 trading_day = brepo.trading_day_for(int(_now_ms()))
                 order = brepo.create_order(
@@ -478,17 +591,55 @@ class ShioajiAdapter:
                     price_type=req.price_type, order_type=req.order_type, octype=req.octype,
                     trading_day=trading_day,
                 )
-                session.commit()
+                # 尚未 commit：若 remote_gateway 存在，ledger insert 併入下面同一次 commit
+                # （這個分支因此是真正的「同一交易」，見上方 risk_guard 分支的落差說明）。
+
+            order_id, client_order_id = order.id, order.client_order_id
+
+            # Inc1 D4（G1）：agent 模式送前持久化——建立這筆 place 指令的 ledger 列，
+            # `reservation_id` 用 client_order_id（與 RiskGuard.check_place 建立保留列的
+            # 同一把鍵），scope（broker/account/mode）取自這個 slot 綁定的帳號並凍結。
+            # ledger `user_id` 優先取這個 adapter 綁定的 slot owner（`self._agent_user_id`，
+            # D1 per-user slot 的真正權威來源——UpCmdAck 的 CAS 帶的正是連線認證身分）；
+            # 未設定時（測試用單一 adapter 服務多個 actor 的舊寫法、或尚未接 registry 的
+            # 呼叫端）退回 `actor_user_id`，兩者在真正的 per-slot 部署下恆相等。
+            cmd_id: str | None = None
+            if self._remote_gateway is not None:
+                ledger_user_id = (
+                    self._agent_user_id if self._agent_user_id is not None else actor_user_id
+                )
+                cmd = agent_commands.new_command(
+                    kind="place", user_id=ledger_user_id, broker=self.broker,
+                    account=self.account, mode=self.mode, client_order_id=client_order_id,
+                    reservation_id=client_order_id,
+                    payload={"action": req.action, "price": str(req.price), "qty": req.qty,
+                             "price_type": req.price_type, "order_type": req.order_type,
+                             "octype": req.octype},
+                    expiry_seconds=self._agent_command_expiry_seconds,
+                )
+                agent_commands.insert_command(session, cmd=cmd)
+                # C9：在這個 session 仍存活的當下就把 `expires_at` 讀成純字串——`cmd` 是
+                # ORM 物件，`session.commit()`（下一行）預設 `expire_on_commit=True` 會讓
+                # 它的屬性全部過期，`_do_place()` 是之後才在 `_supervisor.run()` 裡執行
+                # （這個 `with session:` 區塊早已結束/session 已關閉），屆時再讀
+                # `cmd.expires_at` 會觸發對已關閉 session 的 lazy refresh 而炸
+                # `DetachedInstanceError`。純字串沒有這個問題，可以安全跨到閉包裡用。
+                cmd_id = cmd.cmd_id
+                cmd_expires_at = cmd.expires_at.isoformat()
+            session.commit()
             # callback-before-ack：Order 此刻已 commit（client_order_id→user_id/mode 就位，
             # ordno/broker_order_id 仍是 NULL 佔位），即使成交回報早於下面的 native 呼叫完成，
             # RawInboxWorker 之後仍能靠 ordno/broker_order_id 補齊後解析到這筆委託。
-            order_id, client_order_id = order.id, order.client_order_id
 
         async def _do_place():
             try:
-                await self._send_gate()
+                await self._send_gate(actor_user_id)
                 if self._remote_gateway is not None:
-                    return await self._remote_gateway.place(req)
+                    # C9：`expires_at` 傳這筆指令在 ledger 建立當下凍結的值（上面已讀成
+                    # 純字串 `cmd_expires_at`），不讓 gateway 自己另外重算。
+                    return await self._remote_gateway.place(
+                        req, cmd_id=cmd_id, expires_at=cmd_expires_at
+                    )
                 return await asyncio.to_thread(self._place_blocking, req)
             except RiskError:
                 # send gate 擋下（如 kill switch）：確定沒送出，直接標 failed，不留在
@@ -498,43 +649,105 @@ class ShioajiAdapter:
                 # 的呼叫端冪等鍵慣例）；沒有 risk_guard 時本來就沒有保留列可退。
                 with self._session_factory() as fail_session:
                     fail_order = fail_session.get(Order, order_id)
-                    brepo.mark_order_status(fail_session, fail_order, status="failed")
-                    if self._risk_guard is not None:
-                        brepo.release_quota(fail_session, reservation_id=req.client_order_id)
+                    reservation = req.client_order_id if self._risk_guard is not None else None
+                    agent_commands.apply_place_failure(
+                        fail_session, fail_order, reservation_id=reservation, status="failed"
+                    )
+                    if self._remote_gateway is not None and cmd_id is not None:
+                        # Task 8：這筆指令從未送達 agent（第二層 kill switch 檢查落空）——
+                        # 不會有任何 ack 到來，route 本地終結 ledger（見 resolve_never_dispatched
+                        # docstring）。
+                        agent_commands.resolve_never_dispatched(
+                            fail_session, cmd_id=cmd_id, message="kill switch 已啟動（第二層檢查）"
+                        )
                     fail_session.commit()
                 raise
+            except AgentUnavailableError as exc:
+                # Task 8：同 RiskError 分支——`_send_gate`/`AgentChannel.request` 自己的
+                # ready 檢查落空，這筆指令從未送達 agent，往後也不會有任何 ack，route 必須
+                # 本地終結（分類固定為 "failed"，同既有 `_classify_place_failure` 語意）。
+                with self._session_factory() as fail_session:
+                    fail_order = fail_session.get(Order, order_id)
+                    reservation = req.client_order_id if self._risk_guard is not None else None
+                    agent_commands.apply_place_failure(
+                        fail_session, fail_order, reservation_id=reservation, status="failed"
+                    )
+                    if self._remote_gateway is not None and cmd_id is not None:
+                        agent_commands.resolve_never_dispatched(
+                            fail_session, cmd_id=cmd_id, message=str(exc)
+                        )
+                    fail_session.commit()
+                self._alert_place_failed(
+                    client_order_id=client_order_id, action=req.action, qty=req.qty,
+                    classification="failed", exc=exc,
+                )
+                raise
+            except AgentCommandTimeoutError as exc:
+                # Task 8（D4 route 逾時路徑，修正 round 1）：這個例外型別實際對映
+                # `agent_channel.py` 至少 4 個觸發點，不是原先誤寫的「兩種情境」——
+                # ①`AgentChannel.request` 的 `await self._send(cmd)` 送出失敗（socket 已壞，
+                # 可能已部分送出）；②`asyncio.wait_for(fut, timeout)` 真的等不到 ack；
+                # ③`AgentChannel.detach()` 連線中斷時對所有 pending future `set_exception`
+                # （斷線，不是逾時但同型別）；④ agent 已經回了一則 `error_kind="timeout"` 的
+                # ack（agent 自己的子程序無回應，`_unwrap` 轉出）。`_unwrap`/呼叫端對這 4 種
+                # 情境目前一律 raise 出同一個型別，無法從型別本身分辨。`mark_timeout_observed`
+                # 的 CAS 才是真正分辨依據：True＝①/②/③（這個 cmd 從未收到任何 ack，可放心走
+                # 既有 unknown fail-safe）；False＝④（ack 已經透過 `apply_command_ack` 在別的
+                # 交易完整落地過），這裡必須完全不寫 Order/quota，讓已落庫的結果（不論
+                # ok/error/unknown）保持原樣（S#15/R1-1：Order 不得被逾時路徑改回 unknown）。
+                won = True
+                if self._remote_gateway is not None and cmd_id is not None:
+                    with self._session_factory() as fail_session:
+                        won = agent_commands.mark_timeout_observed(fail_session, cmd_id=cmd_id)
+                        if won:
+                            fail_order = fail_session.get(Order, order_id)
+                            agent_commands.apply_place_failure(
+                                fail_session, fail_order, reservation_id=None, status="unknown"
+                            )
+                        fail_session.commit()
+                else:
+                    with self._session_factory() as fail_session:
+                        fail_order = fail_session.get(Order, order_id)
+                        agent_commands.apply_place_failure(
+                            fail_session, fail_order, reservation_id=None, status="unknown"
+                        )
+                        fail_session.commit()
+                self._alert_place_failed(
+                    client_order_id=client_order_id, action=req.action, qty=req.qty,
+                    classification="unknown", exc=exc,
+                )
+                raise
             except Exception as exc:
+                if self._remote_gateway is not None and isinstance(exc, OrderError):
+                    # Task 8：其餘 ack 衍生的例外（`TradeNotFoundError`/一般 `OrderError`，
+                    # 對映 agent 明確拒絕的 error_kind：trade_not_found/exception/
+                    # mode_mismatch/expired/scope_mismatch）——`apply_command_ack` 已經在
+                    # `channel.request()` 的 future resolve **之前**完整 commit 過 Order/quota
+                    # 效果（agent_ws.py 的 UpCmdAck handler 保證順序），route 不得重新分類、
+                    # 不得重寫，原樣 re-raise 讓呼叫端得到「已失敗」的訊號即可。
+                    raise
                 # 本次精進：先分類這個例外是否為「券商明確拒絕」（確定沒送出）——
                 # 是的話比照 RiskError 分支立即標 failed + 釋放配額，不必等 watchdog
                 # reconcile；分類不出來（逾時/連線中斷/無法辨識）一律維持原本 unknown
                 # fail-safe（round3 #4：不得擅自 release，否則若其實已送達會讓配額被
-                # 誤退還、變相突破日限）。見 `_classify_place_failure` docstring。
+                # 誤退還、變相突破日限）。見 `_classify_place_failure` docstring。此分支
+                # in-process 模式仍會走到（remote 模式的已知例外型別皆已被上面攔截）。
                 classification = _classify_place_failure(exc)
                 with self._session_factory() as fail_session:
                     fail_order = fail_session.get(Order, order_id)
-                    if classification == "failed":
-                        brepo.mark_order_status(fail_session, fail_order, status="failed")
-                        if self._risk_guard is not None:
-                            brepo.release_quota(fail_session, reservation_id=req.client_order_id)
-                    else:
-                        brepo.mark_order_status(fail_session, fail_order, status="unknown")
+                    status = "failed" if classification == "failed" else "unknown"
+                    reservation = (
+                        req.client_order_id
+                        if (self._risk_guard is not None and status == "failed") else None
+                    )
+                    agent_commands.apply_place_failure(
+                        fail_session, fail_order, reservation_id=reservation, status=status
+                    )
                     fail_session.commit()
-                # T0.3 告警（純疊加）：failed/unknown 兩條路都通知；RiskError（send gate/kill
-                # switch 攔截）在上面的 except RiskError 分支就已返回，不會走到這裡——那是預期
-                # 中的風控攔截、非券商失敗，不發 place_failed。
                 self._alert_place_failed(
                     client_order_id=client_order_id, action=req.action, qty=req.qty,
                     classification=classification, exc=exc,
                 )
-                if isinstance(exc, (AgentUnavailableError, AgentCommandTimeoutError)):
-                    # Task 6：remote gateway 專屬例外——DB 決策（上面 failed+release /
-                    # unknown 兩支）已完成，這裡比照上方 `except RiskError: ... raise` 的
-                    # 既有慣例，原樣 re-raise 保留型別，讓呼叫端（watchdog/路由）能用
-                    # isinstance 分辨「agent 未連線」vs「逾時未 ack」兩種不同的重試/告警
-                    # 策略，不強塞進通用 OrderError 訊息裡。in-process 原生失敗（無論是否
-                    # 本身已是 OrderError，如 native 找不到月合約）維持包成新 OrderError 的
-                    # 既有行為，不受這裡影響。
-                    raise
                 if classification == "failed":
                     raise OrderError(
                         f"送單遭券商明確拒絕，委託標記 failed 並已釋放配額："
@@ -548,13 +761,17 @@ class ShioajiAdapter:
         ack_fields = await self._supervisor.run(_do_place)
 
         with self._session_factory() as session:
-            brepo.set_order_ack(
-                session, order_id, broker_order_id=ack_fields["broker_order_id"],
-                ordno=ack_fields["ordno"], status="submitted",
+            order = session.get(Order, order_id)
+            reservation = req.client_order_id if self._risk_guard is not None else None
+            # Task 8：agent 模式下 `apply_command_ack` 多半已經在 `channel.request()` resolve
+            # 之前寫過這筆效果——這裡的呼叫因此常是安全的重複覆寫（`set_order_ack` 寫入相同
+            # 值、`confirm_quota` 的 CAS 對已 confirmed 的列是 no-op），保留呼叫是為了兩件事
+            # 仍然成立：in-process 模式（唯一寫入者，行為零改動）與這裡本身（route 讀
+            # `ack_fields` 建構回傳值，不需要另外查 DB）。
+            agent_commands.apply_place_ack(
+                session, order, ordno=ack_fields["ordno"],
+                broker_order_id=ack_fields["broker_order_id"], reservation_id=reservation,
             )
-            if self._risk_guard is not None:
-                # 送出成功 → 這筆保留的配額永久計入今日已用（round3 #4 收尾）。
-                brepo.confirm_quota(session, reservation_id=req.client_order_id)
             session.commit()
         return OrderAck(
             client_order_id=client_order_id, broker_order_id=ack_fields["broker_order_id"],
@@ -596,15 +813,66 @@ class ShioajiAdapter:
                 raise AuthorizationError("非委託所有人不得取消")
             order_id, ordno, client_order_id = order.id, order.ordno, order.client_order_id
 
+            # N3（MEDIUM，codex 終審 round2）：cancel 的 ledger insert 前加嚴格 readiness
+            # fail-fast——舊版完全沒查 admission_ready 就建 ledger 列，`_do_cancel` 只查寬鬆
+            # 的 `ready`（連線存活＋已登入，不含健康狀態），pending_health/failstop/lease
+            # 過期三態下仍會建出一筆從一開始就注定被拒絕的 AgentCommand（且送到 gateway 的
+            # wire call 才在 `_do_cancel` 被擋下，比 place/update 的「不建任何 DB 決策列」
+            # 慢了一拍）。這裡改與 place()/update() 的 offline fail-fast 同一位置慣例——
+            # `admission_ready` 為 False 就直接拒絕、連 ledger 都不建。**注意**：這裡擋的是
+            # 連線健康狀態，不是 kill switch——cancel 不受 kill switch 影響的既有語意
+            # （spec 明文）完全不動，`_send_gate`（kill switch 檢查的唯一位置）本就不會被
+            # cancel 呼叫。
+            if self._remote_gateway is not None and not self._remote_gateway.admission_ready:
+                raise OrderError("agent 未連線，無法取消")
+
+            # Inc1 D4（G1）：agent 模式送前持久化——cancel 無 quota 效果，`reservation_id`
+            # 留 None（D4 轉移表：cancel 一律「無」quota 效果）。cancel 決策段本身不像
+            # place/update 那樣有 risk_guard 內部 commit 的落差，這裡是真正「同一交易」。
+            cmd_id: str | None = None
+            if self._remote_gateway is not None:
+                ledger_user_id = (
+                    self._agent_user_id if self._agent_user_id is not None else actor_user_id
+                )
+                cmd = agent_commands.new_command(
+                    kind="cancel", user_id=ledger_user_id, broker=self.broker,
+                    account=self.account, mode=self.mode, client_order_id=client_order_id,
+                    ordno=ordno, payload={"ordno": ordno},
+                    expiry_seconds=self._agent_command_expiry_seconds,
+                )
+                agent_commands.insert_command(session, cmd=cmd)
+                cmd_id = cmd.cmd_id
+                # C9：見 place() 同名變數說明——趁 session 還活著讀成純字串，避免
+                # `session.commit()`（下一行，`expire_on_commit=True`）之後、`_do_cancel()`
+                # 才讀 `cmd.expires_at` 觸發對已關閉 session 的 lazy refresh 而炸。
+                cmd_expires_at = cmd.expires_at.isoformat()
+                session.commit()
+
         async def _do_cancel() -> None:
             # kill switch 不擋取消單（spec 明文：取消單仍允許），仍檢查 session/gateway 就緒
             # （Task 6：remote 模式下用 gateway.ready 取代 `_api is None`，同 `_send_gate`
             # 的 remote/in-process 分流方式，但取消單本身不經過 `_classify_place_failure`/
             # release_quota 那條路——這裡刻意用 OrderError 而非 AgentUnavailableError）。
+            # N3（MEDIUM，codex 終審 round2）：改查嚴格的 `admission_ready`（同上面 ledger
+            # insert 前那道 fail-fast 用同一個判準）——舊版查寬鬆的 `ready`（連線存活＋已
+            # 登入，不含健康狀態），pending_health/failstop/lease 過期三態下 `ready` 仍可能
+            # 是 True，讓這第二層縱深防禦形同虛設。與上面 ledger insert 前的檢查同屬一次
+            # cancel 呼叫內的縱深防禦（第一層擋大多數情境、不建 ledger；這裡是鎖內、native
+            # 呼叫前的最後防線，擋「ledger 建立後、native 呼叫前才轉為不健康」的窗口）——
+            # 依然不是 kill switch，取消不受 kill switch 影響的語意不變。
+            # Task 8：cancel 的 D4 轉移表除了 ok 以外一律「不改 Order」——不論是 agent
+            # 明確拒絕（ack 衍生例外，已由 applier 處理）、逾時、還是這裡「從未送達 agent」
+            # 的 offline 例外，都不需要 route 自己做任何本地 Order/ledger 寫回，例外原樣
+            # 傳播即可（cancel 本就沒有 quota 效果，也不像 place/update 有「從未送達」窗口
+            # 需要解 ledger——即使 ledger 永遠 unresolved，也只是不會被重連補送機制撿走
+            # 重播，語意仍安全：cancel 意圖本就該在下次重連時重新嘗試，見 spec D4）。
             if self._remote_gateway is not None:
-                if not self._remote_gateway.ready:
+                if not self._remote_gateway.admission_ready:
                     raise OrderError("agent 未連線")
-                await self._remote_gateway.cancel(ordno)
+                # C9：`expires_at` 傳 ledger 建立當下凍結的值（見 place() 同名參數說明）。
+                await self._remote_gateway.cancel(
+                    ordno, cmd_id=cmd_id, expires_at=cmd_expires_at
+                )
                 return
             if self._api is None:
                 raise OrderError("下單 session 尚未就緒")
@@ -614,7 +882,7 @@ class ShioajiAdapter:
 
         with self._session_factory() as session:
             order = session.get(Order, order_id)
-            brepo.mark_order_status(session, order, status="cancelled")
+            agent_commands.apply_cancel_ack(session, order)
             session.commit()
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="cancelled")
 
@@ -648,6 +916,29 @@ class ShioajiAdapter:
             )
             if order is None:
                 raise OrderError(f"找不到委託 broker_order_id={broker_order_id!r}")
+            # Inc1 D4/R6-1（Task 10）：update admission——這張委託尚未取得券商流水號
+            # （`ordno`）就拒絕改單，且必須排在建立 reservation/ledger 之前（不進 DB 決策段、
+            # 不留任何殘影）。理由：① `DownUpdate` 協定的 `ordno` 是非空必填欄位（見
+            # agent_protocol.py），沒有 ordno 根本組不出合法的下行指令；② 沒有 ordno 代表這張
+            # 單尚未被券商確認承接（place 還在 unknown/等 ack 的中間態），改單語意上不成立。
+            # 與下面的 offline fail-fast 同一位置慣例（比照 place() 冪等 miss 之後、
+            # check_place 之前的既有寫法）；in-process 模式同樣適用——沒有 ordno 就沒有對象
+            # 可改，不限 remote_gateway 存在與否。
+            if order.ordno is None:
+                raise OrderError(
+                    f"委託尚未取得券商流水號（ordno），無法改單：broker_order_id={broker_order_id!r}"
+                )
+            # Inc1 D9：offline fail-fast——`check_update` 若判定口數增加會建立 delta
+            # QuotaReservation（DB 決策段的一部分），這筆保留在改單真的送不出去時還得靠
+            # `_send_gate`/`_do_update` 的例外分支釋放；搬到這裡、`check_update` 之前，
+            # 與 `place()` 的既有寫法（冪等查找 miss 之後、`check_place` 之前）同一位置語意——
+            # agent 未連線時直接拒絕，連保留列都不建立，不進 DB 決策段（比照 spec D9「offline
+            # 擋新單」）。`_send_gate` 內仍保留同一判定作為縱深防禦第二層（若在這個檢查通過
+            # 後、native 呼叫前才斷線，那裡的 unavailable→failed＋退配額語意不變）。C2
+            # （HIGH，codex 終審）：改查 `admission_ready`——pending_health/failstop/lease
+            # 過期三態下也要在這裡 fail-fast，不建 delta reservation。
+            if self._remote_gateway is not None and not self._remote_gateway.admission_ready:
+                raise OrderError("agent 未連線，無法改單")
             new_price = price if price is not None else order.price
             new_qty = qty if qty is not None else order.qty
             request_hash = canonical_payload_hash(
@@ -666,19 +957,74 @@ class ShioajiAdapter:
             action = order.action  # 供 T0.3 place_failed 告警用（session 關閉後不再讀 detached order）
             price_type = order.price_type  # 改單不能改變 price_type，送出前判斷 MKT 用既有值
 
-        # round3 #4/#11 收尾：這次改單「若有」保留的 delta 配額（RiskGuard.check_update 只在
-        # new_qty 較原本增加時才會建立這列，見 repository.reservation_id_for_update），送出
-        # 成功/失敗後在這裡 confirm/release；沒有 risk_guard 就沒有保留列，不猜測呼叫。
-        reservation_id = (
-            brepo.reservation_id_for_update(client_order_id=client_order_id, request_hash=request_hash)
-            if self._risk_guard is not None else None
-        )
+            # round3 #4/#11 收尾：這次改單「若有」保留的 delta 配額（RiskGuard.check_update
+            # 只在 new_qty 較原本增加時才會建立這列，見 repository.reservation_id_for_update），
+            # 送出成功/失敗後在這裡 confirm/release；沒有 risk_guard 就沒有保留列，不猜測呼叫。
+            # Task 8：搬到 `with` 區塊內（原本在區塊外），讓下面的 ledger insert 能引用
+            # 同一個 reservation_id——兩者都只依賴 client_order_id/request_hash，純函式計算，
+            # 搬動不改變既有結果。
+            reservation_id = (
+                brepo.reservation_id_for_update(client_order_id=client_order_id, request_hash=request_hash)
+                if self._risk_guard is not None else None
+            )
+
+            # Inc1 D4（G1）：agent 模式送前持久化。R5-2/R6-1 update 單飛靠 DB partial unique
+            # index（`uq_agent_cmd_update_singleflight`，Task 1 已建）——若這個 Order 已有其他
+            # 未 resolved 的 update ledger 列，這裡的 insert 會撞唯一鍵，走 IntegrityError
+            # 分支轉成「前一筆改單結果未定」（codex R6-3：先確認撞的正是這個 index 再轉友善
+            # 訊息，其餘 IntegrityError 原樣拋出）。
+            cmd_id: str | None = None
+            if self._remote_gateway is not None:
+                ledger_user_id = (
+                    self._agent_user_id if self._agent_user_id is not None else actor_user_id
+                )
+                cmd = agent_commands.new_command(
+                    kind="update", user_id=ledger_user_id, broker=self.broker,
+                    account=self.account, mode=self.mode, client_order_id=client_order_id,
+                    ordno=ordno, reservation_id=reservation_id,
+                    payload={"price": (str(new_price) if new_price is not None else None),
+                             "qty": new_qty, "price_type": price_type},
+                    expiry_seconds=self._agent_command_expiry_seconds,
+                )
+                try:
+                    agent_commands.insert_command(session, cmd=cmd)
+                    session.commit()
+                except IntegrityError:
+                    session.rollback()
+                    if brepo.has_unresolved_update_command(session, client_order_id=client_order_id):
+                        # C8（MEDIUM，codex 終審）：撞單飛鍵——這次嘗試在 `check_update`
+                        # 階段（若 delta>0）已經 reserve 並 commit 過一筆 delta
+                        # QuotaReservation（見模組頂部「已知落差」說明：check_update 內部
+                        # 自行 commit，早於這裡的 ledger insert 撞鍵，回滾救不回它）。撞鍵
+                        # 代表這筆 ledger 從未真正落地送出，若不清理會永久孤兒佔用配額——
+                        # 這是「正常請求可確定觸發」的路徑（兩個併發改單就會踩到），不是
+                        # crash 才會發生的窄窗。只在這次的 reservation_id 未被贏家（現存
+                        # unresolved 的 update ledger 列）引用時才釋放：
+                        # `reservation_id_for_update` 是 client_order_id+request_hash 的
+                        # 確定性推導，相同內容重送會得到同一個 reservation_id——這種情況
+                        # release 會誤傷贏家仍在使用中的保留列，必須跳過。
+                        if reservation_id is not None:
+                            winner_reservation_id = brepo.unresolved_update_reservation_id(
+                                session, client_order_id=client_order_id
+                            )
+                            if winner_reservation_id != reservation_id:
+                                brepo.release_quota(session, reservation_id=reservation_id)
+                                session.commit()
+                        raise OrderError("前一筆改單結果未定，請稍候或確認前次改單狀態") from None
+                    raise
+                cmd_id = cmd.cmd_id
+                # C9：見 place() 同名變數說明——趁 session 還活著（`with` 區塊尚未結束）讀成
+                # 純字串，避免 `_do_update()`（`with` 區塊結束、session 已關閉之後才執行）
+                # 再讀 `cmd.expires_at` 觸發對已關閉 session 的 lazy refresh 而炸。
+                cmd_expires_at = cmd.expires_at.isoformat()
 
         async def _do_update() -> None:
-            await self._send_gate()
+            await self._send_gate(actor_user_id)
             if self._remote_gateway is not None:
+                # C9：`expires_at` 傳 ledger 建立當下凍結的值（見 place() 同名參數說明）。
                 await self._remote_gateway.update(
-                    ordno, price=new_price, qty=new_qty, price_type=price_type
+                    ordno, price=new_price, qty=new_qty, price_type=price_type, cmd_id=cmd_id,
+                    expires_at=cmd_expires_at,
                 )
                 return
             await asyncio.to_thread(self._update_blocking, ordno, new_price, new_qty, price_type)
@@ -689,44 +1035,82 @@ class ShioajiAdapter:
             # send gate 擋下（如 kill switch 剛好在改單當下被打開）：確定沒送出，退還這次
             # 改單嘗試「若有」保留的 delta 配額（沒有保留列時 release_quota 是 no-op）；
             # 委託本身的狀態不變（改單失敗不代表委託本身壞了，不比照 place 標 failed）。
-            if reservation_id is not None:
-                with self._session_factory() as fail_session:
+            with self._session_factory() as fail_session:
+                if reservation_id is not None:
                     brepo.release_quota(fail_session, reservation_id=reservation_id)
-                    fail_session.commit()
+                if self._remote_gateway is not None and cmd_id is not None:
+                    agent_commands.resolve_never_dispatched(
+                        fail_session, cmd_id=cmd_id, message="kill switch 已啟動（第二層檢查）"
+                    )
+                fail_session.commit()
+            raise
+        except AgentUnavailableError as exc:
+            # Task 8：這筆改單指令從未送達 agent（`_send_gate`/`AgentChannel.request` 的
+            # ready 檢查落空），往後也不會有任何 ack——比照 RiskError 分支釋放 delta，
+            # 並本地終結 ledger（同 place 分支的理由）。
+            with self._session_factory() as fail_session:
+                if reservation_id is not None:
+                    brepo.release_quota(fail_session, reservation_id=reservation_id)
+                if self._remote_gateway is not None and cmd_id is not None:
+                    agent_commands.resolve_never_dispatched(fail_session, cmd_id=cmd_id, message=str(exc))
+                fail_session.commit()
+            self._alert_place_failed(
+                client_order_id=client_order_id, action=action, qty=new_qty,
+                classification="failed", exc=exc,
+            )
             raise
         except _TradeNotFoundError:
             # bug 2/3 收尾：根本沒有送出任何 native update_order 呼叫（連對應 Trade 都找
             # 不到——已成交/已刪/跨日等），不屬於下面 except Exception 分支「結果不明」的
             # unknown fail-safe 範疇，不誤標委託狀態（委託本身狀態不變，同 RiskError 分支
-            # 既有原則）；這次改單嘗試「若有」保留的 delta 配額確定沒被使用，一律釋放。
-            if reservation_id is not None:
+            # 既有原則）。in-process：native 直接拋出，這次改單嘗試「若有」保留的 delta
+            # 配額確定沒被使用，一律釋放。agent 模式：這個型別在這裡一定是 ack 衍生
+            # （`_unwrap` 對 error_kind="trade_not_found" 的對映）——`apply_command_ack`
+            # 已經 release 過 delta，route 不重套。
+            if self._remote_gateway is None and reservation_id is not None:
                 with self._session_factory() as fail_session:
                     brepo.release_quota(fail_session, reservation_id=reservation_id)
                     fail_session.commit()
             raise
+        except AgentCommandTimeoutError as exc:
+            # Task 8（D4 route 逾時路徑，同 place 分支的理由）：`mark_timeout_observed` 只用
+            # 來記錄／分辨這次逾時是否仍然有效——update 逾時的轉移表結果是「不改 Order、
+            # delta 保留」，不論 CAS 輸贏都不需要任何本地寫入（True＝真的還沒收到 ack，
+            # 維持既有『不改』；False＝ack 已經在別的交易落地過，同樣不得再寫，讓已落庫的
+            # 結果保持原樣，S#15/R1-1）。
+            if self._remote_gateway is not None and cmd_id is not None:
+                with self._session_factory() as fail_session:
+                    agent_commands.mark_timeout_observed(fail_session, cmd_id=cmd_id)
+                    fail_session.commit()
+            self._alert_place_failed(
+                client_order_id=client_order_id, action=action, qty=new_qty,
+                classification="unknown", exc=exc,
+            )
+            raise
         except Exception as exc:
+            if self._remote_gateway is not None and isinstance(exc, OrderError):
+                # Task 8：其餘 ack 衍生的明確拒絕（exception/mode_mismatch/expired/
+                # scope_mismatch）——`apply_command_ack` 已經 release 過 delta（不標
+                # failed），route 不重套、不重新分類，原樣 re-raise。
+                raise
             # 本次精進：同 place 分支，先分類是否為「券商明確拒絕」。是的話這次改單
             # 嘗試確定沒生效——比照上面 RiskError 分支，立即釋放「若有」保留的 delta
             # 配額，不必等 watchdog reconcile；委託本身狀態不變（改單失敗不代表委託
             # 本身壞了，不比照 place 標 failed，同 RiskError 分支的既有原則）。分類不出來
-            # 一律維持原本 unknown fail-safe（結果不明，不 release、不 confirm，留給
-            # Task 8 watchdog reconcile 決議）。
+            # 一律維持原本 unknown fail-safe（結果不明，不 release、不 confirm）。此分支
+            # in-process 模式仍會走到（remote 模式的已知例外型別皆已被上面攔截）。
             classification = _classify_place_failure(exc)
             if classification == "failed":
                 if reservation_id is not None:
                     with self._session_factory() as fail_session:
                         brepo.release_quota(fail_session, reservation_id=reservation_id)
                         fail_session.commit()
-                # T0.3 告警（純疊加）；RiskError/_TradeNotFoundError 在上面各自的 except 分支
-                # 就已返回、不會走到這裡（那兩者非券商送單失敗，不發 place_failed）。
+                # T0.3 告警（純疊加）；RiskError/_TradeNotFoundError/AgentUnavailableError 在
+                # 上面各自的 except 分支就已返回，不會走到這裡。
                 self._alert_place_failed(
                     client_order_id=client_order_id, action=action, qty=new_qty,
                     classification="failed", exc=exc,
                 )
-                if isinstance(exc, (AgentUnavailableError, AgentCommandTimeoutError)):
-                    # Task 6：同 place 分支，保留 remote gateway 專屬例外型別（見上方
-                    # `_do_place` 的等價註解），不強塞進通用 OrderError 訊息裡。
-                    raise
                 raise OrderError(
                     f"改單遭券商明確拒絕，delta 配額已釋放（委託本身狀態不變）："
                     f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
@@ -739,8 +1123,6 @@ class ShioajiAdapter:
                 client_order_id=client_order_id, action=action, qty=new_qty,
                 classification="unknown", exc=exc,
             )
-            if isinstance(exc, (AgentUnavailableError, AgentCommandTimeoutError)):
-                raise
             raise OrderError(
                 f"改單失敗，委託標記 unknown 待 reconcile："
                 f"{_redact_secrets(str(exc), secrets=self._secrets_to_redact)}"
@@ -748,10 +1130,9 @@ class ShioajiAdapter:
 
         with self._session_factory() as session:
             order = session.get(Order, order_id)
-            order.price, order.qty = new_price, new_qty
-            brepo.mark_order_status(session, order, status="submitted")
-            if reservation_id is not None:
-                brepo.confirm_quota(session, reservation_id=reservation_id)
+            agent_commands.apply_update_ack(
+                session, order, new_price=new_price, new_qty=new_qty, reservation_id=reservation_id
+            )
             session.commit()
         return OrderAck(client_order_id=client_order_id, broker_order_id=broker_order_id, ordno=ordno, status="submitted")
 
@@ -851,16 +1232,48 @@ class ShioajiAdapter:
     #     PartFilled 狀態一律由成交回報（deal_report）驅動的 `PositionTracker.apply_fill`→
     #     `brepo.apply_order_fill` 更新，不經這個 mapper。
 
-    def _map_deal_report(self, payload: dict) -> Fill:
+    def _estimate_sim_fee(self, *, symbol: str, price: Decimal, qty: int) -> Decimal | None:
+        """sim 成交 fee 估算（單邊）：每口＝券商手續費＋期交稅（成交價×契約乘數×10萬分之2，
+        四捨五入到元），再 × qty。`symbol` 是具體月合約代碼（如 "TXFH6"），前 3 碼是商品根。
+        手續費映射未設、或商品根不在映射/乘數表時，退回 flat `sim_fee_per_lot × qty`
+        （既有行為）；兩者皆無 → None（維持「缺值就是缺值」，不靜默記 0）。"""
+        root = (symbol or "")[:3].upper()
+        commission = (self._sim_commission_per_lot or {}).get(root)
+        multiplier = _CONTRACT_MULTIPLIER.get(root)
+        if commission is not None and multiplier is not None:
+            tax_per_lot = (price * multiplier * _FUTURES_TAX_RATE).quantize(
+                Decimal("1"), rounding=ROUND_HALF_UP
+            )
+            return (commission + tax_per_lot) * qty
+        if self._sim_fee_per_lot is not None:
+            return self._sim_fee_per_lot * qty
+        return None
+
+    def _map_deal_report(self, payload: dict, *, account: str | None = None) -> Fill:
+        """`account` 是 RawInbox 列上蓋章的值（Inc1 D5，呼叫端見
+        `RawInboxWorker._process_deal`）——只在非 None 時才驗證 `payload["account_id"]` 與它
+        相符（R1-5 payload_mismatch），None（列上未蓋章的舊資料/未帶 scope 的直接呼叫）時跳過
+        驗證，維持既有位元級行為（同 R2-2 的 user_id NULL 放行原則，不因為新增檢查而讓歷史/
+        測試路徑退化）。"""
         try:
-            fill_id = payload["trade_id"]
-            if not fill_id:
+            trade_id = payload["trade_id"]
+            if not trade_id:
                 raise ValueError("trade_id 為空")
+            # trade_id 是「委託」層級識別碼：同一張委託拆成多筆成交時每筆共用同一個
+            # trade_id（staging 實測：4 口市價單→4 筆 deal 同 trade_id、exchange_seq
+            # 000001–000004）。單獨拿它當 fill_id 會讓 Deal 去重帳本把第 2 筆起的成交
+            # 全部誤判為重播丟棄，filled_qty 永遠卡在第一筆——fill_id 必須組上每筆
+            # 唯一的 exchange_seq。缺 exchange_seq 比照缺 trade_id 拒絕（V3-4：不用
+            # 可能碰撞的 fallback 冒充 fill_id）。
+            exchange_seq = payload["exchange_seq"]
+            if not exchange_seq:
+                raise ValueError("exchange_seq 為空")
+            fill_id = f"{trade_id}-{exchange_seq}"
             action = payload["action"]
             qty = int(payload["quantity"])
             price = Decimal(str(payload["price"]))
             ts = int(round(float(payload["ts"]) * 1000))  # 真實 ts 是 epoch 秒(float)，Deal.ts 需 epoch-ms
-            account = payload["account_id"]
+            payload_account = payload["account_id"]
             ordno = payload.get("ordno")
             broker_order_id = payload.get("seqno") or ordno
             fee_raw = payload.get("fee")
@@ -869,12 +1282,24 @@ class ShioajiAdapter:
         except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
             raise ValueError(f"deal_report payload 缺值或格式不合法: {exc}") from exc
 
-        if fee is None and self.mode == "sim" and self._sim_fee_per_lot is not None:
-            # A6：sim 模擬單成交 fee 常缺值/零，依設定的「每口」估算，按 qty 分批累計時自然正確
-            # （每筆 fill 各自算 qty*sim_fee_per_lot，PositionTracker 累加 open_fee_total/close_fee_total
-            # 時就是「已成交口數 * 每口 fee」的正確累計，不需要另外處理批次）。real 模式缺值一律
+        if account is not None and payload_account != account:
+            # R1-5：deal_report payload 自帶的 account_id 與這列 raw_inbox 事件產生當下蓋章的
+            # account 矛盾——可能是帳號冒用或上游資料損壞，一律 fail closed 且**不重試**
+            # （mapper 一律以列 scope 為權威，不信任 payload 自帶值）。
+            raise RawInboxDeadLetterError(
+                "payload_mismatch",
+                f"deal_report payload.account_id={payload_account!r} 與列上蓋章 "
+                f"account={account!r} 不符，fail closed",
+            )
+        account = payload_account
+
+        if fee is None and self.mode == "sim":
+            # A6：sim 模擬單成交 fee 常缺值/零，依「每口」估算，按 qty 分批累計時自然正確
+            # （每筆 fill 各自算每口成本×qty，PositionTracker 累加 open_fee_total/close_fee_total
+            # 時就是「已成交口數 × 每口成本」的正確累計，不需要另外處理批次）。real 模式缺值一律
             # 保持 None（round3 HIGH：不得靜默記 0，那會讓正式 PnL 永久低估成本）。
-            fee = self._sim_fee_per_lot * qty
+            # 2026-09-05 起優先用台灣實際成本（券商手續費＋期交稅實算），見 _estimate_sim_fee。
+            fee = self._estimate_sim_fee(symbol=symbol, price=price, qty=qty)
 
         return Fill(
             broker=self.broker, fill_id=str(fill_id), ordno=ordno, broker_order_id=broker_order_id,
@@ -900,7 +1325,12 @@ class ShioajiAdapter:
         "Filled": "filled", "PendingSubmit": "sending", "Submitted": "submitted",
     }
 
-    def _map_order_report(self, payload: dict) -> OrderReport:
+    def _map_order_report(self, payload: dict, *, account: str | None = None) -> OrderReport:
+        """`account`（Inc1 D5/S3 拆除）是 RawInbox 列上蓋章的值（呼叫端見
+        `RawInboxWorker._process_order_report`）——**不**回退讀 `self.account`：那是 mutable
+        單例，事件產生後若帳號被換掉，處理當下讀到的會是新帳號，錯誤地覆蓋掉舊事件真正的
+        歸屬（S3 要拆的縫）。直接呼叫（未傳 `account`，例如既有單元測試）維持 `None`，不強迫
+        補齊。"""
         if "operation" in payload or "order" in payload:
             # 即時串流 callback（真實 FuturesOrderEvent 巢狀結構）。
             order_detail = payload.get("order") or {}
@@ -925,7 +1355,7 @@ class ShioajiAdapter:
         if not ordno and not broker_order_id:
             raise ValueError("order_report 缺委託關聯鍵（order.id/order.seqno 或 order_id/seqno），無法關聯委託")
         return OrderReport(
-            broker=self.broker, account=self.account, mode=self.mode,
+            broker=self.broker, account=account, mode=self.mode,
             ordno=ordno, broker_order_id=broker_order_id, status=status,
         )
 

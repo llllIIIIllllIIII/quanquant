@@ -11,10 +11,13 @@ from sqlmodel import Session, select
 
 from quanquant.broker import repository as brepo
 from quanquant.broker import watchdog as watchdog_module
+from quanquant.broker.agent_commands import apply_command_ack, insert_command
+from quanquant.broker.agent_protocol import UpCmdAck
+from quanquant.broker.base import AgentCommandTimeoutError
 from quanquant.broker.session_state import OrderSessionState
 from quanquant.broker.supervisor import BrokerSupervisor
-from quanquant.broker.watchdog import run_order_watchdog
-from quanquant.db.models import QuotaReservation, RawInbox
+from quanquant.broker.watchdog import run_agent_watchdog, run_order_watchdog
+from quanquant.db.models import AgentCommand, QuotaReservation, RawInbox
 
 
 class _FlakyAdapter:
@@ -423,3 +426,386 @@ def test_unknown_quota_reconcile_update_reservation_left_reserved_when_adapter_l
             select(QuotaReservation).where(QuotaReservation.reservation_id == reservation_id)
         ).first()
         assert reservation.state == "reserved"
+
+
+# ---------------------------------------------------------------------------
+# Task 11（G3）：agent 模式 unknown-resolver 的 per-slot watchdog 整合（S#7/22/37）
+#
+# agent 模式沒有本機 native 可查——`_MinimalAdapter` 只給 `.supervisor`/`._session_factory`；
+# 真正的 query_qty round-trip 由 `_FakeGatewayForWatchdog` 模擬（比照
+# test_agent_registry.py `_FakeGateway` 的假物件慣例）。
+# ---------------------------------------------------------------------------
+
+_ABROKER, _AACCOUNT, _AMODE = "shioaji", "F1", "sim"
+
+
+class _FakeGatewayForWatchdog:
+    def __init__(self, *, ready: bool = True, qty_by_ordno: dict | None = None) -> None:
+        self.ready = ready
+        self._qty_by_ordno = qty_by_ordno or {}
+        self.query_calls: list[str] = []
+
+    async def query_qty(self, ordno: str):
+        self.query_calls.append(ordno)
+        return self._qty_by_ordno.get(ordno)
+
+
+def _agent_order(session, *, client_order_id, ordno, status="submitted", qty=2):
+    order = brepo.create_order(
+        session, client_order_id=client_order_id, request_hash="H1", user_id=1, mode=_AMODE,
+        broker=_ABROKER, account=_AACCOUNT, symbol="TXF", action="Buy", qty=qty,
+        price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+        trading_day="2026-08-07",
+    )
+    order.status = status
+    order.ordno = ordno
+    order.broker_order_id = ordno
+    session.add(order)
+    session.flush()
+    return order
+
+
+def _agent_update_cmd(session, *, cmd_id, ordno, client_order_id, reservation_id=None,
+                       price="18500", qty=5):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cmd = AgentCommand(
+        cmd_id=cmd_id, user_id=1, kind="update", broker=_ABROKER, account=_AACCOUNT, mode=_AMODE,
+        ordno=ordno, client_order_id=client_order_id, reservation_id=reservation_id,
+        payload=json.dumps({"price": price, "qty": qty, "price_type": "LMT"}),
+        created_at=now, expires_at=now + timedelta(minutes=2),
+    )
+    insert_command(session, cmd=cmd)
+    return cmd
+
+
+def _agent_cancel_cmd(session, *, cmd_id, ordno):
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    cmd = AgentCommand(
+        cmd_id=cmd_id, user_id=1, kind="cancel", broker=_ABROKER, account=_AACCOUNT, mode=_AMODE,
+        ordno=ordno, payload=json.dumps({}),
+        created_at=now, expires_at=now + timedelta(minutes=2),
+    )
+    insert_command(session, cmd=cmd)
+    return cmd
+
+
+def _mark_timeout(engine, cmd_id: str) -> None:
+    """走既有 apply_command_ack 的 timeout 分支，讓指令進入 outcome='unknown'、
+    resolved_at IS NULL 的適用集合（同正式收斂路徑，不手動改欄位）。"""
+    outcome = apply_command_ack(
+        lambda: Session(engine), cmd_id=cmd_id, user_id=1,
+        ack=UpCmdAck(cmd_id=cmd_id, event_id=1, ok=False, error_kind="timeout", message="t/o"),
+    )
+    assert outcome.resolved is False and outcome.outcome == "unknown"
+
+
+def test_agent_reconcile_unknown_quota_skips_when_gateway_not_ready(engine):
+    """D8：slot 未 ready 直接跳過本輪，不查券商（沒有 gateway 可查詢，查了也只是逾時噪音）。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1")
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-1", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1")
+        s.commit()
+    _mark_timeout(engine, "cmd-1")
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=False, qty_by_ordno={"O1": 5})
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == []
+    with Session(engine) as s:
+        assert s.get(AgentCommand, "cmd-1").resolved_at is None
+
+
+# ---------------------------------------------------------------------------
+# C7（MEDIUM，codex 終審）：watchdog 入口不能把「純 DB、不需要 gateway round-trip」的終態
+# resolver 也一併跳過——舊版 `if not gateway.ready: return` 連 cancel/終態 update 都擋，
+# agent 永不回連時這些其實已經能靠純 DB 狀態誠實收斂的 ledger 列會永遠卡著。
+# ---------------------------------------------------------------------------
+
+
+def test_agent_reconcile_unknown_quota_terminal_update_resolves_even_when_gateway_not_ready(engine):
+    """C7：U1（update）unknown、Order 已因為 cancel 進終態——即使 gateway 未 ready（agent
+    永不回連），watchdog 仍要能把這種純 DB 可判定的 update ledger 列收斂掉（終態保守
+    confirm 分支不需要 query_qty），不永久卡住 update 單飛鎖/換帳號 guard。鏡射既有
+    `test_agent_reconcile_unknown_quota_terminal_resolver_conservative_confirm_and_guard_
+    release`，唯一差異是 `gateway.ready=False`。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2, status="submitted")
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-u1", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1", price="18500", qty=5)
+        s.commit()
+    _mark_timeout(engine, "cmd-u1")  # U1: outcome=unknown, resolved_at IS NULL
+
+    with Session(engine) as s:
+        _agent_cancel_cmd(s, cmd_id="cmd-cancel", ordno="O1")
+        s.commit()
+    outcome = apply_command_ack(
+        lambda: Session(engine), cmd_id="cmd-cancel", user_id=1,
+        ack=UpCmdAck(cmd_id="cmd-cancel", event_id=2, ok=True, result={}),
+    )
+    assert outcome.applied
+    with Session(engine) as s:
+        assert brepo.find_order_by_client_order_id(s, "C1").status == "cancelled"
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=False)  # agent 永不回連
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == []  # 完全沒有嘗試 query_qty（gateway 未 ready）
+    with Session(engine) as s:
+        cmd = s.get(AgentCommand, "cmd-u1")
+        assert cmd.resolved_at is not None
+        assert cmd.outcome == "unknown" and cmd.resolved_via == "report"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "confirmed"
+
+
+def test_agent_reconcile_unknown_quota_offline_cancel_resolver_works_when_gateway_not_ready(engine):
+    """C7：cancel 的 state-based resolver（`resolve_unresolved_cancel_via_report`）純 DB
+    判定——即使 cancel 本身逾時未 ack（unresolved），只要 Order 已經靠其他管道（如報告
+    report-first）進終態，watchdog 也該能收斂，完全不受 `gateway.ready` 限制。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2, status="submitted")
+        _agent_cancel_cmd(s, cmd_id="cmd-cancel", ordno="O1")
+        s.commit()
+    _mark_timeout(engine, "cmd-cancel")  # cancel 逾時未 ack：仍 unresolved
+
+    # Order 靠其他管道（例如成交回報）進終態，不經 cancel ack 本身。
+    with Session(engine) as s:
+        order = brepo.find_order_by_client_order_id(s, "C1")
+        brepo.mark_order_status(s, order, status="filled")
+        s.commit()
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=False)
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == []
+    with Session(engine) as s:
+        cmd = s.get(AgentCommand, "cmd-cancel")
+        assert cmd.resolved_at is not None
+        assert cmd.outcome == "unknown" and cmd.resolved_via == "report"
+
+
+def test_agent_reconcile_unknown_quota_skips_created_sent_then_resolves_after_timeout(engine):
+    """S#7：ledger 未終結（created/sent，outcome IS NULL）watchdog 跳過→timeout 落地
+    （進入 outcome='unknown' 適用集合）後 query_qty 兩分支之一（confirm）收斂。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2)
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-1", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1", price="18500", qty=5)
+        s.commit()
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=True, qty_by_ordno={"O1": 5})
+
+    # ①created/sent：resolver 跳過本輪，完全不查券商。
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+    assert gateway.query_calls == []
+    with Session(engine) as s:
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "reserved"
+
+    # ②timeout 落地 → 進入適用集合，二分收斂之一（改後值 → confirm＋寫 Order）。
+    _mark_timeout(engine, "cmd-1")
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+    assert gateway.query_calls == ["O1"]
+    with Session(engine) as s:
+        cmd = s.get(AgentCommand, "cmd-1")
+        assert cmd.resolved_at is not None and cmd.outcome == "ok" and cmd.resolved_via == "query_qty"
+        order = brepo.find_order_by_client_order_id(s, "C1")
+        assert order.qty == 5
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "confirmed"
+
+
+class _FlakyTimeoutGateway:
+    """單筆 query_qty 逾時（指定的那個 ordno 拋 `AgentCommandTimeoutError`），其餘 ordno 照常
+    回傳——驗證 Task 11 修復回合 1（發現 3）：`_reconcile_unknown_quota_agent` 迴圈裡單筆
+    逾時只影響那一筆，不得中斷整輪、連累其餘 cmd 也沒被查。"""
+
+    def __init__(self, *, ready: bool = True, timeout_ordno: str, qty_by_ordno: dict) -> None:
+        self.ready = ready
+        self._timeout_ordno = timeout_ordno
+        self._qty_by_ordno = qty_by_ordno
+        self.query_calls: list[str] = []
+
+    async def query_qty(self, ordno: str):
+        self.query_calls.append(ordno)
+        if ordno == self._timeout_ordno:
+            raise AgentCommandTimeoutError(f"等待 cmd_ack 逾時（ordno={ordno}）")
+        return self._qty_by_ordno.get(ordno)
+
+
+def test_agent_reconcile_unknown_quota_single_cmd_timeout_does_not_abort_whole_round(engine):
+    """Task 11 修復回合 1（發現 3）：迴圈中單筆 query_qty 逾時（`AgentCommandTimeoutError`）
+    不得中斷整輪——這一筆留待下一輪重試（`resolved_at` 仍是 NULL），但排在它之後的其餘
+    update cmd 仍要照跑，恰一次收斂。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2)
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-timeout", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1", price="18500", qty=5)
+
+        _agent_order(s, client_order_id="C2", ordno="O2", qty=2)
+        assert brepo.reserve_quota(s, reservation_id="delta-2", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-ok", ordno="O2", client_order_id="C2",
+                          reservation_id="delta-2", price="18500", qty=5)
+        s.commit()
+    _mark_timeout(engine, "cmd-timeout")
+    _mark_timeout(engine, "cmd-ok")
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FlakyTimeoutGateway(ready=True, timeout_ordno="O1", qty_by_ordno={"O2": 5})
+
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == ["O1", "O2"]  # O1 逾時不阻擋 O2 繼續被查
+    with Session(engine) as s:
+        timeout_cmd = s.get(AgentCommand, "cmd-timeout")
+        assert timeout_cmd.resolved_at is None  # 這筆留待下一輪重試
+        ok_cmd = s.get(AgentCommand, "cmd-ok")
+        assert ok_cmd.resolved_at is not None
+        assert ok_cmd.outcome == "ok" and ok_cmd.resolved_via == "query_qty"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-2")).one().state == "confirmed"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "reserved"  # 未被亂動
+
+
+def test_agent_reconcile_unknown_quota_never_touches_place_commands(engine):
+    """S#22/R2-1：place 的 outcome=unknown 且無 broker ID——agent 版 resolver 結構上只掃
+    kind IN ('update','cancel')，place 一律不碰、永不自動 release（人工終結程序見 Task 14）。"""
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C-PLACE", request_hash="H1", user_id=1, mode=_AMODE,
+            broker=_ABROKER, account=_AACCOUNT, symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-08-07",
+        )
+        order.status = "unknown"
+        s.add(order)
+        s.flush()
+        assert brepo.reserve_quota(s, reservation_id="C-PLACE", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=1, daily_limit=20)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        cmd = AgentCommand(
+            cmd_id="cmd-place", user_id=1, kind="place", broker=_ABROKER, account=_AACCOUNT,
+            mode=_AMODE, client_order_id="C-PLACE", reservation_id="C-PLACE",
+            payload=json.dumps({"action": "Buy", "price": "18000", "qty": 1, "price_type": "LMT",
+                                "order_type": "ROD", "octype": "New"}),
+            created_at=now, expires_at=now + timedelta(minutes=2),
+        )
+        insert_command(s, cmd=cmd)
+        s.commit()
+    _mark_timeout(engine, "cmd-place")
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=True)
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    assert gateway.query_calls == []  # place 從未被查詢
+    with Session(engine) as s:
+        assert brepo.find_order_by_client_order_id(s, "C-PLACE").status == "unknown"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "C-PLACE")).one().state == "reserved"
+        assert s.get(AgentCommand, "cmd-place").resolved_at is None
+
+
+def test_agent_reconcile_unknown_quota_terminal_resolver_conservative_confirm_and_guard_release(engine):
+    """S#37/R5-3：U1（update）unknown → cancel 成功 → Order 進終態、list_trades 查無
+    （query_qty 回 None）→ 終態 resolver 保守 confirm＋不 release，且 UpLogin 換帳號 guard
+    因此解除（U1 resolved 後不再被 `has_unresolved_risky_commands_other_account` 擋）。"""
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2, status="submitted")
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-u1", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1", price="18500", qty=5)
+        s.commit()
+    _mark_timeout(engine, "cmd-u1")  # U1: outcome=unknown, resolved_at IS NULL
+
+    with Session(engine) as s:
+        _agent_cancel_cmd(s, cmd_id="cmd-cancel", ordno="O1")
+        s.commit()
+    outcome = apply_command_ack(
+        lambda: Session(engine), cmd_id="cmd-cancel", user_id=1,
+        ack=UpCmdAck(cmd_id="cmd-cancel", event_id=2, ok=True, result={}),
+    )
+    assert outcome.applied
+    with Session(engine) as s:
+        assert brepo.find_order_by_client_order_id(s, "C1").status == "cancelled"
+
+    with Session(engine) as s:
+        # 換帳號前：U1 仍未 resolved → guard 應該擋。
+        assert brepo.has_unresolved_risky_commands_other_account(s, user_id=1, account="OTHER")
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=True, qty_by_ordno={})  # O1 查無 → None
+    asyncio.run(watchdog_module._reconcile_unknown_quota_agent(adapter, gateway, user_id=1))
+
+    with Session(engine) as s:
+        cmd = s.get(AgentCommand, "cmd-u1")
+        assert cmd.resolved_at is not None
+        assert cmd.outcome == "unknown" and cmd.resolved_via == "report"
+        assert s.exec(select(QuotaReservation).where(
+            QuotaReservation.reservation_id == "delta-1")).one().state == "confirmed"
+        # guard 解除：U1 已 resolved，換帳號不再被它擋。
+        assert not brepo.has_unresolved_risky_commands_other_account(s, user_id=1, account="OTHER")
+
+
+def test_run_agent_watchdog_invokes_unknown_quota_resolver_each_cycle(engine):
+    with Session(engine) as s:
+        _agent_order(s, client_order_id="C1", ordno="O1", qty=2)
+        assert brepo.reserve_quota(s, reservation_id="delta-1", user_id=1, mode="sim",
+                                   trading_day="2026-08-07", qty=3, daily_limit=20)
+        _agent_update_cmd(s, cmd_id="cmd-1", ordno="O1", client_order_id="C1",
+                          reservation_id="delta-1", price="18500", qty=5)
+        s.commit()
+    _mark_timeout(engine, "cmd-1")
+
+    adapter = _MinimalAdapter(lambda: Session(engine))
+    gateway = _FakeGatewayForWatchdog(ready=True, qty_by_ordno={"O1": 5})
+
+    async def scenario():
+        task = asyncio.create_task(run_agent_watchdog(
+            adapter, user_id=1, unquarantine_after_seconds=0.02, gateway=gateway,
+        ))
+        await asyncio.sleep(0.12)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+    assert gateway.query_calls  # 真的被 per-slot watchdog 呼叫到
+    with Session(engine) as s:
+        assert s.get(AgentCommand, "cmd-1").resolved_at is not None
+
+
+def test_run_agent_watchdog_gateway_none_skips_resolver_gracefully(engine):
+    """gateway 未接線（防禦性容錯）——watchdog 迴圈仍正常跑 retry_quarantined，不崩潰。"""
+    adapter = _MinimalAdapter(lambda: Session(engine))
+
+    async def scenario():
+        task = asyncio.create_task(run_agent_watchdog(
+            adapter, user_id=1, unquarantine_after_seconds=0.02, gateway=None,
+        ))
+        await asyncio.sleep(0.08)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())  # 不崩潰即通過

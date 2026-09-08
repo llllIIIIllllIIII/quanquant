@@ -19,6 +19,7 @@ from quanquant.broker import repository as brepo
 from quanquant.broker import shioaji_adapter as shioaji_adapter_module
 from quanquant.broker import watchdog as watchdog_module
 from quanquant.broker.base import AuthorizationError, OrderError, RiskError
+from quanquant.broker.inbox_worker import RawInboxDeadLetterError
 from quanquant.broker.risk import RiskGuard
 from quanquant.broker.shioaji_adapter import ShioajiAdapter
 from quanquant.broker.supervisor import BrokerSupervisor
@@ -256,7 +257,7 @@ def test_place_riskerror_send_gate_does_not_alert_place_failed(engine):
     alerter = _RecordingAlerter()
     adapter = _adapter(engine, risk_guard=_real_guard(engine), ops_alerter=alerter)
 
-    async def _blocked_gate():
+    async def _blocked_gate(user_id):
         raise RiskError("kill switch 已啟動，拒絕送出")
 
     adapter._send_gate = _blocked_gate
@@ -499,6 +500,37 @@ def test_update_raises_clear_error_and_releases_delta_quota_when_no_matching_tra
         assert update_row.state == "released"  # 確定沒生效，delta 配額立即釋放
 
 
+def test_update_rejects_order_without_ordno_in_process_mode_too(engine):
+    """Task 10（R6-1/S#38）：ordno IS NULL 的 admission 檢查不限 remote_gateway 存在與否——
+    in-process 模式同樣適用（沒有 ordno 就沒有對象可改，語意上與是否走 agent 通道無關）。
+    直接造一張 broker_order_id 已知、但 ordno 仍是 NULL 的委託（模擬 place 尚未取得 ordno
+    的中間態），確認 update() 在碰 RiskGuard.check_update／native 呼叫之前就已經拒絕。
+
+    刻意帶真正的 `RiskGuard`（而非 `_adapter(engine)` 預設的 `risk_guard=None`）：若沒有這道
+    admission 檢查，`check_update` 判定口數增加會先建立一筆 delta `QuotaReservation`，之後才
+    在 native 層（`_find_trade_by_ordno` 找不到 id=None 的委託）以 `TradeNotFoundError` 收尾
+    ——那樣雖然最終也會 raise，但已經留下一筆孤兒保留列；這裡驗證的正是「不建立任何
+    reservation」，不能靠 risk_guard=None 的弱版本掩蓋掉這個差異。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="c-noord", request_hash="H", user_id=1, mode="sim",
+            broker="shioaji", account="F1", symbol="TXF", action="Buy", qty=1,
+            price=Decimal("18000"), price_type="LMT", order_type="ROD", octype="New",
+            trading_day="2026-06-16",
+        )
+        order.broker_order_id = "B-NOORD"
+        s.add(order)
+        s.commit()
+
+    with pytest.raises(OrderError, match="ordno"):
+        asyncio.run(adapter.update("B-NOORD", actor_user_id=1, qty=5))
+    assert adapter._api.placed == []  # native 完全沒被呼叫
+    with Session(engine) as s:
+        assert s.exec(select(QuotaReservation)).all() == []  # 沒有留下任何孤兒保留列
+
+
 def test_find_trade_by_ordno_matches_order_id_not_broker_ordno_field(engine):
     """bug A 回歸：實測 payload（權威）——`order.id`=`order.seqno`="101CB7"（我方存的
     ordno/broker_order_id 關聯鍵），`order.ordno`="001CB9"（交易所委託書號，另一個不同
@@ -533,6 +565,9 @@ def test_send_gate_blocks_when_kill_switch_on():
         def assert_owner(self, actor_user_id):
             pass
 
+        def blocked(self, user_id):
+            return True
+
         def check_place(self, session, req, **kw):
             order = brepo.create_order(
                 session, client_order_id=req.client_order_id, request_hash="H",
@@ -558,6 +593,49 @@ def test_send_gate_blocks_when_kill_switch_on():
         assert order.status == "failed"  # 不留在 pending 卡死（V3-2 收尾）
 
 
+# ---- D3：兩層 kill switch（per-user + 全站總閘）在 adapter/_send_gate 層的等價驗收 ----
+
+def test_send_gate_self_kill_switch_blocks_only_actor_not_other_owner(engine):
+    """A 開自己的急停 → A 的 place 被 _send_gate 擋下、native 從未被呼叫；B（另一個 owner）
+    的 place 完全不受影響（S#40 D3 核心情境，經真正 RiskGuard + ShioajiAdapter 全鏈路）。"""
+    guard = _real_guard(engine, owner_user_ids=frozenset({1, 2}))
+    adapter = _adapter(engine, risk_guard=guard)
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(client_order_id="C-A", user_id=1), actor_user_id=1))
+    assert len(adapter._api.placed) == 0
+
+    ack = asyncio.run(adapter.place(_req(client_order_id="C-B", user_id=2), actor_user_id=2))
+    assert ack.status == "submitted"
+    assert len(adapter._api.placed) == 1
+
+
+def test_send_gate_global_kill_switch_blocks_every_owner(engine):
+    guard = _real_guard(engine, owner_user_ids=frozenset({1, 2}))
+    adapter = _adapter(engine, risk_guard=guard)
+    guard.set_kill_switch(True, scope="global", actor_user_id=2)  # 任一 owner 翻的閘也擋別人
+
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(client_order_id="C-A", user_id=1), actor_user_id=1))
+    with pytest.raises(RiskError):
+        asyncio.run(adapter.place(_req(client_order_id="C-B", user_id=2), actor_user_id=2))
+    assert len(adapter._api.placed) == 0
+
+
+def test_cancel_not_blocked_by_either_kill_switch_layer(engine):
+    """取消單不受兩層開關影響（spec 明文、沿用既有語意）：全站總閘與 per-user 急停都開著，
+    取消既有委託仍必須成功。"""
+    guard = _real_guard(engine)
+    adapter = _adapter(engine, risk_guard=guard)
+    ack = asyncio.run(adapter.place(_req(), actor_user_id=1))
+    guard.set_kill_switch(True, scope="global", actor_user_id=1)
+    guard.set_kill_switch(True, scope="self", actor_user_id=1)
+
+    ack2 = asyncio.run(adapter.cancel(ack.broker_order_id, actor_user_id=1))
+    assert ack2.status == "cancelled"
+
+
 # ---- callback：只落地 RawInbox（round3 BLOCKER#2） ----
 
 def test_callback_only_calls_commit_raw_callback_and_persists_raw_inbox(engine, monkeypatch):
@@ -565,9 +643,9 @@ def test_callback_only_calls_commit_raw_callback_and_persists_raw_inbox(engine, 
     calls = []
     original = shioaji_adapter_module.commit_raw_callback
 
-    def spy(session_factory, *, kind, broker, payload):
+    def spy(session_factory, *, kind, broker, payload, **kw):
         calls.append((kind, broker, payload))
-        return original(session_factory, kind=kind, broker=broker, payload=payload)
+        return original(session_factory, kind=kind, broker=broker, payload=payload, **kw)
 
     monkeypatch.setattr(shioaji_adapter_module, "commit_raw_callback", spy)
 
@@ -585,6 +663,67 @@ def test_callback_only_calls_commit_raw_callback_and_persists_raw_inbox(engine, 
         assert json.loads(row.payload)["trade_id"] == "D1"
         # 只落地 RawInbox，不直接處理業務邏輯：沒有 Order/Deal/BrokerPosition 被動到
         assert s.exec(select(Order)).first() is None
+
+
+def test_callback_stamps_account_mode_and_leaves_user_id_none_in_process(engine):
+    """Inc1 D5：in-process `_persist_raw` → `(user_id=None, account=self.account,
+    mode=self.mode)`——這是三個 scoped staging 呼叫端之一（R1-6）。"""
+    adapter = _adapter(engine)  # account="F1", mode="sim"
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.account == "F1" and row.mode == "sim" and row.user_id is None
+
+
+def test_callback_stamps_agent_user_id_when_adapter_constructed_with_one(engine):
+    """前瞻性驗證（Task 7 依賴）：`agent_user_id` 建構參數必須一路傳進落地的 RawInbox 列——
+    目前沒有任何呼叫端會傳非 None 值（單一共享 channel、in-process 零變更），但介面必須先接好，
+    Task 7 per-slot adapter 才能直接生效而不必再動這段程式碼。"""
+    adapter = ShioajiAdapter(
+        api_key="k", secret_key="s", ca_path=None, ca_passwd=None, person_id=None,
+        symbol="TXF", mode="sim", session_factory=lambda: Session(engine),
+        supervisor=BrokerSupervisor(), agent_user_id=42,
+    )
+    adapter._api = object()
+    adapter._contract = object()
+    adapter.account = "F1"
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.user_id == 42
+
+
+def test_persist_raw_wakes_wired_worker_after_commit_succeeds(engine):
+    """驗收條件3（in-process 佈線）：`_persist_raw`（callback thread 落地路徑，經
+    `commit_raw_callback`）commit 成功後，必須透過 `adapter.raw_committed_hook` 呼叫接線的
+    喚醒 callback——比照 `web/app.py::_start_order_subsystem` 的接線方式
+    （`adapter.raw_committed_hook = inbox_worker.request_wake`）。喚醒不能在落地之前發生。"""
+    adapter = _adapter(engine)
+    woke: list[bool] = []
+    adapter.raw_committed_hook = lambda: woke.append(True)
+
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+
+    assert woke == [True]
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).first() is not None  # 已落地，喚醒不是空跑
+
+
+def test_persist_raw_default_raw_committed_hook_is_none_and_noop(engine):
+    """未接線（預設 None，未被 app.py 設定過）維持現行行為完全不變——不 raise。"""
+    adapter = _adapter(engine)
+    assert adapter.raw_committed_hook is None
+    adapter._on_order_cb("FuturesDeal", {"trade_id": "D1", "action": "Buy",
+                                          "quantity": 1, "price": "18000", "ts": 1_780_000_000.0,
+                                          "account_id": "F1", "ordno": "O1"})
+    with Session(engine) as s:
+        assert s.exec(select(RawInbox)).first() is not None
 
 
 def test_callback_order_report_uses_order_report_kind(engine):
@@ -744,7 +883,7 @@ def test_place_releases_quota_reservation_when_send_gate_raises_riskerror(engine
     guard = _real_guard(engine)
     adapter = _adapter(engine, risk_guard=guard)
 
-    async def _blocked_gate():
+    async def _blocked_gate(user_id):
         raise RiskError("kill switch 已啟動，拒絕送出")
 
     adapter._send_gate = _blocked_gate
@@ -817,7 +956,7 @@ def test_update_releases_delta_quota_reservation_when_send_gate_raises_riskerror
     adapter = _adapter(engine, risk_guard=guard)
     ack = asyncio.run(adapter.place(_req(qty=2), actor_user_id=1))
 
-    async def _blocked_gate():
+    async def _blocked_gate(user_id):
         raise RiskError("kill switch 已啟動，拒絕送出")
 
     adapter._send_gate = _blocked_gate
@@ -950,11 +1089,12 @@ def test_cancel_rejects_non_owner_of_order_even_when_actor_is_a_different_owner(
 
 # ---- mapper：嚴格驗證 ----
 
-def _adapter_stub_for_mapper(*, sim_fee_per_lot=None, mode="sim"):
+def _adapter_stub_for_mapper(*, sim_fee_per_lot=None, mode="sim", sim_commission_per_lot=None):
     return ShioajiAdapter(
         api_key="k", secret_key="s", ca_path=None, ca_passwd=None, person_id=None,
         symbol="TXF", mode=mode, session_factory=lambda: None,
         supervisor=BrokerSupervisor(), sim_fee_per_lot=sim_fee_per_lot,
+        sim_commission_per_lot=sim_commission_per_lot,
     )
 
 
@@ -970,18 +1110,76 @@ def test_map_deal_report_fills_sim_fee_from_setting_when_missing():
     """A6：sim 模擬單成交常缺 fee，依設定 sim_fee_per_lot * qty 估算，不留 None/0。"""
     adapter = _adapter_stub_for_mapper(sim_fee_per_lot=Decimal("20"))
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 3, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 3,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
     })  # payload 無 "fee" 欄位、無 "octype"（真實 FuturesDealEvent 沒有這個欄位）
     assert fill.fee == Decimal("60")  # 20 * 3 口
     assert fill.ts == 1_780_000_000_000  # 秒→毫秒
 
 
+def _taiwan_cost_payload(**over):
+    base = {"trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+            "price": "45000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
+            "code": "TXFH6"}
+    base.update(over)
+    return base
+
+
+def test_sim_fee_taiwan_cost_txf_commission_plus_tax():
+    """台灣實際成本（2026-09-05 拍板）：fee＝手續費＋期交稅（成交價×乘數×10萬分之2）。
+    大台 45000 點：稅 45000×200×0.00002＝180，手續費 50 → 每口 230；2 口＝460。"""
+    adapter = _adapter_stub_for_mapper(
+        sim_commission_per_lot={"TXF": Decimal("50"), "MXF": Decimal("25"), "TMF": Decimal("10")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(quantity=2))
+    assert fill.fee == Decimal("460")
+
+
+def test_sim_fee_taiwan_cost_mxf_uses_smaller_multiplier():
+    """小台乘數 50：稅 45000×50×0.00002＝45，手續費 25 → 每口 70。"""
+    adapter = _adapter_stub_for_mapper(sim_commission_per_lot={"MXF": Decimal("25")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(code="MXFH6"))
+    assert fill.fee == Decimal("70")
+
+
+def test_sim_fee_taiwan_cost_tax_rounds_half_up_to_dollar():
+    """期交稅四捨五入到元：微台 44875 點→44875×10×0.00002＝8.975→9，手續費 10 → 19。"""
+    adapter = _adapter_stub_for_mapper(sim_commission_per_lot={"TMF": Decimal("10")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(code="TMFH6", price="44875"))
+    assert fill.fee == Decimal("19")
+
+
+def test_sim_fee_unknown_symbol_root_falls_back_to_flat_per_lot():
+    """商品根不在映射/乘數表 → 退回 flat sim_fee_per_lot（既有行為），不猜乘數。"""
+    adapter = _adapter_stub_for_mapper(
+        sim_fee_per_lot=Decimal("20"), sim_commission_per_lot={"TXF": Decimal("50")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(code="ZZZH6", quantity=3))
+    assert fill.fee == Decimal("60")  # 20 × 3
+
+
+def test_sim_fee_broker_supplied_fee_not_overridden_by_estimation():
+    """payload 自帶 fee → 一律用券商值，不進估算。"""
+    adapter = _adapter_stub_for_mapper(sim_commission_per_lot={"TXF": Decimal("50")})
+    fill = adapter._map_deal_report(_taiwan_cost_payload(fee="33"))
+    assert fill.fee == Decimal("33")
+
+
+def test_parse_sim_commission_map_valid_empty_and_errors():
+    parse = shioaji_adapter_module.parse_sim_commission_map
+    assert parse("TXF:50,MXF:25,TMF:10") == {
+        "TXF": Decimal("50"), "MXF": Decimal("25"), "TMF": Decimal("10")}
+    assert parse("") == {}
+    assert parse(" txf : 50 ") == {"TXF": Decimal("50")}  # 空白容忍、key 大寫化
+    with pytest.raises(ValueError):
+        parse("TXF=50")  # 少了冒號
+    with pytest.raises(ValueError):
+        parse("TXF:abc")  # 金額不是數字
+
+
 def test_map_deal_report_real_missing_fee_stays_none_no_sim_substitution():
     adapter = _adapter_stub_for_mapper(sim_fee_per_lot=Decimal("20"), mode="real")
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1",
     })
     assert fill.fee is None  # real 一律取 broker 回報，缺就是缺，不用 sim 設定頂替
 
@@ -991,8 +1189,8 @@ def test_map_deal_report_converts_epoch_seconds_ts_to_epoch_ms_for_correct_tradi
     會讓 trading_day_for 算出 1970 年（epoch 秒當 ms 用，值小了 1000 倍）。"""
     adapter = _adapter_stub_for_mapper()
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
     })
     assert fill.ts == 1_780_000_000_000
     trading_day = brepo.trading_day_for(fill.ts)
@@ -1005,10 +1203,36 @@ def test_map_deal_report_octype_is_placeholder_overridden_by_inbox_worker():
     覆蓋（見該檔/本檔下面的端到端契約測試）。"""
     adapter = _adapter_stub_for_mapper()
     fill = adapter._map_deal_report({
-        "trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
-        "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20",
     })
     assert fill.octype == "Auto"
+
+
+def test_map_deal_report_fill_id_combines_trade_id_and_exchange_seq():
+    """同一張委託拆成多筆成交時，每筆共用同一個 trade_id、只有 exchange_seq 不同
+    （staging 實測：4 口市價單→4 筆 deal 同 trade_id、exchange_seq 000001–000004）。
+    fill_id 單獨用 trade_id 會讓去重帳本把第 2 筆起全部誤判為重播丟棄，
+    filled_qty 永遠卡在 1（1/x partfilled bug）。"""
+    adapter = _adapter_stub_for_mapper()
+    base = {"trade_id": "103217", "action": "Buy", "quantity": 1, "price": "18000",
+            "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20"}
+    f1 = adapter._map_deal_report({**base, "exchange_seq": "000001"})
+    f2 = adapter._map_deal_report({**base, "exchange_seq": "000002"})
+    assert f1.fill_id == "103217-000001"
+    assert f2.fill_id == "103217-000002"
+    assert f1.fill_id != f2.fill_id  # 兩筆都要能入帳，不可互撞去重鍵
+
+
+def test_map_deal_report_rejects_missing_or_empty_exchange_seq():
+    """缺/空 exchange_seq 比照缺 trade_id 拒絕（V3-4：不用可能碰撞的 fallback 冒充 fill_id）。"""
+    adapter = _adapter_stub_for_mapper()
+    base = {"trade_id": "D1", "action": "Buy", "quantity": 1, "price": "18000",
+            "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1", "fee": "20"}
+    with pytest.raises(ValueError):
+        adapter._map_deal_report(base)  # 缺 exchange_seq
+    with pytest.raises(ValueError):
+        adapter._map_deal_report({**base, "exchange_seq": ""})  # 空字串
 
 
 def test_map_order_report_rejects_missing_ordno_and_broker_order_id_flat_reconcile_shape():
@@ -1065,6 +1289,103 @@ def test_map_order_report_op_type_status_table(op_type, expected_status):
     assert report.status == expected_status
 
 
+# ---- Inc1 D5/S3：mapper 改吃列上蓋章 account，不再讀 self.account ----
+
+def test_map_order_report_returns_passed_account_not_self_account():
+    """S3 拆除：即使 self.account 當下是別的值，report.account 必須是呼叫端傳入的
+    （row 上蓋章的）account，不是 adapter 目前的 self.account。"""
+    adapter = _adapter_stub_for_mapper()
+    adapter.account = "F1"  # adapter 目前的（可能已被換帳號覆寫的）self.account
+    report = adapter._map_order_report(
+        {"order_id": "O1", "seqno": "B1", "status": "Cancelled"}, account="F2",
+    )
+    assert report.account == "F2"  # 不是 self.account="F1"
+
+
+def test_map_order_report_account_defaults_to_none_when_not_passed():
+    """未傳 account（既有直接呼叫端）不回退讀 self.account——維持明確的「未知蓋章」語意。"""
+    adapter = _adapter_stub_for_mapper()
+    adapter.account = "F1"
+    report = adapter._map_order_report({"order_id": "O1", "seqno": "B1", "status": "Cancelled"})
+    assert report.account is None
+
+
+def test_map_deal_report_payload_account_mismatch_raises_payload_mismatch_dead_letter():
+    """R1-5：deal_report payload 自帶的 account_id 與列蓋章 account 矛盾 → fail closed，
+    RawInboxDeadLetterError(reason="payload_mismatch")，不是可重試的 ValueError。"""
+    adapter = _adapter_stub_for_mapper()
+    with pytest.raises(RawInboxDeadLetterError) as exc_info:
+        adapter._map_deal_report(
+            {"trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+             "price": "18000", "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1"},
+            account="F1",
+        )
+    assert exc_info.value.reason == "payload_mismatch"
+
+
+def test_map_deal_report_account_none_skips_mismatch_check_backward_compat():
+    """row.account 為 None（未蓋章的舊資料/直接呼叫）時跳過驗證，維持既有位元級行為
+    （同 R2-2 的 user_id NULL 放行原則）。"""
+    adapter = _adapter_stub_for_mapper()
+    fill = adapter._map_deal_report({
+        "trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+        "price": "18000", "ts": 1_780_000_000.0, "account_id": "F9", "ordno": "O1",
+    })  # account 未帶 → 預設 None，不驗證
+    assert fill.account == "F9"
+
+
+def test_map_deal_report_matching_account_passes_through():
+    adapter = _adapter_stub_for_mapper()
+    fill = adapter._map_deal_report(
+        {"trade_id": "D1", "exchange_seq": "000001", "action": "Buy", "quantity": 1,
+         "price": "18000", "ts": 1_780_000_000.0, "account_id": "F1", "ordno": "O1"},
+        account="F1",
+    )
+    assert fill.account == "F1"
+
+
+def test_map_order_report_uses_row_account_not_current_self_account_after_switch(engine):
+    """S3 拆除的端到端回歸（S#14/I7）：委託在帳號 F1 底下建立並補送舊事件，即使 adapter 之後
+    已經換到帳號 F2（模擬使用者換帳號重連，`self.account` 已被覆寫），這筆補送的舊事件仍須
+    正確歸屬 F1——若 mapper 誤用當下的 self.account="F2" 查詢，會解不到委託而 quarantine。"""
+    from quanquant.broker.inbox_worker import RawInboxWorker
+
+    adapter = _adapter(engine)  # account="F1"
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C1", request_hash="H1", user_id=1, mode="sim", broker="shioaji",
+            account="F1", symbol="TXF", action="Buy", qty=1, price=Decimal("18000"),
+            price_type="LMT", order_type="ROD", octype="New", trading_day="2026-06-16",
+        )
+        brepo.set_order_ack(s, order.id, broker_order_id="B1", ordno="O1", status="submitted")
+        s.commit()
+
+    # 舊帳號（F1）的委託回報，此刻正確落地並蓋章 account="F1"（模擬 in-process _persist_raw
+    # 在事件產生當下的蓋章時機）。
+    with Session(engine) as s:
+        brepo.stage_raw_inbox(
+            s, kind="order_report", broker="shioaji",
+            payload=json.dumps({"order_id": "O1", "seqno": "B1", "status": "Cancelled"}),
+            account="F1", mode="sim",
+        )
+        s.commit()
+
+    adapter.account = "F2"  # 換帳號：self.account 現在已經是 F2
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    handled = worker.process_batch_once()
+    assert handled == 1
+
+    with Session(engine) as s:
+        refreshed = s.exec(select(Order)).first()
+        assert refreshed.status == "cancelled"  # 用列蓋章 F1 正確解析，沒有因為換帳號而失聯
+        row = s.exec(select(RawInbox)).first()
+        assert row.processed is True and row.quarantine is False
+
+
 # ---- 以 _core.pyi 真實結構為藍本的端到端契約測試（bug 1(b)）：
 #      真實 FuturesDeal/FuturesOrder callback（非 dict、無 to_dict 的 mapping）
 #      → _json_safe → commit_raw_callback（JSON 落地）→ RawInboxWorker 解碼 → mapper
@@ -1115,6 +1436,52 @@ def test_futures_deal_event_contract_end_to_end_opens_position_using_resolved_or
         assert refreshed_order.filled_qty == 1
         row = s.exec(select(RawInbox)).first()
         assert row.processed is True and row.quarantine is False
+
+
+def test_multi_lot_order_split_deals_same_trade_id_all_accumulate_to_filled(engine):
+    """1/x partfilled 回歸測試（staging 實測 2026-09-01）：多口市價單被撮合拆成多筆
+    成交回報，每筆共用同一個 trade_id、exchange_seq 遞增。舊版 fill_id 只用 trade_id，
+    第 2 筆起被去重帳本誤判為重播丟棄 → filled_qty 永遠卡 1。修正後兩筆都入帳，
+    Order 走到 filled。"""
+    from quanquant.broker.inbox_worker import RawInboxWorker
+    from quanquant.db.models import Deal, Order
+
+    adapter = _adapter(engine)
+    with Session(engine) as s:
+        order = brepo.create_order(
+            s, client_order_id="C1", request_hash="H1", user_id=1, mode="sim", broker="shioaji",
+            account="F1", symbol="TXF", action="Buy", qty=2, price=Decimal("18500"),
+            price_type="MKT", order_type="IOC", octype="New", trading_day="2026-06-16",
+        )
+        order_id = order.id
+        brepo.set_order_ack(s, order.id, broker_order_id="103217", ordno="O1", status="submitted")
+        s.commit()
+
+    base = {
+        "trade_id": "103217", "seqno": "103217", "ordno": "O1",
+        "broker_id": "F002000", "account_id": "F1", "action": "Buy", "code": "TXF",
+        "full_code": "TXFG6", "price": 18500.0, "quantity": 1, "subaccount": "",
+        "security_type": "FUT", "delivery_month": "202607", "strike_price": 0.0,
+        "option_right": "Future", "market_type": "Day", "combo": False,
+        "ts": 1_780_000_000.0,
+    }
+    adapter._on_order_cb("FuturesDeal", _FakeMapping({**base, "exchange_seq": "000001"}))
+    adapter._on_order_cb("FuturesDeal", _FakeMapping({**base, "exchange_seq": "000002",
+                                                      "ts": 1_780_000_001.0}))
+
+    worker = RawInboxWorker(
+        session_factory=lambda: Session(engine), supervisor=BrokerSupervisor(),
+        deal_mapper=adapter._map_deal_report, order_report_mapper=adapter._map_order_report,
+    )
+    assert worker.process_batch_once() == 2
+
+    with Session(engine) as s:
+        deals = list(s.exec(select(Deal)))
+        assert len(deals) == 2  # 兩筆各自入帳，第 2 筆不可被當成重播丟棄
+        assert {d.fill_id for d in deals} == {"103217-000001", "103217-000002"}
+        refreshed = s.get(Order, order_id)
+        assert refreshed.filled_qty == 2
+        assert refreshed.status == "filled"
 
 
 def test_futures_deal_event_contract_specific_contract_code_end_to_end_shows_up_in_positions(engine):
@@ -1339,3 +1706,51 @@ def test_reconcile_noop_when_api_none_does_not_raise(engine):
     asyncio.run(adapter.reconcile())  # 不應拋例外（尚未連線時 watchdog 也可能呼叫到）
     with Session(engine) as s:
         assert list(s.exec(select(RawInbox))) == []
+
+
+# ---- Inc1 D5（R1-6）：reconcile 落列改走 stage_scoped_raw_inbox（唯一 scoped staging API），
+#      蓋章 account/mode/user_id，且與 cursor 推進同一交易 ----
+
+def test_reconcile_stages_rows_with_account_mode_scope_stamped(engine):
+    adapter = _adapter(engine)  # account="F1", mode="sim"
+    adapter._api.list_trades = lambda: [
+        _FakeTrade2("ORD1", "SEQ1", "Submitted", order_datetime=datetime(2026, 6, 16, 9, 0))
+    ]
+    asyncio.run(adapter.reconcile())
+    with Session(engine) as s:
+        row = s.exec(select(RawInbox)).first()
+        assert row.account == "F1" and row.mode == "sim"
+        # 目前仍是單一共享 channel/adapter（Task 7 才建 per-slot adapter），agent_user_id 未
+        # 被任何呼叫端設定，行為與 in-process 完全一致——user_id 恆 None。
+        assert row.user_id is None
+
+
+def test_reconcile_stage_and_cursor_advance_are_same_transaction_rolls_back_together(engine, monkeypatch):
+    """R1-6/S#18：reconcile 落列與 cursor 推進必須同一交易——中途任何一筆失敗（模擬 DB 短暫
+    故障），已落地的列與 cursor 推進都要一起回滾，不留下「列已落地但 cursor 沒推進」或反過來
+    的半殘狀態。"""
+    adapter = _adapter(engine)
+    calls = {"n": 0}
+    original = shioaji_adapter_module.stage_scoped_raw_inbox
+
+    def _boom_on_second(session, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("模擬中途 DB 短暫故障")
+        return original(session, **kw)
+
+    monkeypatch.setattr(shioaji_adapter_module, "stage_scoped_raw_inbox", _boom_on_second)
+
+    with pytest.raises(RuntimeError):
+        adapter._stage_reconcile_results(
+            [
+                {"order_id": "O1", "seqno": "B1", "status": "Cancelled"},
+                {"order_id": "O2", "seqno": "B2", "status": "Cancelled"},
+            ],
+            datetime(2026, 6, 16, 9, 0),
+        )
+
+    with Session(engine) as s:
+        assert list(s.exec(select(RawInbox))) == []  # 第一筆也被回滾，沒有半殘留
+        cursor = brepo.get_reconcile_cursor(s, broker="shioaji", account="F1", mode="sim")
+        assert cursor is None  # cursor 沒推進

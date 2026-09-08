@@ -1,108 +1,242 @@
 {% extends "base.html" %}
 {% block content %}
-<div x-data="{ open: false }" @closeordermodal.window="open = false">
+<div class="journal-head">
+  {# 009：sim 執行模式標題旁掛橘黃「模擬單」徽章（同 .badge.open 色族 #f0b90b）；real
+     或子系統停用時不顯示任何徽章。反映 server 執行 mode（exec_mode），與任何 ?mode=
+     檢視參數無關。用 Jinja 註解（不是 HTML 註解）——real 頁面驗收「不顯示任何 mode
+     徽章」，HTML 註解裡提到「模擬單」三個字也會被瀏覽器/測試斷言的原始文字掃到。 #}
+  <h3>下單{% if exec_mode == 'sim' %} <span class="badge open exec-mode-badge">模擬單</span>{% endif %}</h3>
+</div>
 
-  <div class="journal-head">
-    <h3>下單</h3>
+{% if not service_available %}
+<p class="error-banner">下單子系統目前未啟用，無法送出新委託（歷史委託仍可查看）。</p>
+{% endif %}
+
+<!-- 005：緊急停止（原 kill switch）與冷靜期的切換控制都搬到獨立的「風險控管」頁
+     （/risk）；下單頁只在生效中才顯示狀態橫幅，正常狀態零占位。 -->
+{% if kill_switch.blocked %}
+<div class="risk-banner">
+  <strong>🔴 緊急停止下單已啟動 — 目前拒絕新委託</strong>
+  <a href="/risk">前往風險控管頁查看／解除</a>
+</div>
+{% endif %}
+{% if cooldown %}
+<div class="risk-banner">
+  <strong>🔒 你正在冷靜期中 — 只能平倉、無法開新倉</strong>
+  <span>到期時間：{{ cooldown_until_text }}</span>
+  <a href="/risk">前往風險控管頁查看</a>
+</div>
+{% endif %}
+
+<!-- R2-4：Agent Token 產生／重置整塊 UI 搬到帳戶設定頁（/account）；本頁只留連線狀態
+     一列。這條連線同時掛在 /orders/stream 的 sse:orders-changed 上——agent WS 連線/斷線
+     時 agent_ws.py 會 hub.publish()，狀態列因此能即時反映，不必等下一次本分頁動作。 -->
+<div hx-ext="sse" sse-connect="/orders/stream">
+  {% include "partials/banner_stack.html" %}
+  <div id="agent-status-box"
+       hx-get="/orders/agent-status"
+       hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+</div>
+
+<div class="form-error-slot"></div>
+
+<!-- 002（B 版）：精簡報價列——商品選擇器併入報價列左段（不留在表單第一格），
+     沿用既有 /quote + /quote/stream + partials/quote.html，不新增第二個 poller、
+     不複製片段（quote-compact 只是 class 變體）。選擇器放在 <form> 外面，用
+     form="order-form" 關聯回下方表單——FormData 仍會帶上 symbol，送出契約不變。
+     sticky 吸在 topnav 下方（<768px 取消吸附，見 app.css）。
+     限制（終審回饋，尚未實作重連本體）：sse-connect 目前寫死 symbols[0]，htmx 的 SSE
+     擴充不會因為屬性變動就重連——多商品上線前必須補上「切換商品時重建這個 sse-connect
+     容器」，否則會發生「hx-get 換上的無報價片段被舊商品的 SSE 推播覆蓋」的競態。目前
+     只有單一商品，此限制無實際影響。
+
+     006：精簡條（position-strip）掛在同一個 sse-connect 作用域內——浮動損益「隨報價
+     即時更新」重用這條既有的 quote SSE，不新增推播管線（給工程師的實作提示原文：
+     「可先掛在既有 quote SSE 的節奏上（同一個 5 秒源），不必新增推播」）。
+
+     實作時發現的落差：dashboard.py::quote_stream 的實際心跳是每 ~1 秒（`asyncio.wait_for
+     (..., timeout=1.0)` 逾時就重發同一價格讓報價「看起來活著」），比提示文字假設的
+     「5 秒源」（TAIFEX 上游輪詢間隔）密得多；若不加節流，`sse:message` 會讓這支端點被
+     每個開著頁面的分頁每秒打一次（DB 讀），重新引入當初把委託/部位表從 `every 2s` 改
+     SSE 推送、就是為了消滅的那種輪詢式壓力。改用 htmx 內建的 `throttle:5s` trigger
+     修飾詞：仍然是「掛在既有 SSE 連線上」（不新增連線/推播管線，符合提示原意），但把
+     實際觸發 hx-get 的頻率限制在最多每 5 秒一次——真正對齊提示文字講的「同一個 5 秒源」
+     節奏，而不是被心跳的實際頻率牽著走。
+
+     本分頁自己下單/取消/改單造成的部位變動另外掛 `refreshorders from:body`，不受節流
+     影響、即時反映；非本分頁來源的成交（如 agent 端非同步回報）則隨下一次節流後的報價
+     刷新（至多 ~5 秒）內自然收斂——這個 eventual-consistency 的取捨是刻意的：精簡條與
+     agent-status-box 分屬兩個不同的 sse-connect 掃描（quote-stream／orders-stream），
+     htmx-ext-sse 的 `sse:` trigger 只會綁到「最近的」單一 sse-connect 祖先，一個元素
+     無法同時訂閱兩條串流；比起讓精簡條完全跳過報價節奏（PnL 在持倉期間會凍結不動，
+     違反「隨報價即時更新」的核心訴求），選擇跟報價心跳走（但節流到 5 秒）。 -->
+<div hx-ext="sse" sse-connect="/quote/stream?symbol={{ symbols[0] }}">
+  <!-- 003：展開看中文品名（optgroup 標題）、收合只看代碼（option 文字）——原生 <optgroup>
+       天然達成，不需自訂下拉元件，鍵盤/螢幕閱讀器/手機原生選單全部保留。 -->
+  <section class="quote-panel quote-compact">
+    <select name="symbol" form="order-form" id="order-symbol" class="quote-symbol-select" aria-label="商品">
+      {% for s in symbols %}
+      <optgroup label="{{ s | symbol_label }}"><option value="{{ s }}">{{ s }}</option></optgroup>
+      {% endfor %}
+    </select>
+    <div id="quote" sse-swap="message" hx-swap="innerHTML"
+         hx-get="/quote" hx-include="#order-symbol" hx-trigger="load, change from:#order-symbol">
+      <div class="quote">等待報價…</div>
+    </div>
+  </section>
+
+  <!-- 006：未平倉／浮動損益／可動用保證金精簡條——symbol-scoped，跟著商品選擇器走
+       （hx-include 帶上目前選到的 symbol）；無倉時整段部位/浮損不顯示（見
+       partials/position_strip.html／GET /orders/position-strip）。 -->
+  <div id="pos-strip-box"
+       hx-get="/orders/position-strip" hx-include="#order-symbol"
+       hx-trigger="load, change from:#order-symbol, refreshorders from:body, sse:message throttle:5s"
+       hx-swap="innerHTML"></div>
+</div>
+
+<!-- hx-disabled-elt：送出期間停用送出鈕，杜絕「回應還沒回來前的 double-submit」——連點的
+     第二下會帶同一顆 client_order_id（成功回應才會 OOB 換鍵），撞 repository 冪等短路而靜默
+     回既有委託、不建新單，使用者感覺「沒反應」。
+
+     007（sim 確認視窗）：`data-sim-confirm` 由伺服器算好（sim 且未勾「不再顯示」時為
+     "1"），static/order_confirm.js 監聽 htmx 的 `htmx:confirm` 事件、依這個旗標決定
+     要不要攔截送出改跳確認視窗（#sim-confirm-dialog）——real 完全不吃這個旗標，一律
+     不攔截，走既有的後端強制兩階段確認（confirm_dialog.html）。 -->
+<form id="order-form" hx-post="/orders" hx-swap="none" hx-disabled-elt="find button[type='submit']"
+      data-sim-confirm="{{ '1' if sim_confirm_required else '0' }}"
+      x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '{{ prefill_price if prefill_price is not none else '' }}' }">
+  <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
+  <div class="grid">
+    <fieldset class="side-field">
+      <legend>方向</legend>
+      <div class="side-toggle">
+        <input type="radio" id="side-buy" class="side-radio" name="action" value="Buy" checked>
+        <label for="side-buy" class="side-opt side-buy">買</label>
+        <input type="radio" id="side-sell" class="side-radio" name="action" value="Sell">
+        <label for="side-sell" class="side-opt side-sell">賣</label>
+      </div>
+    </fieldset>
+    <label>口數
+      <input name="qty" type="number" min="1" value="1">
+    </label>
   </div>
+  <div class="grid">
+    <label>價格
+      <!-- bug 1（simtrade 實測回歸）：MKT 時改用 readonly（而非 disabled）——disabled
+           欄位完全依賴瀏覽器/HTMX 排除送出的行為，這件事本身無法用 TestClient 驗證
+           （見 docs/superpowers/reviews/2026-07-25 驗收殘留：真瀏覽器 UI/HTMX 未經真
+           瀏覽器互動）；readonly 一律隨表單送出，切到 MKT 時同時把顯示/送出值自動歸零
+           （見下方 price_type 的 x-on:change），讓後端一律收得到明確的 price=0，不需要
+           再依賴「有沒有送出這個欄位」。空值/None 後端 _parse_order_price 仍有防線
+           （見 web/routers/orders.py），這裡是前端層再多一道保險。 -->
+      <!-- 2026-09-05（使用者拍板，需求 A）：LMT 初值預填「當下市價」（orders_page 算好
+           的 prefill_price，見 web/routers/orders.py）；`data-qq-prefilled` 標記這個
+           初值是系統填的、不是使用者手改——static/order_price_prefill.js 用這個旗標
+           判斷之後（切商品／MKT 切回 LMT）要不要跟著更新現價；使用者真的手改過（原生
+           input 事件）就把旗標清掉，之後不再自動覆寫。這只是表單初值，送出契約／驗證
+           （_parse_order_price）／tick 規則完全不變。 -->
+      <input name="price" id="order-price" type="text" placeholder="18000" x-model="priceValue"
+             x-bind:readonly="priceType === 'MKT'"
+             {% if prefill_price is not none %}data-qq-prefilled="1"{% endif %}>
+    </label>
+    <label>價格類型
+      <select name="price_type" id="order-price-type" x-model="priceType"
+              x-on:change="if (priceType === 'MKT') { priceValue = '0'; if (orderType === 'ROD') orderType = 'IOC'; }">
+        <option value="LMT">限價</option><option value="MKT">市價</option>
+      </select>
+    </label>
+    <label>委託類型
+      <!-- TAIFEX 市價單不接受 ROD——MKT 時只能選 IOC/FOK，LMT 才可以 ROD。 -->
+      <select name="order_type" x-model="orderType">
+        <option value="ROD" x-bind:disabled="priceType === 'MKT'">ROD</option>
+        <option value="IOC">IOC</option>
+        <option value="FOK">FOK</option>
+      </select>
+    </label>
+    <label>倉別
+      <!-- R2-5：冷靜期生效中，倉別鎖定「平倉」（新倉／自動 disabled）——讓使用者填單當下
+           就知道只能平倉，而不是送出後才被伺服器端風控拒絕（「按了才知道」）。伺服器端的
+           擋單邏輯本來就存在（broker/risk.py::check_place 的 octype!='Cover' 分支），這裡
+           純粹是表單 UI 預先揭露，不改任何攔截規則。送出鈕刻意維持可用（見下方
+           form-actions）——平倉是安全閥，不可整顆停用。
 
-  {% if not service_available %}
-  <p class="error-banner">下單子系統目前未啟用，無法送出新委託（歷史委託仍可查看）。</p>
+           終審必修（CRITICAL-2）：這裡刻意只吃 `cooldown`，不吃 `kill_switch.blocked`。
+           R2-5 原文的前提是「F0 改『只擋開倉』後」才把急停套進同一套鎖倉別 UI——但
+           check_place() 目前的順序是 kill switch 檢查（risk.py 174-175，`self.blocked()`
+           全擋）先於 cooldown 的 octype 判斷，F0「只擋開倉」尚未實作，急停生效時平倉一樣
+           會被伺服器拒絕。若把 kill_switch.blocked 也算進 octype_locked，會顯示「僅能
+           平倉」且送出鈕可按，使用者填完平倉單送出才發現一樣被拒——正是 R2-5 想消滅的
+           「按了才知道」，UI 說的是還沒實現的未來狀態。急停生效時改走下方 footer 的
+           「送出鈕整顆停用」（005 已驗收的行為，不可退步）；F0 把 check_place 改成
+           octype-aware（只擋開倉）之後，才把 kill_switch.blocked 併回這裡的判斷。 -->
+      {% set octype_locked = cooldown %}
+      <select name="octype">
+        <option value="New" {% if octype_locked %}disabled{% endif %}>新倉</option>
+        <option value="Cover" {% if octype_locked %}selected{% endif %}>平倉</option>
+        <option value="Auto" {% if octype_locked %}disabled{% endif %}>自動</option>
+      </select>
+    </label>
+  </div>
+  {% if octype_locked %}
+  <small class="risk-status-note warn">冷靜期中僅能平倉，無法開新倉。</small>
   {% endif %}
+  <footer class="form-actions">
+    <!-- 005（不可退步）：急停生效中整顆停用送出鈕——check_place 目前對急停是全擋（見上方
+         倉別欄位的說明），不是只擋開倉，維持「送出鈕停用」才是誠實的 UI；等 F0 把急停也
+         改成 octype-aware 後再比照冷靜期改用鎖倉別＋送出鈕保留可用。 -->
+    <button type="submit" {% if not service_available or kill_switch.blocked %}disabled{% endif %}>送出</button>
+  </footer>
+</form>
 
-  {# owner-only 全域 kill switch 控制（server 端切換仍一律經 assert_owner，非只靠此隱藏）。 #}
-  {% if is_owner %}
-  {% include "partials/kill_switch_control.html" %}
-  {% endif %}
+<div class="confirm-slot"></div>
 
-  <div class="form-error-slot"></div>
+{# 007：sim 下單確認視窗——內容同 real 確認框的完整委託摘要（static/order_confirm.js
+   於 htmx:confirm 攔截送出時填入 #sim-confirm-summary，讀當下表單欄位值，不需要伺服器
+   額外回應）；明示「模擬單」橘黃徽章（009）。勾選「不再顯示」送出後即時把
+   `data-sim-confirm` 改成 "0"（這個分頁立即生效）並非同步存回 User（PUT
+   /api/user/skip-sim-confirm，比照 QQTheme.toggle 既有慣例：失敗只影響下次載入）。
 
-  <!-- hx-disabled-elt：送出期間停用送出鈕，杜絕「回應還沒回來前的 double-submit」——連點的
-       第二下會帶同一顆 client_order_id（成功回應才會 OOB 換鍵），撞 repository 冪等短路而靜默
-       回既有委託、不建新單，使用者感覺「沒反應」。 -->
-  <form hx-post="/orders" hx-swap="none" hx-disabled-elt="find button[type='submit']"
-        x-data="{ priceType: 'LMT', orderType: 'ROD', priceValue: '' }">
-    <input type="hidden" id="client-order-id-input" name="client_order_id" value="{{ client_order_id }}">
-    <div class="grid">
-      <label>商品
-        <select name="symbol">{% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}</select>
-      </label>
-      <label>方向
-        <select name="action"><option value="Buy">買</option><option value="Sell">賣</option></select>
-      </label>
-      <label>口數
-        <input name="qty" type="number" min="1" value="1">
-      </label>
-    </div>
-    <div class="grid">
-      <label>價格
-        <!-- bug 1（simtrade 實測回歸）：MKT 時改用 readonly（而非 disabled）——disabled
-             欄位完全依賴瀏覽器/HTMX 排除送出的行為，這件事本身無法用 TestClient 驗證
-             （見 docs/superpowers/reviews/2026-07-25 驗收殘留：真瀏覽器 UI/HTMX 未經真
-             瀏覽器互動）；readonly 一律隨表單送出，切到 MKT 時同時把顯示/送出值自動歸零
-             （見下方 price_type 的 x-on:change），讓後端一律收得到明確的 price=0，不需要
-             再依賴「有沒有送出這個欄位」。空值/None 後端 _parse_order_price 仍有防線
-             （見 web/routers/orders.py），這裡是前端層再多一道保險。 -->
-        <input name="price" type="text" placeholder="18000" x-model="priceValue" x-bind:readonly="priceType === 'MKT'">
-      </label>
-      <label>價格類型
-        <select name="price_type" x-model="priceType"
-                x-on:change="if (priceType === 'MKT') { priceValue = '0'; if (orderType === 'ROD') orderType = 'IOC'; }">
-          <option value="LMT">限價</option><option value="MKT">市價</option>
-        </select>
-      </label>
-      <label>委託類型
-        <!-- TAIFEX 市價單不接受 ROD——MKT 時只能選 IOC/FOK，LMT 才可以 ROD。 -->
-        <select name="order_type" x-model="orderType">
-          <option value="ROD" x-bind:disabled="priceType === 'MKT'">ROD</option>
-          <option value="IOC">IOC</option>
-          <option value="FOK">FOK</option>
-        </select>
-      </label>
-      <label>倉別
-        <select name="octype"><option value="New">新倉</option><option value="Cover">平倉</option><option value="Auto">自動</option></select>
-      </label>
-    </div>
+   只在 exec_mode == 'sim' 時渲染這個 dialog：real 模式下 order_confirm.js 的
+   htmx:confirm 攔截本來就不會觸發它（`data-sim-confirm` 恆為 "0"），但 009 驗收
+   「real 頁面不顯示任何 mode 徽章」看的是整頁原始碼，不只是可見區域——不渲染這段
+   對 real 沒有任何行為影響（本來就用不到），卻讓「real 無標」這個承諾對頁面原始碼
+   同樣成立。 #}
+{% if exec_mode == 'sim' %}
+<dialog id="sim-confirm-dialog" aria-labelledby="sim-confirm-title">
+  <article class="modal-card">
+    <header>
+      <strong id="sim-confirm-title">確認送出 <span class="badge open exec-mode-badge">模擬單</span></strong>
+    </header>
+    <p id="sim-confirm-summary"></p>
+    <label>
+      <input type="checkbox" id="sim-confirm-skip-checkbox"> 不再顯示（之後模擬單直接送出）
+    </label>
     <footer class="form-actions">
-      <button type="submit" {% if not service_available %}disabled{% endif %}>送出</button>
+      <button type="button" class="secondary" id="sim-confirm-cancel-btn">取消</button>
+      <button type="button" id="sim-confirm-submit-btn">確認送出</button>
     </footer>
-  </form>
+  </article>
+</dialog>
+{% endif %}
 
-  <div class="confirm-slot"></div>
-
-  <div class="mode-tabs" role="tablist">
-    <a role="button" class="{{ '' if mode == 'real' else 'contrast' }}" href="/orders?mode=real">正式</a>
-    <a role="button" class="{{ 'contrast' if mode == 'sim' else '' }}" href="/orders?mode=sim">模擬</a>
-  </div>
-
-  <!-- SSE 推送取代盲輪詢：委託/成交/部位有變動時，後端 /orders/stream 推一個 orders-changed
-       事件（主要由 RawInboxWorker 非同步成交落地觸發，見 broker/inbox_worker.py），瀏覽器據此
-       重抓自己 user-scoped 的委託/部位。保留 load（首載）與 refreshorders from:body（本分頁
-       下單/改單/取消當下即時刷新）；不再每 2s 盲輪詢、不再壓 event loop/supervisor 鎖。 -->
-  <div hx-ext="sse" sse-connect="/orders/stream">
-    <div id="agent-status-box"
-         hx-get="/orders/agent-status"
-         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
-
-    <h4>委託</h4>
-    <div hx-get="/orders/list?mode={{ mode }}"
-         hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
-
-    <h4>部位</h4>
+<!-- 2026-09-05（使用者拍板，需求 B）：對 006「部位表移出下單頁」的有意識部分還原——
+     精簡條（quote-panel 旁的 #pos-strip-box，symbol-scoped）維持不動，這裡另外在頁面
+     最下方掛回「全部」未平倉部位（不只當前商品），放在「報價→表單→送出」動線之後，
+     不擠壓原本一屏能完成下單的體驗。重用既有 `/orders/positions` endpoint 與
+     `partials/position_table.html`（未平倉頁 /orders/holdings 在用的那套，含浮損欄），
+     不帶 `?mode=`——本頁本來就不接受 mode 檢視參數，一律反映 server-side 執行 mode
+     （同精簡條/agent 狀態）。掛載寫法（hx-get＋`refreshorders from:body`／
+     `sse:orders-changed` 雙 trigger）比照 orders_queue.html／orders_holdings.html
+     既有寫法，自成一個 sse-connect 範圍（不與頁首 agent 狀態共用同一條連線，維持各
+     區塊獨立、互不牽動）。 -->
+<div class="journal-head">
+  <h3>未平倉部位</h3>
+  <small class="muted"><a href="/orders/holdings">查看未平倉頁 →</a></small>
+</div>
+<div hx-ext="sse" sse-connect="/orders/stream">
+  <div class="table-wrap">
     <div hx-get="/orders/positions"
          hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
   </div>
-
-  <!-- 改單 modal -->
-  <dialog :open="open">
-    <article class="modal-card">
-      <header>
-        <button aria-label="Close" rel="prev" @click="open = false"></button>
-        <strong>改單</strong>
-      </header>
-      <div id="order-edit-modal"></div>
-    </article>
-  </dialog>
-
 </div>
 {% endblock %}

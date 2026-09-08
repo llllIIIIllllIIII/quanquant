@@ -814,10 +814,12 @@
     tfs: TFS,
     tf: "1m",
     session: "all",
+    // 004（2026-08-28 需求）：選單用語改交易者慣用的盤別名稱；code（all/day/night）與
+    // /api/candles 的 session 查詢參數不變，只改顯示字串。
     sessions: [
-      { code: "all", label: "全部" },
-      { code: "day", label: "只日盤" },
-      { code: "night", label: "只夜盤" },
+      { code: "all", label: "全日盤" },
+      { code: "day", label: "日盤" },
+      { code: "night", label: "夜盤" },
     ],
     settingsOpen: false,
     moreOpen: false,

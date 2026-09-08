@@ -22,6 +22,13 @@ class Transport(Protocol):
     async def close(self) -> None: ...
 
 
+class TokenRejectedError(RuntimeError):
+    """WS 握手被 server 以 close code 1008 拒絕（token 無效/停用/非 owner，見
+    web/routers/agent_ws.py::_authenticate 的既有語意）。GUI 決策樹用它判斷『不能再信
+    metadata 說 token 未過期』，headless 路徑不特別處理（沿用既有例外傳播/backoff 行為，
+    不影響 G5）。"""
+
+
 class WebsocketsTransport:
     """websockets 套件實作；header x-agent-token 帶 token。"""
 
@@ -39,7 +46,15 @@ class WebsocketsTransport:
         await self._ws.send(json.dumps(msg))
 
     async def receive(self) -> dict:
-        data = await self._ws.recv()
+        try:
+            data = await self._ws.recv()
+        except websockets.exceptions.ConnectionClosed as exc:
+            code = getattr(exc, "code", None)
+            if code is None:
+                code = getattr(getattr(exc, "rcvd", None), "code", None)
+            if code == 1008:
+                raise TokenRejectedError("agent WS 握手被拒（token 無效/停用/非 owner）") from exc
+            raise
         return json.loads(data)
 
     async def close(self) -> None:

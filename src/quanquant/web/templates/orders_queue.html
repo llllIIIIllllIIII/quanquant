@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% from "macros/segmented.html" import mode_tabs %}
+{% block content %}
+<div x-data="{ open: false }" @closeordermodal.window="open = false">
+
+  <div class="journal-head">
+    <h3>委託</h3>
+  </div>
+
+  {{ mode_tabs(mode, '/orders/queue') }}
+
+  <!-- 取消失敗時 _form_error() 用 HX-Retarget 打到這個 slot（沿用下單頁原本的既有機制，
+       搬家後這個掛載點也要跟著搬過來，否則取消失敗時 htmx 找不到 retarget 目標）。 -->
+  <div class="form-error-slot"></div>
+
+  <!-- SSE 推送取代盲輪詢：委託/成交/部位有變動時，後端 /orders/stream 推一個 orders-changed
+       事件（主要由 RawInboxWorker 非同步成交落地觸發，見 broker/inbox_worker.py），瀏覽器據此
+       重抓自己 user-scoped 的委託。保留 load（首載）與 refreshorders from:body（本分頁
+       改單/取消當下即時刷新）；不再每 2s 盲輪詢、不再壓 event loop/supervisor 鎖。 -->
+  <div hx-ext="sse" sse-connect="/orders/stream">
+    {% include "partials/banner_stack.html" %}
+    <div class="table-wrap">
+      <div hx-get="/orders/list?mode={{ mode }}"
+           hx-trigger="load, refreshorders from:body, sse:orders-changed" hx-swap="innerHTML"></div>
+    </div>
+  </div>
+
+  <!-- 改單 modal -->
+  <dialog :open="open">
+    <article class="modal-card">
+      <header>
+        <button aria-label="Close" rel="prev" @click="open = false"></button>
+        <strong>改單</strong>
+      </header>
+      <div id="order-edit-modal"></div>
+    </article>
+  </dialog>
+
+</div>
+{% endblock %}

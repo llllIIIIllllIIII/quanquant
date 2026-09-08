@@ -23,6 +23,11 @@ def _settings(**over):
     base = dict(
         shioaji_trade_api_key="k", shioaji_trade_secret_key="s",
         order_mode="sim", order_owner_user_ids="1", symbol="TXF",
+        # 這幾個 in-process 路徑測試明確假設 order_channel="inprocess"（預設值）——
+        # 顯式釘住，不依賴 code-level 預設值，避免受本機 `.env`（例如手動測試 agent 通道
+        # 時暫時設的 ORDER_CHANNEL=agent）汙染而跑錯分支（pydantic-settings 會讀
+        # `.env`，測試不應該依賴開發機當下的檔案內容）。
+        order_channel="inprocess",
     )
     base.update(over)
     return Settings(**base)
@@ -101,20 +106,26 @@ def test_invalid_order_channel_marks_unhealthy_no_tasks():
 def test_order_channel_agent_dispatches_before_inprocess_preflight(monkeypatch):
     # Step 3.2 分流（Task 8）：order_channel="agent" 時完全繞過 in-process 的
     # shioaji_trade_api_key/CA preflight，改走 `_start_agent_channel_subsystem`
-    # （agent_channel 被設、app.state.order_service 是 remote_gateway 模式的 adapter）。
+    # （Task 7：`agent_registry` 被設，registry 裡有這個 owner 的 `UserAgentSlot`，
+    # slot.adapter 是 remote_gateway 模式的 adapter；全站 `order_session_state` 只代表
+    # wiring 完成，不等任何 slot 連線，D9）。
     monkeypatch.setattr("quanquant.web.app.get_engine", _test_engine)
 
     app = FastAPI()
     tasks: list = []
     asyncio.run(_start_order_subsystem(
-        app, _settings(order_channel="agent", agent_ws_token="tok"), tasks,
+        app, _settings(order_channel="agent"), tasks,
     ))
 
     from quanquant.broker.agent_channel import AgentChannel
-    assert isinstance(app.state.agent_channel, AgentChannel)
-    assert app.state.order_session_state.disabled is True
-    assert "agent 未連線" in app.state.order_session_state.last_error
-    assert len(tasks) >= 2
+    slot = app.state.agent_registry.get(1)   # order_owner_user_ids="1"（_settings 預設）
+    assert slot is not None
+    assert isinstance(slot.channel, AgentChannel)
+    assert slot.session_state.disabled is True
+    assert "agent 未連線" in slot.session_state.last_error
+    assert app.state.order_session_state.ready is True   # D9：wiring 完成即 ready
+    assert len(slot.tasks) >= 2
+    assert len(tasks) >= 4
 
 
 def test_connect_success_publishes_service_and_schedules_background_tasks(monkeypatch):
@@ -132,3 +143,6 @@ def test_connect_success_publishes_service_and_schedules_background_tasks(monkey
     assert app.state.order_inbox_worker is not None
     # inbox worker run() + watchdog + confirm token 清理，三個背景 task 都掛上去
     assert len(tasks) == 3
+    # 事件喚醒佈線（in-process）：adapter 的 raw_committed_hook 必須接到「這個」inbox
+    # worker 的 request_wake，`_persist_raw` commit 成功後才能喚醒正確的 worker。
+    assert app.state.order_service.raw_committed_hook == app.state.order_inbox_worker.request_wake

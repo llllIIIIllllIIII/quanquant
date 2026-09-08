@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>冷靜期管理（唯讀）</h2>
+{# R2-2（D-2，2026-09-02）：反悔窗僅本人可在啟動後 5 分鐘內自行取消；逾時後任何人（含
+   管理員）都無法提前解除，只能等到期——這頁只供查看目前狀態，不再提供解除操作。 #}
+<p class="muted">使用者自我禁制：僅本人可在啟動後 5 分鐘內自行取消；逾時後任何人（含管理員）都無法提前解除，只能等到期。這裡僅供查看目前狀態。</p>
+
+{% if not items %}
+<p>目前沒有使用者處於冷靜期。</p>
+{% else %}
+<table>
+  <thead>
+    <tr><th>使用者</th><th>到期時間</th><th>建立時間</th></tr>
+  </thead>
+  <tbody>
+  {% for item in items %}
+    <tr>
+      <td>{{ item.username }}{% if item.display_name %}（{{ item.display_name }}）{% endif %}</td>
+      <td>{{ item.until_text }}</td>
+      <td>{{ item.created_text }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+{% endblock %}

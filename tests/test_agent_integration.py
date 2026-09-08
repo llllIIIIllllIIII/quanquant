@@ -39,8 +39,10 @@ from quanquant.agent.buffer import DurableBuffer
 from quanquant.agent.runner import AgentRunner
 from quanquant.agent.testing import fake_native_factory
 from quanquant.agent.ws_client import WebsocketsTransport
+from quanquant.auth.agent_tokens import issue_token
 from quanquant.auth.tokens import SESSION_COOKIE, sign_session
 from quanquant.broker.agent_channel import AgentChannel, AgentNativeGateway
+from quanquant.broker.agent_registry import AgentRegistry, UserAgentSlot
 from quanquant.broker.inbox_worker import RawInboxWorker
 from quanquant.broker.order_events import OrderEventHub
 from quanquant.broker.risk import RiskGuard
@@ -97,7 +99,6 @@ class _ThreadChild:
 
 @pytest.fixture
 def live_server(engine, user, monkeypatch):
-    monkeypatch.setenv("AGENT_WS_TOKEN", "tok")
     # 修正 1（見檔頭說明）：orders_agent_status 的 partial 只在 order_channel=="agent" 時
     # 才輸出任何文字，不補這行最後 "agent 已連線" 斷言必敗。
     monkeypatch.setenv("ORDER_CHANNEL", "agent")
@@ -113,6 +114,15 @@ def live_server(engine, user, monkeypatch):
     def session_factory():
         return Session(engine)
 
+    # D2：全站靜態 AGENT_WS_TOKEN 已移除，改為每個 user 一枚 DB opaque token——這裡幫
+    # `user`（conftest 的預設登入帳號，也是下面 RiskGuard 的唯一 owner）簽發一枚真正的
+    # token，agent 端連線改帶這枚（見下方 WebsocketsTransport(token=agent_token)）。
+    with session_factory() as s:
+        agent_token = issue_token(s, user_id=user.id, ttl_days=30)
+
+    # Task 7：per-user slot（單 owner，registry 只有一格）——channel/gateway/adapter/
+    # session_state/supervisor 全部打包進 UserAgentSlot，`app.state.agent_registry` 取代
+    # 舊的單一全域 app.state.agent_channel/order_service/order_session_state。
     supervisor = BrokerSupervisor()
     guard = RiskGuard(session_factory=session_factory, secret="s",
                       owner_user_ids=frozenset({user.id}),
@@ -129,14 +139,15 @@ def live_server(engine, user, monkeypatch):
     worker = RawInboxWorker(session_factory=session_factory, supervisor=supervisor,
                             deal_mapper=adapter._map_deal_report,
                             order_report_mapper=adapter._map_order_report,
-                            order_events=hub, idle_interval=0.05)
+                            order_events=hub, idle_interval=0.05, user_id=user.id)
     state = OrderSessionState()
     state.mark_disabled("agent 未連線")
-    app.state.agent_channel = channel
-    app.state.order_service = adapter
+    slot = UserAgentSlot(user_id=user.id, channel=channel, gateway=gateway, adapter=adapter,
+                         session_state=state, supervisor=supervisor, tasks=[])
+    registry = AgentRegistry()
+    registry.add(slot)
+    app.state.agent_registry = registry
     app.state.order_risk_guard = guard
-    app.state.order_inbox_worker = worker
-    app.state.order_session_state = state
     app.state.order_session_factory = session_factory
     app.state.order_events = hub
 
@@ -158,7 +169,7 @@ def live_server(engine, user, monkeypatch):
         time.sleep(0.05)
     assert server.started, "uvicorn 未啟動"
     port = server.servers[0].sockets[0].getsockname()[1]
-    yield f"127.0.0.1:{port}", app
+    yield f"127.0.0.1:{port}", app, agent_token
     server.should_exit = True
     thread.join(timeout=10)
     get_settings.cache_clear()
@@ -172,18 +183,19 @@ async def _until(cond, timeout=10.0):
 
 
 async def test_skeleton_roundtrip_and_kill_switch(live_server, engine, user, tmp_path):
-    host, app = live_server
+    host, app, agent_token = live_server
     buf = DurableBuffer(tmp_path / "o.db")
     child = _ThreadChild(str(tmp_path / "o.db"))
-    runner = AgentRunner(transport=WebsocketsTransport(f"ws://{host}/ws/agent", token="tok"),
+    runner = AgentRunner(transport=WebsocketsTransport(f"ws://{host}/ws/agent", token=agent_token),
                          buffer=buf, child=child, pump_interval=0.05, resend_after=1.0,
                          child_command_timeout=5, child_ping_interval=30,
                          child_ping_timeout=5, heartbeat_interval=30)
     runner.ensure_child()
     run_task = asyncio.create_task(runner.run_once())
     try:
-        await _until(lambda: app.state.agent_channel.ready)
-        assert app.state.order_session_state.ready          # login → mark_ready
+        slot = app.state.agent_registry.get(user.id)
+        await _until(lambda: slot.channel.ready)
+        assert slot.session_state.ready          # login → mark_ready
 
         async with httpx.AsyncClient(base_url=f"http://{host}") as client:
             client.cookies.set(SESSION_COOKIE, sign_session(user.id, user.token_version))
@@ -210,8 +222,8 @@ async def test_skeleton_roundtrip_and_kill_switch(live_server, engine, user, tmp
 
             assert "agent 已連線" in (await client.get("/orders/agent-status")).text
 
-            # kill switch：ON 後新單被擋、child 未收到新 place
-            await client.post("/orders/kill-switch", data={"enabled": "true"})
+            # kill switch：ON 後新單被擋、child 未收到新 place（D3：全站總閘 scope=global）
+            await client.post("/orders/kill-switch", data={"enabled": "true", "scope": "global"})
             n_ops = len(child.ops)
             r = await client.post("/orders", data={
                 "client_order_id": "e2e-2", "symbol": "TXF", "action": "Buy",

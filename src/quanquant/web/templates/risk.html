@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block head %}
+{# flatpickr（釘版 4.6.13）：冷靜期到期時間選擇器，隨冷靜期控制一併從 orders.html 搬到本頁。 #}
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.css">
+<script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/flatpickr.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/flatpickr@4.6.13/dist/l10n/zh-tw.js"></script>
+{% endblock %}
+{% block content %}
+<div class="journal-head">
+  <h3>風險控管</h3>
+</div>
+
+<article class="risk-card">
+  <h4>緊急停止下單</h4>
+  <p class="muted">
+    啟動後立即拒絕新委託；<strong>只擋新單，不會自動取消既有掛單</strong>——已送出且尚未成交的
+    委託仍留在市場上，需要人工判斷是否手動撤單。「我的緊急停止」帳號本人即可操作；
+    「全站緊急停止」僅管理員可操作。
+  </p>
+  {% with self_readonly=not is_owner, global_readonly=not is_admin %}
+  {% include "partials/kill_switch_control.html" %}
+  {% endwith %}
+</article>
+
+{% if is_owner %}
+<article class="risk-card">
+  <h4>交易冷靜期</h4>
+  {% with until_text=cooldown_until_text, can_cancel=cooldown_can_cancel, cancel_deadline_text=cooldown_cancel_deadline_text %}
+  {% include "partials/cooldown_control.html" %}
+  {% endwith %}
+</article>
+{% endif %}
+
+{% if is_admin %}
+<article class="risk-card">
+  <h4>Agent 連線控制</h4>
+  {% with blocked=agent_blocked %}{% include "partials/agent_connection_control.html" %}{% endwith %}
+</article>
+{% endif %}
+{% endblock %}
