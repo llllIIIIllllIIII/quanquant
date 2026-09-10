@@ -577,6 +577,38 @@ button.risk-btn-danger:is(:hover, :focus), [role="button"].risk-btn-danger:is(:h
 @media (max-width: 767px) { .ind-split { flex-direction: column; }
   .ind-list { flex-basis: auto; border-right: none; border-bottom: 1px solid var(--qq-border); padding-right: 0; } }
 
+/* 011（2026-09-10，需求 A）：參數列一多，「儲存／取消」與「＋ 新增」就被推到卷軸底下，
+   每次調參數都要多一個「滑到最下面」的動作——病灶是 Pico 預設的
+   `dialog > article { max-height: ...; overflow: auto }` 讓捲動發生在 article 這一層，
+   header／footer 跟著一起被捲走。改成 dialog 自己不長高：article 為 flex column
+   並限高、header／footer 固定不動，中間 .ind-split 內部捲動——動作永遠在原地看得到。 */
+.ind-settings {
+  display: flex; flex-direction: column;
+  max-height: min(86vh, 780px); overflow: hidden;
+}
+.ind-settings > header, .ind-settings > footer { flex: 0 0 auto; }
+.ind-settings > footer.form-actions { border-top: 1px solid var(--qq-border); padding-top: 0.75rem; }
+.ind-settings > .ind-split { flex: 1 1 auto; min-height: 0; overflow: hidden; }
+/* 兩欄各自捲動：左欄找指標、右欄調參數，互不牽動。 */
+.ind-settings .ind-list, .ind-settings .ind-detail { overflow-y: auto; min-height: 0; }
+
+/* 右欄欄頂固定列：指標名 ＋「＋ 新增」——加線的入口不再跟著參數列往下跑。 */
+.ind-detail-head {
+  position: sticky; top: 0; z-index: 1; background: var(--qq-surface);
+  display: flex; align-items: center; justify-content: space-between; gap: 0.5rem;
+  padding-bottom: 0.4rem; margin-bottom: 0.5rem; border-bottom: 1px solid var(--qq-border);
+}
+.ind-detail-head .mini { margin: 0; white-space: nowrap; }
+
+/* 窄螢幕：改回「整個 dialog 一起捲」——欄位各自捲在小畫面上反而更難操作；
+   「儲存／取消」sticky 在底部，不需捲動就按得到。 */
+@media (max-width: 767px) {
+  .ind-settings { max-height: min(90vh, 780px); overflow-y: auto; }
+  .ind-settings > .ind-split { overflow: visible; }
+  .ind-settings .ind-list, .ind-settings .ind-detail { overflow: visible; }
+  .ind-settings > footer.form-actions { position: sticky; bottom: 0; background: var(--qq-surface); }
+}
+
 /* ---- 休市／資料停滯狀態 banner ---- */
 .market-banner {
   font-size: 0.78rem;

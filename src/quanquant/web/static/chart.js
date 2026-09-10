@@ -1041,6 +1041,32 @@
       this.settingsOpen = true;
     },
 
+    // 011（2026-09-10，需求 A）：「＋ 新增」移到右欄欄頂的固定列之後，新增的參數列會
+    // 出現在捲動區最下面——加完自動捲到那一列並聚焦，避免「按了好像沒反應」。
+    // 附帶（2026-09-10，一併改動，小成本高價值）：新線的預設值不再固定 10／黃，改取
+    // 「上一條的兩倍週期」＋還沒用過的顏色——原本每按一次都長出一條和前一條完全一樣的線
+    // （同週期同色＝畫在彼此身上），使用者看不出新增有生效。
+    addIndicatorLine(key, el) {
+      const conf = this.form[key];
+      if (!conf) return;
+      if (!Array.isArray(conf.params)) conf.params = [];
+      const palette = ["#f0b90b", "#ff9800", "#2196f3", "#e91e63", "#935EBD", "#26a69a"];
+      const used = conf.params.map((p) => (p.color || "").toLowerCase());
+      const color = palette.find((c) => !used.includes(c.toLowerCase())) || palette[conf.params.length % palette.length];
+      const last = conf.params[conf.params.length - 1];
+      const period = last && Number.isFinite(last.period) ? Math.min(last.period * 2, 999) : 10;
+      conf.params.push({ period, color });
+      this.$nextTick(() => {
+        const col = el && el.closest(".ind-detail");
+        const rows = col ? col.querySelectorAll(".param-row") : [];
+        const row = rows[rows.length - 1];
+        if (!row) return;
+        row.scrollIntoView({ block: "nearest" });
+        const input = row.querySelector("input[type='number']");
+        if (input) input.focus();
+      });
+    },
+
     async saveSettings() {
       for (const entry of this.indicators) {
         const conf = this.form[entry.key];

@@ -258,7 +258,15 @@
         <section class="ind-detail" x-show="activeIndicator" x-cloak>
           <template x-for="e in indicators.filter((x) => x.key === activeIndicator)" :key="e.key">
             <div>
-              <strong x-text="e.title"></strong> <small class="muted" x-text="e.hint"></small>
+              <!-- 011（2026-09-10，需求 A）：指標名與「＋ 新增」收進欄頂固定列（sticky），
+                   參數列在下方自己捲——加線的入口不再隨參數變多被推到卷軸底下。 -->
+              <div class="ind-detail-head">
+                <div><strong x-text="e.title"></strong> <small class="muted" x-text="e.hint"></small></div>
+                <template x-if="e.repeatable">
+                  <button type="button" class="outline mini"
+                          @click="addIndicatorLine(e.key, $el)">＋ 新增</button>
+                </template>
+              </div>
 
               <!-- repeatable：多條線 -->
               <template x-if="e.repeatable">
@@ -271,8 +279,6 @@
                               @click="form[e.key].params.splice(i, 1)">−</button>
                     </div>
                   </template>
-                  <button type="button" class="outline mini"
-                          @click="form[e.key].params.push({period: 10, color: '#f0b90b'})">＋ 新增</button>
                 </div>
               </template>
 
