@@ -45,7 +45,10 @@ def test_review_objective_no_longer_conflates_trade_count_with_order_quota(clien
 def test_save_review_then_page_shows_saved_state(client, session, user):
     today = today_trading_day()
     _closed(session, user.id, exit_time=dt.datetime.combine(today, dt.time(9, 0)))
-    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}"
+    # R3-1：復盤是存在 mode="real" 下，`client` fixture 未設 app.state.order_service，
+    # `/stats` 未帶 ?mode= 現在會 fallback 回 "sim"（見 web/deps.py::resolve_mode）——
+    # 明確帶 ?mode=real 讓讀回頁面時對得上剛才存的復盤所屬的 mode。
+    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real"
 
     resp = client.post("/stats/review", data={
         "mode": "real", "trading_day": today.isoformat(),
@@ -76,7 +79,9 @@ def test_second_save_updates_subjective_but_freezes_snapshot(client, session, us
         "discipline_note": "改過了", "emotion_note": "", "tomorrow_focus": "",
     })
 
-    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}"
+    # R3-1：同上一測試——復盤存在 mode="real"，讀回頁面要帶 ?mode=real 才對得上
+    # （client fixture 未設 order_service，未帶 ?mode= 會 fallback 回 "sim"）。
+    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real"
     page = client.get(f"/stats?{qs}")
     assert "改過了" in page.text
     assert "已平倉 <b>1</b> 筆" in page.text  # 快照仍是第一次儲存時的 1 筆，不是後來變成的 2 筆

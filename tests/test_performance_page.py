@@ -40,7 +40,10 @@ def test_default_range_includes_previous_night_session_trade(client, session, us
     _closed(session, user.id, exit_time=lower + dt.timedelta(hours=2))  # 昨晚夜盤延續
     _closed(session, user.id, exit_time=upper + dt.timedelta(hours=1))  # 今天自己的夜盤（屬次一交易日）
 
-    resp = client.get("/stats")
+    # R3-1：`client` fixture 未設 app.state.order_service，`/stats` 未帶 ?mode= 現在預設
+    # fallback 回 "sim"（見 web/deps.py::resolve_mode）；這裡驗的是日期範圍邏輯，資料是
+    # `_closed` 預設的 mode="real"，故明確帶 ?mode=real 讓兩者對得上，不受預設值變動影響。
+    resp = client.get("/stats?mode=real")
     assert "共 1 筆" in resp.text
 
 
@@ -77,7 +80,8 @@ def _extract_total_pnl(html: str) -> str:
 def test_pagination_page_count_and_labels(client, session, user):
     today = today_trading_day()
     _make_many_closed_trades(session, user.id, 55, day=today)
-    resp = client.get(f"/stats?date_from={today.isoformat()}&date_to={today.isoformat()}")
+    # R3-1：資料是 `_closed` 預設的 mode="real"，明確帶 ?mode=real（見上方註解）。
+    resp = client.get(f"/stats?date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real")
     assert "共 55 筆、第 1 / 2 頁" in resp.text
 
 
@@ -86,7 +90,7 @@ def test_page_2_total_pnl_matches_page_1(client, session, user):
     不是只算當前頁。"""
     today = today_trading_day()
     _make_many_closed_trades(session, user.id, 55, day=today)
-    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}"
+    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real"
     page1 = client.get(f"/stats?{qs}&page=1")
     page2 = client.get(f"/stats?{qs}&page=2")
     assert _extract_total_pnl(page1.text) == _extract_total_pnl(page2.text)
@@ -98,7 +102,7 @@ def test_page_2_total_pnl_matches_page_1(client, session, user):
 def test_page_out_of_range_clamped_not_500(client, session, user):
     today = today_trading_day()
     _make_many_closed_trades(session, user.id, 3, day=today)
-    resp = client.get(f"/stats?date_from={today.isoformat()}&date_to={today.isoformat()}&page=999")
+    resp = client.get(f"/stats?date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real&page=999")
     assert resp.status_code == 200
     assert "第 1 / 1 頁" in resp.text
 
@@ -109,7 +113,7 @@ def test_result_filter_only_losses(client, session, user):
     today = today_trading_day()
     _closed(session, user.id, exit_time=dt.datetime.combine(today, dt.time(9, 0)), pnl_sign=1)
     _closed(session, user.id, exit_time=dt.datetime.combine(today, dt.time(10, 0)), pnl_sign=-1)
-    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}"
+    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real"
     resp = client.get(f"/stats?{qs}&result=loss")
     assert "共 1 筆" in resp.text
 
@@ -118,7 +122,7 @@ def test_include_manual_toggle_changes_count(client, session, user):
     today = today_trading_day()
     _closed(session, user.id, exit_time=dt.datetime.combine(today, dt.time(9, 0)), source="shioaji")
     _closed(session, user.id, exit_time=dt.datetime.combine(today, dt.time(10, 0)), source="manual")
-    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}"
+    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real"
     default_resp = client.get(f"/stats?{qs}")
     with_manual_resp = client.get(f"/stats?{qs}&include_manual=1")
     assert "共 1 筆" in default_resp.text
@@ -130,7 +134,7 @@ def test_include_manual_toggle_changes_count(client, session, user):
 def test_export_csv_includes_all_filtered_rows_not_just_one_page(client, session, user):
     today = today_trading_day()
     _make_many_closed_trades(session, user.id, 55, day=today)
-    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}"
+    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real"
     csv_resp = client.get(f"/stats/export.csv?{qs}")
     lines = csv_resp.text.strip().splitlines()
     assert len(lines) - 1 == 55  # header + 55 rows，不受單頁 50 筆上限截斷
@@ -140,7 +144,7 @@ def test_export_scope_respects_result_filter(client, session, user):
     today = today_trading_day()
     _closed(session, user.id, exit_time=dt.datetime.combine(today, dt.time(9, 0)), pnl_sign=1)
     _closed(session, user.id, exit_time=dt.datetime.combine(today, dt.time(10, 0)), pnl_sign=-1)
-    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&result=win"
+    qs = f"date_from={today.isoformat()}&date_to={today.isoformat()}&mode=real&result=win"
     csv_resp = client.get(f"/stats/export.csv?{qs}")
     lines = csv_resp.text.strip().splitlines()
     assert len(lines) - 1 == 1

@@ -24,7 +24,7 @@ from quanquant.journal.trading_day import today_trading_day
 from quanquant.stats.export import to_csv_bytes, to_xlsx_bytes
 from quanquant.stats.metrics import compute_stats
 from quanquant.stats.streaks import max_losing_streak_for_trades
-from quanquant.web.deps import get_current_user, get_session, parse_date
+from quanquant.web.deps import get_current_user, get_order_service, get_session, parse_date, resolve_mode
 from quanquant.web.templating import templates
 
 router = APIRouter()
@@ -136,7 +136,8 @@ async def stats_page(
     request: Request,
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
-    mode: str = Query("real"),
+    service=Depends(get_order_service),
+    mode: str | None = Query(None),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
@@ -145,6 +146,9 @@ async def stats_page(
     include_manual: bool = Query(False),
     page: int = Query(1, ge=1),
 ):
+    # R3-1（2026-09-10）：未帶 `?mode=` 時跟隨 server 執行模式，與 /orders/queue、
+    # /orders/deals、/orders/holdings 一致（見 web/deps.py::resolve_mode）。
+    mode = resolve_mode(mode, service)
     frm, to = _resolve_range(date_from, date_to)
     closed = _period_filtered(session, user.id, mode, symbol, tag, frm, to, result, include_manual)
     stats_result = compute_stats(closed)
@@ -226,7 +230,8 @@ async def stats_data(
 async def export_csv(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
-    mode: str = Query("real"),
+    service=Depends(get_order_service),
+    mode: str | None = Query(None),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
@@ -234,6 +239,8 @@ async def export_csv(
     result: str | None = Query(None),
     include_manual: bool = Query(False),
 ):
+    # R3-1（2026-09-10）：直接貼網址不會誤拿正式資料——同 stats_page 的預設值邏輯。
+    mode = resolve_mode(mode, service)
     frm, to = _resolve_range(date_from, date_to)
     closed = _period_filtered(session, user.id, mode, symbol, tag, frm, to, result, include_manual)
     return Response(
@@ -247,7 +254,8 @@ async def export_csv(
 async def export_xlsx(
     session: Session = Depends(get_session),
     user: User = Depends(get_current_user),
-    mode: str = Query("real"),
+    service=Depends(get_order_service),
+    mode: str | None = Query(None),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
@@ -255,6 +263,8 @@ async def export_xlsx(
     result: str | None = Query(None),
     include_manual: bool = Query(False),
 ):
+    # R3-1（2026-09-10）：直接貼網址不會誤拿正式資料——同 stats_page 的預設值邏輯。
+    mode = resolve_mode(mode, service)
     frm, to = _resolve_range(date_from, date_to)
     closed = _period_filtered(session, user.id, mode, symbol, tag, frm, to, result, include_manual)
     return Response(

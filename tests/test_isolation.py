@@ -55,10 +55,14 @@ def test_repo_get_update_delete_scoped(session, user, user_b):
 def test_journal_page_shows_only_own(client, client_b, session, user, user_b):
     _trade(session, user.id, price="11111")
     _trade(session, user_b.id, price="22222")
-    assert "11,111" in client.get("/journal").text
-    assert "22,222" not in client.get("/journal").text
-    assert "11,111" not in client_b.get("/journal").text
-    assert "22,222" in client_b.get("/journal").text
+    # R3-1：`_trade` 用 TradeCreate 預設 mode="real"；`client`/`client_b` 都未設
+    # app.state.order_service，`/journal` 未帶 ?mode= 現在會 fallback 回 "sim"
+    # （見 web/deps.py::resolve_mode），故明確帶 ?mode=real 讓資料對得上——這裡驗的是
+    # 跨用戶隔離，不是 mode 預設行為本身（後者見 test_mode_default_follows_service.py）。
+    assert "11,111" in client.get("/journal?mode=real").text
+    assert "22,222" not in client.get("/journal?mode=real").text
+    assert "11,111" not in client_b.get("/journal?mode=real").text
+    assert "22,222" in client_b.get("/journal?mode=real").text
 
 
 def test_cannot_delete_others_trade_via_route(client_b, session, user):

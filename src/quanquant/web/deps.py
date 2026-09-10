@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from quanquant.broker.agent_registry import UserAgentSlot
 
 __all__ = ["get_session", "get_poller", "get_pulse", "get_order_session_state", "parse_date",
-           "get_current_user", "require_admin", "get_agent_slot", "get_order_service"]
+           "get_current_user", "require_admin", "get_agent_slot", "get_order_service", "resolve_mode"]
 
 
 def get_poller(request: Request) -> QuotePoller | None:
@@ -102,3 +102,22 @@ def get_order_service(request: Request, user: User = Depends(get_current_user)):
         slot = registry.get(user.id)
         return slot.adapter if slot is not None else None
     return getattr(request.app.state, "order_service", None)
+
+
+def resolve_mode(mode: str | None, service) -> str:
+    """R3-1（2026-09-10）：`mode` 分頁未帶 `?mode=` 時的預設值共用 helper——跟隨 server
+    執行模式（`service.mode`），與 `orders.py` 既有三個新頁（`orders_queue_page`／
+    `orders_deals_page`／`orders_holdings_page`）沿用的
+    `_mode(mode or (service.mode if service is not None else None))` 慣例完全一致（見該檔
+    `_mode`）。帶 `?mode=` 時一律優先，不受這裡影響。
+
+    `service` 為 `None`（下單子系統停用、或呼叫者非 owner，見 `get_order_service`）、或
+    `service.mode` 不是合法值時，fallback 回 `"sim"`——沿用 orders.py 既有慣例：寧可預設
+    顯示風險較低的模擬資料，也不要在無法判斷真實執行模式時靜默落回 real。
+
+    這輪（2026-09-10 R3-1）只套用在 `stats.py`／`trades.py`；`orders.py` 本身這次刻意不碰
+    ——另一條並行開發線正在改它，待該線合併後兩邊應收斂成同一份實作（`orders.py::_mode`
+    屆時改呼叫這裡）。
+    """
+    candidate = mode or (service.mode if service is not None else None)
+    return candidate if candidate in ("sim", "real") else "sim"

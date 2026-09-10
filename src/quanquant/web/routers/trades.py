@@ -12,7 +12,7 @@ from quanquant.journal import review_repository as review_repo
 from quanquant.journal.pnl import unrealized_pnl
 from quanquant.journal.schemas import TradeCreate, TradeUpdate, split_tags
 from quanquant.poller import QuotePoller
-from quanquant.web.deps import get_current_user, get_poller, get_session, parse_date
+from quanquant.web.deps import get_current_user, get_order_service, get_poller, get_session, parse_date, resolve_mode
 from quanquant.web.templating import render_partial, templates
 
 router = APIRouter()
@@ -80,13 +80,17 @@ async def journal_page(
     session: Session = Depends(get_session),
     poller: QuotePoller | None = Depends(get_poller),
     user: User = Depends(get_current_user),
+    service=Depends(get_order_service),
     symbol: str | None = Query(None),
     tag: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     status: str = Query("all"),
-    mode: str = Query("real"),
+    mode: str | None = Query(None),
 ):
+    # R3-1（2026-09-10）：未帶 `?mode=` 時跟隨 server 執行模式，與 /orders/queue、
+    # /orders/deals、/orders/holdings、/stats 一致（見 web/deps.py::resolve_mode）。
+    mode = resolve_mode(mode, service)
     trades = repo.list_trades(
         session,
         user_id=user.id,
